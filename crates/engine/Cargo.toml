@@ -1,0 +1,9 @@
+[package]
+name = "engine"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+common = { path = "../common" }
+bytes.workspace = true
+parking_lot.workspace = true

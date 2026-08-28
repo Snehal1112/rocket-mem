@@ -1,0 +1,7 @@
+[package]
+name = "rocket-mem"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+engine = { path = "../engine" }
