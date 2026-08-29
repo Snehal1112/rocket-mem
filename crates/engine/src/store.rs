@@ -2,15 +2,18 @@ use crate::{shard::Shard, Value};
 use bytes::Bytes;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::AtomicU64;
 
 pub struct Store {
     shards: Vec<Shard>,
+    clock: AtomicU64,
 }
 
 impl Store {
     pub fn new(shard_count: usize) -> Self {
         Self {
             shards: (0..shard_count).map(|_| Shard::new()).collect(),
+            clock: AtomicU64::new(0),
         }
     }
 
@@ -22,16 +25,16 @@ impl Store {
     }
 
     pub fn get(&self, key: &[u8]) -> Option<Value> {
-        self.shard_for(key).get(key)
+        self.shard_for(key).get(key, &self.clock)
     }
     pub fn set(&self, key: Bytes, value: Value) {
-        self.shard_for(&key).set(key, value)
+        self.shard_for(&key).set(key, value, &self.clock)
     }
     pub fn del(&self, key: &[u8]) -> bool {
         self.shard_for(key).del(key)
     }
     pub fn exists(&self, key: &[u8]) -> bool {
-        self.shard_for(key).exists(key)
+        self.shard_for(key).exists(key, &self.clock)
     }
     pub fn keys(&self) -> Vec<Bytes> {
         self.shards.iter().flat_map(|s| s.keys()).collect()
@@ -40,13 +43,13 @@ impl Store {
     where
         F: FnOnce(Option<&Value>) -> R,
     {
-        self.shard_for(key).with_ref(key, f)
+        self.shard_for(key).with_ref(key, f, &self.clock)
     }
     pub fn with_mut<F, R>(&self, key: &[u8], f: F) -> R
     where
         F: FnOnce(Option<&mut Value>) -> R,
     {
-        self.shard_for(key).with_mut(key, f)
+        self.shard_for(key).with_mut(key, f, &self.clock)
     }
     pub fn expire_at(&self, key: &[u8], at: std::time::Instant) -> bool {
         self.shard_for(key).expire_at(key, at)
@@ -72,6 +75,17 @@ impl Store {
             (idx + 1) as u64
         };
         (next, keys)
+    }
+
+    pub fn memory_used(&self) -> usize {
+        self.shards.iter().map(|s| s.bytes_used()).sum()
+    }
+
+    pub fn sample_for_eviction(&self, per_shard: usize) -> Vec<(Bytes, u64)> {
+        self.shards
+            .iter()
+            .flat_map(|s| s.sample_recency(per_shard))
+            .collect()
     }
 
     #[cfg(test)]
@@ -242,6 +256,25 @@ mod tests {
         let store = Store::new(16);
         // shard index 16 wraps to shard 0 (16 % 16 == 0) — must not panic
         assert_eq!(store.active_expire_cycle(16), 0);
+    }
+
+    #[test]
+    fn memory_used_sums_bytes_used_across_all_shards() {
+        let store = Store::new(16);
+        assert_eq!(store.memory_used(), 0);
+        store.set(Bytes::from_static(b"k"), Value::String(Bytes::from_static(b"v")));
+        assert!(store.memory_used() > 0);
+    }
+
+    #[test]
+    fn sample_for_eviction_collects_candidates_from_every_shard() {
+        let store = Store::new(16);
+        for i in 0..32 {
+            store.set(Bytes::from(format!("k{i}")), Value::String(Bytes::from_static(b"v")));
+        }
+        // with 32 keys spread across 16 shards, sampling 1 per shard should find at least
+        // several distinct shards' worth of candidates (exact count depends on hash distribution)
+        assert!(store.sample_for_eviction(1).len() >= 8);
     }
 
     #[test]

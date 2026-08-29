@@ -70,6 +70,20 @@ impl Value {
             Value::SortedSet(_) => "zset",
         }
     }
+
+    /// A rough byte-size estimate — not exact, not meant to be (see
+    /// ../../docs/superpowers/specs/2026-08-30-sprint-4-spec.md's LRU/MAXMEMORY decision).
+    pub fn approx_size(&self) -> usize {
+        const OVERHEAD: usize = 48; // rough per-entry bookkeeping estimate
+        let content = match self {
+            Value::String(b) => b.len(),
+            Value::List(l) => l.iter().map(|b| b.len() + 8).sum(),
+            Value::Hash(m) => m.iter().map(|(k, v)| k.len() + v.len() + 16).sum(),
+            Value::Set(s) => s.iter().map(|b| b.len() + 8).sum(),
+            Value::SortedSet(z) => z.members_ascending().map(|m| m.len() + 24).sum(),
+        };
+        OVERHEAD + content
+    }
 }
 
 #[cfg(test)]
@@ -142,5 +156,18 @@ mod tests {
     #[test]
     fn type_name_reports_zset_for_sorted_set_values() {
         assert_eq!(Value::SortedSet(SortedSet::new()).type_name(), "zset");
+    }
+
+    #[test]
+    fn approx_size_grows_with_string_content_length() {
+        let small = Value::String(Bytes::from_static(b"hi"));
+        let big = Value::String(Bytes::from_static(b"a much longer string value"));
+        assert!(big.approx_size() > small.approx_size());
+    }
+
+    #[test]
+    fn approx_size_is_never_zero_even_for_an_empty_value() {
+        assert!(Value::String(Bytes::new()).approx_size() > 0);
+        assert!(Value::List(VecDeque::new()).approx_size() > 0);
     }
 }
