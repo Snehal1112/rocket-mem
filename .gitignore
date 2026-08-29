@@ -22,3 +22,5 @@ target
 
 # Superpowers plugin: isolated worktree workspace
 .worktrees/
+
+.claude
