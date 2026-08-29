@@ -2,3 +2,6 @@
 name = "protocol"
 edition.workspace = true
 version.workspace = true
+
+[dependencies]
+bytes.workspace = true
