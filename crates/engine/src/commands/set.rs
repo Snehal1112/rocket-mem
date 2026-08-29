@@ -18,7 +18,11 @@ pub fn sadd(engine: &Engine, key: Bytes, member: Bytes) -> Result<(), common::En
 }
 
 pub fn srem(engine: &Engine, key: &[u8], member: &[u8]) -> Result<bool, common::EngineError> {
-    let mut set = get_set(engine, key)?;
+    let mut set = match engine.get(key) {
+        None => return Ok(false),
+        Some(Value::Set(s)) => s,
+        Some(_) => return Err(common::EngineError::WrongType),
+    };
     let removed = set.remove(member);
     engine.set(Bytes::copy_from_slice(key), Value::Set(set));
     Ok(removed)

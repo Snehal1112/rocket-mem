@@ -25,14 +25,22 @@ pub fn lpush(engine: &Engine, key: Bytes, val: Bytes) -> Result<(), common::Engi
 }
 
 pub fn rpop(engine: &Engine, key: &[u8]) -> Result<Option<Bytes>, common::EngineError> {
-    let mut list = get_list(engine, key)?;
+    let mut list = match engine.get(key) {
+        None => return Ok(None),
+        Some(Value::List(l)) => l,
+        Some(_) => return Err(common::EngineError::WrongType),
+    };
     let popped = list.pop_back();
     engine.set(Bytes::copy_from_slice(key), Value::List(list));
     Ok(popped)
 }
 
 pub fn lpop(engine: &Engine, key: &[u8]) -> Result<Option<Bytes>, common::EngineError> {
-    let mut list = get_list(engine, key)?;
+    let mut list = match engine.get(key) {
+        None => return Ok(None),
+        Some(Value::List(l)) => l,
+        Some(_) => return Err(common::EngineError::WrongType),
+    };
     let popped = list.pop_front();
     engine.set(Bytes::copy_from_slice(key), Value::List(list));
     Ok(popped)
