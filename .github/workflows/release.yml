@@ -1,0 +1,126 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  changelog:
+    name: Generate Changelog
+    runs-on: ubuntu-latest
+    outputs:
+      body: ${{ steps.cliff.outputs.content }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate changelog
+        uses: orhun/git-cliff-action@v4
+        id: cliff
+        with:
+          config: cliff.toml
+          args: --latest --strip header
+
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Each runner builds its own host triple natively -- no cross-compilation.
+          - os: ubuntu-latest
+            os_name: linux
+            arch: amd64
+            ext: ""
+            archive: tar.gz
+          - os: macos-latest
+            os_name: darwin
+            arch: arm64
+            ext: ""
+            archive: tar.gz
+          - os: windows-latest
+            os_name: windows
+            arch: amd64
+            ext: ".exe"
+            archive: zip
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release --bin rocket-mem
+
+      - name: Package (tar.gz)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          VERSION="${{ github.ref_name }}"
+          BINARY="rocket-mem-${VERSION}-${{ matrix.os_name }}-${{ matrix.arch }}"
+          mkdir -p dist
+          cp "target/release/rocket-mem${{ matrix.ext }}" "dist/${BINARY}"
+          ARCHIVE="${BINARY}.tar.gz"
+          tar -czf "dist/${ARCHIVE}" -C dist "${BINARY}"
+          # Hash from inside dist so the recorded filename has no path prefix,
+          # which lets consumers verify against a bare downloaded archive.
+          cd dist
+          command -v sha256sum >/dev/null 2>&1 && sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256" || shasum -a 256 "${ARCHIVE}" > "${ARCHIVE}.sha256"
+
+      - name: Package (zip)
+        if: matrix.archive == 'zip'
+        shell: bash
+        run: |
+          VERSION="${{ github.ref_name }}"
+          BINARY="rocket-mem-${VERSION}-${{ matrix.os_name }}-${{ matrix.arch }}${{ matrix.ext }}"
+          mkdir -p dist
+          cp "target/release/rocket-mem${{ matrix.ext }}" "dist/${BINARY}"
+          ARCHIVE="rocket-mem-${VERSION}-${{ matrix.os_name }}-${{ matrix.arch }}.zip"
+          7z a "dist/${ARCHIVE}" "dist/${BINARY}"
+          # Hash from inside dist so the recorded filename has no path prefix.
+          cd dist
+          command -v sha256sum >/dev/null 2>&1 && sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256" || shasum -a 256 "${ARCHIVE}" > "${ARCHIVE}.sha256"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rocket-mem-${{ matrix.os_name }}-${{ matrix.arch }}
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+            dist/*.zip
+            dist/*.zip.sha256
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: [build, changelog]
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CHANGELOG_BODY: ${{ needs.changelog.outputs.body }}
+        run: |
+          VERSION="${{ github.ref_name }}"
+          gh release create "${VERSION}" \
+            --draft \
+            --title "rocket-mem ${VERSION}" \
+            --notes "${CHANGELOG_BODY}" \
+            dist/*.tar.gz dist/*.tar.gz.sha256 \
+            dist/*.zip dist/*.zip.sha256

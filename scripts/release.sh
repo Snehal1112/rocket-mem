@@ -151,4 +151,5 @@ git push origin "$branch" "$new_tag"
 
 echo ""
 echo -e "${GREEN}Bumped, tagged, and pushed: ${new_tag}${NC}"
-echo "No release workflow is wired up yet (planned for Sprint 8) -- build and publish artifacts manually for now."
+echo "GitHub Actions will build release binaries and open a draft release shortly."
+echo "Monitor: https://github.com/$(git remote get-url origin | sed 's/.*github.com[:/]\(.*\)\.git/\1/')/actions"

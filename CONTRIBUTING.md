@@ -65,7 +65,10 @@ What it does, in order:
 4. Creates a signed tag on that commit and verifies the signature before pushing.
 5. Pushes the current branch and the tag to `origin`.
 
-There's no CI release workflow triggered by the tag yet (planned for Sprint 8 — see the sprint plan) — build and publish artifacts manually until then.
+The pushed tag triggers [`.github/workflows/release.yml`](.github/workflows/release.yml), which:
+1. Generates a changelog from conventional-commit history since the last tag, via [`git-cliff`](https://git-cliff.org/) (config: [`cliff.toml`](cliff.toml)).
+2. Builds a release binary natively on Linux, macOS, and Windows runners (no cross-compilation), packaged as `.tar.gz` (Linux/macOS) or `.zip` (Windows) with a `.sha256` checksum alongside each archive.
+3. Opens a **draft** GitHub Release named after the tag, with the changelog as its body and all platform archives attached — review and publish it manually.
 
 ## License
 
