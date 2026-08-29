@@ -34,6 +34,20 @@ fn format_score(score: f64) -> Bytes {
     }
 }
 
+/// `EXPIREAT`/`PEXPIREAT` give an absolute Unix timestamp; `Instant` has no epoch relationship,
+/// so the absolute target is first resolved via `SystemTime`, then re-expressed as a delta
+/// applied to `Instant::now()`. A target already in the past collapses to `Duration::ZERO`,
+/// which the very next expiry check reads as already-expired — see
+/// ../../specs/2026-08-30-sprint-4-spec.md for why this two-step conversion is necessary.
+fn instant_from_unix_ms(target_unix_ms: i64) -> std::time::Instant {
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    let target = UNIX_EPOCH + Duration::from_millis(target_unix_ms.max(0) as u64);
+    let delta = target
+        .duration_since(SystemTime::now())
+        .unwrap_or(Duration::ZERO);
+    std::time::Instant::now() + delta
+}
+
 fn parse_score(raw: &[u8]) -> Result<f64, Frame> {
     let score: f64 = std::str::from_utf8(raw)
         .ok()
@@ -752,10 +766,66 @@ pub fn dispatch(engine: &Engine, frame: Frame, protocol: &mut Protocol, client_i
             Some(k) => Frame::Bulk(k),
             None => Frame::Null,
         },
-        "EXPIRE" | "PEXPIRE" | "EXPIREAT" | "PEXPIREAT" | "TTL" | "PTTL" | "PERSIST" => {
-            Frame::Error(format!(
-                "ERR {name} is not supported yet (planned Sprint 4 — no expiry reaper exists)"
-            ))
+        "EXPIRE" | "PEXPIRE" => {
+            require_args!(rest, 2, name.to_ascii_lowercase().as_str());
+            let n: i64 = match std::str::from_utf8(&rest[1])
+                .ok()
+                .and_then(|s| s.parse().ok())
+            {
+                Some(n) => n,
+                None => return Frame::Error("ERR value is not an integer or out of range".into()),
+            };
+            let delta = if name == "EXPIRE" {
+                std::time::Duration::from_secs(n.max(0) as u64)
+            } else {
+                std::time::Duration::from_millis(n.max(0) as u64)
+            };
+            match engine.expire_at(&rest[0], std::time::Instant::now() + delta) {
+                true => Frame::Integer(1),
+                false => Frame::Integer(0),
+            }
+        }
+        "EXPIREAT" | "PEXPIREAT" => {
+            require_args!(rest, 2, name.to_ascii_lowercase().as_str());
+            let n: i64 = match std::str::from_utf8(&rest[1])
+                .ok()
+                .and_then(|s| s.parse().ok())
+            {
+                Some(n) => n,
+                None => return Frame::Error("ERR value is not an integer or out of range".into()),
+            };
+            let target_unix_ms = if name == "EXPIREAT" {
+                n.saturating_mul(1000)
+            } else {
+                n
+            };
+            match engine.expire_at(&rest[0], instant_from_unix_ms(target_unix_ms)) {
+                true => Frame::Integer(1),
+                false => Frame::Integer(0),
+            }
+        }
+        "TTL" => {
+            require_args!(rest, 1, "ttl");
+            match engine.ttl(&rest[0]) {
+                engine::TtlStatus::NoSuchKey => Frame::Integer(-2),
+                engine::TtlStatus::NoExpiry => Frame::Integer(-1),
+                engine::TtlStatus::Remaining(d) => Frame::Integer(d.as_secs().max(1) as i64),
+            }
+        }
+        "PTTL" => {
+            require_args!(rest, 1, "pttl");
+            match engine.ttl(&rest[0]) {
+                engine::TtlStatus::NoSuchKey => Frame::Integer(-2),
+                engine::TtlStatus::NoExpiry => Frame::Integer(-1),
+                engine::TtlStatus::Remaining(d) => Frame::Integer(d.as_millis().max(1) as i64),
+            }
+        }
+        "PERSIST" => {
+            require_args!(rest, 1, "persist");
+            match engine.persist(&rest[0]) {
+                true => Frame::Integer(1),
+                false => Frame::Integer(0),
+            }
         }
         "PING" => match rest.first() {
             Some(msg) => Frame::Bulk(msg.clone()),
@@ -2677,31 +2747,221 @@ mod tests {
     }
 
     #[test]
-    fn expire_family_returns_a_clear_not_implemented_error() {
+    fn expire_sets_a_relative_ttl_and_ttl_reports_it_positive() {
         let engine = Engine::new();
-        for name in [
-            "EXPIRE",
-            "PEXPIRE",
-            "EXPIREAT",
-            "PEXPIREAT",
-            "TTL",
-            "PTTL",
-            "PERSIST",
-        ] {
-            let reply = dispatch(
+        dispatch(
+            &engine,
+            cmd(&[b"SET", b"k", b"v"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(
+            dispatch(
                 &engine,
-                cmd(&[name.as_bytes(), b"k"]),
+                cmd(&[b"EXPIRE", b"k", b"100"]),
                 &mut Protocol::default(),
-                1,
-            );
-            let Frame::Error(msg) = reply else {
-                panic!("expected Frame::Error for {name}, got something else")
-            };
-            assert!(
-                msg.contains("not supported yet"),
-                "unexpected message for {name}: {msg}"
-            );
-        }
+                1
+            ),
+            Frame::Integer(1)
+        );
+        let Frame::Integer(secs) =
+            dispatch(&engine, cmd(&[b"TTL", b"k"]), &mut Protocol::default(), 1)
+        else {
+            panic!("expected Integer")
+        };
+        assert!((1..=100).contains(&secs));
+    }
+
+    #[test]
+    fn expire_on_a_missing_key_returns_zero() {
+        let engine = Engine::new();
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"EXPIRE", b"missing", b"100"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Integer(0)
+        );
+    }
+
+    #[test]
+    fn expire_with_a_non_integer_seconds_is_a_resp_error() {
+        let engine = Engine::new();
+        dispatch(
+            &engine,
+            cmd(&[b"SET", b"k", b"v"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"EXPIRE", b"k", b"soon"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Error("ERR value is not an integer or out of range".into())
+        );
+    }
+
+    #[test]
+    fn pexpire_sets_a_millisecond_ttl() {
+        let engine = Engine::new();
+        dispatch(
+            &engine,
+            cmd(&[b"SET", b"k", b"v"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"PEXPIRE", b"k", b"60000"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Integer(1)
+        );
+        let Frame::Integer(ms) =
+            dispatch(&engine, cmd(&[b"PTTL", b"k"]), &mut Protocol::default(), 1)
+        else {
+            panic!("expected Integer")
+        };
+        assert!((1..=60000).contains(&ms));
+    }
+
+    #[test]
+    fn expireat_with_a_past_timestamp_deletes_the_key_immediately() {
+        let engine = Engine::new();
+        dispatch(
+            &engine,
+            cmd(&[b"SET", b"k", b"v"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"EXPIREAT", b"k", b"1"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Integer(1)
+        );
+        assert_eq!(
+            dispatch(&engine, cmd(&[b"GET", b"k"]), &mut Protocol::default(), 1),
+            Frame::Null
+        );
+    }
+
+    #[test]
+    fn pexpireat_with_a_future_timestamp_keeps_the_key_alive() {
+        let engine = Engine::new();
+        dispatch(
+            &engine,
+            cmd(&[b"SET", b"k", b"v"]),
+            &mut Protocol::default(),
+            1,
+        );
+        let future_ms = (std::time::SystemTime::now() + std::time::Duration::from_secs(60))
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+            .to_string();
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"PEXPIREAT", b"k", future_ms.as_bytes()]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Integer(1)
+        );
+        assert_eq!(
+            dispatch(&engine, cmd(&[b"GET", b"k"]), &mut Protocol::default(), 1),
+            Frame::Bulk(Bytes::from_static(b"v"))
+        );
+    }
+
+    #[test]
+    fn ttl_on_a_missing_key_returns_negative_two() {
+        let engine = Engine::new();
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"TTL", b"missing"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Integer(-2)
+        );
+    }
+
+    #[test]
+    fn ttl_on_a_key_with_no_expiry_returns_negative_one() {
+        let engine = Engine::new();
+        dispatch(
+            &engine,
+            cmd(&[b"SET", b"k", b"v"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(
+            dispatch(&engine, cmd(&[b"TTL", b"k"]), &mut Protocol::default(), 1),
+            Frame::Integer(-1)
+        );
+    }
+
+    #[test]
+    fn persist_removes_an_existing_ttl_through_dispatch() {
+        let engine = Engine::new();
+        dispatch(
+            &engine,
+            cmd(&[b"SET", b"k", b"v"]),
+            &mut Protocol::default(),
+            1,
+        );
+        dispatch(
+            &engine,
+            cmd(&[b"EXPIRE", b"k", b"100"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"PERSIST", b"k"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Integer(1)
+        );
+        assert_eq!(
+            dispatch(&engine, cmd(&[b"TTL", b"k"]), &mut Protocol::default(), 1),
+            Frame::Integer(-1)
+        );
+    }
+
+    #[test]
+    fn persist_on_a_key_with_no_ttl_returns_zero() {
+        let engine = Engine::new();
+        dispatch(
+            &engine,
+            cmd(&[b"SET", b"k", b"v"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"PERSIST", b"k"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Integer(0)
+        );
     }
 
     #[test]
