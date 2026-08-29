@@ -3,5 +3,16 @@ name = "rocket-mem"
 edition.workspace = true
 version.workspace = true
 
+[lib]
+name = "rocket_mem"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rocket-mem"
+path = "src/main.rs"
+
 [dependencies]
 engine = { path = "../engine" }
+protocol = { path = "../protocol" }
+common = { path = "../common" }
+bytes.workspace = true

@@ -1,3 +1,3 @@
 fn main() {
-    // Networking built in Sprint 2.
+    // Networking wired up in 04-tcp-listener.md.
 }

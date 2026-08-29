@@ -131,7 +131,10 @@ dependencies = [
 name = "rocket-mem"
 version = "0.1.0"
 dependencies = [
+ "bytes",
+ "common",
  "engine",
+ "protocol",
 ]
 
 [[package]]
