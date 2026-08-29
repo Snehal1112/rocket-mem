@@ -353,6 +353,21 @@ pub fn dispatch(engine: &Engine, frame: Frame, protocol: &mut Protocol, client_i
                     .collect(),
             )
         }
+        "SCAN" => {
+            require_args!(rest, 1, "scan");
+            let cursor: u64 = match std::str::from_utf8(&rest[0])
+                .ok()
+                .and_then(|s| s.parse().ok())
+            {
+                Some(n) => n,
+                None => return Frame::Error("ERR invalid cursor".into()),
+            };
+            let (next, keys) = engine.scan(cursor);
+            Frame::Array(vec![
+                Frame::Bulk(Bytes::from(next.to_string())),
+                Frame::Array(keys.into_iter().map(Frame::Bulk).collect()),
+            ])
+        }
         "RANDOMKEY" => match commands::keys::randomkey(engine) {
             Some(k) => Frame::Bulk(k),
             None => Frame::Null,
@@ -1159,6 +1174,75 @@ mod tests {
             dispatch(&engine, cmd(&[b"KEYS", b"*"]), &mut Protocol::default(), 1),
             Frame::Array(vec![])
         );
+    }
+
+    #[test]
+    fn scan_zero_returns_an_array_of_cursor_and_keys() {
+        let engine = Engine::new();
+        dispatch(
+            &engine,
+            cmd(&[b"SET", b"k", b"v"]),
+            &mut Protocol::default(),
+            1,
+        );
+        let reply = dispatch(&engine, cmd(&[b"SCAN", b"0"]), &mut Protocol::default(), 1);
+        let Frame::Array(parts) = reply else {
+            panic!("expected Array")
+        };
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0], Frame::Bulk(Bytes::from_static(b"1")));
+    }
+
+    #[test]
+    fn scan_with_a_non_numeric_cursor_is_a_resp_error() {
+        let engine = Engine::new();
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"SCAN", b"notacursor"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Error("ERR invalid cursor".into())
+        );
+    }
+
+    #[test]
+    fn a_full_scan_over_dispatch_eventually_returns_cursor_zero() {
+        let engine = Engine::new();
+        for i in 0..50 {
+            dispatch(
+                &engine,
+                cmd(&[b"SET", format!("k{i}").as_bytes(), b"v"]),
+                &mut Protocol::default(),
+                1,
+            );
+        }
+        let mut cursor = Bytes::from_static(b"0");
+        let mut total_keys = 0;
+        loop {
+            let reply = dispatch(
+                &engine,
+                cmd(&[b"SCAN", &cursor]),
+                &mut Protocol::default(),
+                1,
+            );
+            let Frame::Array(parts) = reply else {
+                panic!("expected Array")
+            };
+            let Frame::Bulk(next) = parts[0].clone() else {
+                panic!("expected Bulk cursor")
+            };
+            let Frame::Array(keys) = parts[1].clone() else {
+                panic!("expected Array of keys")
+            };
+            total_keys += keys.len();
+            cursor = next;
+            if cursor.as_ref() == b"0" {
+                break;
+            }
+        }
+        assert_eq!(total_keys, 50);
     }
 
     #[test]
