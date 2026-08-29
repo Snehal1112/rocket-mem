@@ -37,7 +37,7 @@ macro_rules! require_args {
     };
 }
 
-pub fn dispatch(engine: &Engine, frame: Frame, _protocol: &mut Protocol, _client_id: u64) -> Frame {
+pub fn dispatch(engine: &Engine, frame: Frame, protocol: &mut Protocol, client_id: u64) -> Frame {
     let args = match frame_to_args(frame) {
         Ok(a) => a,
         Err(e) => return e,
@@ -289,8 +289,64 @@ pub fn dispatch(engine: &Engine, frame: Frame, _protocol: &mut Protocol, _client
         "INFO" => Frame::Bulk(Bytes::from_static(
             b"# Server\r\nredis_version:rocket-mem-0.1.0\r\n",
         )),
+        "HELLO" => match rest.first() {
+            None => hello_reply(*protocol, client_id),
+            Some(arg) => match arg.as_ref() {
+                b"2" => {
+                    if rest.len() > 1 {
+                        return Frame::Error("ERR syntax error".into());
+                    }
+                    *protocol = Protocol::Resp2;
+                    hello_reply(*protocol, client_id)
+                }
+                b"3" => {
+                    if rest.len() > 1 {
+                        return Frame::Error("ERR syntax error".into());
+                    }
+                    *protocol = Protocol::Resp3;
+                    hello_reply(*protocol, client_id)
+                }
+                _ => Frame::Error("NOPROTO unsupported protocol version".into()),
+            },
+        },
         _ => Frame::Error(format!("ERR unknown command '{name}'")),
     }
+}
+
+fn hello_reply(protocol: Protocol, client_id: u64) -> Frame {
+    Frame::Map(vec![
+        (
+            Frame::Bulk(Bytes::from_static(b"server")),
+            Frame::Bulk(Bytes::from_static(b"redis")),
+        ),
+        (
+            Frame::Bulk(Bytes::from_static(b"version")),
+            Frame::Bulk(Bytes::from_static(b"rocket-mem-0.1.0")),
+        ),
+        (
+            Frame::Bulk(Bytes::from_static(b"proto")),
+            Frame::Integer(match protocol {
+                Protocol::Resp2 => 2,
+                Protocol::Resp3 => 3,
+            }),
+        ),
+        (
+            Frame::Bulk(Bytes::from_static(b"id")),
+            Frame::Integer(client_id as i64),
+        ),
+        (
+            Frame::Bulk(Bytes::from_static(b"mode")),
+            Frame::Bulk(Bytes::from_static(b"standalone")),
+        ),
+        (
+            Frame::Bulk(Bytes::from_static(b"role")),
+            Frame::Bulk(Bytes::from_static(b"master")),
+        ),
+        (
+            Frame::Bulk(Bytes::from_static(b"modules")),
+            Frame::Array(vec![]),
+        ),
+    ])
 }
 
 #[cfg(test)]
@@ -734,13 +790,110 @@ mod tests {
     }
 
     #[test]
-    fn hello_is_not_implemented_and_falls_through_to_unknown_command() {
-        // per 2026-08-29-sprint-2-spec.md's RESP3 decision: HELLO gets the same
-        // treatment as any other unrecognized command, on purpose
+    fn hello_with_no_args_reports_current_protocol_without_switching() {
         let engine = Engine::new();
+        let mut protocol = Protocol::Resp2;
+        let reply = dispatch(&engine, cmd(&[b"HELLO"]), &mut protocol, 7);
+        assert_eq!(protocol, Protocol::Resp2); // unchanged
         assert_eq!(
-            dispatch(&engine, cmd(&[b"HELLO", b"3"]), &mut Protocol::default(), 1),
-            Frame::Error("ERR unknown command 'HELLO'".into())
+            reply,
+            Frame::Map(vec![
+                (
+                    Frame::Bulk(Bytes::from_static(b"server")),
+                    Frame::Bulk(Bytes::from_static(b"redis"))
+                ),
+                (
+                    Frame::Bulk(Bytes::from_static(b"version")),
+                    Frame::Bulk(Bytes::from_static(b"rocket-mem-0.1.0"))
+                ),
+                (Frame::Bulk(Bytes::from_static(b"proto")), Frame::Integer(2)),
+                (Frame::Bulk(Bytes::from_static(b"id")), Frame::Integer(7)),
+                (
+                    Frame::Bulk(Bytes::from_static(b"mode")),
+                    Frame::Bulk(Bytes::from_static(b"standalone"))
+                ),
+                (
+                    Frame::Bulk(Bytes::from_static(b"role")),
+                    Frame::Bulk(Bytes::from_static(b"master"))
+                ),
+                (
+                    Frame::Bulk(Bytes::from_static(b"modules")),
+                    Frame::Array(vec![])
+                ),
+            ])
         );
+    }
+
+    #[test]
+    fn hello_2_switches_protocol_to_resp2() {
+        let engine = Engine::new();
+        let mut protocol = Protocol::Resp3;
+        let reply = dispatch(&engine, cmd(&[b"HELLO", b"2"]), &mut protocol, 1);
+        assert_eq!(protocol, Protocol::Resp2);
+        let Frame::Map(pairs) = reply else {
+            panic!("expected Map")
+        };
+        assert!(pairs.contains(&(Frame::Bulk(Bytes::from_static(b"proto")), Frame::Integer(2))));
+    }
+
+    #[test]
+    fn hello_3_switches_protocol_to_resp3() {
+        let engine = Engine::new();
+        let mut protocol = Protocol::Resp2;
+        let reply = dispatch(&engine, cmd(&[b"HELLO", b"3"]), &mut protocol, 42);
+        assert_eq!(protocol, Protocol::Resp3);
+        assert_eq!(
+            reply,
+            Frame::Map(vec![
+                (
+                    Frame::Bulk(Bytes::from_static(b"server")),
+                    Frame::Bulk(Bytes::from_static(b"redis"))
+                ),
+                (
+                    Frame::Bulk(Bytes::from_static(b"version")),
+                    Frame::Bulk(Bytes::from_static(b"rocket-mem-0.1.0"))
+                ),
+                (Frame::Bulk(Bytes::from_static(b"proto")), Frame::Integer(3)),
+                (Frame::Bulk(Bytes::from_static(b"id")), Frame::Integer(42)),
+                (
+                    Frame::Bulk(Bytes::from_static(b"mode")),
+                    Frame::Bulk(Bytes::from_static(b"standalone"))
+                ),
+                (
+                    Frame::Bulk(Bytes::from_static(b"role")),
+                    Frame::Bulk(Bytes::from_static(b"master"))
+                ),
+                (
+                    Frame::Bulk(Bytes::from_static(b"modules")),
+                    Frame::Array(vec![])
+                ),
+            ])
+        );
+    }
+
+    #[test]
+    fn hello_with_unsupported_protover_returns_noproto_and_leaves_protocol_unchanged() {
+        let engine = Engine::new();
+        let mut protocol = Protocol::Resp2;
+        let reply = dispatch(&engine, cmd(&[b"HELLO", b"4"]), &mut protocol, 1);
+        assert_eq!(protocol, Protocol::Resp2); // unchanged
+        assert_eq!(
+            reply,
+            Frame::Error("NOPROTO unsupported protocol version".into())
+        );
+    }
+
+    #[test]
+    fn hello_with_extra_args_after_protover_is_a_syntax_error() {
+        let engine = Engine::new();
+        let mut protocol = Protocol::Resp2;
+        let reply = dispatch(
+            &engine,
+            cmd(&[b"HELLO", b"3", b"AUTH", b"user", b"pass"]),
+            &mut protocol,
+            1,
+        );
+        assert_eq!(protocol, Protocol::Resp2); // unchanged — the switch never happened
+        assert_eq!(reply, Frame::Error("ERR syntax error".into()));
     }
 }
