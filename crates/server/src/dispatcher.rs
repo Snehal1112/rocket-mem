@@ -258,6 +258,89 @@ pub fn dispatch(engine: &Engine, frame: Frame, protocol: &mut Protocol, client_i
                 Err(e) => engine_error_to_frame(e),
             }
         }
+        "LINDEX" => {
+            require_args!(rest, 2, "lindex");
+            let index: i64 = match std::str::from_utf8(&rest[1])
+                .ok()
+                .and_then(|s| s.parse().ok())
+            {
+                Some(n) => n,
+                None => return Frame::Error("ERR value is not an integer or out of range".into()),
+            };
+            match commands::list::lindex(engine, &rest[0], index) {
+                Ok(Some(b)) => Frame::Bulk(b),
+                Ok(None) => Frame::Null,
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
+        "LSET" => {
+            require_args!(rest, 3, "lset");
+            let index: i64 = match std::str::from_utf8(&rest[1])
+                .ok()
+                .and_then(|s| s.parse().ok())
+            {
+                Some(n) => n,
+                None => return Frame::Error("ERR value is not an integer or out of range".into()),
+            };
+            match commands::list::lset(engine, rest[0].clone(), index, rest[2].clone()) {
+                Ok(true) => Frame::Simple("OK".into()),
+                Ok(false) => Frame::Error("ERR index out of range".into()),
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
+        "LTRIM" => {
+            require_args!(rest, 3, "ltrim");
+            let (start, stop) = match (
+                std::str::from_utf8(&rest[1])
+                    .ok()
+                    .and_then(|s| s.parse::<i64>().ok()),
+                std::str::from_utf8(&rest[2])
+                    .ok()
+                    .and_then(|s| s.parse::<i64>().ok()),
+            ) {
+                (Some(a), Some(b)) => (a, b),
+                _ => return Frame::Error("ERR value is not an integer or out of range".into()),
+            };
+            match commands::list::ltrim(engine, rest[0].clone(), start, stop) {
+                Ok(()) => Frame::Simple("OK".into()),
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
+        "LREM" => {
+            require_args!(rest, 3, "lrem");
+            let count: i64 = match std::str::from_utf8(&rest[1])
+                .ok()
+                .and_then(|s| s.parse().ok())
+            {
+                Some(n) => n,
+                None => return Frame::Error("ERR value is not an integer or out of range".into()),
+            };
+            match commands::list::lrem(engine, rest[0].clone(), count, &rest[2]) {
+                Ok(n) => Frame::Integer(n as i64),
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
+        "LINSERT" => {
+            require_args!(rest, 4, "linsert");
+            let before = match String::from_utf8_lossy(&rest[1])
+                .to_ascii_uppercase()
+                .as_str()
+            {
+                "BEFORE" => true,
+                "AFTER" => false,
+                _ => return Frame::Error("ERR syntax error".into()),
+            };
+            match commands::list::linsert(
+                engine,
+                rest[0].clone(),
+                before,
+                &rest[2],
+                rest[3].clone(),
+            ) {
+                Ok(n) => Frame::Integer(n),
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
         "SADD" => {
             require_args!(rest, 2, "sadd");
             match commands::set::sadd(engine, rest[0].clone(), rest[1].clone()) {
@@ -1592,6 +1675,179 @@ mod tests {
                 1
             ),
             Frame::Null
+        );
+    }
+
+    #[test]
+    fn lindex_lset_round_trip_through_dispatch() {
+        let engine = Engine::new();
+        dispatch(
+            &engine,
+            cmd(&[b"RPUSH", b"l", b"a"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"LINDEX", b"l", b"0"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Bulk(Bytes::from_static(b"a"))
+        );
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"LSET", b"l", b"0", b"z"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Simple("OK".into())
+        );
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"LINDEX", b"l", b"0"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Bulk(Bytes::from_static(b"z"))
+        );
+    }
+
+    #[test]
+    fn lset_out_of_range_is_a_resp_error() {
+        let engine = Engine::new();
+        dispatch(
+            &engine,
+            cmd(&[b"RPUSH", b"l", b"a"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"LSET", b"l", b"5", b"z"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Error("ERR index out of range".into())
+        );
+    }
+
+    #[test]
+    fn ltrim_then_lrange_round_trip_through_dispatch() {
+        let engine = Engine::new();
+        for v in [b"a" as &[u8], b"b", b"c"] {
+            dispatch(
+                &engine,
+                cmd(&[b"RPUSH", b"l", v]),
+                &mut Protocol::default(),
+                1,
+            );
+        }
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"LTRIM", b"l", b"0", b"1"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Simple("OK".into())
+        );
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"LRANGE", b"l", b"0", b"-1"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"a")),
+                Frame::Bulk(Bytes::from_static(b"b"))
+            ])
+        );
+    }
+
+    #[test]
+    fn lrem_returns_the_count_removed_through_dispatch() {
+        let engine = Engine::new();
+        for v in [b"a" as &[u8], b"x", b"x"] {
+            dispatch(
+                &engine,
+                cmd(&[b"RPUSH", b"l", v]),
+                &mut Protocol::default(),
+                1,
+            );
+        }
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"LREM", b"l", b"0", b"x"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Integer(2)
+        );
+    }
+
+    #[test]
+    fn linsert_before_and_after_work_through_dispatch() {
+        let engine = Engine::new();
+        dispatch(
+            &engine,
+            cmd(&[b"RPUSH", b"l", b"a"]),
+            &mut Protocol::default(),
+            1,
+        );
+        dispatch(
+            &engine,
+            cmd(&[b"RPUSH", b"l", b"c"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"LINSERT", b"l", b"BEFORE", b"c", b"b"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Integer(3)
+        );
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"LRANGE", b"l", b"0", b"-1"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"a")),
+                Frame::Bulk(Bytes::from_static(b"b")),
+                Frame::Bulk(Bytes::from_static(b"c")),
+            ])
+        );
+    }
+
+    #[test]
+    fn linsert_with_an_invalid_direction_is_a_resp_error() {
+        let engine = Engine::new();
+        dispatch(
+            &engine,
+            cmd(&[b"RPUSH", b"l", b"a"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"LINSERT", b"l", b"SIDEWAYS", b"a", b"b"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Error("ERR syntax error".into())
         );
     }
 
