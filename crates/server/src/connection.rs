@@ -7,6 +7,8 @@ use tokio::net::TcpListener;
 use tokio_util::codec::Framed;
 
 pub async fn serve(listener: TcpListener, engine: Arc<Engine>) {
+    tokio::spawn(active_expire_loop(Arc::clone(&engine)));
+
     let mut next_client_id: u64 = 1;
     loop {
         let (socket, _addr) = match listener.accept().await {
@@ -17,6 +19,19 @@ pub async fn serve(listener: TcpListener, engine: Arc<Engine>) {
         next_client_id += 1;
         let engine = Arc::clone(&engine);
         tokio::spawn(handle_connection(socket, engine, client_id));
+    }
+}
+
+/// Sweeps one shard per tick, rotating through all 16 — see
+/// ../../docs/superpowers/specs/2026-08-30-sprint-4-spec.md's active-expiry decision for why a
+/// whole-shard sweep (not per-key sampling) is the deliberate simplification here.
+async fn active_expire_loop(engine: Arc<Engine>) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
+    let mut shard_idx: usize = 0;
+    loop {
+        interval.tick().await;
+        engine.active_expire_cycle(shard_idx);
+        shard_idx = shard_idx.wrapping_add(1);
     }
 }
 
@@ -157,6 +172,49 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         // a second, independent connection must still work — proves the
         // dropped connection's task didn't take the whole server down with it
+        let mut framed = Framed::new(
+            TcpStream::connect(addr).await.unwrap(),
+            RespCodec::default(),
+        );
+        framed
+            .send(Frame::Array(vec![Frame::Bulk(Bytes::from_static(b"PING"))]))
+            .await
+            .unwrap();
+        assert_eq!(
+            framed.next().await.unwrap().unwrap(),
+            Frame::Simple("PONG".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_actively_expires_a_key_even_without_any_read_touching_it() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let engine = Arc::new(Engine::new());
+        engine.set(
+            Bytes::from_static(b"k"),
+            engine::Value::String(Bytes::from_static(b"v")),
+        );
+        engine.expire_at(
+            b"k",
+            std::time::Instant::now() + std::time::Duration::from_millis(20),
+        );
+        tokio::spawn(serve(listener, engine.clone()));
+
+        // Wait for a *full* rotation, not just a few ticks: the loop sweeps one shard per
+        // 100ms tick, so all 16 shards are only guaranteed covered after ~1.6s — and which
+        // shard `k` landed in depends on DefaultHasher, which this test can't predict. 2s
+        // leaves headroom over that 1.6s floor. Real (unpaused) time is required here:
+        // tokio's clock doesn't advance `std::time::Instant`, which is what `Entry`'s expiry
+        // is measured against, so `tokio::time::pause()` would tick the loop without ever
+        // making the key expired.
+        tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+
+        // sweeping every shard now should find nothing left to remove — the loop already did it
+        let total_removed: usize = (0..16).map(|i| engine.active_expire_cycle(i)).sum();
+        assert_eq!(total_removed, 0);
+
+        // the server is still alive and serving other requests, proving the loop didn't crash it
         let mut framed = Framed::new(
             TcpStream::connect(addr).await.unwrap(),
             RespCodec::default(),
