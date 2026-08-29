@@ -276,6 +276,80 @@ pub fn dispatch(engine: &Engine, frame: Frame, protocol: &mut Protocol, client_i
                 Err(e) => engine_error_to_frame(e),
             }
         }
+        "GETSET" => {
+            require_args!(rest, 2, "getset");
+            match commands::string::getset(engine, rest[0].clone(), rest[1].clone()) {
+                Ok(Some(b)) => Frame::Bulk(b),
+                Ok(None) => Frame::Null,
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
+        "MSET" => {
+            require_args!(rest, 2, "mset");
+            if rest.len() % 2 != 0 {
+                return Frame::Error("ERR wrong number of arguments for 'mset' command".into());
+            }
+            let pairs: Vec<(Bytes, Bytes)> = rest
+                .chunks(2)
+                .map(|c| (c[0].clone(), c[1].clone()))
+                .collect();
+            commands::string::mset(engine, pairs);
+            Frame::Simple("OK".into())
+        }
+        "MGET" => {
+            require_args!(rest, 1, "mget");
+            let vals = commands::string::mget(engine, rest);
+            Frame::Array(
+                vals.into_iter()
+                    .map(|v| match v {
+                        Some(b) => Frame::Bulk(b),
+                        None => Frame::Null,
+                    })
+                    .collect(),
+            )
+        }
+        "MSETNX" => {
+            require_args!(rest, 2, "msetnx");
+            if rest.len() % 2 != 0 {
+                return Frame::Error("ERR wrong number of arguments for 'msetnx' command".into());
+            }
+            let pairs: Vec<(Bytes, Bytes)> = rest
+                .chunks(2)
+                .map(|c| (c[0].clone(), c[1].clone()))
+                .collect();
+            match commands::string::msetnx(engine, pairs) {
+                true => Frame::Integer(1),
+                false => Frame::Integer(0),
+            }
+        }
+        "RENAME" => {
+            require_args!(rest, 2, "rename");
+            match commands::keys::rename(engine, &rest[0], rest[1].clone()) {
+                Ok(()) => Frame::Simple("OK".into()),
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
+        "RENAMENX" => {
+            require_args!(rest, 2, "renamenx");
+            match commands::keys::renamenx(engine, &rest[0], rest[1].clone()) {
+                Ok(true) => Frame::Integer(1),
+                Ok(false) => Frame::Integer(0),
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
+        "TYPE" => {
+            require_args!(rest, 1, "type");
+            Frame::Simple(commands::keys::key_type(engine, &rest[0]).into())
+        }
+        "RANDOMKEY" => match commands::keys::randomkey(engine) {
+            Some(k) => Frame::Bulk(k),
+            None => Frame::Null,
+        },
+        "EXPIRE" | "PEXPIRE" | "EXPIREAT" | "PEXPIREAT" | "TTL" | "PTTL" | "PERSIST" => {
+            Frame::Error(format!(
+                "ERR {name} is not supported yet (planned Sprint 4 — no expiry reaper exists)"
+            ))
+        }
         "PING" => match rest.first() {
             Some(msg) => Frame::Bulk(msg.clone()),
             None => Frame::Simple("PONG".into()),
@@ -882,6 +956,177 @@ mod tests {
             reply,
             Frame::Error("NOPROTO unsupported protocol version".into())
         );
+    }
+
+    #[test]
+    fn getset_round_trips_through_dispatch() {
+        let engine = Engine::new();
+        dispatch(
+            &engine,
+            cmd(&[b"SET", b"k", b"old"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"GETSET", b"k", b"new"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Bulk(Bytes::from_static(b"old"))
+        );
+        assert_eq!(
+            dispatch(&engine, cmd(&[b"GET", b"k"]), &mut Protocol::default(), 1),
+            Frame::Bulk(Bytes::from_static(b"new"))
+        );
+    }
+
+    #[test]
+    fn mset_then_mget_round_trips_through_dispatch() {
+        let engine = Engine::new();
+        dispatch(
+            &engine,
+            cmd(&[b"MSET", b"a", b"1", b"b", b"2"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"MGET", b"a", b"b", b"missing"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"1")),
+                Frame::Bulk(Bytes::from_static(b"2")),
+                Frame::Null,
+            ])
+        );
+    }
+
+    #[test]
+    fn mset_with_an_odd_number_of_args_is_a_resp_error() {
+        let engine = Engine::new();
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"MSET", b"a", b"1", b"b"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Error("ERR wrong number of arguments for 'mset' command".into())
+        );
+    }
+
+    #[test]
+    fn msetnx_returns_zero_when_a_key_already_exists() {
+        let engine = Engine::new();
+        dispatch(
+            &engine,
+            cmd(&[b"SET", b"a", b"1"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"MSETNX", b"a", b"2", b"b", b"2"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Integer(0)
+        );
+    }
+
+    #[test]
+    fn rename_then_get_round_trips_through_dispatch() {
+        let engine = Engine::new();
+        dispatch(
+            &engine,
+            cmd(&[b"SET", b"src", b"v"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"RENAME", b"src", b"dst"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Simple("OK".into())
+        );
+        assert_eq!(
+            dispatch(&engine, cmd(&[b"GET", b"dst"]), &mut Protocol::default(), 1),
+            Frame::Bulk(Bytes::from_static(b"v"))
+        );
+    }
+
+    #[test]
+    fn rename_on_missing_key_returns_resp_error() {
+        let engine = Engine::new();
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"RENAME", b"missing", b"dst"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Error("no such key".into())
+        );
+    }
+
+    #[test]
+    fn type_reports_none_for_a_missing_key() {
+        let engine = Engine::new();
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"TYPE", b"missing"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Simple("none".into())
+        );
+    }
+
+    #[test]
+    fn randomkey_on_empty_keyspace_returns_null() {
+        let engine = Engine::new();
+        assert_eq!(
+            dispatch(&engine, cmd(&[b"RANDOMKEY"]), &mut Protocol::default(), 1),
+            Frame::Null
+        );
+    }
+
+    #[test]
+    fn expire_family_returns_a_clear_not_implemented_error() {
+        let engine = Engine::new();
+        for name in [
+            "EXPIRE",
+            "PEXPIRE",
+            "EXPIREAT",
+            "PEXPIREAT",
+            "TTL",
+            "PTTL",
+            "PERSIST",
+        ] {
+            let reply = dispatch(
+                &engine,
+                cmd(&[name.as_bytes(), b"k"]),
+                &mut Protocol::default(),
+                1,
+            );
+            let Frame::Error(msg) = reply else {
+                panic!("expected Frame::Error for {name}, got something else")
+            };
+            assert!(
+                msg.contains("not supported yet"),
+                "unexpected message for {name}: {msg}"
+            );
+        }
     }
 
     #[test]
