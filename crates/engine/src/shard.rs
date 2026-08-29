@@ -99,6 +99,13 @@ impl Shard {
         }
     }
 
+    pub fn remove_expired(&self) -> usize {
+        let mut guard = self.map.write();
+        let before = guard.len();
+        guard.retain(|_, entry| !entry.is_expired());
+        before - guard.len()
+    }
+
     pub fn ttl(&self, key: &[u8]) -> crate::engine::TtlStatus {
         use crate::engine::TtlStatus;
         let guard = self.map.read();
@@ -340,5 +347,36 @@ mod tests {
         shard.expire_at(b"k", Instant::now() - Duration::from_secs(1));
         assert!(shard.with_mut(b"k", |v| v.is_none()));
         assert_eq!(shard.keys(), Vec::<Bytes>::new()); // gone, not just hidden
+    }
+
+    #[test]
+    fn remove_expired_deletes_only_expired_entries_and_reports_the_count() {
+        let shard = Shard::new();
+        shard.set(
+            Bytes::from_static(b"live"),
+            Value::String(Bytes::from_static(b"v")),
+        );
+        shard.set(
+            Bytes::from_static(b"dead1"),
+            Value::String(Bytes::from_static(b"v")),
+        );
+        shard.set(
+            Bytes::from_static(b"dead2"),
+            Value::String(Bytes::from_static(b"v")),
+        );
+        shard.expire_at(b"dead1", Instant::now() - Duration::from_secs(1));
+        shard.expire_at(b"dead2", Instant::now() - Duration::from_secs(1));
+        assert_eq!(shard.remove_expired(), 2);
+        assert_eq!(shard.keys(), vec![Bytes::from_static(b"live")]);
+    }
+
+    #[test]
+    fn remove_expired_on_a_shard_with_nothing_expired_removes_nothing() {
+        let shard = Shard::new();
+        shard.set(
+            Bytes::from_static(b"live"),
+            Value::String(Bytes::from_static(b"v")),
+        );
+        assert_eq!(shard.remove_expired(), 0);
     }
 }

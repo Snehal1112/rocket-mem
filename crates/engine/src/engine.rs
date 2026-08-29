@@ -59,6 +59,9 @@ impl Engine {
     pub fn ttl(&self, key: &[u8]) -> TtlStatus {
         self.store.ttl(key)
     }
+    pub fn active_expire_cycle(&self, shard_idx: usize) -> usize {
+        self.store.active_expire_cycle(shard_idx)
+    }
 }
 
 impl Default for Engine {
@@ -177,6 +180,19 @@ mod tests {
         let engine = Engine::new();
         assert!(engine.with_mut(b"missing", |v| v.is_none()));
         assert!(!engine.exists(b"missing"));
+    }
+
+    #[test]
+    fn active_expire_cycle_removes_expired_keys_in_the_targeted_shard() {
+        let engine = Engine::new();
+        engine.set(
+            Bytes::from_static(b"k"),
+            Value::String(Bytes::from_static(b"v")),
+        );
+        engine.expire_at(b"k", Instant::now() - Duration::from_secs(1));
+        // sweep every shard once — the key's shard is wherever it landed
+        let total_removed: usize = (0..16).map(|i| engine.active_expire_cycle(i)).sum();
+        assert_eq!(total_removed, 1);
     }
 
     #[test]

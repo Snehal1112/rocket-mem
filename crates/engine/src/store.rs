@@ -57,6 +57,9 @@ impl Store {
     pub fn ttl(&self, key: &[u8]) -> crate::engine::TtlStatus {
         self.shard_for(key).ttl(key)
     }
+    pub fn active_expire_cycle(&self, shard_idx: usize) -> usize {
+        self.shards[shard_idx % self.shards.len()].remove_expired()
+    }
     pub fn scan(&self, cursor: u64) -> (u64, Vec<Bytes>) {
         let idx = cursor as usize;
         if idx >= self.shards.len() {
@@ -213,6 +216,32 @@ mod tests {
             let key = Bytes::from(format!("pre{i}"));
             assert!(seen.contains(&key), "missing pre-existing key pre{i}");
         }
+    }
+
+    #[test]
+    fn active_expire_cycle_sweeps_the_requested_shard_by_index() {
+        let store = Store::new(16);
+        // find a key that hashes to shard 0 by trying keys until shard_key_counts confirms it
+        let key = Bytes::from_static(b"probe");
+        store.set(key.clone(), Value::String(Bytes::from_static(b"v")));
+        let shard_idx = store
+            .shard_key_counts()
+            .iter()
+            .position(|&c| c > 0)
+            .unwrap();
+        store.expire_at(
+            &key,
+            std::time::Instant::now() - std::time::Duration::from_secs(1),
+        );
+        let removed = store.active_expire_cycle(shard_idx);
+        assert_eq!(removed, 1);
+    }
+
+    #[test]
+    fn active_expire_cycle_wraps_an_out_of_range_shard_index() {
+        let store = Store::new(16);
+        // shard index 16 wraps to shard 0 (16 % 16 == 0) — must not panic
+        assert_eq!(store.active_expire_cycle(16), 0);
     }
 
     #[test]
