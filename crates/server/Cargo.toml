@@ -16,3 +16,6 @@ engine = { path = "../engine" }
 protocol = { path = "../protocol" }
 common = { path = "../common" }
 bytes.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures-util.workspace = true
