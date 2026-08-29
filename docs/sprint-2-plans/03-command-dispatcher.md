@@ -248,7 +248,7 @@ Expected: clean — `engine::commands` functions used here now have a real (non-
 
 - [ ] **Step 6: Commit**
 
-```bash
-git add crates/server/Cargo.toml crates/server/src/lib.rs crates/server/src/main.rs crates/server/src/dispatcher.rs
-git commit -m "feat(server): add command dispatcher, convert server crate to lib+bin"
-```
+Invoke the `1-git-commit` skill (`Skill` tool, name `1-git-commit`) to stage and commit
+`crates/server/Cargo.toml`, `crates/server/src/lib.rs`, `crates/server/src/main.rs`, and
+`crates/server/src/dispatcher.rs` — do not compose the commit message freeform. Suggested
+subject: `feat(server): add command dispatcher, convert server crate to lib+bin`.

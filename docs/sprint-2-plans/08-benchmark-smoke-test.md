@@ -61,7 +61,6 @@ Fix the root cause (most likely a lock ordering issue causing a deadlock between
 
 - [ ] **Step 5: Commit**
 
-```bash
-git add docs/sprint-2-plans/benchmark-smoke-test-results.md
-git commit -m "docs: record Sprint 2 redis-benchmark smoke test result"
-```
+Invoke the `1-git-commit` skill (`Skill` tool, name `1-git-commit`) to stage and commit
+`docs/sprint-2-plans/benchmark-smoke-test-results.md` — do not compose the commit message
+freeform. Suggested subject: `docs: record Sprint 2 redis-benchmark smoke test result`.

@@ -94,7 +94,6 @@ Expected: PASS, all tests including the 5 new ones
 
 - [ ] **Step 5: Commit**
 
-```bash
-git add crates/protocol/src/codec.rs
-git commit -m "test(protocol): prove RespCodec::decode handles split reads and pipelining"
-```
+Invoke the `1-git-commit` skill (`Skill` tool, name `1-git-commit`) to stage and commit
+`crates/protocol/src/codec.rs` — do not compose the commit message freeform. Suggested
+subject: `test(protocol): prove RespCodec::decode handles split reads and pipelining`.

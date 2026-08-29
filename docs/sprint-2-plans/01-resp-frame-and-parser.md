@@ -90,10 +90,9 @@ Expected: PASS, 3/3
 
 - [ ] **Step 5: Commit**
 
-```bash
-git add crates/protocol/src/frame.rs crates/protocol/src/lib.rs
-git commit -m "feat(protocol): add Frame enum for RESP2 values"
-```
+Invoke the `1-git-commit` skill (`Skill` tool, name `1-git-commit`) to stage and commit
+`crates/protocol/src/frame.rs` and `crates/protocol/src/lib.rs` — do not compose the
+commit message freeform. Suggested subject: `feat(protocol): add Frame enum for RESP2 values`.
 
 ---
 
@@ -261,10 +260,10 @@ Expected: PASS, 6/6
 
 - [ ] **Step 7: Commit**
 
-```bash
-git add crates/protocol/src/codec.rs crates/protocol/src/lib.rs crates/protocol/Cargo.toml Cargo.toml Cargo.lock
-git commit -m "feat(protocol): add RespCodec::encode (Frame -> RESP2 bytes)"
-```
+Invoke the `1-git-commit` skill (`Skill` tool, name `1-git-commit`) to stage and commit
+`crates/protocol/src/codec.rs`, `crates/protocol/src/lib.rs`, `crates/protocol/Cargo.toml`,
+`Cargo.toml`, and `Cargo.lock` — do not compose the commit message freeform. Suggested
+subject: `feat(protocol): add RespCodec::encode (Frame -> RESP2 bytes)`.
 
 ---
 
@@ -451,7 +450,6 @@ Expected: PASS, 14/14 (6 from Task 2 + 8 new)
 
 - [ ] **Step 5: Commit**
 
-```bash
-git add crates/protocol/src/codec.rs
-git commit -m "feat(protocol): add RespCodec::decode (RESP2 bytes -> Frame)"
-```
+Invoke the `1-git-commit` skill (`Skill` tool, name `1-git-commit`) to stage and commit
+`crates/protocol/src/codec.rs` — do not compose the commit message freeform. Suggested
+subject: `feat(protocol): add RespCodec::decode (RESP2 bytes -> Frame)`.

@@ -58,10 +58,9 @@ Expected: every line prints a sensible value (`True`, `'OK'`, `'bar'`, `1`, `1`,
 
 - [ ] **Step 4: Commit**
 
-```bash
-git add docs/sprint-2-plans/client-verification-results.md
-git commit -m "docs: record redis-py manual verification result"
-```
+Invoke the `1-git-commit` skill (`Skill` tool, name `1-git-commit`) to stage and commit
+`docs/sprint-2-plans/client-verification-results.md` — do not compose the commit message
+freeform. Suggested subject: `docs: record redis-py manual verification result`.
 
 ---
 
@@ -109,10 +108,9 @@ Expected: every line prints a sensible value with no unhandled promise rejection
 
 - [ ] **Step 3: Commit**
 
-```bash
-git add docs/sprint-2-plans/client-verification-results.md
-git commit -m "docs: record ioredis manual verification result"
-```
+Invoke the `1-git-commit` skill (`Skill` tool, name `1-git-commit`) to stage and commit
+`docs/sprint-2-plans/client-verification-results.md` — do not compose the commit message
+freeform. Suggested subject: `docs: record ioredis manual verification result`.
 
 ---
 
@@ -171,10 +169,9 @@ Expected: every command returns a sensible reply, no `(error)` lines except wher
 
 - [ ] **Step 3: Commit**
 
-```bash
-git add docs/sprint-2-plans/client-verification-results.md
-git commit -m "docs: record redis-cli full command-set verification"
-```
+Invoke the `1-git-commit` skill (`Skill` tool, name `1-git-commit`) to stage and commit
+`docs/sprint-2-plans/client-verification-results.md` — do not compose the commit message
+freeform. Suggested subject: `docs: record redis-cli full command-set verification`.
 
 ---
 
@@ -196,7 +193,6 @@ Cover, concretely (not generically — cite real commits/files, not vague impres
 
 - [ ] **Step 2: Commit**
 
-```bash
-git add docs/phase-1-retro.md
-git commit -m "docs: add Phase 1 (Weeks 1-4 / Sprints 1-2) retro"
-```
+Invoke the `1-git-commit` skill (`Skill` tool, name `1-git-commit`) to stage and commit
+`docs/phase-1-retro.md` — do not compose the commit message freeform. Suggested subject:
+`docs: add Phase 1 (Weeks 1-4 / Sprints 1-2) retro`.

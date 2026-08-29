@@ -50,10 +50,9 @@ Expected: PASS — no code changes yet, just new dependencies resolving
 
 - [ ] **Step 4: Commit**
 
-```bash
-git add Cargo.toml crates/server/Cargo.toml Cargo.lock
-git commit -m "chore(server): add tokio, tokio-util, futures-util dependencies"
-```
+Invoke the `1-git-commit` skill (`Skill` tool, name `1-git-commit`) to stage and commit
+`Cargo.toml`, `crates/server/Cargo.toml`, and `Cargo.lock` — do not compose the commit
+message freeform. Suggested subject: `chore(server): add tokio, tokio-util, futures-util dependencies`.
 
 ---
 
@@ -232,7 +231,7 @@ Expected: all clean
 
 - [ ] **Step 8: Commit**
 
-```bash
-git add crates/server/src/connection.rs crates/server/src/lib.rs crates/server/src/main.rs
-git commit -m "feat(server): add TCP accept loop, task-per-connection, wire up main()"
-```
+Invoke the `1-git-commit` skill (`Skill` tool, name `1-git-commit`) to stage and commit
+`crates/server/src/connection.rs`, `crates/server/src/lib.rs`, and `crates/server/src/main.rs`
+— do not compose the commit message freeform. Suggested subject:
+`feat(server): add TCP accept loop, task-per-connection, wire up main()`.

@@ -80,10 +80,9 @@ Expected: PASS, all tests including the 3 new ones
 
 - [ ] **Step 5: Commit**
 
-```bash
-git add crates/server/src/dispatcher.rs
-git commit -m "fix(server): validate arg count before indexing, closing the panic gap from 03"
-```
+Invoke the `1-git-commit` skill (`Skill` tool, name `1-git-commit`) to stage and commit
+`crates/server/src/dispatcher.rs` — do not compose the commit message freeform. Suggested
+subject: `fix(server): validate arg count before indexing, closing the panic gap from 03`.
 
 ---
 
@@ -371,10 +370,9 @@ Expected: clean
 
 - [ ] **Step 6: Commit**
 
-```bash
-git add crates/server/src/dispatcher.rs
-git commit -m "feat(server): wire remaining Sprint 1 commands (SET flags, hash/list/set families)"
-```
+Invoke the `1-git-commit` skill (`Skill` tool, name `1-git-commit`) to stage and commit
+`crates/server/src/dispatcher.rs` — do not compose the commit message freeform. Suggested
+subject: `feat(server): wire remaining Sprint 1 commands (SET flags, hash/list/set families)`.
 
 ---
 
@@ -466,10 +464,10 @@ Expected: PASS, 3/3
 
 - [ ] **Step 5: Commit**
 
-```bash
-git add crates/server/Cargo.toml crates/server/tests/integration.rs Cargo.lock
-git commit -m "test(server): add redis-rs integration test harness"
-```
+Invoke the `1-git-commit` skill (`Skill` tool, name `1-git-commit`) to stage and commit
+`crates/server/Cargo.toml`, `crates/server/tests/integration.rs`, and `Cargo.lock` — do
+not compose the commit message freeform. Suggested subject:
+`test(server): add redis-rs integration test harness`.
 
 ---
 
@@ -522,7 +520,6 @@ Expected: clean
 
 - [ ] **Step 5: Commit**
 
-```bash
-git add crates/server/tests/integration.rs
-git commit -m "test(server): add malformed-input integration test"
-```
+Invoke the `1-git-commit` skill (`Skill` tool, name `1-git-commit`) to stage and commit
+`crates/server/tests/integration.rs` — do not compose the commit message freeform.
+Suggested subject: `test(server): add malformed-input integration test`.

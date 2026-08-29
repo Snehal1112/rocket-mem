@@ -65,10 +65,9 @@ Expected: PASS, all tests including the 3 new ones
 
 - [ ] **Step 5: Commit**
 
-```bash
-git add crates/server/src/dispatcher.rs
-git commit -m "feat(server): add PING/ECHO"
-```
+Invoke the `1-git-commit` skill (`Skill` tool, name `1-git-commit`) to stage and commit
+`crates/server/src/dispatcher.rs` — do not compose the commit message freeform. Suggested
+subject: `feat(server): add PING/ECHO`.
 
 ---
 
@@ -132,7 +131,6 @@ Expected: PASS, all tests including the 4 new ones
 
 - [ ] **Step 5: Commit**
 
-```bash
-git add crates/server/src/dispatcher.rs
-git commit -m "feat(server): add SELECT/COMMAND/INFO stubs"
-```
+Invoke the `1-git-commit` skill (`Skill` tool, name `1-git-commit`) to stage and commit
+`crates/server/src/dispatcher.rs` — do not compose the commit message freeform. Suggested
+subject: `feat(server): add SELECT/COMMAND/INFO stubs`.
