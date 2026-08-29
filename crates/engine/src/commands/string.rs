@@ -59,6 +59,39 @@ pub fn incr_by(engine: &Engine, key: Bytes, delta: i64) -> Result<i64, common::E
     Ok(next)
 }
 
+pub fn getset(engine: &Engine, key: Bytes, val: Bytes) -> Result<Option<Bytes>, common::EngineError> {
+    let old = get(engine, &key)?;
+    engine.set(key, Value::String(val));
+    Ok(old)
+}
+
+pub fn mset(engine: &Engine, pairs: Vec<(Bytes, Bytes)>) {
+    for (k, v) in pairs {
+        engine.set(k, Value::String(v));
+    }
+}
+
+/// A missing key and a wrong-type key are indistinguishable in the result — both come back
+/// `None` — matching real Redis's documented MGET behavior of never erroring.
+pub fn mget(engine: &Engine, keys: &[Bytes]) -> Vec<Option<Bytes>> {
+    keys.iter()
+        .map(|k| match engine.get(k) {
+            Some(Value::String(b)) => Some(b),
+            _ => None,
+        })
+        .collect()
+}
+
+pub fn msetnx(engine: &Engine, pairs: Vec<(Bytes, Bytes)>) -> bool {
+    if pairs.iter().any(|(k, _)| engine.exists(k)) {
+        return false;
+    }
+    for (k, v) in pairs {
+        engine.set(k, Value::String(v));
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,5 +211,86 @@ mod tests {
         );
         let err = incr_by(&engine, Bytes::from_static(b"k"), 1).unwrap_err();
         assert_eq!(err, common::EngineError::NotAnInteger);
+    }
+
+    #[test]
+    fn getset_returns_old_value_and_sets_new_one() {
+        let engine = Engine::new();
+        engine.set(Bytes::from_static(b"k"), Value::String(Bytes::from_static(b"old")));
+        let old = getset(&engine, Bytes::from_static(b"k"), Bytes::from_static(b"new")).unwrap();
+        assert_eq!(old, Some(Bytes::from_static(b"old")));
+        assert_eq!(get(&engine, b"k").unwrap(), Some(Bytes::from_static(b"new")));
+    }
+
+    #[test]
+    fn getset_on_missing_key_returns_none_and_creates_it() {
+        let engine = Engine::new();
+        let old = getset(&engine, Bytes::from_static(b"k"), Bytes::from_static(b"v")).unwrap();
+        assert_eq!(old, None);
+        assert_eq!(get(&engine, b"k").unwrap(), Some(Bytes::from_static(b"v")));
+    }
+
+    #[test]
+    fn getset_on_hash_key_returns_wrongtype() {
+        let engine = Engine::new();
+        engine.set(Bytes::from_static(b"h"), Value::Hash(Default::default()));
+        let err = getset(&engine, Bytes::from_static(b"h"), Bytes::from_static(b"v")).unwrap_err();
+        assert_eq!(err, common::EngineError::WrongType);
+    }
+
+    #[test]
+    fn mset_sets_every_pair() {
+        let engine = Engine::new();
+        mset(
+            &engine,
+            vec![
+                (Bytes::from_static(b"a"), Bytes::from_static(b"1")),
+                (Bytes::from_static(b"b"), Bytes::from_static(b"2")),
+            ],
+        );
+        assert_eq!(get(&engine, b"a").unwrap(), Some(Bytes::from_static(b"1")));
+        assert_eq!(get(&engine, b"b").unwrap(), Some(Bytes::from_static(b"2")));
+    }
+
+    #[test]
+    fn mget_returns_none_for_missing_keys_in_order() {
+        let engine = Engine::new();
+        engine.set(Bytes::from_static(b"a"), Value::String(Bytes::from_static(b"1")));
+        let result = mget(&engine, &[Bytes::from_static(b"a"), Bytes::from_static(b"missing")]);
+        assert_eq!(result, vec![Some(Bytes::from_static(b"1")), None]);
+    }
+
+    #[test]
+    fn mget_returns_none_for_a_wrongtype_key_instead_of_erroring() {
+        // MGET is Redis's documented exception to the WRONGTYPE convention: a non-string key
+        // among the requested keys comes back nil for that key, not an error for the whole command.
+        let engine = Engine::new();
+        engine.set(Bytes::from_static(b"h"), Value::Hash(Default::default()));
+        let result = mget(&engine, &[Bytes::from_static(b"h")]);
+        assert_eq!(result, vec![None]);
+    }
+
+    #[test]
+    fn msetnx_fails_and_sets_nothing_if_any_key_already_exists() {
+        let engine = Engine::new();
+        engine.set(Bytes::from_static(b"a"), Value::String(Bytes::from_static(b"existing")));
+        let applied = msetnx(
+            &engine,
+            vec![
+                (Bytes::from_static(b"a"), Bytes::from_static(b"new")),
+                (Bytes::from_static(b"b"), Bytes::from_static(b"new")),
+            ],
+        );
+        assert!(!applied);
+        assert_eq!(get(&engine, b"a").unwrap(), Some(Bytes::from_static(b"existing")));
+        assert_eq!(get(&engine, b"b").unwrap(), None);
+    }
+
+    #[test]
+    fn msetnx_succeeds_when_no_key_exists() {
+        let engine = Engine::new();
+        let applied = msetnx(&engine, vec![(Bytes::from_static(b"a"), Bytes::from_static(b"1"))]);
+        assert!(applied);
+        assert_eq!(get(&engine, b"a").unwrap(), Some(Bytes::from_static(b"1")));
     }
 }
