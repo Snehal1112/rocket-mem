@@ -62,7 +62,7 @@ dependencies = [
 
 [[package]]
 name = "common"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "thiserror",
 ]
@@ -86,7 +86,7 @@ checksum = "252afb9ae5eaa683babdc6a068b3f5726eb19e05070c731f9b2a23a7c3e8ed34"
 
 [[package]]
 name = "engine"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "bytes",
  "common",
@@ -385,7 +385,7 @@ dependencies = [
 
 [[package]]
 name = "protocol"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "bytes",
  "tokio-util",
@@ -435,7 +435,7 @@ dependencies = [
 
 [[package]]
 name = "rocket-mem"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "bytes",
  "common",
