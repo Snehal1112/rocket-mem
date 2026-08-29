@@ -2,13 +2,13 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** implement `PING`, `ECHO`, `SELECT`, `COMMAND`, and `INFO` in the dispatcher — the handshake/capability-probe commands real client libraries send before or alongside actual data commands, per `../rocket-mem-production-plan.md` Week 4.
+**Goal:** implement `PING`, `ECHO`, `SELECT`, `COMMAND`, and `INFO` in the dispatcher — the handshake/capability-probe commands real client libraries send before or alongside actual data commands, per `../../../rocket-mem-production-plan.md` Week 4.
 
 **Architecture:** five new arms in `dispatcher::dispatch`'s `match`. None of these touch `Engine` — they're protocol-level bookkeeping, not storage operations.
 
 **Tech Stack:** no new dependencies.
 
-**Spec:** `00-sprint-2-spec.md` — the RESP3/`HELLO` decision (reject, don't implement) is directly relevant: `HELLO` deliberately falls through to the existing "unknown command" arm, it does not get its own case here.
+**Spec:** `../../specs/2026-08-29-sprint-2-spec.md` — the RESP3/`HELLO` decision (reject, don't implement) is directly relevant: `HELLO` deliberately falls through to the existing "unknown command" arm, it does not get its own case here.
 
 **Depends on:** `03-command-dispatcher.md` must be complete. Independent of `04-tcp-listener.md` — these are pure `dispatch()` tests, no socket needed.
 

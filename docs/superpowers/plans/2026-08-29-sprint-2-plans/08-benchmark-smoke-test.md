@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** confirm rocket-mem doesn't panic or deadlock under `redis-benchmark`'s concurrent load — a light smoke test, not a performance benchmark. Real throughput comparison against Redis is explicitly Sprint 6 / Week 12 scope (`../rocket-mem-production-plan.md`), not this sprint's.
+**Goal:** confirm rocket-mem doesn't panic or deadlock under `redis-benchmark`'s concurrent load — a light smoke test, not a performance benchmark. Real throughput comparison against Redis is explicitly Sprint 6 / Week 12 scope (`../../../rocket-mem-production-plan.md`), not this sprint's.
 
 **Architecture:** no production code — this is a manual run of the real Redis project's own `redis-benchmark` CLI tool against a running rocket-mem instance, with the result recorded in the repo.
 
@@ -10,14 +10,14 @@
 
 **Depends on:** `04-tcp-listener.md` must be complete (needs a working TCP server to point the benchmark at). This item is independent of `05`–`07` — it can run any time after networking exists.
 
-**Priority note:** this is Sprint 2's P2 item, per `../rocket-mem-sprint-plan.md` — the first thing to cut if the sprint runs long. Don't let it block anything else finishing.
+**Priority note:** this is Sprint 2's P2 item, per `../../../rocket-mem-sprint-plan.md` — the first thing to cut if the sprint runs long. Don't let it block anything else finishing.
 
 ---
 
 ### Task 1: Run `redis-benchmark` against a running rocket-mem instance
 
 **Files:**
-- Create: `docs/sprint-2-plans/benchmark-smoke-test-results.md`
+- Create: `docs/superpowers/plans/2026-08-29-sprint-2-plans/benchmark-smoke-test-results.md`
 
 - [ ] **Step 1: Start the server in release mode** (debug-mode timings aren't meaningful even for a smoke test — the pass/fail bar here is "no panic/deadlock," not speed, but a debug build's occasional GC-like pauses from unoptimized allocation can look deceptively like contention)
 
@@ -46,7 +46,7 @@ Fix the root cause (most likely a lock ordering issue causing a deadlock between
 - [ ] **Step 4: Record the result**
 
 ```markdown
-<!-- docs/sprint-2-plans/benchmark-smoke-test-results.md -->
+<!-- docs/superpowers/plans/2026-08-29-sprint-2-plans/benchmark-smoke-test-results.md -->
 # Sprint 2 — Benchmark Smoke Test Result
 
 **Date:** <today's date>
@@ -62,5 +62,5 @@ Fix the root cause (most likely a lock ordering issue causing a deadlock between
 - [ ] **Step 5: Commit**
 
 Invoke the `1-git-commit` skill (`Skill` tool, name `1-git-commit`) to stage and commit
-`docs/sprint-2-plans/benchmark-smoke-test-results.md` — do not compose the commit message
+`docs/superpowers/plans/2026-08-29-sprint-2-plans/benchmark-smoke-test-results.md` — do not compose the commit message
 freeform. Suggested subject: `docs: record Sprint 2 redis-benchmark smoke test result`.

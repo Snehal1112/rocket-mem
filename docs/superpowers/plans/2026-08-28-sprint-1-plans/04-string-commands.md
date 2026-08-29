@@ -6,7 +6,7 @@
 
 **Architecture:** each command is a free function taking `&Engine` plus its arguments, returning `Result<T, common::EngineError>`. This mirrors how Sprint 2's dispatcher will call them — no dispatcher exists yet, these are called directly from tests.
 
-**Scope note:** `SET`'s `EX`/`PX` flags are deferred to Sprint 4 (see `00-sprint-1-spec.md`). Only `NX`/`XX` are implemented here.
+**Scope note:** `SET`'s `EX`/`PX` flags are deferred to Sprint 4 (see `../../specs/2026-08-28-sprint-1-spec.md`). Only `NX`/`XX` are implemented here.
 
 **Depends on:** `03-engine-facade.md` must be complete.
 

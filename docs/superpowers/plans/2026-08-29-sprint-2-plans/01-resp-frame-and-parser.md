@@ -4,11 +4,11 @@
 
 **Goal:** define the `Frame` type and a `RespCodec` implementing `tokio_util::codec::{Decoder, Encoder}` that converts between RESP2 wire bytes and `Frame` values, with no networking involved yet — pure buffer-in, buffer-out.
 
-**Architecture:** `crates/protocol` gains a `frame.rs` (the `Frame` enum) and a `codec.rs` (`RespCodec`, wrapping a recursive-descent parser). Both modules are `pub` at every level per `00-sprint-2-spec.md`'s CI gotcha note, since nothing calls this crate yet.
+**Architecture:** `crates/protocol` gains a `frame.rs` (the `Frame` enum) and a `codec.rs` (`RespCodec`, wrapping a recursive-descent parser). Both modules are `pub` at every level per `../../specs/2026-08-29-sprint-2-spec.md`'s CI gotcha note, since nothing calls this crate yet.
 
 **Tech Stack:** `bytes::{Bytes, BytesMut, Buf}`, `tokio_util::codec::{Decoder, Encoder}`.
 
-**Spec:** `00-sprint-2-spec.md` — `Frame` type and RESP2 wire format table are authoritative; don't redefine them here.
+**Spec:** `../../specs/2026-08-29-sprint-2-spec.md` — `Frame` type and RESP2 wire format table are authoritative; don't redefine them here.
 
 ## Global Constraints
 

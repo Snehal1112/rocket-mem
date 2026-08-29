@@ -15,7 +15,7 @@
 ### Task 1: Run the smoke sequence against `redis-py`
 
 **Files:**
-- Create: `docs/sprint-2-plans/client-verification-results.md`
+- Create: `docs/superpowers/plans/2026-08-29-sprint-2-plans/client-verification-results.md`
 
 - [ ] **Step 1: Start the server**
 
@@ -41,12 +41,12 @@ print('SISMEMBER:', r.sismember('s', 'member'))
 "
 ```
 
-Expected: every line prints a sensible value (`True`, `'OK'`, `'bar'`, `1`, `1`, `'value'`, `1`, `['a']`, `1`, `True`) with no exceptions raised. `redis-py` sends `HELLO` on connect by default in recent versions — confirm it falls back to RESP2 silently per `00-sprint-2-spec.md`'s decision rather than raising a connection error. If it does raise, that decision needs revisiting before this task can pass, not this checklist.
+Expected: every line prints a sensible value (`True`, `'OK'`, `'bar'`, `1`, `1`, `'value'`, `1`, `['a']`, `1`, `True`) with no exceptions raised. `redis-py` sends `HELLO` on connect by default in recent versions — confirm it falls back to RESP2 silently per `../../specs/2026-08-29-sprint-2-spec.md`'s decision rather than raising a connection error. If it does raise, that decision needs revisiting before this task can pass, not this checklist.
 
 - [ ] **Step 3: Record the result**
 
 ```markdown
-<!-- docs/sprint-2-plans/client-verification-results.md -->
+<!-- docs/superpowers/plans/2026-08-29-sprint-2-plans/client-verification-results.md -->
 # Sprint 2 — Manual Client Verification Results
 
 ## redis-py
@@ -59,7 +59,7 @@ Expected: every line prints a sensible value (`True`, `'OK'`, `'bar'`, `1`, `1`,
 - [ ] **Step 4: Commit**
 
 Invoke the `1-git-commit` skill (`Skill` tool, name `1-git-commit`) to stage and commit
-`docs/sprint-2-plans/client-verification-results.md` — do not compose the commit message
+`docs/superpowers/plans/2026-08-29-sprint-2-plans/client-verification-results.md` — do not compose the commit message
 freeform. Suggested subject: `docs: record redis-py manual verification result`.
 
 ---
@@ -67,7 +67,7 @@ freeform. Suggested subject: `docs: record redis-py manual verification result`.
 ### Task 2: Run the smoke sequence against `ioredis`
 
 **Files:**
-- Modify: `docs/sprint-2-plans/client-verification-results.md`
+- Modify: `docs/superpowers/plans/2026-08-29-sprint-2-plans/client-verification-results.md`
 
 - [ ] **Step 1: Install and run `ioredis` against the still-running server**
 
@@ -97,7 +97,7 @@ Expected: every line prints a sensible value with no unhandled promise rejection
 - [ ] **Step 2: Record the result**
 
 ```markdown
-<!-- append to docs/sprint-2-plans/client-verification-results.md -->
+<!-- append to docs/superpowers/plans/2026-08-29-sprint-2-plans/client-verification-results.md -->
 
 ## ioredis
 - **Version tested:** <fill in the version `npm list ioredis` reports>
@@ -109,7 +109,7 @@ Expected: every line prints a sensible value with no unhandled promise rejection
 - [ ] **Step 3: Commit**
 
 Invoke the `1-git-commit` skill (`Skill` tool, name `1-git-commit`) to stage and commit
-`docs/sprint-2-plans/client-verification-results.md` — do not compose the commit message
+`docs/superpowers/plans/2026-08-29-sprint-2-plans/client-verification-results.md` — do not compose the commit message
 freeform. Suggested subject: `docs: record ioredis manual verification result`.
 
 ---
@@ -117,7 +117,7 @@ freeform. Suggested subject: `docs: record ioredis manual verification result`.
 ### Task 3: `redis-cli` full command-set pass (the sprint's headline DoD item)
 
 **Files:**
-- Modify: `docs/sprint-2-plans/client-verification-results.md`
+- Modify: `docs/superpowers/plans/2026-08-29-sprint-2-plans/client-verification-results.md`
 
 - [ ] **Step 1: Run every Sprint 1 command via `redis-cli` against the still-running server**
 
@@ -159,7 +159,7 @@ Expected: every command returns a sensible reply, no `(error)` lines except wher
 - [ ] **Step 2: Record the result**
 
 ```markdown
-<!-- append to docs/sprint-2-plans/client-verification-results.md -->
+<!-- append to docs/superpowers/plans/2026-08-29-sprint-2-plans/client-verification-results.md -->
 
 ## redis-cli — full Sprint 1 command set
 - **Date:** <today's date>
@@ -170,14 +170,14 @@ Expected: every command returns a sensible reply, no `(error)` lines except wher
 - [ ] **Step 3: Commit**
 
 Invoke the `1-git-commit` skill (`Skill` tool, name `1-git-commit`) to stage and commit
-`docs/sprint-2-plans/client-verification-results.md` — do not compose the commit message
+`docs/superpowers/plans/2026-08-29-sprint-2-plans/client-verification-results.md` — do not compose the commit message
 freeform. Suggested subject: `docs: record redis-cli full command-set verification`.
 
 ---
 
 ### Task 4: Phase 1 retro note
 
-Sprint 2's Definition of Done in `../rocket-mem-sprint-plan.md` includes "Phase 1 retro note added to the repo (per the master plan's Week 4 task)." Phase 1 (`../rocket-mem-production-plan.md`, Weeks 1–4) spans both Sprint 1 and Sprint 2 — this retro covers the whole phase, not just this sprint, mirroring the format Sprint 1's own retro used (one line on what took longer than estimated, one line on what to adjust) but scaled to a phase-level writeup per the master plan's Week 4 sub-task: "what surprised you, what's technical debt to revisit in Phase 3."
+Sprint 2's Definition of Done in `../../../rocket-mem-sprint-plan.md` includes "Phase 1 retro note added to the repo (per the master plan's Week 4 task)." Phase 1 (`../../../rocket-mem-production-plan.md`, Weeks 1–4) spans both Sprint 1 and Sprint 2 — this retro covers the whole phase, not just this sprint, mirroring the format Sprint 1's own retro used (one line on what took longer than estimated, one line on what to adjust) but scaled to a phase-level writeup per the master plan's Week 4 sub-task: "what surprised you, what's technical debt to revisit in Phase 3."
 
 **Files:**
 - Create: `docs/phase-1-retro.md`
@@ -187,9 +187,9 @@ Sprint 2's Definition of Done in `../rocket-mem-sprint-plan.md` includes "Phase 
 Cover, concretely (not generically — cite real commits/files, not vague impressions):
 - What shipped vs. what was planned across Sprints 1–2 (any P0/P1 slippage, what got cut as P2)
 - Where actual effort diverged from the sprint plan's hour estimates, and in which direction
-- Real bugs the test suite caught during implementation (Sprint 1 had two — the phantom-key `lpop`/`rpop`/`srem` bug and the swallowed-WRONGTYPE bug, both in `docs/sprint-1-plans/known-issues`-style detail; record Sprint 2's equivalents here, if any — the arg-count panic gap flagged in `03-command-dispatcher.md` and closed in `06-integration-test-harness.md`'s Task 1 is one candidate)
+- Real bugs the test suite caught during implementation (Sprint 1 had two — the phantom-key `lpop`/`rpop`/`srem` bug and the swallowed-WRONGTYPE bug, both in `docs/superpowers/plans/2026-08-28-sprint-1-plans/known-issues`-style detail; record Sprint 2's equivalents here, if any — the arg-count panic gap flagged in `03-command-dispatcher.md` and closed in `06-integration-test-harness.md`'s Task 1 is one candidate)
 - Technical debt explicitly deferred rather than accidentally skipped: `SET EX/PX` (Sprint 4), multi-value `RPUSH`/`LPUSH` (Sprint 3), RESP3/`HELLO` (not planned, a deliberate divergence)
-- Anything from `00-sprint-2-spec.md`'s design decisions (the lib+bin crate split, in-process integration testing, the `pub`-everywhere CI gotcha fix) that did or didn't hold up once actually implemented
+- Anything from `../../specs/2026-08-29-sprint-2-spec.md`'s design decisions (the lib+bin crate split, in-process integration testing, the `pub`-everywhere CI gotcha fix) that did or didn't hold up once actually implemented
 
 - [ ] **Step 2: Commit**
 

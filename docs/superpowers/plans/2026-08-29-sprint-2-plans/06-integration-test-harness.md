@@ -6,9 +6,9 @@
 
 **Architecture:** `dispatch()`'s `match` grows to cover the full Sprint 1 command surface. A new `crates/server/tests/integration.rs` file (Rust's standard integration-test location — a separate compilation unit from `src/`, only able to see `rocket_mem`'s public API) drives the server exactly the way a real client would.
 
-**Tech Stack:** `redis` (the `redis-rs` crate) as a dev-dependency only, per `00-sprint-2-spec.md`.
+**Tech Stack:** `redis` (the `redis-rs` crate) as a dev-dependency only, per `../../specs/2026-08-29-sprint-2-spec.md`.
 
-**Spec:** `00-sprint-2-spec.md` — the in-process (not subprocess) integration-test approach is authoritative.
+**Spec:** `../../specs/2026-08-29-sprint-2-spec.md` — the in-process (not subprocess) integration-test approach is authoritative.
 
 **Depends on:** `04-tcp-listener.md` and `05-stub-commands.md` must both be complete.
 

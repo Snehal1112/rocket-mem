@@ -2,7 +2,7 @@
 
 **Goal:** real Redis clients (`redis-cli`, plus 2+ language libraries) can connect to rocket-mem over TCP and run the full Sprint 1 command set.
 
-**Scope:** covers Sprint 2's 8 backlog items (see `../rocket-mem-sprint-plan.md`, Sprint 2, and `../rocket-mem-production-plan.md`, Weeks 3–4). This doc fixes the shared design decisions — the `Frame` type, the RESP2 wire format, the RESP3/`HELLO` decision, the dispatcher shape, and the workspace/crate changes — that every implementation plan below assumes as ground truth. Individual plans don't re-derive these; they reference this doc.
+**Scope:** covers Sprint 2's 8 backlog items (see `../../rocket-mem-sprint-plan.md`, Sprint 2, and `../../rocket-mem-production-plan.md`, Weeks 3–4). This doc fixes the shared design decisions — the `Frame` type, the RESP2 wire format, the RESP3/`HELLO` decision, the dispatcher shape, and the workspace/crate changes — that every implementation plan below assumes as ground truth. Individual plans don't re-derive these; they reference this doc.
 
 **Architecture recap:** per the master plan's Architecture Decision Record — layered, sharded, lock-based, task-per-connection. Sprint 1 built the bottom layer (storage engine). This sprint builds the middle and top layers: Command Dispatcher and Protocol Layer (RESP2 only — RESP3 is explicitly rejected this sprint, see below).
 
@@ -98,7 +98,7 @@ Every line-terminated field ends `\r\n` — not bare `\n`. Decoding must treat a
 
 ## RESP3 / `HELLO` decision — **reject, force RESP2**
 
-Sprint 2's named risk in `../rocket-mem-sprint-plan.md` says decide this explicitly, don't discover it mid-debug. **Decision: rocket-mem does not implement RESP3.** `HELLO` is treated as an unrecognized command and gets the same `Frame::Error("ERR unknown command 'HELLO'")` response as any other unknown command (see item 05). This is safe: `redis-py`, `ioredis`, and `go-redis` all send `HELLO 3` optimistically on connect and fall back to RESP2 on any error response — this is the documented client-negotiation behavior all three follow, not a rocket-mem-specific accommodation. Revisit RESP3 only if a client library is found that hard-fails instead of falling back (none of the three targeted in item 07 do).
+Sprint 2's named risk in `../../rocket-mem-sprint-plan.md` says decide this explicitly, don't discover it mid-debug. **Decision: rocket-mem does not implement RESP3.** `HELLO` is treated as an unrecognized command and gets the same `Frame::Error("ERR unknown command 'HELLO'")` response as any other unknown command (see item 05). This is safe: `redis-py`, `ioredis`, and `go-redis` all send `HELLO 3` optimistically on connect and fall back to RESP2 on any error response — this is the documented client-negotiation behavior all three follow, not a rocket-mem-specific accommodation. Revisit RESP3 only if a client library is found that hard-fails instead of falling back (none of the three targeted in item 07 do).
 
 ## Command dispatcher shape (`crates/server/src/dispatcher.rs`)
 
@@ -126,7 +126,7 @@ Sprint 1's retro: `cargo clippy --workspace -- -D warnings` flags any function w
 
 ## Sequencing
 
-Plans depend on each other in this order:
+Plans depend on each other in this order (all live in `../plans/2026-08-29-sprint-2-plans/`):
 1. `01-resp-frame-and-parser.md` — `Frame` type + RESP2 decoder/encoder (no I/O yet, buffer-in/buffer-out)
 2. `02-partial-read-framing.md` (depends on 1) — proves the decoder handles a command split across multiple reads
 3. `03-command-dispatcher.md` (depends on 1, and Sprint 1's `engine`) — no networking yet, calls `dispatch()` directly with hand-built `Frame`s
@@ -138,7 +138,7 @@ Plans depend on each other in this order:
 
 ## Definition of done for the sprint
 
-Matches Sprint 2 in `../rocket-mem-sprint-plan.md`:
+Matches Sprint 2 in `../../rocket-mem-sprint-plan.md`:
 - [ ] `redis-cli` runs every Sprint 1 command correctly over real TCP
 - [ ] At least 2 non-Rust client libraries connect and run a basic workload
 - [ ] Split/malformed-input integration tests pass in CI

@@ -4,11 +4,11 @@
 
 **Goal:** a `dispatch(&Engine, Frame) -> Frame` function that parses a RESP command array, validates it, calls the matching Sprint 1 `engine::commands::*` function, and serializes the result back to a `Frame` — with no networking involved yet, called directly with hand-built `Frame`s in tests.
 
-**Architecture:** lives in `crates/server`, which becomes a lib+bin hybrid this sprint (see `00-sprint-2-spec.md`). `dispatch` is the single entry point Sprint 2's TCP listener (item 04) will call per received frame — same relationship `Engine` had to Sprint 1's commands.
+**Architecture:** lives in `crates/server`, which becomes a lib+bin hybrid this sprint (see `../../specs/2026-08-29-sprint-2-spec.md`). `dispatch` is the single entry point Sprint 2's TCP listener (item 04) will call per received frame — same relationship `Engine` had to Sprint 1's commands.
 
 **Tech Stack:** no new dependencies — `bytes`, `protocol::Frame`, `engine::{Engine, commands::*}`, `common::EngineError`.
 
-**Spec:** `00-sprint-2-spec.md` — the dispatcher shape, case-insensitivity rule, and `EngineError` → `Frame::Error` mapping convention are authoritative.
+**Spec:** `../../specs/2026-08-29-sprint-2-spec.md` — the dispatcher shape, case-insensitivity rule, and `EngineError` → `Frame::Error` mapping convention are authoritative.
 
 **Depends on:** `01-resp-frame-and-parser.md` must be complete. Independent of `02-partial-read-framing.md`.
 

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`rocket-mem` is a from-scratch, RESP-compatible (Redis wire protocol) in-memory data store written in Rust, built as a 16-week solo project. Full roadmap and rationale live in `docs/rocket-mem-production-plan.md` (16-week phase plan + Architecture Decision Record) and `docs/rocket-mem-sprint-plan.md` (2-week sprint breakdown with priorities/DoD). `docs/sprint-1-plans/` holds the (now-executed) TDD implementation plans for Sprint 1.
+`rocket-mem` is a from-scratch, RESP-compatible (Redis wire protocol) in-memory data store written in Rust, built as a 16-week solo project. Full roadmap and rationale live in `docs/rocket-mem-production-plan.md` (16-week phase plan + Architecture Decision Record) and `docs/rocket-mem-sprint-plan.md` (2-week sprint breakdown with priorities/DoD). Per-sprint specs and implementation plans live under `docs/superpowers/specs/` and `docs/superpowers/plans/<date>-sprint-N-plans/` — see "Sprint planning docs" below. `docs/superpowers/plans/2026-08-28-sprint-1-plans/` holds the (now-executed) TDD implementation plans for Sprint 1; `docs/superpowers/plans/2026-08-29-sprint-2-plans/` holds Sprint 2's (not yet executed).
 
 Only Sprint 1 is built so far: a protocol-agnostic storage engine with no networking. There is no RESP parser, no dispatcher, and no TCP listener yet — that's Sprint 2.
 
@@ -50,6 +50,11 @@ Read `value.rs` → `shard.rs` → `store.rs` → `engine.rs` → `commands/` in
 - **Missing key ≠ error**: a read on a missing key returns `None`/empty (not an error), and a *mutation* that finds nothing to do must not write back a phantom empty collection. `commands/missing_key_semantics_tests.rs` codifies this — it previously caught a real bug where `lpop`/`rpop`/`srem` wrote back an empty List/Set for a key that was never set.
 - **Deferred scope**: `SET`'s `EX`/`PX` flags are intentionally not implemented (only `NX`/`XX`) — there's no expiry reaper until Sprint 4, so time-based flags would be dead code until then.
 
-## Superpowers plugin scaffolding
+## Sprint planning docs
 
-`docs/superpowers/plans/`, `docs/superpowers/specs/`, and `.worktrees/` (gitignored) are workspace conventions for the Superpowers Claude Code plugin's planning/worktree-isolation skills — not part of the application itself.
+This project's sprint specs and implementation plans follow the Superpowers Claude Code plugin's own default save convention (the `writing-plans`/`brainstorming` skills), adopted here as the project's standing convention:
+
+- `docs/superpowers/specs/<date>-sprint-N-spec.md` — one spec per sprint, fixing shared design decisions (workspace layout, wire formats, architecture calls) that every plan in that sprint assumes as ground truth. Cross-references the master plan/sprint-plan docs and the sibling plans folder with relative paths (`../../rocket-mem-*.md`, `../plans/<date>-sprint-N-plans/`).
+- `docs/superpowers/plans/<date>-sprint-N-plans/` — one numbered TDD implementation plan per backlog item for that sprint (`01-*.md`, `02-*.md`, ...), each referencing its sprint's spec via `../../specs/<date>-sprint-N-spec.md`.
+
+`.worktrees/` (gitignored) is a separate Superpowers convention, for the `using-git-worktrees` skill's isolated-workspace creation.

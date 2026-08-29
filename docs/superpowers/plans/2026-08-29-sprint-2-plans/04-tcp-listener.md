@@ -8,7 +8,7 @@
 
 **Tech Stack:** `tokio::net::{TcpListener, TcpStream}`, `tokio::spawn`, `tokio_util::codec::Framed`, `futures-util::{StreamExt, SinkExt}` (new dependency — needed to call `.next()`/`.send()` on a `Framed`).
 
-**Spec:** `00-sprint-2-spec.md` — the lib+bin crate split and the in-process integration-test approach are authoritative.
+**Spec:** `../../specs/2026-08-29-sprint-2-spec.md` — the lib+bin crate split and the in-process integration-test approach are authoritative.
 
 **Depends on:** `01-resp-frame-and-parser.md` and `03-command-dispatcher.md` must both be complete.
 

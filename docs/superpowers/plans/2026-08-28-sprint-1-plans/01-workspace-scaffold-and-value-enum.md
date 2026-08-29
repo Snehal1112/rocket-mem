@@ -4,7 +4,7 @@
 
 **Goal:** stand up the Cargo workspace with four crates and define the `Value` enum every data-type command will operate on.
 
-**Architecture:** a Cargo workspace with `common`, `engine`, `protocol`, `server` crates. `protocol` and `server` are empty placeholders this sprint — Sprint 2 fills them in. See `00-sprint-1-spec.md` for the full layout and rationale.
+**Architecture:** a Cargo workspace with `common`, `engine`, `protocol`, `server` crates. `protocol` and `server` are empty placeholders this sprint — Sprint 2 fills them in. See `../../specs/2026-08-28-sprint-1-spec.md` for the full layout and rationale.
 
 **Tech Stack:** Rust workspace, `bytes` for zero-copy byte buffers, `thiserror` for error types.
 

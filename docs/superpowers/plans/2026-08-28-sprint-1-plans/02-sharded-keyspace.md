@@ -4,7 +4,7 @@
 
 **Goal:** build the N-shard, lock-based keyspace that every command operates through — the concurrency backbone of the whole server.
 
-**Architecture:** a fixed array of 16 `Shard`s, each wrapping `RwLock<HashMap<Bytes, Value>>`. Keys route to a shard via `DefaultHasher` over the key bytes, modulo shard count. See `00-sprint-1-spec.md`.
+**Architecture:** a fixed array of 16 `Shard`s, each wrapping `RwLock<HashMap<Bytes, Value>>`. Keys route to a shard via `DefaultHasher` over the key bytes, modulo shard count. See `../../specs/2026-08-28-sprint-1-spec.md`.
 
 **Tech Stack:** `parking_lot::RwLock`, `std::collections::HashMap`.
 

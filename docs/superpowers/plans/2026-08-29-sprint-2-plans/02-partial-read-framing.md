@@ -2,13 +2,13 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** prove `RespCodec::decode` correctly handles a command that arrives split across multiple TCP reads — this is Sprint 2's other named risk (per `../rocket-mem-sprint-plan.md`: "Partial-read framing bugs are subtle — works with `redis-cli`, silently breaks under pipelining. Write the split-write test before declaring networking done, not after.").
+**Goal:** prove `RespCodec::decode` correctly handles a command that arrives split across multiple TCP reads — this is Sprint 2's other named risk (per `../../../rocket-mem-sprint-plan.md`: "Partial-read framing bugs are subtle — works with `redis-cli`, silently breaks under pipelining. Write the split-write test before declaring networking done, not after.").
 
 **Architecture:** no new production code — `parse_frame`/`decode` from `01-resp-frame-and-parser.md` were already written to return `Ok(None)` on an incomplete buffer without consuming anything, which is exactly the property that makes split reads safe. This plan adds the tests that prove it, plus a pipelining test (two full commands arriving in one read) since that's the mirror-image bug (over-consuming, not under-consuming).
 
 **Tech Stack:** `bytes::BytesMut`, `tokio_util::codec::Decoder`. No real sockets needed — feeding a `BytesMut` in stages against the same `Decoder` instance a real `Framed<TcpStream, _>` would use is sufficient to prove this property, and is far less flaky than an actual split TCP write.
 
-**Spec:** `00-sprint-2-spec.md`.
+**Spec:** `../../specs/2026-08-29-sprint-2-spec.md`.
 
 **Depends on:** `01-resp-frame-and-parser.md` must be complete.
 
