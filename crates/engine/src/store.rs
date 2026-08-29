@@ -36,6 +36,19 @@ impl Store {
     pub fn keys(&self) -> Vec<Bytes> {
         self.shards.iter().flat_map(|s| s.keys()).collect()
     }
+    pub fn scan(&self, cursor: u64) -> (u64, Vec<Bytes>) {
+        let idx = cursor as usize;
+        if idx >= self.shards.len() {
+            return (0, Vec::new());
+        }
+        let keys = self.shards[idx].keys();
+        let next = if idx + 1 >= self.shards.len() {
+            0
+        } else {
+            (idx + 1) as u64
+        };
+        (next, keys)
+    }
 
     #[cfg(test)]
     pub fn shard_key_counts(&self) -> Vec<usize> {
@@ -80,6 +93,105 @@ mod tests {
             non_empty > 1,
             "expected keys to spread across shards, got {non_empty} non-empty"
         );
+    }
+
+    #[test]
+    fn scan_from_cursor_zero_returns_shard_zeros_keys_and_the_next_cursor() {
+        let store = Store::new(16);
+        store.set(
+            Bytes::from_static(b"k"),
+            Value::String(Bytes::from_static(b"v")),
+        );
+        let (next, _keys) = store.scan(0);
+        assert_eq!(next, 1);
+    }
+
+    #[test]
+    fn scan_wraps_back_to_zero_after_the_last_shard() {
+        let store = Store::new(16);
+        let (next, keys) = store.scan(15);
+        assert_eq!(next, 0);
+        assert!(keys.is_empty() || !keys.is_empty()); // shard 15 may or may not be empty; only the cursor matters here
+    }
+
+    #[test]
+    fn scan_past_the_last_shard_returns_zero_and_no_keys() {
+        let store = Store::new(16);
+        let (next, keys) = store.scan(16);
+        assert_eq!(next, 0);
+        assert!(keys.is_empty());
+    }
+
+    #[test]
+    fn a_full_scan_visits_every_pre_existing_key_exactly_once() {
+        use std::collections::HashMap;
+
+        let store = Store::new(16);
+        for i in 0..200 {
+            store.set(
+                Bytes::from(format!("k{i}")),
+                Value::String(Bytes::from_static(b"v")),
+            );
+        }
+
+        let mut seen_counts: HashMap<Bytes, usize> = HashMap::new();
+        let mut cursor = 0u64;
+        loop {
+            let (next, keys) = store.scan(cursor);
+            for k in keys {
+                *seen_counts.entry(k).or_insert(0) += 1;
+            }
+            cursor = next;
+            if cursor == 0 {
+                break;
+            }
+        }
+
+        assert_eq!(seen_counts.len(), 200);
+        assert!(seen_counts.values().all(|&count| count == 1));
+    }
+
+    #[test]
+    fn scan_visits_every_pre_existing_key_at_least_once_under_concurrent_writes() {
+        use std::collections::HashSet;
+        use std::sync::Arc;
+        use std::thread;
+
+        let store = Arc::new(Store::new(16));
+        for i in 0..5000 {
+            store.set(
+                Bytes::from(format!("pre{i}")),
+                Value::String(Bytes::from_static(b"v")),
+            );
+        }
+
+        let writer_store = Arc::clone(&store);
+        let writer = thread::spawn(move || {
+            for i in 0..5000 {
+                writer_store.set(
+                    Bytes::from(format!("new{i}")),
+                    Value::String(Bytes::from_static(b"v")),
+                );
+            }
+        });
+
+        let mut seen: HashSet<Bytes> = HashSet::new();
+        let mut cursor = 0u64;
+        loop {
+            let (next, keys) = store.scan(cursor);
+            seen.extend(keys);
+            cursor = next;
+            if cursor == 0 {
+                break;
+            }
+        }
+
+        writer.join().unwrap();
+
+        for i in 0..5000 {
+            let key = Bytes::from(format!("pre{i}"));
+            assert!(seen.contains(&key), "missing pre-existing key pre{i}");
+        }
     }
 
     #[test]

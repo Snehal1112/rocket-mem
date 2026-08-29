@@ -27,6 +27,9 @@ impl Engine {
     pub fn keys(&self) -> Vec<Bytes> {
         self.store.keys()
     }
+    pub fn scan(&self, cursor: u64) -> (u64, Vec<Bytes>) {
+        self.store.scan(cursor)
+    }
 }
 
 impl Default for Engine {
