@@ -2,52 +2,73 @@ use crate::{Engine, Value};
 use bytes::Bytes;
 use std::collections::VecDeque;
 
-fn get_list(engine: &Engine, key: &[u8]) -> Result<VecDeque<Bytes>, common::EngineError> {
-    match engine.get(key) {
-        None => Ok(VecDeque::new()),
-        Some(Value::List(l)) => Ok(l),
-        Some(_) => Err(common::EngineError::WrongType),
-    }
-}
+// Every function below reads/mutates a list in place via `Engine::with_ref`/`with_mut`
+// instead of cloning the whole `VecDeque` out and writing a replacement back -- the old
+// clone-mutate-writeback pattern made every single-element push/pop O(current list length)
+// instead of O(1), which compounds into O(n²) total cost for n sequential pushes to one key
+// (confirmed by `redis-benchmark`: a single-key LPUSH benchmark visibly degraded over time
+// and didn't finish 100k requests in 60s before this fix).
 
 pub fn rpush(engine: &Engine, key: Bytes, val: Bytes) -> Result<(), common::EngineError> {
-    let mut list = get_list(engine, &key)?;
-    list.push_back(val);
-    engine.set(key, Value::List(list));
+    let existed = engine.with_mut(&key, |existing| -> Result<bool, common::EngineError> {
+        match existing {
+            Some(Value::List(list)) => {
+                list.push_back(val.clone()); // Bytes clone is O(1), not a deep copy
+                Ok(true)
+            }
+            Some(_) => Err(common::EngineError::WrongType),
+            None => Ok(false),
+        }
+    })?;
+    if !existed {
+        let mut list = VecDeque::new();
+        list.push_back(val);
+        engine.set(key, Value::List(list));
+    }
     Ok(())
 }
 
 pub fn lpush(engine: &Engine, key: Bytes, val: Bytes) -> Result<(), common::EngineError> {
-    let mut list = get_list(engine, &key)?;
-    list.push_front(val);
-    engine.set(key, Value::List(list));
+    let existed = engine.with_mut(&key, |existing| -> Result<bool, common::EngineError> {
+        match existing {
+            Some(Value::List(list)) => {
+                list.push_front(val.clone());
+                Ok(true)
+            }
+            Some(_) => Err(common::EngineError::WrongType),
+            None => Ok(false),
+        }
+    })?;
+    if !existed {
+        let mut list = VecDeque::new();
+        list.push_front(val);
+        engine.set(key, Value::List(list));
+    }
     Ok(())
 }
 
 pub fn rpop(engine: &Engine, key: &[u8]) -> Result<Option<Bytes>, common::EngineError> {
-    let mut list = match engine.get(key) {
-        None => return Ok(None),
-        Some(Value::List(l)) => l,
-        Some(_) => return Err(common::EngineError::WrongType),
-    };
-    let popped = list.pop_back();
-    engine.set(Bytes::copy_from_slice(key), Value::List(list));
-    Ok(popped)
+    engine.with_mut(key, |existing| match existing {
+        None => Ok(None),
+        Some(Value::List(list)) => Ok(list.pop_back()),
+        Some(_) => Err(common::EngineError::WrongType),
+    })
 }
 
 pub fn lpop(engine: &Engine, key: &[u8]) -> Result<Option<Bytes>, common::EngineError> {
-    let mut list = match engine.get(key) {
-        None => return Ok(None),
-        Some(Value::List(l)) => l,
-        Some(_) => return Err(common::EngineError::WrongType),
-    };
-    let popped = list.pop_front();
-    engine.set(Bytes::copy_from_slice(key), Value::List(list));
-    Ok(popped)
+    engine.with_mut(key, |existing| match existing {
+        None => Ok(None),
+        Some(Value::List(list)) => Ok(list.pop_front()),
+        Some(_) => Err(common::EngineError::WrongType),
+    })
 }
 
 pub fn llen(engine: &Engine, key: &[u8]) -> Result<usize, common::EngineError> {
-    Ok(get_list(engine, key)?.len())
+    engine.with_ref(key, |v| match v {
+        None => Ok(0),
+        Some(Value::List(list)) => Ok(list.len()),
+        Some(_) => Err(common::EngineError::WrongType),
+    })
 }
 
 /// start/stop follow Redis semantics: negative indices count from the end, -1 is the last element.
@@ -57,24 +78,33 @@ pub fn lrange(
     start: i64,
     stop: i64,
 ) -> Result<Vec<Bytes>, common::EngineError> {
-    let list = get_list(engine, key)?;
-    let len = list.len() as i64;
-    let norm = |i: i64| -> i64 {
-        if i < 0 {
-            (len + i).max(0)
-        } else {
-            i.min(len)
+    engine.with_ref(key, |v| {
+        let list = match v {
+            None => return Ok(Vec::new()),
+            Some(Value::List(list)) => list,
+            Some(_) => return Err(common::EngineError::WrongType),
+        };
+        let len = list.len() as i64;
+        let norm = |i: i64| -> i64 {
+            if i < 0 {
+                (len + i).max(0)
+            } else {
+                i.min(len)
+            }
+        };
+        let (s, e) = (norm(start), norm(stop) + 1);
+        if s >= e {
+            return Ok(Vec::new());
         }
-    };
-    let (s, e) = (norm(start), norm(stop) + 1);
-    if s >= e {
-        return Ok(Vec::new());
-    }
-    Ok(list
-        .into_iter()
-        .skip(s as usize)
-        .take((e - s) as usize)
-        .collect())
+        // Only the requested slice gets cloned, not the whole list -- e.g. `LRANGE key 0 9`
+        // on a million-element list clones 10 Bytes handles, not a million.
+        Ok(list
+            .iter()
+            .skip(s as usize)
+            .take((e - s) as usize)
+            .cloned()
+            .collect())
+    })
 }
 
 pub fn lindex(
@@ -82,13 +112,19 @@ pub fn lindex(
     key: &[u8],
     index: i64,
 ) -> Result<Option<Bytes>, common::EngineError> {
-    let list = get_list(engine, key)?;
-    let len = list.len() as i64;
-    let idx = if index < 0 { len + index } else { index };
-    if idx < 0 || idx >= len {
-        return Ok(None);
-    }
-    Ok(list.get(idx as usize).cloned())
+    engine.with_ref(key, |v| {
+        let list = match v {
+            None => return Ok(None),
+            Some(Value::List(list)) => list,
+            Some(_) => return Err(common::EngineError::WrongType),
+        };
+        let len = list.len() as i64;
+        let idx = if index < 0 { len + index } else { index };
+        if idx < 0 || idx >= len {
+            return Ok(None);
+        }
+        Ok(list.get(idx as usize).cloned())
+    })
 }
 
 pub fn lset(
@@ -97,15 +133,20 @@ pub fn lset(
     index: i64,
     val: Bytes,
 ) -> Result<bool, common::EngineError> {
-    let mut list = get_list(engine, &key)?;
-    let len = list.len() as i64;
-    let idx = if index < 0 { len + index } else { index };
-    if idx < 0 || idx >= len {
-        return Ok(false);
-    }
-    list[idx as usize] = val;
-    engine.set(key, Value::List(list));
-    Ok(true)
+    engine.with_mut(&key, |existing| {
+        let list = match existing {
+            None => return Ok(false),
+            Some(Value::List(list)) => list,
+            Some(_) => return Err(common::EngineError::WrongType),
+        };
+        let len = list.len() as i64;
+        let idx = if index < 0 { len + index } else { index };
+        if idx < 0 || idx >= len {
+            return Ok(false);
+        }
+        list[idx as usize] = val;
+        Ok(true)
+    })
 }
 
 pub fn ltrim(
@@ -128,41 +169,49 @@ pub fn lrem(
     count: i64,
     val: &[u8],
 ) -> Result<usize, common::EngineError> {
-    let list = get_list(engine, &key)?;
-    let mut removed = 0usize;
-    let new_list: VecDeque<Bytes> = if count >= 0 {
-        let mut remaining = if count == 0 {
-            usize::MAX
-        } else {
-            count as usize
+    engine.with_mut(&key, |existing| {
+        let list = match existing {
+            None => return Ok(0),
+            Some(Value::List(list)) => list,
+            Some(_) => return Err(common::EngineError::WrongType),
         };
-        let mut items: Vec<Bytes> = list.into_iter().collect();
-        items.retain(|item| {
-            if remaining > 0 && item.as_ref() == val {
-                remaining -= 1;
-                removed += 1;
-                false
+        let mut removed = 0usize;
+        if count >= 0 {
+            let mut remaining = if count == 0 {
+                usize::MAX
             } else {
-                true
+                count as usize
+            };
+            list.retain(|item| {
+                if remaining > 0 && item.as_ref() == val {
+                    remaining -= 1;
+                    removed += 1;
+                    false
+                } else {
+                    true
+                }
+            });
+        } else {
+            let mut remaining = (-count) as usize;
+            // Scan from the tail; indices come out highest-first, which is exactly the
+            // order VecDeque::remove needs so earlier removals don't shift later ones.
+            let mut to_remove = Vec::new();
+            for (idx, item) in list.iter().enumerate().rev() {
+                if remaining == 0 {
+                    break;
+                }
+                if item.as_ref() == val {
+                    to_remove.push(idx);
+                    remaining -= 1;
+                }
             }
-        });
-        items.into_iter().collect()
-    } else {
-        let mut remaining = (-count) as usize;
-        let mut items: Vec<Bytes> = list.into_iter().rev().collect();
-        items.retain(|item| {
-            if remaining > 0 && item.as_ref() == val {
-                remaining -= 1;
-                removed += 1;
-                false
-            } else {
-                true
+            removed = to_remove.len();
+            for idx in to_remove {
+                list.remove(idx);
             }
-        });
-        items.into_iter().rev().collect()
-    };
-    engine.set(key, Value::List(new_list));
-    Ok(removed)
+        }
+        Ok(removed)
+    })
 }
 
 pub fn linsert(
@@ -172,18 +221,19 @@ pub fn linsert(
     pivot: &[u8],
     val: Bytes,
 ) -> Result<i64, common::EngineError> {
-    if !engine.exists(&key) {
-        return Ok(0);
-    }
-    let mut list = get_list(engine, &key)?;
-    let Some(pos) = list.iter().position(|item| item.as_ref() == pivot) else {
-        return Ok(-1);
-    };
-    let insert_at = if before { pos } else { pos + 1 };
-    list.insert(insert_at, val);
-    let len = list.len() as i64;
-    engine.set(key, Value::List(list));
-    Ok(len)
+    engine.with_mut(&key, |existing| {
+        let list = match existing {
+            None => return Ok(0),
+            Some(Value::List(list)) => list,
+            Some(_) => return Err(common::EngineError::WrongType),
+        };
+        let Some(pos) = list.iter().position(|item| item.as_ref() == pivot) else {
+            return Ok(-1);
+        };
+        let insert_at = if before { pos } else { pos + 1 };
+        list.insert(insert_at, val);
+        Ok(list.len() as i64)
+    })
 }
 
 #[cfg(test)]

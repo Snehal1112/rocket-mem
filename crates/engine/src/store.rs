@@ -36,6 +36,18 @@ impl Store {
     pub fn keys(&self) -> Vec<Bytes> {
         self.shards.iter().flat_map(|s| s.keys()).collect()
     }
+    pub fn with_ref<F, R>(&self, key: &[u8], f: F) -> R
+    where
+        F: FnOnce(Option<&Value>) -> R,
+    {
+        self.shard_for(key).with_ref(key, f)
+    }
+    pub fn with_mut<F, R>(&self, key: &[u8], f: F) -> R
+    where
+        F: FnOnce(Option<&mut Value>) -> R,
+    {
+        self.shard_for(key).with_mut(key, f)
+    }
     pub fn scan(&self, cursor: u64) -> (u64, Vec<Bytes>) {
         let idx = cursor as usize;
         if idx >= self.shards.len() {

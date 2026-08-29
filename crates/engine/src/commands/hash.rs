@@ -4,21 +4,36 @@ use std::collections::HashMap;
 
 /// Returns whether `field` was newly added (`false` if it already existed and was overwritten) —
 /// callers implementing variadic `HSET` sum this across pairs for the count Redis reports.
+/// Mutates in place via `with_mut` -- see list.rs's top-of-file note for why this matters.
 pub fn hset(
     engine: &Engine,
     key: Bytes,
     field: Bytes,
     val: Bytes,
 ) -> Result<bool, common::EngineError> {
-    let mut map = match engine.get(&key) {
-        Some(Value::Hash(m)) => m,
-        Some(_) => return Err(common::EngineError::WrongType),
-        None => HashMap::new(),
-    };
-    let is_new = !map.contains_key(&field);
-    map.insert(field, val);
-    engine.set(key, Value::Hash(map));
-    Ok(is_new)
+    let existed = engine.with_mut(
+        &key,
+        |existing| -> Result<Option<bool>, common::EngineError> {
+            match existing {
+                Some(Value::Hash(map)) => {
+                    let is_new = !map.contains_key(&field);
+                    map.insert(field.clone(), val.clone());
+                    Ok(Some(is_new))
+                }
+                Some(_) => Err(common::EngineError::WrongType),
+                None => Ok(None),
+            }
+        },
+    )?;
+    match existed {
+        Some(is_new) => Ok(is_new),
+        None => {
+            let mut map = HashMap::new();
+            map.insert(field, val);
+            engine.set(key, Value::Hash(map));
+            Ok(true)
+        }
+    }
 }
 
 pub fn hget(
@@ -26,23 +41,19 @@ pub fn hget(
     key: &[u8],
     field: &[u8],
 ) -> Result<Option<Bytes>, common::EngineError> {
-    match engine.get(key) {
+    engine.with_ref(key, |v| match v {
         None => Ok(None),
-        Some(Value::Hash(m)) => Ok(m.get(field).cloned()),
+        Some(Value::Hash(map)) => Ok(map.get(field).cloned()),
         Some(_) => Err(common::EngineError::WrongType),
-    }
+    })
 }
 
 pub fn hdel(engine: &Engine, key: &[u8], field: &[u8]) -> Result<bool, common::EngineError> {
-    match engine.get(key) {
+    engine.with_mut(key, |existing| match existing {
         None => Ok(false),
-        Some(Value::Hash(mut m)) => {
-            let removed = m.remove(field).is_some();
-            engine.set(Bytes::copy_from_slice(key), Value::Hash(m));
-            Ok(removed)
-        }
+        Some(Value::Hash(map)) => Ok(map.remove(field).is_some()),
         Some(_) => Err(common::EngineError::WrongType),
-    }
+    })
 }
 
 pub fn hgetall(engine: &Engine, key: &[u8]) -> Result<HashMap<Bytes, Bytes>, common::EngineError> {
@@ -54,11 +65,19 @@ pub fn hgetall(engine: &Engine, key: &[u8]) -> Result<HashMap<Bytes, Bytes>, com
 }
 
 pub fn hexists(engine: &Engine, key: &[u8], field: &[u8]) -> Result<bool, common::EngineError> {
-    Ok(hgetall(engine, key)?.contains_key(field))
+    engine.with_ref(key, |v| match v {
+        None => Ok(false),
+        Some(Value::Hash(map)) => Ok(map.contains_key(field)),
+        Some(_) => Err(common::EngineError::WrongType),
+    })
 }
 
 pub fn hlen(engine: &Engine, key: &[u8]) -> Result<usize, common::EngineError> {
-    Ok(hgetall(engine, key)?.len())
+    engine.with_ref(key, |v| match v {
+        None => Ok(0),
+        Some(Value::Hash(map)) => Ok(map.len()),
+        Some(_) => Err(common::EngineError::WrongType),
+    })
 }
 
 pub fn hincrby(
@@ -67,22 +86,36 @@ pub fn hincrby(
     field: Bytes,
     delta: i64,
 ) -> Result<i64, common::EngineError> {
-    let mut map = match engine.get(&key) {
-        Some(Value::Hash(m)) => m,
-        Some(_) => return Err(common::EngineError::WrongType),
-        None => HashMap::new(),
-    };
-    let current: i64 = match map.get(&field) {
-        Some(b) => std::str::from_utf8(b)
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .ok_or(common::EngineError::NotAnInteger)?,
-        None => 0,
-    };
-    let next = current + delta;
-    map.insert(field, Bytes::from(next.to_string()));
-    engine.set(key, Value::Hash(map));
-    Ok(next)
+    let existed = engine.with_mut(
+        &key,
+        |existing| -> Result<Option<i64>, common::EngineError> {
+            match existing {
+                Some(Value::Hash(map)) => {
+                    let current: i64 = match map.get(&field) {
+                        Some(b) => std::str::from_utf8(b)
+                            .ok()
+                            .and_then(|s| s.parse().ok())
+                            .ok_or(common::EngineError::NotAnInteger)?,
+                        None => 0,
+                    };
+                    let next = current + delta;
+                    map.insert(field.clone(), Bytes::from(next.to_string()));
+                    Ok(Some(next))
+                }
+                Some(_) => Err(common::EngineError::WrongType),
+                None => Ok(None),
+            }
+        },
+    )?;
+    match existed {
+        Some(next) => Ok(next),
+        None => {
+            let mut map = HashMap::new();
+            map.insert(field, Bytes::from(delta.to_string()));
+            engine.set(key, Value::Hash(map));
+            Ok(delta)
+        }
+    }
 }
 
 pub fn hkeys(engine: &Engine, key: &[u8]) -> Result<Vec<Bytes>, common::EngineError> {
@@ -98,8 +131,11 @@ pub fn hmget(
     key: &[u8],
     fields: &[Bytes],
 ) -> Result<Vec<Option<Bytes>>, common::EngineError> {
-    let map = hgetall(engine, key)?;
-    Ok(fields.iter().map(|f| map.get(f).cloned()).collect())
+    engine.with_ref(key, |v| match v {
+        None => Ok(fields.iter().map(|_| None).collect()),
+        Some(Value::Hash(map)) => Ok(fields.iter().map(|f| map.get(f).cloned()).collect()),
+        Some(_) => Err(common::EngineError::WrongType),
+    })
 }
 
 pub fn hsetnx(
@@ -108,17 +144,32 @@ pub fn hsetnx(
     field: Bytes,
     val: Bytes,
 ) -> Result<bool, common::EngineError> {
-    let mut map = match engine.get(&key) {
-        Some(Value::Hash(m)) => m,
-        Some(_) => return Err(common::EngineError::WrongType),
-        None => HashMap::new(),
-    };
-    if map.contains_key(&field) {
-        return Ok(false);
+    let existed = engine.with_mut(
+        &key,
+        |existing| -> Result<Option<bool>, common::EngineError> {
+            match existing {
+                Some(Value::Hash(map)) => {
+                    if map.contains_key(&field) {
+                        Ok(Some(false))
+                    } else {
+                        map.insert(field.clone(), val.clone());
+                        Ok(Some(true))
+                    }
+                }
+                Some(_) => Err(common::EngineError::WrongType),
+                None => Ok(None),
+            }
+        },
+    )?;
+    match existed {
+        Some(applied) => Ok(applied),
+        None => {
+            let mut map = HashMap::new();
+            map.insert(field, val);
+            engine.set(key, Value::Hash(map));
+            Ok(true)
+        }
     }
-    map.insert(field, val);
-    engine.set(key, Value::Hash(map));
-    Ok(true)
 }
 
 #[cfg(test)]

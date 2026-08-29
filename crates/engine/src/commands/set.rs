@@ -12,22 +12,35 @@ fn get_set(engine: &Engine, key: &[u8]) -> Result<HashSet<Bytes>, common::Engine
 
 /// Returns whether `member` was newly added (`false` if it was already present) —
 /// callers implementing variadic `SADD` sum this across members for the count Redis reports.
+/// Mutates in place via `with_mut` -- see list.rs's top-of-file note for why this matters.
 pub fn sadd(engine: &Engine, key: Bytes, member: Bytes) -> Result<bool, common::EngineError> {
-    let mut set = get_set(engine, &key)?;
-    let added = set.insert(member);
-    engine.set(key, Value::Set(set));
-    Ok(added)
+    let existed = engine.with_mut(
+        &key,
+        |existing| -> Result<Option<bool>, common::EngineError> {
+            match existing {
+                Some(Value::Set(set)) => Ok(Some(set.insert(member.clone()))),
+                Some(_) => Err(common::EngineError::WrongType),
+                None => Ok(None),
+            }
+        },
+    )?;
+    match existed {
+        Some(added) => Ok(added),
+        None => {
+            let mut set = HashSet::new();
+            set.insert(member);
+            engine.set(key, Value::Set(set));
+            Ok(true)
+        }
+    }
 }
 
 pub fn srem(engine: &Engine, key: &[u8], member: &[u8]) -> Result<bool, common::EngineError> {
-    let mut set = match engine.get(key) {
-        None => return Ok(false),
-        Some(Value::Set(s)) => s,
-        Some(_) => return Err(common::EngineError::WrongType),
-    };
-    let removed = set.remove(member);
-    engine.set(Bytes::copy_from_slice(key), Value::Set(set));
-    Ok(removed)
+    engine.with_mut(key, |existing| match existing {
+        None => Ok(false),
+        Some(Value::Set(set)) => Ok(set.remove(member)),
+        Some(_) => Err(common::EngineError::WrongType),
+    })
 }
 
 pub fn smembers(engine: &Engine, key: &[u8]) -> Result<HashSet<Bytes>, common::EngineError> {
@@ -35,11 +48,19 @@ pub fn smembers(engine: &Engine, key: &[u8]) -> Result<HashSet<Bytes>, common::E
 }
 
 pub fn sismember(engine: &Engine, key: &[u8], member: &[u8]) -> Result<bool, common::EngineError> {
-    Ok(get_set(engine, key)?.contains(member))
+    engine.with_ref(key, |v| match v {
+        None => Ok(false),
+        Some(Value::Set(set)) => Ok(set.contains(member)),
+        Some(_) => Err(common::EngineError::WrongType),
+    })
 }
 
 pub fn scard(engine: &Engine, key: &[u8]) -> Result<usize, common::EngineError> {
-    Ok(get_set(engine, key)?.len())
+    engine.with_ref(key, |v| match v {
+        None => Ok(0),
+        Some(Value::Set(set)) => Ok(set.len()),
+        Some(_) => Err(common::EngineError::WrongType),
+    })
 }
 
 pub fn sinter(engine: &Engine, keys: &[Bytes]) -> Result<HashSet<Bytes>, common::EngineError> {
@@ -110,17 +131,18 @@ pub fn sdiffstore(
 
 pub fn spop(engine: &Engine, key: &[u8]) -> Result<Option<Bytes>, common::EngineError> {
     use rand::seq::IteratorRandom;
-    let mut set = match engine.get(key) {
-        None => return Ok(None),
-        Some(Value::Set(s)) => s,
-        Some(_) => return Err(common::EngineError::WrongType),
-    };
-    let Some(member) = set.iter().choose(&mut rand::thread_rng()).cloned() else {
-        return Ok(None);
-    };
-    set.remove(&member);
-    engine.set(Bytes::copy_from_slice(key), Value::Set(set));
-    Ok(Some(member))
+    engine.with_mut(key, |existing| {
+        let set = match existing {
+            None => return Ok(None),
+            Some(Value::Set(set)) => set,
+            Some(_) => return Err(common::EngineError::WrongType),
+        };
+        let Some(member) = set.iter().choose(&mut rand::thread_rng()).cloned() else {
+            return Ok(None);
+        };
+        set.remove(&member);
+        Ok(Some(member))
+    })
 }
 
 pub fn srandmember(engine: &Engine, key: &[u8]) -> Result<Option<Bytes>, common::EngineError> {

@@ -1,25 +1,36 @@
 use crate::{Engine, SortedSet, Value};
 use bytes::Bytes;
 
-pub(crate) fn get_zset(engine: &Engine, key: &[u8]) -> Result<SortedSet, common::EngineError> {
-    match engine.get(key) {
-        None => Ok(SortedSet::new()),
-        Some(Value::SortedSet(z)) => Ok(z),
-        Some(_) => Err(common::EngineError::WrongType),
-    }
-}
-
+/// Mutates in place via `with_mut` -- see list.rs's top-of-file note for why this matters.
 pub fn zadd(
     engine: &Engine,
     key: Bytes,
     score: f64,
     member: Bytes,
 ) -> Result<bool, common::EngineError> {
-    let mut zset = get_zset(engine, &key)?;
-    let is_new = zset.score(&member).is_none();
-    zset.insert(member, score);
-    engine.set(key, Value::SortedSet(zset));
-    Ok(is_new)
+    let existed = engine.with_mut(
+        &key,
+        |existing| -> Result<Option<bool>, common::EngineError> {
+            match existing {
+                Some(Value::SortedSet(zset)) => {
+                    let is_new = zset.score(&member).is_none();
+                    zset.insert(member.clone(), score);
+                    Ok(Some(is_new))
+                }
+                Some(_) => Err(common::EngineError::WrongType),
+                None => Ok(None),
+            }
+        },
+    )?;
+    match existed {
+        Some(is_new) => Ok(is_new),
+        None => {
+            let mut zset = SortedSet::new();
+            zset.insert(member, score);
+            engine.set(key, Value::SortedSet(zset));
+            Ok(true)
+        }
+    }
 }
 
 pub fn zscore(
@@ -27,22 +38,27 @@ pub fn zscore(
     key: &[u8],
     member: &[u8],
 ) -> Result<Option<f64>, common::EngineError> {
-    Ok(get_zset(engine, key)?.score(member))
+    engine.with_ref(key, |v| match v {
+        None => Ok(None),
+        Some(Value::SortedSet(zset)) => Ok(zset.score(member)),
+        Some(_) => Err(common::EngineError::WrongType),
+    })
 }
 
 pub fn zrem(engine: &Engine, key: &[u8], member: &[u8]) -> Result<bool, common::EngineError> {
-    let mut zset = match engine.get(key) {
-        None => return Ok(false),
-        Some(Value::SortedSet(z)) => z,
-        Some(_) => return Err(common::EngineError::WrongType),
-    };
-    let removed = zset.remove(member);
-    engine.set(Bytes::copy_from_slice(key), Value::SortedSet(zset));
-    Ok(removed)
+    engine.with_mut(key, |existing| match existing {
+        None => Ok(false),
+        Some(Value::SortedSet(zset)) => Ok(zset.remove(member)),
+        Some(_) => Err(common::EngineError::WrongType),
+    })
 }
 
 pub fn zcard(engine: &Engine, key: &[u8]) -> Result<usize, common::EngineError> {
-    Ok(get_zset(engine, key)?.len())
+    engine.with_ref(key, |v| match v {
+        None => Ok(0),
+        Some(Value::SortedSet(zset)) => Ok(zset.len()),
+        Some(_) => Err(common::EngineError::WrongType),
+    })
 }
 
 pub fn zincrby(
@@ -51,11 +67,29 @@ pub fn zincrby(
     delta: f64,
     member: Bytes,
 ) -> Result<f64, common::EngineError> {
-    let mut zset = get_zset(engine, &key)?;
-    let new_score = zset.score(&member).unwrap_or(0.0) + delta;
-    zset.insert(member, new_score);
-    engine.set(key, Value::SortedSet(zset));
-    Ok(new_score)
+    let existed = engine.with_mut(
+        &key,
+        |existing| -> Result<Option<f64>, common::EngineError> {
+            match existing {
+                Some(Value::SortedSet(zset)) => {
+                    let new_score = zset.score(&member).unwrap_or(0.0) + delta;
+                    zset.insert(member.clone(), new_score);
+                    Ok(Some(new_score))
+                }
+                Some(_) => Err(common::EngineError::WrongType),
+                None => Ok(None),
+            }
+        },
+    )?;
+    match existed {
+        Some(new_score) => Ok(new_score),
+        None => {
+            let mut zset = SortedSet::new();
+            zset.insert(member, delta);
+            engine.set(key, Value::SortedSet(zset));
+            Ok(delta)
+        }
+    }
 }
 
 /// start/stop follow the same negative-index Redis semantics as `list::lrange`.
@@ -65,25 +99,31 @@ pub fn zrange(
     start: i64,
     stop: i64,
 ) -> Result<Vec<Bytes>, common::EngineError> {
-    let zset = get_zset(engine, key)?;
-    let members: Vec<Bytes> = zset.members_ascending().cloned().collect();
-    let len = members.len() as i64;
-    let norm = |i: i64| -> i64 {
-        if i < 0 {
-            (len + i).max(0)
-        } else {
-            i.min(len)
+    engine.with_ref(key, |v| {
+        let zset = match v {
+            None => return Ok(Vec::new()),
+            Some(Value::SortedSet(zset)) => zset,
+            Some(_) => return Err(common::EngineError::WrongType),
+        };
+        let len = zset.len() as i64;
+        let norm = |i: i64| -> i64 {
+            if i < 0 {
+                (len + i).max(0)
+            } else {
+                i.min(len)
+            }
+        };
+        let (s, e) = (norm(start), norm(stop) + 1);
+        if s >= e {
+            return Ok(Vec::new());
         }
-    };
-    let (s, e) = (norm(start), norm(stop) + 1);
-    if s >= e {
-        return Ok(Vec::new());
-    }
-    Ok(members
-        .into_iter()
-        .skip(s as usize)
-        .take((e - s) as usize)
-        .collect())
+        Ok(zset
+            .members_ascending()
+            .skip(s as usize)
+            .take((e - s) as usize)
+            .cloned()
+            .collect())
+    })
 }
 
 pub fn zrank(
@@ -91,9 +131,13 @@ pub fn zrank(
     key: &[u8],
     member: &[u8],
 ) -> Result<Option<usize>, common::EngineError> {
-    let zset = get_zset(engine, key)?;
-    let rank = zset.members_ascending().position(|m| m.as_ref() == member);
-    Ok(rank)
+    engine.with_ref(key, |v| match v {
+        None => Ok(None),
+        Some(Value::SortedSet(zset)) => {
+            Ok(zset.members_ascending().position(|m| m.as_ref() == member))
+        }
+        Some(_) => Err(common::EngineError::WrongType),
+    })
 }
 
 #[cfg(test)]
