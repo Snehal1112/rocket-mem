@@ -197,6 +197,57 @@ pub fn dispatch(engine: &Engine, frame: Frame, protocol: &mut Protocol, client_i
                 Err(e) => engine_error_to_frame(e),
             }
         }
+        "HINCRBY" => {
+            require_args!(rest, 3, "hincrby");
+            let delta: i64 = match std::str::from_utf8(&rest[2])
+                .ok()
+                .and_then(|s| s.parse().ok())
+            {
+                Some(n) => n,
+                None => return Frame::Error("ERR value is not an integer or out of range".into()),
+            };
+            match commands::hash::hincrby(engine, rest[0].clone(), rest[1].clone(), delta) {
+                Ok(n) => Frame::Integer(n),
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
+        "HKEYS" => {
+            require_args!(rest, 1, "hkeys");
+            match commands::hash::hkeys(engine, &rest[0]) {
+                Ok(fields) => Frame::Array(fields.into_iter().map(Frame::Bulk).collect()),
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
+        "HVALS" => {
+            require_args!(rest, 1, "hvals");
+            match commands::hash::hvals(engine, &rest[0]) {
+                Ok(vals) => Frame::Array(vals.into_iter().map(Frame::Bulk).collect()),
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
+        "HMGET" => {
+            require_args!(rest, 2, "hmget");
+            match commands::hash::hmget(engine, &rest[0], &rest[1..]) {
+                Ok(vals) => Frame::Array(
+                    vals.into_iter()
+                        .map(|v| match v {
+                            Some(b) => Frame::Bulk(b),
+                            None => Frame::Null,
+                        })
+                        .collect(),
+                ),
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
+        "HSETNX" => {
+            require_args!(rest, 3, "hsetnx");
+            match commands::hash::hsetnx(engine, rest[0].clone(), rest[1].clone(), rest[2].clone())
+            {
+                Ok(true) => Frame::Integer(1),
+                Ok(false) => Frame::Integer(0),
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
         "RPUSH" => {
             require_args!(rest, 2, "rpush");
             match commands::list::rpush(engine, rest[0].clone(), rest[1].clone()) {
@@ -1848,6 +1899,117 @@ mod tests {
                 1
             ),
             Frame::Error("ERR syntax error".into())
+        );
+    }
+
+    #[test]
+    fn hincrby_round_trips_through_dispatch() {
+        let engine = Engine::new();
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"HINCRBY", b"h", b"f", b"5"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Integer(5)
+        );
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"HINCRBY", b"h", b"f", b"3"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Integer(8)
+        );
+    }
+
+    #[test]
+    fn hincrby_on_a_non_integer_field_is_a_resp_error() {
+        let engine = Engine::new();
+        dispatch(
+            &engine,
+            cmd(&[b"HSET", b"h", b"f", b"abc"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"HINCRBY", b"h", b"f", b"1"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Error("value is not an integer or out of range".into())
+        );
+    }
+
+    #[test]
+    fn hkeys_and_hvals_round_trip_through_dispatch() {
+        let engine = Engine::new();
+        dispatch(
+            &engine,
+            cmd(&[b"HSET", b"h", b"f", b"v"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(
+            dispatch(&engine, cmd(&[b"HKEYS", b"h"]), &mut Protocol::default(), 1),
+            Frame::Array(vec![Frame::Bulk(Bytes::from_static(b"f"))])
+        );
+        assert_eq!(
+            dispatch(&engine, cmd(&[b"HVALS", b"h"]), &mut Protocol::default(), 1),
+            Frame::Array(vec![Frame::Bulk(Bytes::from_static(b"v"))])
+        );
+    }
+
+    #[test]
+    fn hmget_returns_null_for_missing_fields_through_dispatch() {
+        let engine = Engine::new();
+        dispatch(
+            &engine,
+            cmd(&[b"HSET", b"h", b"f1", b"v1"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"HMGET", b"h", b"f1", b"missing"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Array(vec![Frame::Bulk(Bytes::from_static(b"v1")), Frame::Null])
+        );
+    }
+
+    #[test]
+    fn hsetnx_returns_zero_when_the_field_already_exists() {
+        let engine = Engine::new();
+        dispatch(
+            &engine,
+            cmd(&[b"HSET", b"h", b"f", b"first"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"HSETNX", b"h", b"f", b"second"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Integer(0)
+        );
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"HGET", b"h", b"f"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Bulk(Bytes::from_static(b"first"))
         );
     }
 
