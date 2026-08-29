@@ -12,6 +12,7 @@ thiserror = "1"
 tracing = "0.1"
 parking_lot = "0.12"
 rand = "0.8"
+ordered-float = "4"
 tokio-util = { version = "0.7", features = ["codec"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
 futures-util = { version = "0.3", features = ["sink"] }

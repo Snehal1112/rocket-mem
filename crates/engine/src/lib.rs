@@ -6,4 +6,4 @@ mod store;
 mod value;
 pub use engine::Engine;
 pub use store::Store;
-pub use value::Value;
+pub use value::{SortedSet, Value};
