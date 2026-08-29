@@ -429,6 +429,64 @@ pub fn dispatch(engine: &Engine, frame: Frame, protocol: &mut Protocol, client_i
                 Err(e) => engine_error_to_frame(e),
             }
         }
+        "SINTER" => {
+            require_args!(rest, 1, "sinter");
+            match commands::set::sinter(engine, rest) {
+                Ok(members) => Frame::Array(members.into_iter().map(Frame::Bulk).collect()),
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
+        "SUNION" => {
+            require_args!(rest, 1, "sunion");
+            match commands::set::sunion(engine, rest) {
+                Ok(members) => Frame::Array(members.into_iter().map(Frame::Bulk).collect()),
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
+        "SDIFF" => {
+            require_args!(rest, 1, "sdiff");
+            match commands::set::sdiff(engine, rest) {
+                Ok(members) => Frame::Array(members.into_iter().map(Frame::Bulk).collect()),
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
+        "SINTERSTORE" => {
+            require_args!(rest, 2, "sinterstore");
+            match commands::set::sinterstore(engine, rest[0].clone(), &rest[1..]) {
+                Ok(n) => Frame::Integer(n as i64),
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
+        "SUNIONSTORE" => {
+            require_args!(rest, 2, "sunionstore");
+            match commands::set::sunionstore(engine, rest[0].clone(), &rest[1..]) {
+                Ok(n) => Frame::Integer(n as i64),
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
+        "SDIFFSTORE" => {
+            require_args!(rest, 2, "sdiffstore");
+            match commands::set::sdiffstore(engine, rest[0].clone(), &rest[1..]) {
+                Ok(n) => Frame::Integer(n as i64),
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
+        "SPOP" => {
+            require_args!(rest, 1, "spop");
+            match commands::set::spop(engine, &rest[0]) {
+                Ok(Some(b)) => Frame::Bulk(b),
+                Ok(None) => Frame::Null,
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
+        "SRANDMEMBER" => {
+            require_args!(rest, 1, "srandmember");
+            match commands::set::srandmember(engine, &rest[0]) {
+                Ok(Some(b)) => Frame::Bulk(b),
+                Ok(None) => Frame::Null,
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
         "GETSET" => {
             require_args!(rest, 2, "getset");
             match commands::string::getset(engine, rest[0].clone(), rest[1].clone()) {
@@ -2010,6 +2068,155 @@ mod tests {
                 1
             ),
             Frame::Bulk(Bytes::from_static(b"first"))
+        );
+    }
+
+    #[test]
+    fn sinter_sunion_sdiff_round_trip_through_dispatch() {
+        let engine = Engine::new();
+        dispatch(
+            &engine,
+            cmd(&[b"SADD", b"a", b"x"]),
+            &mut Protocol::default(),
+            1,
+        );
+        dispatch(
+            &engine,
+            cmd(&[b"SADD", b"a", b"y"]),
+            &mut Protocol::default(),
+            1,
+        );
+        dispatch(
+            &engine,
+            cmd(&[b"SADD", b"b", b"y"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"SINTER", b"a", b"b"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Array(vec![Frame::Bulk(Bytes::from_static(b"y"))])
+        );
+        let Frame::Array(mut union) = dispatch(
+            &engine,
+            cmd(&[b"SUNION", b"a", b"b"]),
+            &mut Protocol::default(),
+            1,
+        ) else {
+            panic!("expected Array")
+        };
+        union.sort_by_key(|f| format!("{f:?}"));
+        assert_eq!(
+            union,
+            vec![
+                Frame::Bulk(Bytes::from_static(b"x")),
+                Frame::Bulk(Bytes::from_static(b"y"))
+            ]
+        );
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"SDIFF", b"a", b"b"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Array(vec![Frame::Bulk(Bytes::from_static(b"x"))])
+        );
+    }
+
+    #[test]
+    fn sinterstore_stores_the_result_through_dispatch() {
+        let engine = Engine::new();
+        dispatch(
+            &engine,
+            cmd(&[b"SADD", b"a", b"x"]),
+            &mut Protocol::default(),
+            1,
+        );
+        dispatch(
+            &engine,
+            cmd(&[b"SADD", b"b", b"x"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"SINTERSTORE", b"dest", b"a", b"b"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Integer(1)
+        );
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"SMEMBERS", b"dest"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Array(vec![Frame::Bulk(Bytes::from_static(b"x"))])
+        );
+    }
+
+    #[test]
+    fn spop_removes_a_member_through_dispatch() {
+        let engine = Engine::new();
+        dispatch(
+            &engine,
+            cmd(&[b"SADD", b"s", b"x"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(
+            dispatch(&engine, cmd(&[b"SPOP", b"s"]), &mut Protocol::default(), 1),
+            Frame::Bulk(Bytes::from_static(b"x"))
+        );
+        assert_eq!(
+            dispatch(&engine, cmd(&[b"SCARD", b"s"]), &mut Protocol::default(), 1),
+            Frame::Integer(0)
+        );
+    }
+
+    #[test]
+    fn spop_on_missing_key_returns_null() {
+        let engine = Engine::new();
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"SPOP", b"missing"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Null
+        );
+    }
+
+    #[test]
+    fn srandmember_does_not_remove_the_member_through_dispatch() {
+        let engine = Engine::new();
+        dispatch(
+            &engine,
+            cmd(&[b"SADD", b"s", b"x"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"SRANDMEMBER", b"s"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Bulk(Bytes::from_static(b"x"))
+        );
+        assert_eq!(
+            dispatch(&engine, cmd(&[b"SCARD", b"s"]), &mut Protocol::default(), 1),
+            Frame::Integer(1)
         );
     }
 
