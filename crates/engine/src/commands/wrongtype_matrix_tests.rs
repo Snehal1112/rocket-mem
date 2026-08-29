@@ -1,4 +1,4 @@
-use crate::commands::{hash, list, set, string};
+use crate::commands::{hash, list, set, sorted_set, string};
 use crate::{Engine, Value};
 use bytes::Bytes;
 
@@ -87,6 +87,20 @@ fn set_commands_reject_non_set_keys() {
     assert_wrongtype!(set::sadd(
         &e,
         Bytes::from_static(b"k"),
+        Bytes::from_static(b"m")
+    ));
+}
+
+#[test]
+fn sorted_set_commands_reject_non_sorted_set_keys() {
+    assert_wrongtype!(sorted_set::zscore(&engine_with_string_key(), b"k", b"m"));
+    assert_wrongtype!(sorted_set::zrem(&engine_with_hash_key(), b"k", b"m"));
+    assert_wrongtype!(sorted_set::zcard(&engine_with_list_key(), b"k"));
+    let e = engine_with_string_key();
+    assert_wrongtype!(sorted_set::zadd(
+        &e,
+        Bytes::from_static(b"k"),
+        1.0,
         Bytes::from_static(b"m")
     ));
 }
