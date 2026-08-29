@@ -54,3 +54,26 @@ async fn redis_rs_client_gets_a_real_error_on_wrongtype() {
     let err = result.unwrap_err();
     assert!(err.to_string().contains("WRONGTYPE"));
 }
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+
+#[tokio::test]
+async fn malformed_resp_input_gets_a_graceful_disconnect_not_a_crash() {
+    let url = spawn_test_server().await;
+    let addr = url.strip_prefix("redis://").unwrap();
+
+    let mut raw = TcpStream::connect(addr).await.unwrap();
+    raw.write_all(b"@this is not RESP\r\n").await.unwrap();
+    // the connection should close (EOF), not hang or echo garbage back
+    let mut buf = [0u8; 16];
+    let n = raw.read(&mut buf).await.unwrap();
+    assert_eq!(n, 0, "expected EOF on malformed input, got {n} bytes back");
+
+    // the server itself must still be up — a fresh, well-formed connection works fine
+    let client = redis::Client::open(url).unwrap();
+    let mut con = client.get_multiplexed_async_connection().await.unwrap();
+    let _: () = redis::AsyncCommands::set(&mut con, "still-alive", "yes")
+        .await
+        .unwrap();
+}
