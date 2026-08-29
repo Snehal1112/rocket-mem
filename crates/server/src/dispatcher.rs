@@ -26,6 +26,25 @@ fn engine_error_to_frame(e: common::EngineError) -> Frame {
     Frame::Error(e.to_string())
 }
 
+fn format_score(score: f64) -> Bytes {
+    if score.fract() == 0.0 && score.is_finite() {
+        Bytes::from((score as i64).to_string())
+    } else {
+        Bytes::from(score.to_string())
+    }
+}
+
+fn parse_score(raw: &[u8]) -> Result<f64, Frame> {
+    let score: f64 = std::str::from_utf8(raw)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| Frame::Error("ERR value is not a valid float".into()))?;
+    if !score.is_finite() {
+        return Err(Frame::Error("ERR value is not a valid float".into()));
+    }
+    Ok(score)
+}
+
 macro_rules! require_args {
     ($rest:expr, $n:expr, $name:expr) => {
         if $rest.len() < $n {
@@ -340,6 +359,52 @@ pub fn dispatch(engine: &Engine, frame: Frame, protocol: &mut Protocol, client_i
         "TYPE" => {
             require_args!(rest, 1, "type");
             Frame::Simple(commands::keys::key_type(engine, &rest[0]).into())
+        }
+        "ZADD" => {
+            require_args!(rest, 3, "zadd");
+            let score = match parse_score(&rest[1]) {
+                Ok(s) => s,
+                Err(e) => return e,
+            };
+            match commands::sorted_set::zadd(engine, rest[0].clone(), score, rest[2].clone()) {
+                Ok(true) => Frame::Integer(1),
+                Ok(false) => Frame::Integer(0),
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
+        "ZSCORE" => {
+            require_args!(rest, 2, "zscore");
+            match commands::sorted_set::zscore(engine, &rest[0], &rest[1]) {
+                Ok(Some(score)) => Frame::Bulk(format_score(score)),
+                Ok(None) => Frame::Null,
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
+        "ZREM" => {
+            require_args!(rest, 2, "zrem");
+            match commands::sorted_set::zrem(engine, &rest[0], &rest[1]) {
+                Ok(true) => Frame::Integer(1),
+                Ok(false) => Frame::Integer(0),
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
+        "ZCARD" => {
+            require_args!(rest, 1, "zcard");
+            match commands::sorted_set::zcard(engine, &rest[0]) {
+                Ok(n) => Frame::Integer(n as i64),
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
+        "ZINCRBY" => {
+            require_args!(rest, 3, "zincrby");
+            let delta = match parse_score(&rest[1]) {
+                Ok(s) => s,
+                Err(e) => return e,
+            };
+            match commands::sorted_set::zincrby(engine, rest[0].clone(), delta, rest[2].clone()) {
+                Ok(score) => Frame::Bulk(format_score(score)),
+                Err(e) => engine_error_to_frame(e),
+            }
         }
         "KEYS" => {
             require_args!(rest, 1, "keys");
@@ -1243,6 +1308,176 @@ mod tests {
             }
         }
         assert_eq!(total_keys, 50);
+    }
+
+    #[test]
+    fn zadd_then_zscore_round_trips_through_dispatch() {
+        let engine = Engine::new();
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"ZADD", b"z", b"5", b"alice"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Integer(1)
+        );
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"ZSCORE", b"z", b"alice"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Bulk(Bytes::from_static(b"5"))
+        );
+    }
+
+    #[test]
+    fn zadd_existing_member_returns_zero_and_updates_score() {
+        let engine = Engine::new();
+        dispatch(
+            &engine,
+            cmd(&[b"ZADD", b"z", b"5", b"alice"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"ZADD", b"z", b"9", b"alice"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Integer(0)
+        );
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"ZSCORE", b"z", b"alice"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Bulk(Bytes::from_static(b"9"))
+        );
+    }
+
+    #[test]
+    fn zadd_with_a_non_numeric_score_is_a_resp_error() {
+        let engine = Engine::new();
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"ZADD", b"z", b"notanumber", b"alice"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Error("ERR value is not a valid float".into())
+        );
+    }
+
+    #[test]
+    fn zadd_with_nan_or_infinite_score_is_a_resp_error() {
+        let engine = Engine::new();
+        for bad in [&b"nan"[..], &b"inf"[..], &b"-inf"[..]] {
+            assert_eq!(
+                dispatch(
+                    &engine,
+                    cmd(&[b"ZADD", b"z", bad, b"alice"]),
+                    &mut Protocol::default(),
+                    1
+                ),
+                Frame::Error("ERR value is not a valid float".into())
+            );
+        }
+    }
+
+    #[test]
+    fn zscore_on_missing_member_returns_null() {
+        let engine = Engine::new();
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"ZSCORE", b"z", b"missing"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Null
+        );
+    }
+
+    #[test]
+    fn zrem_then_zcard_round_trip_through_dispatch() {
+        let engine = Engine::new();
+        dispatch(
+            &engine,
+            cmd(&[b"ZADD", b"z", b"5", b"alice"]),
+            &mut Protocol::default(),
+            1,
+        );
+        dispatch(
+            &engine,
+            cmd(&[b"ZADD", b"z", b"2", b"bob"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(
+            dispatch(&engine, cmd(&[b"ZCARD", b"z"]), &mut Protocol::default(), 1),
+            Frame::Integer(2)
+        );
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"ZREM", b"z", b"alice"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Integer(1)
+        );
+        assert_eq!(
+            dispatch(&engine, cmd(&[b"ZCARD", b"z"]), &mut Protocol::default(), 1),
+            Frame::Integer(1)
+        );
+    }
+
+    #[test]
+    fn zincrby_returns_the_new_score_as_a_bulk_string() {
+        let engine = Engine::new();
+        dispatch(
+            &engine,
+            cmd(&[b"ZADD", b"z", b"5", b"alice"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"ZINCRBY", b"z", b"3", b"alice"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Bulk(Bytes::from_static(b"8"))
+        );
+    }
+
+    #[test]
+    fn zscore_formats_a_fractional_score_without_trailing_zeros() {
+        let engine = Engine::new();
+        dispatch(
+            &engine,
+            cmd(&[b"ZADD", b"z", b"5.5", b"alice"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"ZSCORE", b"z", b"alice"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Bulk(Bytes::from_static(b"5.5"))
+        );
     }
 
     #[test]
