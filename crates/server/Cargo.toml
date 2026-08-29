@@ -19,3 +19,6 @@ bytes.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 futures-util.workspace = true
+
+[dev-dependencies]
+redis = { version = "0.27", features = ["tokio-comp"] }
