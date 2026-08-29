@@ -58,8 +58,33 @@ pub fn dispatch(engine: &Engine, frame: Frame) -> Frame {
         }
         "SET" => {
             require_args!(rest, 2, "set");
-            engine.set(rest[0].clone(), Value::String(rest[1].clone()));
-            Frame::Simple("OK".into())
+            let key = rest[0].clone();
+            let val = rest[1].clone();
+            let flags: Vec<String> = rest[2..]
+                .iter()
+                .map(|b| String::from_utf8_lossy(b).to_ascii_uppercase())
+                .collect();
+            if flags.iter().any(|f| f == "EX" || f == "PX") {
+                return Frame::Error(
+                    "ERR syntax error: EX/PX are not supported yet (planned Sprint 4)".into(),
+                );
+            }
+            if flags.iter().any(|f| f == "NX") {
+                if commands::string::set_nx(engine, key, val) {
+                    Frame::Simple("OK".into())
+                } else {
+                    Frame::Null
+                }
+            } else if flags.iter().any(|f| f == "XX") {
+                if commands::string::set_xx(engine, key, val) {
+                    Frame::Simple("OK".into())
+                } else {
+                    Frame::Null
+                }
+            } else {
+                engine.set(key, Value::String(val));
+                Frame::Simple("OK".into())
+            }
         }
         "APPEND" => {
             require_args!(rest, 2, "append");
@@ -101,6 +126,152 @@ pub fn dispatch(engine: &Engine, frame: Frame) -> Frame {
             match commands::hash::hget(engine, &rest[0], &rest[1]) {
                 Ok(Some(b)) => Frame::Bulk(b),
                 Ok(None) => Frame::Null,
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
+        "INCRBY" => {
+            require_args!(rest, 2, "incrby");
+            let delta: i64 = match std::str::from_utf8(&rest[1])
+                .ok()
+                .and_then(|s| s.parse().ok())
+            {
+                Some(n) => n,
+                None => return Frame::Error("ERR value is not an integer or out of range".into()),
+            };
+            match commands::string::incr_by(engine, rest[0].clone(), delta) {
+                Ok(n) => Frame::Integer(n),
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
+        "HDEL" => {
+            require_args!(rest, 2, "hdel");
+            match commands::hash::hdel(engine, &rest[0], &rest[1]) {
+                Ok(true) => Frame::Integer(1),
+                Ok(false) => Frame::Integer(0),
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
+        "HGETALL" => {
+            require_args!(rest, 1, "hgetall");
+            match commands::hash::hgetall(engine, &rest[0]) {
+                Ok(map) => Frame::Array(
+                    map.into_iter()
+                        .flat_map(|(f, v)| [Frame::Bulk(f), Frame::Bulk(v)])
+                        .collect(),
+                ),
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
+        "HEXISTS" => {
+            require_args!(rest, 2, "hexists");
+            match commands::hash::hexists(engine, &rest[0], &rest[1]) {
+                Ok(true) => Frame::Integer(1),
+                Ok(false) => Frame::Integer(0),
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
+        "HLEN" => {
+            require_args!(rest, 1, "hlen");
+            match commands::hash::hlen(engine, &rest[0]) {
+                Ok(n) => Frame::Integer(n as i64),
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
+        "RPUSH" => {
+            require_args!(rest, 2, "rpush");
+            match commands::list::rpush(engine, rest[0].clone(), rest[1].clone()) {
+                Ok(()) => match commands::list::llen(engine, &rest[0]) {
+                    Ok(n) => Frame::Integer(n as i64),
+                    Err(e) => engine_error_to_frame(e),
+                },
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
+        "LPUSH" => {
+            require_args!(rest, 2, "lpush");
+            match commands::list::lpush(engine, rest[0].clone(), rest[1].clone()) {
+                Ok(()) => match commands::list::llen(engine, &rest[0]) {
+                    Ok(n) => Frame::Integer(n as i64),
+                    Err(e) => engine_error_to_frame(e),
+                },
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
+        "RPOP" => {
+            require_args!(rest, 1, "rpop");
+            match commands::list::rpop(engine, &rest[0]) {
+                Ok(Some(b)) => Frame::Bulk(b),
+                Ok(None) => Frame::Null,
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
+        "LPOP" => {
+            require_args!(rest, 1, "lpop");
+            match commands::list::lpop(engine, &rest[0]) {
+                Ok(Some(b)) => Frame::Bulk(b),
+                Ok(None) => Frame::Null,
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
+        "LLEN" => {
+            require_args!(rest, 1, "llen");
+            match commands::list::llen(engine, &rest[0]) {
+                Ok(n) => Frame::Integer(n as i64),
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
+        "LRANGE" => {
+            require_args!(rest, 3, "lrange");
+            let (start, stop) = match (
+                std::str::from_utf8(&rest[1])
+                    .ok()
+                    .and_then(|s| s.parse::<i64>().ok()),
+                std::str::from_utf8(&rest[2])
+                    .ok()
+                    .and_then(|s| s.parse::<i64>().ok()),
+            ) {
+                (Some(a), Some(b)) => (a, b),
+                _ => return Frame::Error("ERR value is not an integer or out of range".into()),
+            };
+            match commands::list::lrange(engine, &rest[0], start, stop) {
+                Ok(items) => Frame::Array(items.into_iter().map(Frame::Bulk).collect()),
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
+        "SADD" => {
+            require_args!(rest, 2, "sadd");
+            match commands::set::sadd(engine, rest[0].clone(), rest[1].clone()) {
+                Ok(()) => Frame::Integer(1),
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
+        "SREM" => {
+            require_args!(rest, 2, "srem");
+            match commands::set::srem(engine, &rest[0], &rest[1]) {
+                Ok(true) => Frame::Integer(1),
+                Ok(false) => Frame::Integer(0),
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
+        "SMEMBERS" => {
+            require_args!(rest, 1, "smembers");
+            match commands::set::smembers(engine, &rest[0]) {
+                Ok(members) => Frame::Array(members.into_iter().map(Frame::Bulk).collect()),
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
+        "SISMEMBER" => {
+            require_args!(rest, 2, "sismember");
+            match commands::set::sismember(engine, &rest[0], &rest[1]) {
+                Ok(true) => Frame::Integer(1),
+                Ok(false) => Frame::Integer(0),
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
+        "SCARD" => {
+            require_args!(rest, 1, "scard");
+            match commands::set::scard(engine, &rest[0]) {
+                Ok(n) => Frame::Integer(n as i64),
                 Err(e) => engine_error_to_frame(e),
             }
         }
@@ -282,6 +453,115 @@ mod tests {
         assert_eq!(
             dispatch(&engine, cmd(&[b"ECHO"])),
             Frame::Error("ERR wrong number of arguments for 'echo' command".into())
+        );
+    }
+
+    #[test]
+    fn set_nx_returns_null_when_key_already_exists() {
+        let engine = Engine::new();
+        dispatch(&engine, cmd(&[b"SET", b"k", b"old"]));
+        assert_eq!(
+            dispatch(&engine, cmd(&[b"SET", b"k", b"new", b"NX"])),
+            Frame::Null
+        );
+        assert_eq!(
+            dispatch(&engine, cmd(&[b"GET", b"k"])),
+            Frame::Bulk(Bytes::from_static(b"old"))
+        );
+    }
+
+    #[test]
+    fn set_with_ex_flag_returns_a_clear_not_implemented_error() {
+        let engine = Engine::new();
+        assert_eq!(
+            dispatch(&engine, cmd(&[b"SET", b"k", b"v", b"EX", b"10"])),
+            Frame::Error("ERR syntax error: EX/PX are not supported yet (planned Sprint 4)".into())
+        );
+    }
+
+    #[test]
+    fn incrby_parses_the_delta_argument() {
+        let engine = Engine::new();
+        dispatch(&engine, cmd(&[b"SET", b"counter", b"10"]));
+        assert_eq!(
+            dispatch(&engine, cmd(&[b"INCRBY", b"counter", b"5"])),
+            Frame::Integer(15)
+        );
+    }
+
+    #[test]
+    fn incrby_on_a_non_integer_delta_returns_resp_error() {
+        let engine = Engine::new();
+        assert_eq!(
+            dispatch(&engine, cmd(&[b"INCRBY", b"counter", b"notanumber"])),
+            Frame::Error("ERR value is not an integer or out of range".into())
+        );
+    }
+
+    #[test]
+    fn hdel_hgetall_hexists_hlen_round_trip() {
+        let engine = Engine::new();
+        dispatch(&engine, cmd(&[b"HSET", b"h", b"f", b"v"]));
+        assert_eq!(
+            dispatch(&engine, cmd(&[b"HEXISTS", b"h", b"f"])),
+            Frame::Integer(1)
+        );
+        assert_eq!(dispatch(&engine, cmd(&[b"HLEN", b"h"])), Frame::Integer(1));
+        assert_eq!(
+            dispatch(&engine, cmd(&[b"HDEL", b"h", b"f"])),
+            Frame::Integer(1)
+        );
+        assert_eq!(
+            dispatch(&engine, cmd(&[b"HGETALL", b"h"])),
+            Frame::Array(vec![])
+        );
+    }
+
+    #[test]
+    fn list_commands_round_trip() {
+        let engine = Engine::new();
+        dispatch(&engine, cmd(&[b"RPUSH", b"l", b"a"]));
+        dispatch(&engine, cmd(&[b"RPUSH", b"l", b"b"]));
+        dispatch(&engine, cmd(&[b"LPUSH", b"l", b"z"]));
+        assert_eq!(dispatch(&engine, cmd(&[b"LLEN", b"l"])), Frame::Integer(3));
+        assert_eq!(
+            dispatch(&engine, cmd(&[b"LRANGE", b"l", b"0", b"-1"])),
+            Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"z")),
+                Frame::Bulk(Bytes::from_static(b"a")),
+                Frame::Bulk(Bytes::from_static(b"b")),
+            ])
+        );
+        assert_eq!(
+            dispatch(&engine, cmd(&[b"RPOP", b"l"])),
+            Frame::Bulk(Bytes::from_static(b"b"))
+        );
+        assert_eq!(
+            dispatch(&engine, cmd(&[b"LPOP", b"l"])),
+            Frame::Bulk(Bytes::from_static(b"z"))
+        );
+    }
+
+    #[test]
+    fn set_type_commands_round_trip() {
+        let engine = Engine::new();
+        dispatch(&engine, cmd(&[b"SADD", b"s", b"x"]));
+        assert_eq!(
+            dispatch(&engine, cmd(&[b"SISMEMBER", b"s", b"x"])),
+            Frame::Integer(1)
+        );
+        assert_eq!(
+            dispatch(&engine, cmd(&[b"SISMEMBER", b"s", b"y"])),
+            Frame::Integer(0)
+        );
+        assert_eq!(dispatch(&engine, cmd(&[b"SCARD", b"s"])), Frame::Integer(1));
+        assert_eq!(
+            dispatch(&engine, cmd(&[b"SREM", b"s", b"x"])),
+            Frame::Integer(1)
+        );
+        assert_eq!(
+            dispatch(&engine, cmd(&[b"SMEMBERS", b"s"])),
+            Frame::Array(vec![])
         );
     }
 
