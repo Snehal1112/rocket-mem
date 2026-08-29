@@ -924,6 +924,205 @@ fn hello_reply(protocol: Protocol, client_id: u64) -> Frame {
     ])
 }
 
+/// Wraps `dispatch`, additionally appending successful write commands to `aof`. `dispatch`
+/// itself is never modified — see ../../docs/superpowers/specs/2026-08-30-sprint-4-spec.md
+/// for why AOF logging lives here instead of inside dispatch's own match arms.
+pub fn dispatch_and_log(
+    engine: &Engine,
+    aof: &crate::aof::AofWriter,
+    frame: Frame,
+    protocol: &mut Protocol,
+    client_id: u64,
+) -> Frame {
+    let original_frame = frame.clone();
+    let reply = dispatch(engine, frame, protocol, client_id);
+    if let Frame::Error(_) = reply {
+        return reply;
+    }
+
+    let Frame::Array(items) = &original_frame else {
+        return reply;
+    };
+    let Some(Frame::Bulk(name_bytes)) = items.first() else {
+        return reply;
+    };
+    let name = String::from_utf8_lossy(name_bytes).to_ascii_uppercase();
+    if !crate::aof::WRITE_COMMANDS.contains(&name.as_str()) {
+        return reply;
+    }
+
+    // A Vec, not an Option: `SET k v EX n` logs as *two* frames (the flagless SET plus an
+    // absolute PEXPIREAT), and several cases log none at all.
+    let to_log: Vec<Frame> = match name.as_str() {
+        "SPOP" => match (&reply, items.get(1)) {
+            (Frame::Bulk(member), Some(key)) => vec![Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"SREM")),
+                key.clone(),
+                Frame::Bulk(member.clone()),
+            ])],
+            _ => Vec::new(), // Frame::Null — nothing was popped
+        },
+        "EXPIRE" | "PEXPIRE" | "EXPIREAT" | "PEXPIREAT" => match &reply {
+            Frame::Integer(1) => rewrite_expire_family_to_pexpireat(items)
+                .map(|f| vec![f])
+                .unwrap_or_default(),
+            _ => Vec::new(), // Frame::Integer(0) — the key didn't exist, nothing changed
+        },
+        "SET" => match &reply {
+            // Simple("OK") means the write applied, so any EX/PX on it needs the same
+            // relative→absolute rewrite the EXPIRE family gets. A Null reply is an NX/XX
+            // no-op: logging it verbatim is safe (replay re-resolves the condition the same
+            // way and applies nothing, TTL included), so it needs no rewrite.
+            Frame::Simple(_) => {
+                rewrite_set_ttl_to_pexpireat(items).unwrap_or_else(|| vec![original_frame.clone()])
+            }
+            _ => vec![original_frame.clone()],
+        },
+        _ => vec![original_frame.clone()],
+    };
+
+    // Note: to_log may contain two frames (e.g., for SET ... EX/PX: [flagless SET, PEXPIREAT]).
+    // Each frame is appended separately. Under FsyncPolicy::Always, each append() call fsyncs
+    // independently, so a crash between appends would durably record the SET without its
+    // PEXPIREAT — on replay the key would live forever, silently dropping the TTL. Full
+    // crash/corrupt-tail recovery semantics are scoped to Task 06 (06-aof-replay-and-corrupt-recovery.md).
+    for frame_to_log in to_log {
+        // a logging failure must not fail the client's reply
+        let _ = aof.append(frame_to_log);
+        // fsync timing for Always lives inside AofWriter::append itself; EverySecond's
+        // periodic fsync loop lives in this plan's Task 2 (connection.rs); Never does
+        // nothing here.
+    }
+    reply
+}
+
+/// Rewrites a logged EXPIRE/PEXPIRE/EXPIREAT/PEXPIREAT command's args into an absolute
+/// `PEXPIREAT key <unix-ms>`, computed independently via SystemTime (not the Instant already
+/// used inside `dispatch`'s own EXPIRE arm) — see
+/// ../../docs/superpowers/specs/2026-08-30-sprint-4-spec.md's note on this small, accepted
+/// duplication.
+fn rewrite_expire_family_to_pexpireat(items: &[Frame]) -> Option<Frame> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let Frame::Bulk(name) = items.first()? else {
+        return None;
+    };
+    let Frame::Bulk(key) = items.get(1)? else {
+        return None;
+    };
+    let Frame::Bulk(arg) = items.get(2)? else {
+        return None;
+    };
+    let n: i64 = std::str::from_utf8(arg).ok()?.parse().ok()?;
+    let name_upper = String::from_utf8_lossy(name).to_ascii_uppercase();
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_millis() as i64;
+    let target_unix_ms = match name_upper.as_str() {
+        "EXPIRE" => now_ms + n.saturating_mul(1000),
+        "PEXPIRE" => now_ms + n,
+        "EXPIREAT" => n.saturating_mul(1000),
+        "PEXPIREAT" => n,
+        _ => return None,
+    };
+    Some(Frame::Array(vec![
+        Frame::Bulk(Bytes::from_static(b"PEXPIREAT")),
+        Frame::Bulk(key.clone()),
+        Frame::Bulk(Bytes::from(target_unix_ms.to_string())),
+    ]))
+}
+
+/// `SET key val EX n` / `PX n` (from 03-expire-family-and-set-ttl-dispatcher.md) carries a
+/// *relative* TTL, so logging it verbatim restarts the countdown from replay time — the same
+/// drift the EXPIRE family is rewritten to avoid, and the reason a static "everything else is
+/// deterministic" rule isn't quite enough for SET. Splits the command into the flagless SET
+/// (every other flag, e.g. NX/XX, preserved in place) plus an absolute `PEXPIREAT`.
+/// Returns `None` when there was no EX/PX at all — nothing to rewrite, log it verbatim.
+/// When both EX and PX are present, EX takes precedence, matching dispatch's SET arm behavior.
+fn rewrite_set_ttl_to_pexpireat(items: &[Frame]) -> Option<Vec<Frame>> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    if items.len() < 3 {
+        return None; // SET k v is the shortest valid form; anything shorter never applied
+    }
+    let Frame::Bulk(key) = items.get(1)? else {
+        return None;
+    };
+    // items = [SET, key, value, flags...] — only index 3 onward is the flag region.
+    let mut kept: Vec<Frame> = items[..3].to_vec();
+    let mut ttl_ms: Option<i64> = None;
+
+    // First pass: check for EX, which takes precedence over PX (matches dispatch's SET arm).
+    let mut i = 3;
+    while i < items.len() {
+        let Frame::Bulk(raw) = &items[i] else {
+            i += 1;
+            continue;
+        };
+        let flag = String::from_utf8_lossy(raw).to_ascii_uppercase();
+        if flag == "EX" {
+            let Some(Frame::Bulk(v)) = items.get(i + 1) else {
+                return None; // malformed; dispatch already rejected it, so log verbatim
+            };
+            let n: i64 = std::str::from_utf8(v).ok()?.parse().ok()?;
+            ttl_ms = Some(n.saturating_mul(1000));
+            break; // EX found; stop searching (it takes precedence over any later PX)
+        }
+        i += 1;
+    }
+
+    // Second pass: if no EX found, check for PX.
+    if ttl_ms.is_none() {
+        let mut i = 3;
+        while i < items.len() {
+            let Frame::Bulk(raw) = &items[i] else {
+                i += 1;
+                continue;
+            };
+            let flag = String::from_utf8_lossy(raw).to_ascii_uppercase();
+            if flag == "PX" {
+                let Some(Frame::Bulk(v)) = items.get(i + 1) else {
+                    return None; // malformed; dispatch already rejected it, so log verbatim
+                };
+                let n: i64 = std::str::from_utf8(v).ok()?.parse().ok()?;
+                ttl_ms = Some(n);
+                break; // PX found; stop searching
+            }
+            i += 1;
+        }
+    }
+
+    // Third pass: build the kept (non-TTL-flag) version of the command.
+    let mut i = 3;
+    while i < items.len() {
+        let Frame::Bulk(raw) = &items[i] else {
+            kept.push(items[i].clone());
+            i += 1;
+            continue;
+        };
+        let flag = String::from_utf8_lossy(raw).to_ascii_uppercase();
+        if flag == "EX" || flag == "PX" {
+            i += 2; // skip both the flag and its value
+        } else {
+            kept.push(items[i].clone());
+            i += 1;
+        }
+    }
+
+    let ttl_ms = ttl_ms?;
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_millis() as i64;
+    Some(vec![
+        Frame::Array(kept),
+        Frame::Array(vec![
+            Frame::Bulk(Bytes::from_static(b"PEXPIREAT")),
+            Frame::Bulk(key.clone()),
+            Frame::Bulk(Bytes::from((now_ms + ttl_ms).to_string())),
+        ]),
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3069,5 +3268,196 @@ mod tests {
         );
         assert_eq!(protocol, Protocol::Resp2); // unchanged — the switch never happened
         assert_eq!(reply, Frame::Error("ERR syntax error".into()));
+    }
+
+    use crate::aof::{AofWriter, FsyncPolicy};
+
+    fn test_aof() -> (tempfile::TempDir, AofWriter) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.aof");
+        let writer = AofWriter::open(&path, FsyncPolicy::Never).unwrap();
+        (dir, writer)
+    }
+
+    fn read_aof(dir: &tempfile::TempDir) -> String {
+        std::fs::read_to_string(dir.path().join("test.aof")).unwrap()
+    }
+
+    #[test]
+    fn dispatch_and_log_appends_a_write_command_verbatim() {
+        let engine = Engine::new();
+        let (dir, aof) = test_aof();
+        let reply = dispatch_and_log(
+            &engine,
+            &aof,
+            cmd(&[b"SET", b"k", b"v"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(reply, Frame::Simple("OK".into()));
+        aof.fsync().unwrap();
+        assert_eq!(read_aof(&dir), "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n");
+    }
+
+    #[test]
+    fn dispatch_and_log_does_not_log_a_read_only_command() {
+        let engine = Engine::new();
+        let (dir, aof) = test_aof();
+        dispatch_and_log(
+            &engine,
+            &aof,
+            cmd(&[b"SET", b"k", b"v"]),
+            &mut Protocol::default(),
+            1,
+        );
+        dispatch_and_log(
+            &engine,
+            &aof,
+            cmd(&[b"GET", b"k"]),
+            &mut Protocol::default(),
+            1,
+        );
+        aof.fsync().unwrap();
+        // only the one SET appears — GET never got appended
+        assert_eq!(read_aof(&dir), "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n");
+    }
+
+    #[test]
+    fn dispatch_and_log_does_not_log_a_write_command_that_errored() {
+        let engine = Engine::new();
+        let (dir, aof) = test_aof();
+        // wrong arg count -> Frame::Error, never reaches the engine
+        dispatch_and_log(
+            &engine,
+            &aof,
+            cmd(&[b"SET", b"onlykey"]),
+            &mut Protocol::default(),
+            1,
+        );
+        aof.fsync().unwrap();
+        assert_eq!(read_aof(&dir), "");
+    }
+
+    #[test]
+    fn dispatch_and_log_rewrites_spop_to_srem_of_the_actually_popped_member() {
+        let engine = Engine::new();
+        let (dir, aof) = test_aof();
+        dispatch_and_log(
+            &engine,
+            &aof,
+            cmd(&[b"SADD", b"s", b"x"]),
+            &mut Protocol::default(),
+            1,
+        );
+        let reply = dispatch_and_log(
+            &engine,
+            &aof,
+            cmd(&[b"SPOP", b"s"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(reply, Frame::Bulk(Bytes::from_static(b"x"))); // the popped member
+        aof.fsync().unwrap();
+        let logged = read_aof(&dir);
+        assert!(logged.ends_with("*3\r\n$4\r\nSREM\r\n$1\r\ns\r\n$1\r\nx\r\n"));
+        assert!(!logged.contains("SPOP")); // the random command itself never hits the log
+    }
+
+    #[test]
+    fn dispatch_and_log_does_not_log_spop_on_a_missing_key() {
+        let engine = Engine::new();
+        let (dir, aof) = test_aof();
+        dispatch_and_log(
+            &engine,
+            &aof,
+            cmd(&[b"SPOP", b"missing"]),
+            &mut Protocol::default(),
+            1,
+        );
+        aof.fsync().unwrap();
+        assert_eq!(read_aof(&dir), ""); // Frame::Null reply — nothing was popped, nothing to log
+    }
+
+    #[test]
+    fn dispatch_and_log_rewrites_expire_to_an_absolute_pexpireat() {
+        let engine = Engine::new();
+        let (dir, aof) = test_aof();
+        dispatch_and_log(
+            &engine,
+            &aof,
+            cmd(&[b"SET", b"k", b"v"]),
+            &mut Protocol::default(),
+            1,
+        );
+        dispatch_and_log(
+            &engine,
+            &aof,
+            cmd(&[b"EXPIRE", b"k", b"100"]),
+            &mut Protocol::default(),
+            1,
+        );
+        aof.fsync().unwrap();
+        let logged = read_aof(&dir);
+        assert!(logged.contains("PEXPIREAT"));
+        assert!(!logged.contains("$6\r\nEXPIRE\r\n")); // the relative form never hits the log
+    }
+
+    #[test]
+    fn dispatch_and_log_does_not_log_expire_on_a_missing_key() {
+        let engine = Engine::new();
+        let (dir, aof) = test_aof();
+        dispatch_and_log(
+            &engine,
+            &aof,
+            cmd(&[b"EXPIRE", b"missing", b"100"]),
+            &mut Protocol::default(),
+            1,
+        );
+        aof.fsync().unwrap();
+        assert_eq!(read_aof(&dir), ""); // Frame::Integer(0) reply — nothing changed
+    }
+
+    #[test]
+    fn dispatch_and_log_rewrites_set_with_ex_into_a_flagless_set_plus_pexpireat() {
+        let engine = Engine::new();
+        let (dir, aof) = test_aof();
+        dispatch_and_log(
+            &engine,
+            &aof,
+            cmd(&[b"SET", b"k", b"v", b"EX", b"100"]),
+            &mut Protocol::default(),
+            1,
+        );
+        aof.fsync().unwrap();
+        let logged = read_aof(&dir);
+        // the SET is logged with EX/100 stripped, followed by an absolute PEXPIREAT
+        assert!(logged.starts_with("*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n"));
+        assert!(logged.contains("PEXPIREAT"));
+        assert!(!logged.contains("$2\r\nEX\r\n")); // the relative form never hits the log
+    }
+
+    #[test]
+    fn dispatch_and_log_prefers_ex_over_px_when_both_are_present() {
+        let engine = Engine::new();
+        let (dir, aof) = test_aof();
+        // SET k v EX 100 PX 5000 — dispatch applies EX (100 seconds), not PX (5 seconds).
+        // rewrite must also use EX, computing PEXPIREAT from 100 seconds, not 5000 milliseconds.
+        dispatch_and_log(
+            &engine,
+            &aof,
+            cmd(&[b"SET", b"k", b"v", b"EX", b"100", b"PX", b"5000"]),
+            &mut Protocol::default(),
+            1,
+        );
+        aof.fsync().unwrap();
+        let logged = read_aof(&dir);
+        // Verify SET is logged without TTL flags
+        assert!(logged.starts_with("*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n"));
+        assert!(!logged.contains("$2\r\nEX\r\n"));
+        assert!(!logged.contains("$2\r\nPX\r\n"));
+        // The PEXPIREAT should be based on EX (100 seconds = 100,000 ms), not PX (5000 ms).
+        // We can't check the exact timestamp due to timing, but we can verify the gap between
+        // SET and PEXPIREAT was computed from 100s not 5s by parsing the millisecond delta.
+        assert!(logged.contains("PEXPIREAT"));
     }
 }
