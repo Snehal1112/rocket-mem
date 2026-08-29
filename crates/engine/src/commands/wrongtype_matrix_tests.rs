@@ -63,6 +63,14 @@ fn hash_commands_reject_non_hash_keys() {
         Bytes::from_static(b"f"),
         Bytes::from_static(b"v")
     ));
+    assert_wrongtype!(hash::hkeys(&engine_with_string_key(), b"k"));
+    let e2 = engine_with_string_key();
+    assert_wrongtype!(hash::hincrby(
+        &e2,
+        Bytes::from_static(b"k"),
+        Bytes::from_static(b"f"),
+        1
+    ));
 }
 
 #[test]
