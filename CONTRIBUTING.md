@@ -68,7 +68,30 @@ What it does, in order:
 The pushed tag triggers [`.github/workflows/release.yml`](.github/workflows/release.yml), which:
 1. Generates a changelog from conventional-commit history since the last tag, via [`git-cliff`](https://git-cliff.org/) (config: [`cliff.toml`](cliff.toml)).
 2. Builds a release binary natively on Linux, macOS, and Windows runners (no cross-compilation), packaged as `.tar.gz` (Linux/macOS) or `.zip` (Windows) with a `.sha256` checksum alongside each archive.
-3. Opens a **draft** GitHub Release named after the tag, with the changelog as its body and all platform archives attached — review and publish it manually.
+3. Signs each archive with [minisign](https://jedisct1.github.io/minisign/) (see "Release artifact signing" below), producing a `.sig` file alongside it.
+4. Opens a **draft** GitHub Release named after the tag, with the changelog as its body and every archive/checksum/signature attached — review and publish it manually.
+
+### Release artifact signing
+
+Two layers of trust cover a release: the git tag is GPG-signed (proves *who* cut it — see above), and each downloadable archive is minisign-signed (proves the archive matches what that person's CI actually built, independent of the sha256 checksum which only guards against transit corruption). This is the same mechanism (and the same underlying tool) as Tauri's updater signing — `cargo tauri signer` just wraps [minisign](https://jedisct1.github.io/minisign/) — but rocket-mem uses its **own dedicated keypair**, generated once and unrelated to any other project's signing key, so a compromise of one never implicates the other.
+
+**One-time setup (maintainer only, done locally — not by CI):**
+
+1. Generate a dedicated keypair. This prompts for a password interactively — pick one and store it in a password manager; there's no recovery if it's lost.
+   ```bash
+   cargo tauri signer generate -w ~/.minisign/rocket-mem.key
+   ```
+2. Register the two secrets the workflow reads, via the GitHub web UI: **Settings → Secrets and variables → Actions → New repository secret** on the `rocket-mem` repo.
+   - `RELEASE_SIGNING_KEY` — paste the full contents of `~/.minisign/rocket-mem.key` (e.g. `cat ~/.minisign/rocket-mem.key` and copy its output, newlines included).
+   - `RELEASE_SIGNING_KEY_PASSWORD` — the password you chose in step 1.
+
+Then commit the printed public key (the `.pub` file's contents, safe to publish) somewhere durable in the repo — e.g. as `RELEASE_SIGNING_KEY.pub` at the root — so consumers have something to verify against.
+
+**Verifying a downloaded release** (consumer side, needs the real `minisign` CLI — `brew install minisign` / `apt install minisign` — not `cargo tauri`, which only signs):
+
+```bash
+minisign -Vm rocket-mem-vX.Y.Z-linux-amd64.tar.gz -P <contents of RELEASE_SIGNING_KEY.pub>
+```
 
 ## License
 

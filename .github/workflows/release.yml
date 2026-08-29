@@ -112,6 +112,26 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install minisign signer
+        run: cargo install tauri-cli --locked
+
+      # Detached minisign signatures over the checksummed archives -- proves
+      # the archive came from whoever holds RELEASE_SIGNING_KEY, on top of the
+      # sha256 files above (which only prove it wasn't corrupted in transit).
+      # See CONTRIBUTING.md's "Release artifact signing" section for how the
+      # key was generated and how a consumer verifies a downloaded archive.
+      - name: Sign release artifacts
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.RELEASE_SIGNING_KEY_PASSWORD }}
+        run: |
+          for f in dist/*.tar.gz dist/*.zip; do
+            [ -e "$f" ] || continue
+            cargo tauri signer sign "$f"
+          done
+
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -122,5 +142,5 @@ jobs:
             --draft \
             --title "rocket-mem ${VERSION}" \
             --notes "${CHANGELOG_BODY}" \
-            dist/*.tar.gz dist/*.tar.gz.sha256 \
-            dist/*.zip dist/*.zip.sha256
+            dist/*.tar.gz dist/*.tar.gz.sha256 dist/*.tar.gz.sig \
+            dist/*.zip dist/*.zip.sha256 dist/*.zip.sig
