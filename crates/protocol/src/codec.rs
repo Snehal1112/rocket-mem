@@ -3,7 +3,17 @@ use bytes::{Buf, BufMut, BytesMut};
 use std::io;
 use tokio_util::codec::{Decoder, Encoder};
 
-pub struct RespCodec;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Protocol {
+    #[default]
+    Resp2,
+    Resp3,
+}
+
+#[derive(Default)]
+pub struct RespCodec {
+    pub protocol: Protocol,
+}
 
 impl Encoder<Frame> for RespCodec {
     type Error = std::io::Error;
@@ -32,9 +42,10 @@ impl Encoder<Frame> for RespCodec {
                 dst.put_slice(&b);
                 dst.put_slice(b"\r\n");
             }
-            Frame::Null => {
-                dst.put_slice(b"$-1\r\n");
-            }
+            Frame::Null => match self.protocol {
+                Protocol::Resp2 => dst.put_slice(b"$-1\r\n"),
+                Protocol::Resp3 => dst.put_slice(b"_\r\n"),
+            },
             Frame::Array(items) => {
                 dst.put_u8(b'*');
                 dst.put_slice(items.len().to_string().as_bytes());
@@ -43,6 +54,26 @@ impl Encoder<Frame> for RespCodec {
                     self.encode(item, dst)?;
                 }
             }
+            Frame::Map(pairs) => match self.protocol {
+                Protocol::Resp2 => {
+                    dst.put_u8(b'*');
+                    dst.put_slice((pairs.len() * 2).to_string().as_bytes());
+                    dst.put_slice(b"\r\n");
+                    for (k, v) in pairs {
+                        self.encode(k, dst)?;
+                        self.encode(v, dst)?;
+                    }
+                }
+                Protocol::Resp3 => {
+                    dst.put_u8(b'%');
+                    dst.put_slice(pairs.len().to_string().as_bytes());
+                    dst.put_slice(b"\r\n");
+                    for (k, v) in pairs {
+                        self.encode(k, dst)?;
+                        self.encode(v, dst)?;
+                    }
+                }
+            },
         }
         Ok(())
     }
@@ -158,7 +189,7 @@ mod tests {
     #[test]
     fn encodes_simple_string() {
         let mut buf = BytesMut::new();
-        RespCodec
+        RespCodec::default()
             .encode(Frame::Simple("OK".into()), &mut buf)
             .unwrap();
         assert_eq!(&buf[..], b"+OK\r\n");
@@ -167,7 +198,7 @@ mod tests {
     #[test]
     fn encodes_error() {
         let mut buf = BytesMut::new();
-        RespCodec
+        RespCodec::default()
             .encode(Frame::Error("ERR bad".into()), &mut buf)
             .unwrap();
         assert_eq!(&buf[..], b"-ERR bad\r\n");
@@ -176,14 +207,16 @@ mod tests {
     #[test]
     fn encodes_integer() {
         let mut buf = BytesMut::new();
-        RespCodec.encode(Frame::Integer(42), &mut buf).unwrap();
+        RespCodec::default()
+            .encode(Frame::Integer(42), &mut buf)
+            .unwrap();
         assert_eq!(&buf[..], b":42\r\n");
     }
 
     #[test]
     fn encodes_bulk_string() {
         let mut buf = BytesMut::new();
-        RespCodec
+        RespCodec::default()
             .encode(Frame::Bulk(Bytes::from_static(b"hi")), &mut buf)
             .unwrap();
         assert_eq!(&buf[..], b"$2\r\nhi\r\n");
@@ -192,7 +225,7 @@ mod tests {
     #[test]
     fn encodes_null_as_resp2_null_bulk_string() {
         let mut buf = BytesMut::new();
-        RespCodec.encode(Frame::Null, &mut buf).unwrap();
+        RespCodec::default().encode(Frame::Null, &mut buf).unwrap();
         assert_eq!(&buf[..], b"$-1\r\n");
     }
 
@@ -203,14 +236,14 @@ mod tests {
             Frame::Bulk(Bytes::from_static(b"a")),
             Frame::Integer(1),
         ]);
-        RespCodec.encode(frame, &mut buf).unwrap();
+        RespCodec::default().encode(frame, &mut buf).unwrap();
         assert_eq!(&buf[..], b"*2\r\n$1\r\na\r\n:1\r\n");
     }
 
     #[test]
     fn decodes_simple_string() {
         let mut buf = BytesMut::from(&b"+OK\r\n"[..]);
-        let frame = RespCodec.decode(&mut buf).unwrap().unwrap();
+        let frame = RespCodec::default().decode(&mut buf).unwrap().unwrap();
         assert_eq!(frame, Frame::Simple("OK".into()));
         assert!(buf.is_empty());
     }
@@ -219,7 +252,7 @@ mod tests {
     fn decodes_error() {
         let mut buf = BytesMut::from(&b"-ERR bad\r\n"[..]);
         assert_eq!(
-            RespCodec.decode(&mut buf).unwrap().unwrap(),
+            RespCodec::default().decode(&mut buf).unwrap().unwrap(),
             Frame::Error("ERR bad".into())
         );
     }
@@ -228,7 +261,7 @@ mod tests {
     fn decodes_integer() {
         let mut buf = BytesMut::from(&b":42\r\n"[..]);
         assert_eq!(
-            RespCodec.decode(&mut buf).unwrap().unwrap(),
+            RespCodec::default().decode(&mut buf).unwrap().unwrap(),
             Frame::Integer(42)
         );
     }
@@ -237,7 +270,7 @@ mod tests {
     fn decodes_bulk_string() {
         let mut buf = BytesMut::from(&b"$2\r\nhi\r\n"[..]);
         assert_eq!(
-            RespCodec.decode(&mut buf).unwrap().unwrap(),
+            RespCodec::default().decode(&mut buf).unwrap().unwrap(),
             Frame::Bulk(Bytes::from_static(b"hi"))
         );
     }
@@ -245,13 +278,16 @@ mod tests {
     #[test]
     fn decodes_null_bulk_string() {
         let mut buf = BytesMut::from(&b"$-1\r\n"[..]);
-        assert_eq!(RespCodec.decode(&mut buf).unwrap().unwrap(), Frame::Null);
+        assert_eq!(
+            RespCodec::default().decode(&mut buf).unwrap().unwrap(),
+            Frame::Null
+        );
     }
 
     #[test]
     fn decodes_array_of_bulk_strings_the_shape_a_real_client_sends() {
         let mut buf = BytesMut::from(&b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n"[..]);
-        let frame = RespCodec.decode(&mut buf).unwrap().unwrap();
+        let frame = RespCodec::default().decode(&mut buf).unwrap().unwrap();
         assert_eq!(
             frame,
             Frame::Array(vec![
@@ -265,28 +301,28 @@ mod tests {
     #[test]
     fn unknown_type_byte_is_an_error_not_a_panic() {
         let mut buf = BytesMut::from(&b"@nope\r\n"[..]);
-        assert!(RespCodec.decode(&mut buf).is_err());
+        assert!(RespCodec::default().decode(&mut buf).is_err());
     }
 
     #[test]
     fn empty_buffer_returns_ok_none_not_an_error() {
         let mut buf = BytesMut::new();
-        assert_eq!(RespCodec.decode(&mut buf).unwrap(), None);
+        assert_eq!(RespCodec::default().decode(&mut buf).unwrap(), None);
     }
 
     #[test]
     fn decode_returns_none_on_a_bulk_string_split_mid_header() {
         let mut buf = BytesMut::from(&b"$3\r\nfo"[..]); // header + 2 of 3 body bytes
-        assert_eq!(RespCodec.decode(&mut buf).unwrap(), None);
+        assert_eq!(RespCodec::default().decode(&mut buf).unwrap(), None);
         assert_eq!(&buf[..], b"$3\r\nfo"); // nothing consumed on an incomplete frame
     }
 
     #[test]
     fn decode_reassembles_a_bulk_string_split_across_two_reads() {
         let mut buf = BytesMut::from(&b"$3\r\nfo"[..]);
-        assert_eq!(RespCodec.decode(&mut buf).unwrap(), None);
+        assert_eq!(RespCodec::default().decode(&mut buf).unwrap(), None);
         buf.extend_from_slice(b"o\r\n"); // the rest arrives in a second read
-        let frame = RespCodec.decode(&mut buf).unwrap().unwrap();
+        let frame = RespCodec::default().decode(&mut buf).unwrap().unwrap();
         assert_eq!(frame, Frame::Bulk(Bytes::from_static(b"foo")));
         assert!(buf.is_empty());
     }
@@ -295,11 +331,11 @@ mod tests {
     fn decode_reassembles_a_full_command_split_across_three_reads() {
         // mirrors a real client sending `SET foo bar` split at arbitrary byte boundaries
         let mut buf = BytesMut::from(&b"*3\r\n$3\r\nSET\r\n"[..]);
-        assert_eq!(RespCodec.decode(&mut buf).unwrap(), None);
+        assert_eq!(RespCodec::default().decode(&mut buf).unwrap(), None);
         buf.extend_from_slice(b"$3\r\nfo");
-        assert_eq!(RespCodec.decode(&mut buf).unwrap(), None);
+        assert_eq!(RespCodec::default().decode(&mut buf).unwrap(), None);
         buf.extend_from_slice(b"o\r\n$3\r\nbar\r\n");
-        let frame = RespCodec.decode(&mut buf).unwrap().unwrap();
+        let frame = RespCodec::default().decode(&mut buf).unwrap().unwrap();
         assert_eq!(
             frame,
             Frame::Array(vec![
@@ -313,18 +349,67 @@ mod tests {
     #[test]
     fn decode_returns_none_when_only_the_array_header_has_arrived() {
         let mut buf = BytesMut::from(&b"*2\r\n"[..]);
-        assert_eq!(RespCodec.decode(&mut buf).unwrap(), None);
+        assert_eq!(RespCodec::default().decode(&mut buf).unwrap(), None);
         assert_eq!(&buf[..], b"*2\r\n");
     }
 
     #[test]
     fn decode_only_consumes_one_frame_when_two_full_commands_arrive_pipelined_in_one_read() {
         let mut buf = BytesMut::from(&b"+OK\r\n+ALSO OK\r\n"[..]);
-        let first = RespCodec.decode(&mut buf).unwrap().unwrap();
+        let first = RespCodec::default().decode(&mut buf).unwrap().unwrap();
         assert_eq!(first, Frame::Simple("OK".into()));
         assert_eq!(&buf[..], b"+ALSO OK\r\n"); // second frame untouched, ready for the next decode() call
-        let second = RespCodec.decode(&mut buf).unwrap().unwrap();
+        let second = RespCodec::default().decode(&mut buf).unwrap().unwrap();
         assert_eq!(second, Frame::Simple("ALSO OK".into()));
         assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn encodes_null_as_resp3_null_when_protocol_is_resp3() {
+        let mut buf = BytesMut::new();
+        let mut codec = RespCodec {
+            protocol: Protocol::Resp3,
+        };
+        codec.encode(Frame::Null, &mut buf).unwrap();
+        assert_eq!(&buf[..], b"_\r\n");
+    }
+
+    #[test]
+    fn encodes_map_as_flattened_array_under_resp2() {
+        let mut buf = BytesMut::new();
+        let frame = Frame::Map(vec![(
+            Frame::Bulk(Bytes::from_static(b"proto")),
+            Frame::Integer(2),
+        )]);
+        RespCodec::default().encode(frame, &mut buf).unwrap();
+        assert_eq!(&buf[..], b"*2\r\n$5\r\nproto\r\n:2\r\n");
+    }
+
+    #[test]
+    fn encodes_map_natively_under_resp3() {
+        let mut buf = BytesMut::new();
+        let frame = Frame::Map(vec![(
+            Frame::Bulk(Bytes::from_static(b"proto")),
+            Frame::Integer(3),
+        )]);
+        let mut codec = RespCodec {
+            protocol: Protocol::Resp3,
+        };
+        codec.encode(frame, &mut buf).unwrap();
+        assert_eq!(&buf[..], b"%1\r\n$5\r\nproto\r\n:3\r\n");
+    }
+
+    #[test]
+    fn encodes_map_with_multiple_pairs_under_resp3() {
+        let mut buf = BytesMut::new();
+        let frame = Frame::Map(vec![
+            (Frame::Bulk(Bytes::from_static(b"a")), Frame::Integer(1)),
+            (Frame::Bulk(Bytes::from_static(b"b")), Frame::Integer(2)),
+        ]);
+        let mut codec = RespCodec {
+            protocol: Protocol::Resp3,
+        };
+        codec.encode(frame, &mut buf).unwrap();
+        assert_eq!(&buf[..], b"%2\r\n$1\r\na\r\n:1\r\n$1\r\nb\r\n:2\r\n");
     }
 }
