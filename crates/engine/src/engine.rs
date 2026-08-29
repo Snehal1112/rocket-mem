@@ -1,5 +1,13 @@
 use crate::{store::Store, Value};
 use bytes::Bytes;
+use std::time::{Duration, Instant};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TtlStatus {
+    NoSuchKey,
+    NoExpiry,
+    Remaining(Duration),
+}
 
 pub struct Engine {
     store: Store,
@@ -42,6 +50,15 @@ impl Engine {
     {
         self.store.with_mut(key, f)
     }
+    pub fn expire_at(&self, key: &[u8], at: Instant) -> bool {
+        self.store.expire_at(key, at)
+    }
+    pub fn persist(&self, key: &[u8]) -> bool {
+        self.store.persist(key)
+    }
+    pub fn ttl(&self, key: &[u8]) -> TtlStatus {
+        self.store.ttl(key)
+    }
 }
 
 impl Default for Engine {
@@ -55,6 +72,51 @@ mod tests {
     use super::*;
     use crate::Value;
     use bytes::Bytes;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn ttl_on_a_missing_key_is_no_such_key() {
+        let engine = Engine::new();
+        assert_eq!(engine.ttl(b"missing"), TtlStatus::NoSuchKey);
+    }
+
+    #[test]
+    fn ttl_on_a_key_with_no_expiry_is_no_expiry() {
+        let engine = Engine::new();
+        engine.set(
+            Bytes::from_static(b"k"),
+            Value::String(Bytes::from_static(b"v")),
+        );
+        assert_eq!(engine.ttl(b"k"), TtlStatus::NoExpiry);
+    }
+
+    #[test]
+    fn ttl_on_a_key_with_a_future_expiry_reports_remaining_time() {
+        let engine = Engine::new();
+        engine.set(
+            Bytes::from_static(b"k"),
+            Value::String(Bytes::from_static(b"v")),
+        );
+        engine.expire_at(b"k", Instant::now() + Duration::from_secs(60));
+        match engine.ttl(b"k") {
+            TtlStatus::Remaining(d) => {
+                assert!(d <= Duration::from_secs(60) && d > Duration::from_secs(55))
+            }
+            other => panic!("expected Remaining, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn expire_at_and_persist_round_trip_through_engine() {
+        let engine = Engine::new();
+        engine.set(
+            Bytes::from_static(b"k"),
+            Value::String(Bytes::from_static(b"v")),
+        );
+        assert!(engine.expire_at(b"k", Instant::now() + Duration::from_secs(60)));
+        assert!(engine.persist(b"k"));
+        assert_eq!(engine.ttl(b"k"), TtlStatus::NoExpiry);
+    }
 
     #[test]
     fn engine_get_set_del_exists_round_trip() {

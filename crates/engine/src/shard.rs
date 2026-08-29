@@ -99,6 +99,19 @@ impl Shard {
         }
     }
 
+    pub fn ttl(&self, key: &[u8]) -> crate::engine::TtlStatus {
+        use crate::engine::TtlStatus;
+        let guard = self.map.read();
+        match guard.get(key) {
+            None => TtlStatus::NoSuchKey,
+            Some(entry) if entry.is_expired() => TtlStatus::NoSuchKey,
+            Some(entry) => match entry.expires_at {
+                None => TtlStatus::NoExpiry,
+                Some(at) => TtlStatus::Remaining(at.saturating_duration_since(Instant::now())),
+            },
+        }
+    }
+
     // Preserved from the pre-existing in-place-mutation accessors `commands/{hash,list,set,
     // sorted_set}.rs` already call instead of clone-out/set-back. An expired entry reads back
     // as `None` here exactly as it does through `get`, so those callers don't need to know

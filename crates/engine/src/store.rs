@@ -48,6 +48,15 @@ impl Store {
     {
         self.shard_for(key).with_mut(key, f)
     }
+    pub fn expire_at(&self, key: &[u8], at: std::time::Instant) -> bool {
+        self.shard_for(key).expire_at(key, at)
+    }
+    pub fn persist(&self, key: &[u8]) -> bool {
+        self.shard_for(key).persist(key)
+    }
+    pub fn ttl(&self, key: &[u8]) -> crate::engine::TtlStatus {
+        self.shard_for(key).ttl(key)
+    }
     pub fn scan(&self, cursor: u64) -> (u64, Vec<Bytes>) {
         let idx = cursor as usize;
         if idx >= self.shards.len() {
