@@ -43,7 +43,7 @@ under load; it doesn't (and doesn't need to) prove a perfectly uniform distribut
 ## Why this over the alternatives
 The choice between a sharded-lock design and single-thread/thread-per-core/lock-free/
 proxy-based alternatives was made at the architecture level, not here — see the
-Architecture Decision Record in `rocket-mem-production-plan.md`. This doc only covers
+Architecture Decision Record in `../rocket-mem-production-plan.md`. This doc only covers
 the concrete parameters (shard count, hash choice) within that already-made decision.
 
 ## Known limitation

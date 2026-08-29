@@ -2,7 +2,7 @@
 
 **Goal:** a tested, sharded in-memory engine implementing Strings, Hashes, Lists, and Sets — callable directly with no networking yet — ready for Sprint 2's RESP layer to sit on top of it.
 
-**Scope:** covers Sprint 1's 8 backlog items (see `rocket-mem-sprint-plan.md`, Sprint 1). This doc fixes the shared design decisions — workspace layout, module boundaries, the `Value` type, the sharding scheme — that every implementation plan below assumes as ground truth. Individual plans don't re-derive these; they reference this doc.
+**Scope:** covers Sprint 1's 8 backlog items (see `../rocket-mem-sprint-plan.md`, Sprint 1). This doc fixes the shared design decisions — workspace layout, module boundaries, the `Value` type, the sharding scheme — that every implementation plan below assumes as ground truth. Individual plans don't re-derive these; they reference this doc.
 
 **Architecture recap:** per the master plan's Architecture Decision Record — layered, sharded, lock-based, task-per-connection. This sprint builds only the bottom layer (storage engine); the protocol/dispatch layers are Sprint 2.
 
@@ -79,7 +79,7 @@ Plans depend on each other in this order:
 8. `08-sharding-design-doc.md` (independent — best done after 2, since it documents that decision)
 
 ## Definition of done for the sprint
-Matches Sprint 1 in `rocket-mem-sprint-plan.md`:
+Matches Sprint 1 in `../rocket-mem-sprint-plan.md`:
 - [ ] `cargo test --workspace` green, `cargo clippy --workspace -- -D warnings` clean
 - [ ] Every P0 command has a passing test, including at least one wrong-type/missing-key case
 - [ ] Sharding design doc committed
