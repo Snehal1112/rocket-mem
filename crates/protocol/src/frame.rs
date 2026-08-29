@@ -31,10 +31,16 @@ mod tests {
 
     #[test]
     fn array_frame_holds_nested_frames() {
-        let f = Frame::Array(vec![Frame::Bulk(Bytes::from_static(b"a")), Frame::Integer(1)]);
+        let f = Frame::Array(vec![
+            Frame::Bulk(Bytes::from_static(b"a")),
+            Frame::Integer(1),
+        ]);
         assert_eq!(
             f,
-            Frame::Array(vec![Frame::Bulk(Bytes::from_static(b"a")), Frame::Integer(1)])
+            Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"a")),
+                Frame::Integer(1)
+            ])
         );
     }
 }
