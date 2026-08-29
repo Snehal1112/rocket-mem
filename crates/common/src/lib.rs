@@ -4,4 +4,16 @@ pub enum EngineError {
     WrongType,
     #[error("value is not an integer or out of range")]
     NotAnInteger,
+    #[error("no such key")]
+    NoSuchKey,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_such_key_has_the_expected_display_text() {
+        assert_eq!(EngineError::NoSuchKey.to_string(), "no such key");
+    }
 }
