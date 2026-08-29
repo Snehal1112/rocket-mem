@@ -1,6 +1,6 @@
 use crate::dispatcher;
 use engine::Engine;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{FutureExt, SinkExt, StreamExt};
 use protocol::codec::{Protocol, RespCodec};
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -23,15 +23,36 @@ pub async fn serve(listener: TcpListener, engine: Arc<Engine>) {
 async fn handle_connection(socket: tokio::net::TcpStream, engine: Arc<Engine>, client_id: u64) {
     let mut framed = Framed::new(socket, RespCodec::default());
     let mut protocol = Protocol::default();
-    while let Some(result) = framed.next().await {
-        let frame = match result {
-            Ok(frame) => frame,
-            Err(_) => return, // malformed input or a dropped connection — end this task quietly
+    // Carries a frame pulled ahead by the pipelining peek below, so it isn't re-read.
+    let mut pending: Option<Option<std::io::Result<protocol::Frame>>> = None;
+    loop {
+        let next = match pending.take() {
+            Some(n) => n,
+            None => framed.next().await,
+        };
+        let frame = match next {
+            Some(Ok(frame)) => frame,
+            Some(Err(_)) | None => return, // malformed input or a dropped connection — end this task quietly
         };
         let response = dispatcher::dispatch(&engine, frame, &mut protocol, client_id);
         framed.codec_mut().protocol = protocol; // sync BEFORE sending this reply
-        if framed.send(response).await.is_err() {
+                                                // Buffer without flushing -- a flush is a write syscall, and flushing after
+                                                // every single response is what turned client-side pipelining into a
+                                                // regression instead of a speedup (each pipelined request paid for its own
+                                                // syscall despite arriving in the same TCP read as its neighbors).
+        if framed.feed(response).await.is_err() {
             return; // client went away mid-response
+        }
+        // Peek whether the next request is already buffered from that same read
+        // (i.e. genuinely pipelined) without blocking on the network. If so, keep
+        // batching via feed(); only flush once nothing more is immediately ready.
+        match framed.next().now_or_never() {
+            Some(n) => pending = Some(n),
+            None => {
+                if framed.flush().await.is_err() {
+                    return;
+                }
+            }
         }
     }
 }
