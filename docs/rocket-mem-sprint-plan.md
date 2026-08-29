@@ -10,6 +10,8 @@ This maps the 16-week phase plan (`rocket-mem-production-plan.md`) onto 2-week s
 ## Sprint 1 — Engine core & core data types
 **Maps to:** Weeks 1-2 of the master plan | **Dates:** Day 1–14
 
+**Status:** ✅ Complete — full P0/P1 scope shipped, no cuts. See `docs/phase-1-retro.md`.
+
 **Sprint goal:** A tested, sharded in-memory engine correctly implementing Strings, Hashes, Lists, and Sets — no networking yet.
 
 ### Capacity
@@ -38,10 +40,10 @@ This maps the 16-week phase plan (`rocket-mem-production-plan.md`) onto 2-week s
 | Rust ownership fights eat the week | New patterns (shared state across async boundaries) take longer than expected | If stuck >2 hrs on one compiler error, drop to a simpler locking strategy first, optimize later |
 
 ### Definition of done
-- [ ] `cargo test` green, `cargo clippy -- -D warnings` clean
-- [ ] Every P0 command has a passing test, including at least one wrong-type/missing-key case
-- [ ] Sharding design doc committed (even if brief)
-- [ ] Code pushed; CI runs on push
+- [x] `cargo test` green, `cargo clippy -- -D warnings` clean
+- [x] Every P0 command has a passing test, including at least one wrong-type/missing-key case (`wrongtype_matrix_tests.rs`, `missing_key_semantics_tests.rs`)
+- [x] Sharding design doc committed (even if brief) — `docs/design/sharding-decision.md`
+- [x] Code pushed; CI runs on push
 
 ### Key dates
 | Day | Event |
@@ -55,6 +57,8 @@ This maps the 16-week phase plan (`rocket-mem-production-plan.md`) onto 2-week s
 
 ## Sprint 2 — RESP protocol, networking & client compatibility
 **Maps to:** Weeks 3-4 | **Dates:** Day 15–28
+
+**Status:** ✅ Complete — full P0/P1 scope shipped, plus the P2 benchmark smoke test. RESP3/`HELLO` negotiation was also added beyond original scope. See `docs/phase-1-retro.md` and `docs/superpowers/plans/2026-08-29-sprint-2-plans/{client-verification-results.md,benchmark-smoke-test-results.md}`.
 
 **Sprint goal:** Real Redis clients (redis-cli plus 2+ language libraries) can connect over TCP and run the full Sprint 1 command set.
 
@@ -80,14 +84,14 @@ This maps the 16-week phase plan (`rocket-mem-production-plan.md`) onto 2-week s
 ### Risks
 | Risk | Impact | Mitigation |
 |---|---|---|
-| RESP3/`HELLO` negotiation from modern clients isn't handled | Client libraries fail to connect even though your parser is correct | Decide explicitly this sprint: support RESP3, or reject `HELLO` and force RESP2 — don't discover this mid-debug |
-| Partial-read framing bugs are subtle | Works with `redis-cli`, silently breaks under pipelining | Write the split-write test (P0 item) before declaring networking done, not after |
+| RESP3/`HELLO` negotiation from modern clients isn't handled | Client libraries fail to connect even though your parser is correct | Decide explicitly this sprint: support RESP3, or reject `HELLO` and force RESP2 — don't discover this mid-debug — **resolved:** initially rejected per spec, later implemented (RESP3 negotiation shipped in follow-up commits); `redis-py` 8.1.0 needs `protocol=2` passed explicitly since it doesn't fall back silently on `HELLO` failure |
+| Partial-read framing bugs are subtle | Works with `redis-cli`, silently breaks under pipelining | Write the split-write test (P0 item) before declaring networking done, not after — **resolved:** split/partial-read tests in `crates/protocol/src/codec.rs` cover header- and multi-read-boundary cases |
 
 ### Definition of done
-- [ ] `redis-cli` runs every Sprint 1 command correctly over real TCP
-- [ ] At least 2 non-Rust client libraries connect and run a basic workload
-- [ ] Split/malformed-input integration tests pass in CI
-- [ ] Phase 1 retro note added to the repo (per the master plan's Week 4 task)
+- [x] `redis-cli` runs every Sprint 1 command correctly over real TCP
+- [x] At least 2 non-Rust client libraries connect and run a basic workload (redis-py, ioredis)
+- [x] Split/malformed-input integration tests pass in CI
+- [x] Phase 1 retro note added to the repo (per the master plan's Week 4 task) — `docs/phase-1-retro.md`
 
 ### Key dates
 | Day | Event |
@@ -101,6 +105,8 @@ This maps the 16-week phase plan (`rocket-mem-production-plan.md`) onto 2-week s
 
 ## Sprint 3 — Full command set: keys, collections & sorted sets
 **Maps to:** Weeks 5-6 | **Dates:** Day 29–42
+
+**Status:** ✅ Complete — full P0/P1/P2 scope shipped. See `docs/superpowers/specs/2026-08-29-sprint-3-spec.md` and `docs/superpowers/plans/2026-08-29-sprint-3-plans/`.
 
 **Sprint goal:** Broad command coverage, including a working sorted-set implementation and a concurrency-safe `SCAN`.
 
@@ -127,9 +133,9 @@ This maps the 16-week phase plan (`rocket-mem-production-plan.md`) onto 2-week s
 | Sorted set performance is poor at scale | Only surfaces under load, easy to miss in unit tests | Do a rough 10k/100k-member timing check before calling it done, even informally |
 
 ### Definition of done
-- [ ] Command coverage table in the repo README updated
-- [ ] `SCAN` concurrency stress test passes
-- [ ] Sorted set operations covered by tests including score-ordering edge cases
+- [x] Command coverage table in the repo README updated
+- [x] `SCAN` concurrency stress test passes
+- [x] Sorted set operations covered by tests including score-ordering edge cases
 
 ### Key dates
 | Day | Event |
