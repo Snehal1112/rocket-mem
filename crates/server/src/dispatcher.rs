@@ -1,5 +1,6 @@
 use bytes::Bytes;
 use engine::{commands, Engine, Value};
+use protocol::codec::Protocol;
 use protocol::Frame;
 
 /// Extracts the `Vec<Bytes>` command name+args from an `Array` of `Bulk` frames —
@@ -36,7 +37,7 @@ macro_rules! require_args {
     };
 }
 
-pub fn dispatch(engine: &Engine, frame: Frame) -> Frame {
+pub fn dispatch(engine: &Engine, frame: Frame, _protocol: &mut Protocol, _client_id: u64) -> Frame {
     let args = match frame_to_args(frame) {
         Ok(a) => a,
         Err(e) => return e,
@@ -297,6 +298,7 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use engine::Engine;
+    use protocol::codec::Protocol;
     use protocol::Frame;
 
     fn cmd(parts: &[&[u8]]) -> Frame {
@@ -312,11 +314,21 @@ mod tests {
     fn dispatch_is_case_insensitive_on_command_name() {
         let engine = Engine::new();
         assert_eq!(
-            dispatch(&engine, cmd(&[b"set", b"k", b"v"])),
+            dispatch(
+                &engine,
+                cmd(&[b"set", b"k", b"v"]),
+                &mut Protocol::default(),
+                1
+            ),
             Frame::Simple("OK".into())
         );
         assert_eq!(
-            dispatch(&engine, cmd(&[b"SeT", b"k2", b"v2"])),
+            dispatch(
+                &engine,
+                cmd(&[b"SeT", b"k2", b"v2"]),
+                &mut Protocol::default(),
+                1
+            ),
             Frame::Simple("OK".into())
         );
     }
@@ -324,9 +336,14 @@ mod tests {
     #[test]
     fn dispatch_set_then_get_round_trips() {
         let engine = Engine::new();
-        dispatch(&engine, cmd(&[b"SET", b"foo", b"bar"]));
+        dispatch(
+            &engine,
+            cmd(&[b"SET", b"foo", b"bar"]),
+            &mut Protocol::default(),
+            1,
+        );
         assert_eq!(
-            dispatch(&engine, cmd(&[b"GET", b"foo"])),
+            dispatch(&engine, cmd(&[b"GET", b"foo"]), &mut Protocol::default(), 1),
             Frame::Bulk(Bytes::from_static(b"bar"))
         );
     }
@@ -334,15 +351,33 @@ mod tests {
     #[test]
     fn dispatch_get_on_missing_key_returns_null() {
         let engine = Engine::new();
-        assert_eq!(dispatch(&engine, cmd(&[b"GET", b"missing"])), Frame::Null);
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"GET", b"missing"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Null
+        );
     }
 
     #[test]
     fn dispatch_wrongtype_is_mapped_to_a_resp_error_frame() {
         let engine = Engine::new();
-        dispatch(&engine, cmd(&[b"SET", b"k", b"v"]));
+        dispatch(
+            &engine,
+            cmd(&[b"SET", b"k", b"v"]),
+            &mut Protocol::default(),
+            1,
+        );
         // HSET on a string key: WRONGTYPE
-        let reply = dispatch(&engine, cmd(&[b"HSET", b"k", b"f", b"v"]));
+        let reply = dispatch(
+            &engine,
+            cmd(&[b"HSET", b"k", b"f", b"v"]),
+            &mut Protocol::default(),
+            1,
+        );
         assert_eq!(
             reply,
             Frame::Error(
@@ -355,7 +390,7 @@ mod tests {
     fn dispatch_unknown_command_returns_resp_error() {
         let engine = Engine::new();
         assert_eq!(
-            dispatch(&engine, cmd(&[b"NOPE"])),
+            dispatch(&engine, cmd(&[b"NOPE"]), &mut Protocol::default(), 1),
             Frame::Error("ERR unknown command 'NOPE'".into())
         );
     }
@@ -364,7 +399,12 @@ mod tests {
     fn dispatch_on_non_array_frame_returns_resp_error() {
         let engine = Engine::new();
         assert_eq!(
-            dispatch(&engine, Frame::Simple("not a command".into())),
+            dispatch(
+                &engine,
+                Frame::Simple("not a command".into()),
+                &mut Protocol::default(),
+                1
+            ),
             Frame::Error("ERR invalid request, expected array of bulk strings".into())
         );
     }
@@ -373,7 +413,7 @@ mod tests {
     fn dispatch_on_empty_array_returns_resp_error() {
         let engine = Engine::new();
         assert_eq!(
-            dispatch(&engine, Frame::Array(vec![])),
+            dispatch(&engine, Frame::Array(vec![]), &mut Protocol::default(), 1),
             Frame::Error("ERR empty command".into())
         );
     }
@@ -382,7 +422,7 @@ mod tests {
     fn ping_with_no_args_replies_pong() {
         let engine = Engine::new();
         assert_eq!(
-            dispatch(&engine, cmd(&[b"PING"])),
+            dispatch(&engine, cmd(&[b"PING"]), &mut Protocol::default(), 1),
             Frame::Simple("PONG".into())
         );
     }
@@ -391,7 +431,12 @@ mod tests {
     fn ping_with_a_message_echoes_it_back_as_a_bulk_string() {
         let engine = Engine::new();
         assert_eq!(
-            dispatch(&engine, cmd(&[b"PING", b"hello"])),
+            dispatch(
+                &engine,
+                cmd(&[b"PING", b"hello"]),
+                &mut Protocol::default(),
+                1
+            ),
             Frame::Bulk(Bytes::from_static(b"hello"))
         );
     }
@@ -400,7 +445,7 @@ mod tests {
     fn echo_returns_its_argument() {
         let engine = Engine::new();
         assert_eq!(
-            dispatch(&engine, cmd(&[b"ECHO", b"hi"])),
+            dispatch(&engine, cmd(&[b"ECHO", b"hi"]), &mut Protocol::default(), 1),
             Frame::Bulk(Bytes::from_static(b"hi"))
         );
     }
@@ -409,7 +454,12 @@ mod tests {
     fn select_always_replies_ok_single_db_only() {
         let engine = Engine::new();
         assert_eq!(
-            dispatch(&engine, cmd(&[b"SELECT", b"0"])),
+            dispatch(
+                &engine,
+                cmd(&[b"SELECT", b"0"]),
+                &mut Protocol::default(),
+                1
+            ),
             Frame::Simple("OK".into())
         );
     }
@@ -417,13 +467,17 @@ mod tests {
     #[test]
     fn command_replies_with_an_empty_array_rather_than_erroring() {
         let engine = Engine::new();
-        assert_eq!(dispatch(&engine, cmd(&[b"COMMAND"])), Frame::Array(vec![]));
+        assert_eq!(
+            dispatch(&engine, cmd(&[b"COMMAND"]), &mut Protocol::default(), 1),
+            Frame::Array(vec![])
+        );
     }
 
     #[test]
     fn info_replies_a_non_empty_bulk_string() {
         let engine = Engine::new();
-        let Frame::Bulk(info) = dispatch(&engine, cmd(&[b"INFO"])) else {
+        let Frame::Bulk(info) = dispatch(&engine, cmd(&[b"INFO"]), &mut Protocol::default(), 1)
+        else {
             panic!("expected Bulk")
         };
         assert!(!info.is_empty());
@@ -433,7 +487,12 @@ mod tests {
     fn set_with_too_few_args_returns_resp_error_not_a_panic() {
         let engine = Engine::new();
         assert_eq!(
-            dispatch(&engine, cmd(&[b"SET", b"onlykey"])),
+            dispatch(
+                &engine,
+                cmd(&[b"SET", b"onlykey"]),
+                &mut Protocol::default(),
+                1
+            ),
             Frame::Error("ERR wrong number of arguments for 'set' command".into())
         );
     }
@@ -442,7 +501,12 @@ mod tests {
     fn hset_with_too_few_args_returns_resp_error_not_a_panic() {
         let engine = Engine::new();
         assert_eq!(
-            dispatch(&engine, cmd(&[b"HSET", b"h", b"field"])),
+            dispatch(
+                &engine,
+                cmd(&[b"HSET", b"h", b"field"]),
+                &mut Protocol::default(),
+                1
+            ),
             Frame::Error("ERR wrong number of arguments for 'hset' command".into())
         );
     }
@@ -451,7 +515,7 @@ mod tests {
     fn echo_with_no_args_returns_resp_error_not_a_panic() {
         let engine = Engine::new();
         assert_eq!(
-            dispatch(&engine, cmd(&[b"ECHO"])),
+            dispatch(&engine, cmd(&[b"ECHO"]), &mut Protocol::default(), 1),
             Frame::Error("ERR wrong number of arguments for 'echo' command".into())
         );
     }
@@ -459,13 +523,23 @@ mod tests {
     #[test]
     fn set_nx_returns_null_when_key_already_exists() {
         let engine = Engine::new();
-        dispatch(&engine, cmd(&[b"SET", b"k", b"old"]));
+        dispatch(
+            &engine,
+            cmd(&[b"SET", b"k", b"old"]),
+            &mut Protocol::default(),
+            1,
+        );
         assert_eq!(
-            dispatch(&engine, cmd(&[b"SET", b"k", b"new", b"NX"])),
+            dispatch(
+                &engine,
+                cmd(&[b"SET", b"k", b"new", b"NX"]),
+                &mut Protocol::default(),
+                1
+            ),
             Frame::Null
         );
         assert_eq!(
-            dispatch(&engine, cmd(&[b"GET", b"k"])),
+            dispatch(&engine, cmd(&[b"GET", b"k"]), &mut Protocol::default(), 1),
             Frame::Bulk(Bytes::from_static(b"old"))
         );
     }
@@ -474,7 +548,12 @@ mod tests {
     fn set_with_ex_flag_returns_a_clear_not_implemented_error() {
         let engine = Engine::new();
         assert_eq!(
-            dispatch(&engine, cmd(&[b"SET", b"k", b"v", b"EX", b"10"])),
+            dispatch(
+                &engine,
+                cmd(&[b"SET", b"k", b"v", b"EX", b"10"]),
+                &mut Protocol::default(),
+                1
+            ),
             Frame::Error("ERR syntax error: EX/PX are not supported yet (planned Sprint 4)".into())
         );
     }
@@ -482,9 +561,19 @@ mod tests {
     #[test]
     fn incrby_parses_the_delta_argument() {
         let engine = Engine::new();
-        dispatch(&engine, cmd(&[b"SET", b"counter", b"10"]));
+        dispatch(
+            &engine,
+            cmd(&[b"SET", b"counter", b"10"]),
+            &mut Protocol::default(),
+            1,
+        );
         assert_eq!(
-            dispatch(&engine, cmd(&[b"INCRBY", b"counter", b"5"])),
+            dispatch(
+                &engine,
+                cmd(&[b"INCRBY", b"counter", b"5"]),
+                &mut Protocol::default(),
+                1
+            ),
             Frame::Integer(15)
         );
     }
@@ -493,7 +582,12 @@ mod tests {
     fn incrby_on_a_non_integer_delta_returns_resp_error() {
         let engine = Engine::new();
         assert_eq!(
-            dispatch(&engine, cmd(&[b"INCRBY", b"counter", b"notanumber"])),
+            dispatch(
+                &engine,
+                cmd(&[b"INCRBY", b"counter", b"notanumber"]),
+                &mut Protocol::default(),
+                1
+            ),
             Frame::Error("ERR value is not an integer or out of range".into())
         );
     }
@@ -501,18 +595,41 @@ mod tests {
     #[test]
     fn hdel_hgetall_hexists_hlen_round_trip() {
         let engine = Engine::new();
-        dispatch(&engine, cmd(&[b"HSET", b"h", b"f", b"v"]));
-        assert_eq!(
-            dispatch(&engine, cmd(&[b"HEXISTS", b"h", b"f"])),
-            Frame::Integer(1)
-        );
-        assert_eq!(dispatch(&engine, cmd(&[b"HLEN", b"h"])), Frame::Integer(1));
-        assert_eq!(
-            dispatch(&engine, cmd(&[b"HDEL", b"h", b"f"])),
-            Frame::Integer(1)
+        dispatch(
+            &engine,
+            cmd(&[b"HSET", b"h", b"f", b"v"]),
+            &mut Protocol::default(),
+            1,
         );
         assert_eq!(
-            dispatch(&engine, cmd(&[b"HGETALL", b"h"])),
+            dispatch(
+                &engine,
+                cmd(&[b"HEXISTS", b"h", b"f"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Integer(1)
+        );
+        assert_eq!(
+            dispatch(&engine, cmd(&[b"HLEN", b"h"]), &mut Protocol::default(), 1),
+            Frame::Integer(1)
+        );
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"HDEL", b"h", b"f"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Integer(1)
+        );
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"HGETALL", b"h"]),
+                &mut Protocol::default(),
+                1
+            ),
             Frame::Array(vec![])
         );
     }
@@ -520,12 +637,35 @@ mod tests {
     #[test]
     fn list_commands_round_trip() {
         let engine = Engine::new();
-        dispatch(&engine, cmd(&[b"RPUSH", b"l", b"a"]));
-        dispatch(&engine, cmd(&[b"RPUSH", b"l", b"b"]));
-        dispatch(&engine, cmd(&[b"LPUSH", b"l", b"z"]));
-        assert_eq!(dispatch(&engine, cmd(&[b"LLEN", b"l"])), Frame::Integer(3));
+        dispatch(
+            &engine,
+            cmd(&[b"RPUSH", b"l", b"a"]),
+            &mut Protocol::default(),
+            1,
+        );
+        dispatch(
+            &engine,
+            cmd(&[b"RPUSH", b"l", b"b"]),
+            &mut Protocol::default(),
+            1,
+        );
+        dispatch(
+            &engine,
+            cmd(&[b"LPUSH", b"l", b"z"]),
+            &mut Protocol::default(),
+            1,
+        );
         assert_eq!(
-            dispatch(&engine, cmd(&[b"LRANGE", b"l", b"0", b"-1"])),
+            dispatch(&engine, cmd(&[b"LLEN", b"l"]), &mut Protocol::default(), 1),
+            Frame::Integer(3)
+        );
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"LRANGE", b"l", b"0", b"-1"]),
+                &mut Protocol::default(),
+                1
+            ),
             Frame::Array(vec![
                 Frame::Bulk(Bytes::from_static(b"z")),
                 Frame::Bulk(Bytes::from_static(b"a")),
@@ -533,11 +673,11 @@ mod tests {
             ])
         );
         assert_eq!(
-            dispatch(&engine, cmd(&[b"RPOP", b"l"])),
+            dispatch(&engine, cmd(&[b"RPOP", b"l"]), &mut Protocol::default(), 1),
             Frame::Bulk(Bytes::from_static(b"b"))
         );
         assert_eq!(
-            dispatch(&engine, cmd(&[b"LPOP", b"l"])),
+            dispatch(&engine, cmd(&[b"LPOP", b"l"]), &mut Protocol::default(), 1),
             Frame::Bulk(Bytes::from_static(b"z"))
         );
     }
@@ -545,22 +685,50 @@ mod tests {
     #[test]
     fn set_type_commands_round_trip() {
         let engine = Engine::new();
-        dispatch(&engine, cmd(&[b"SADD", b"s", b"x"]));
+        dispatch(
+            &engine,
+            cmd(&[b"SADD", b"s", b"x"]),
+            &mut Protocol::default(),
+            1,
+        );
         assert_eq!(
-            dispatch(&engine, cmd(&[b"SISMEMBER", b"s", b"x"])),
+            dispatch(
+                &engine,
+                cmd(&[b"SISMEMBER", b"s", b"x"]),
+                &mut Protocol::default(),
+                1
+            ),
             Frame::Integer(1)
         );
         assert_eq!(
-            dispatch(&engine, cmd(&[b"SISMEMBER", b"s", b"y"])),
+            dispatch(
+                &engine,
+                cmd(&[b"SISMEMBER", b"s", b"y"]),
+                &mut Protocol::default(),
+                1
+            ),
             Frame::Integer(0)
         );
-        assert_eq!(dispatch(&engine, cmd(&[b"SCARD", b"s"])), Frame::Integer(1));
         assert_eq!(
-            dispatch(&engine, cmd(&[b"SREM", b"s", b"x"])),
+            dispatch(&engine, cmd(&[b"SCARD", b"s"]), &mut Protocol::default(), 1),
             Frame::Integer(1)
         );
         assert_eq!(
-            dispatch(&engine, cmd(&[b"SMEMBERS", b"s"])),
+            dispatch(
+                &engine,
+                cmd(&[b"SREM", b"s", b"x"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Integer(1)
+        );
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"SMEMBERS", b"s"]),
+                &mut Protocol::default(),
+                1
+            ),
             Frame::Array(vec![])
         );
     }
@@ -571,7 +739,7 @@ mod tests {
         // treatment as any other unrecognized command, on purpose
         let engine = Engine::new();
         assert_eq!(
-            dispatch(&engine, cmd(&[b"HELLO", b"3"])),
+            dispatch(&engine, cmd(&[b"HELLO", b"3"]), &mut Protocol::default(), 1),
             Frame::Error("ERR unknown command 'HELLO'".into())
         );
     }
