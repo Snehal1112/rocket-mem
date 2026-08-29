@@ -8,6 +8,7 @@ pub enum Frame {
     Bulk(Bytes),
     Null,
     Array(Vec<Frame>),
+    Map(Vec<(Frame, Frame)>),
 }
 
 #[cfg(test)]
@@ -42,5 +43,27 @@ mod tests {
                 Frame::Integer(1)
             ])
         );
+    }
+
+    #[test]
+    fn map_frame_holds_key_value_pairs() {
+        let f = Frame::Map(vec![(
+            Frame::Bulk(Bytes::from_static(b"proto")),
+            Frame::Integer(3),
+        )]);
+        assert_eq!(
+            f,
+            Frame::Map(vec![(
+                Frame::Bulk(Bytes::from_static(b"proto")),
+                Frame::Integer(3)
+            )])
+        );
+    }
+
+    #[test]
+    fn map_frames_are_not_equal_to_array_frames_with_the_same_flattened_content() {
+        let map = Frame::Map(vec![(Frame::Integer(1), Frame::Integer(2))]);
+        let array = Frame::Array(vec![Frame::Integer(1), Frame::Integer(2)]);
+        assert_ne!(map, array);
     }
 }
