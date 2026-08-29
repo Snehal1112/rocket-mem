@@ -2,17 +2,25 @@ use redis::AsyncCommands;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
-async fn spawn_test_server() -> String {
+async fn spawn_test_server() -> (tempfile::TempDir, String) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let engine = Arc::new(engine::Engine::new());
-    tokio::spawn(rocket_mem::serve(listener, engine));
-    format!("redis://{addr}")
+    let dir = tempfile::tempdir().unwrap();
+    let aof = Arc::new(
+        rocket_mem::aof::AofWriter::open(
+            &dir.path().join("test.aof"),
+            rocket_mem::aof::FsyncPolicy::Never,
+        )
+        .unwrap(),
+    );
+    tokio::spawn(rocket_mem::serve(listener, engine, aof));
+    (dir, format!("redis://{addr}"))
 }
 
 #[tokio::test]
 async fn redis_rs_client_can_set_and_get_over_real_tcp() {
-    let url = spawn_test_server().await;
+    let (_dir, url) = spawn_test_server().await;
     let client = redis::Client::open(url).unwrap();
     let mut con = client.get_multiplexed_async_connection().await.unwrap();
 
@@ -23,7 +31,7 @@ async fn redis_rs_client_can_set_and_get_over_real_tcp() {
 
 #[tokio::test]
 async fn redis_rs_client_runs_a_mixed_workload_across_all_sprint_1_data_types() {
-    let url = spawn_test_server().await;
+    let (_dir, url) = spawn_test_server().await;
     let client = redis::Client::open(url).unwrap();
     let mut con = client.get_multiplexed_async_connection().await.unwrap();
 
@@ -44,7 +52,7 @@ async fn redis_rs_client_runs_a_mixed_workload_across_all_sprint_1_data_types() 
 
 #[tokio::test]
 async fn redis_rs_client_gets_a_real_error_on_wrongtype() {
-    let url = spawn_test_server().await;
+    let (_dir, url) = spawn_test_server().await;
     let client = redis::Client::open(url).unwrap();
     let mut con = client.get_multiplexed_async_connection().await.unwrap();
 
@@ -60,7 +68,7 @@ use tokio::net::TcpStream;
 
 #[tokio::test]
 async fn malformed_resp_input_gets_a_graceful_disconnect_not_a_crash() {
-    let url = spawn_test_server().await;
+    let (_dir, url) = spawn_test_server().await;
     let addr = url.strip_prefix("redis://").unwrap();
 
     let mut raw = TcpStream::connect(addr).await.unwrap();

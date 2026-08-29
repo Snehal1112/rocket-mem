@@ -1,3 +1,4 @@
+use crate::aof::AofWriter;
 use crate::dispatcher;
 use engine::Engine;
 use futures_util::{FutureExt, SinkExt, StreamExt};
@@ -6,8 +7,9 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio_util::codec::Framed;
 
-pub async fn serve(listener: TcpListener, engine: Arc<Engine>) {
+pub async fn serve(listener: TcpListener, engine: Arc<Engine>, aof: Arc<AofWriter>) {
     tokio::spawn(active_expire_loop(Arc::clone(&engine)));
+    tokio::spawn(periodic_fsync_loop(Arc::clone(&aof)));
 
     let mut next_client_id: u64 = 1;
     loop {
@@ -18,7 +20,8 @@ pub async fn serve(listener: TcpListener, engine: Arc<Engine>) {
         let client_id = next_client_id;
         next_client_id += 1;
         let engine = Arc::clone(&engine);
-        tokio::spawn(handle_connection(socket, engine, client_id));
+        let aof = Arc::clone(&aof);
+        tokio::spawn(handle_connection(socket, engine, aof, client_id));
     }
 }
 
@@ -35,7 +38,24 @@ async fn active_expire_loop(engine: Arc<Engine>) {
     }
 }
 
-async fn handle_connection(socket: tokio::net::TcpStream, engine: Arc<Engine>, client_id: u64) {
+/// `FsyncPolicy::EverySecond`'s periodic fsync — `Always` already fsyncs inline inside
+/// `AofWriter::append`, and `Never` relies on the OS, so this loop firing harmlessly for
+/// those two policies too (fsync is idempotent and cheap when there's nothing new to flush)
+/// keeps this loop unconditional rather than needing to know which policy is active.
+async fn periodic_fsync_loop(aof: Arc<AofWriter>) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+    loop {
+        interval.tick().await;
+        let _ = aof.fsync();
+    }
+}
+
+async fn handle_connection(
+    socket: tokio::net::TcpStream,
+    engine: Arc<Engine>,
+    aof: Arc<AofWriter>,
+    client_id: u64,
+) {
     let mut framed = Framed::new(socket, RespCodec::default());
     let mut protocol = Protocol::default();
     // Carries a frame pulled ahead by the pipelining peek below, so it isn't re-read.
@@ -49,7 +69,7 @@ async fn handle_connection(socket: tokio::net::TcpStream, engine: Arc<Engine>, c
             Some(Ok(frame)) => frame,
             Some(Err(_)) | None => return, // malformed input or a dropped connection — end this task quietly
         };
-        let response = dispatcher::dispatch(&engine, frame, &mut protocol, client_id);
+        let response = dispatcher::dispatch_and_log(&engine, &aof, frame, &mut protocol, client_id);
         framed.codec_mut().protocol = protocol; // sync BEFORE sending this reply
                                                 // Buffer without flushing -- a flush is a write syscall, and flushing after
                                                 // every single response is what turned client-side pipelining into a
@@ -83,12 +103,56 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
     use tokio_util::codec::Framed;
 
+    fn test_aof() -> (tempfile::TempDir, Arc<crate::aof::AofWriter>) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.aof");
+        let writer = crate::aof::AofWriter::open(&path, crate::aof::FsyncPolicy::Never).unwrap();
+        (dir, Arc::new(writer))
+    }
+
+    #[tokio::test]
+    async fn serve_appends_write_commands_to_the_aof() {
+        let dir = tempfile::tempdir().unwrap();
+        let aof_path = dir.path().join("test.aof");
+        let aof = Arc::new(
+            crate::aof::AofWriter::open(&aof_path, crate::aof::FsyncPolicy::Always).unwrap(),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let engine = Arc::new(Engine::new());
+        tokio::spawn(serve(listener, engine, aof));
+
+        let mut framed = Framed::new(
+            TcpStream::connect(addr).await.unwrap(),
+            RespCodec::default(),
+        );
+        framed
+            .send(Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"SET")),
+                Frame::Bulk(Bytes::from_static(b"k")),
+                Frame::Bulk(Bytes::from_static(b"v")),
+            ]))
+            .await
+            .unwrap();
+        assert_eq!(
+            framed.next().await.unwrap().unwrap(),
+            Frame::Simple("OK".into())
+        );
+
+        // give the (Always-policy, synchronous-fsync) append a moment to land on disk
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let contents = std::fs::read_to_string(&aof_path).unwrap();
+        assert_eq!(contents, "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n");
+    }
+
     #[tokio::test]
     async fn serve_handles_a_full_set_get_round_trip_over_a_real_socket() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let engine = Arc::new(Engine::new());
-        tokio::spawn(serve(listener, engine));
+        let (_dir, aof) = test_aof();
+        tokio::spawn(serve(listener, engine, aof));
 
         let stream = TcpStream::connect(addr).await.unwrap();
         let mut framed = Framed::new(stream, RespCodec::default());
@@ -124,7 +188,8 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let engine = Arc::new(Engine::new());
-        tokio::spawn(serve(listener, engine));
+        let (_dir, aof) = test_aof();
+        tokio::spawn(serve(listener, engine, aof));
 
         let mut a = Framed::new(
             TcpStream::connect(addr).await.unwrap(),
@@ -162,7 +227,8 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let engine = Arc::new(Engine::new());
-        tokio::spawn(serve(listener, engine));
+        let (_dir, aof) = test_aof();
+        tokio::spawn(serve(listener, engine, aof));
 
         let stream = TcpStream::connect(addr).await.unwrap();
         drop(stream); // disconnect immediately, before sending anything
@@ -199,7 +265,8 @@ mod tests {
             b"k",
             std::time::Instant::now() + std::time::Duration::from_millis(20),
         );
-        tokio::spawn(serve(listener, engine.clone()));
+        let (_dir, aof) = test_aof();
+        tokio::spawn(serve(listener, engine.clone(), aof));
 
         // Wait for a *full* rotation, not just a few ticks: the loop sweeps one shard per
         // 100ms tick, so all 16 shards are only guaranteed covered after ~1.6s — and which
