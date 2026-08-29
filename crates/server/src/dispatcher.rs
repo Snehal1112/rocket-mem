@@ -3438,10 +3438,15 @@ mod tests {
 
     #[test]
     fn dispatch_and_log_prefers_ex_over_px_when_both_are_present() {
+        use std::time::{SystemTime, UNIX_EPOCH};
         let engine = Engine::new();
         let (dir, aof) = test_aof();
         // SET k v EX 100 PX 5000 — dispatch applies EX (100 seconds), not PX (5 seconds).
         // rewrite must also use EX, computing PEXPIREAT from 100 seconds, not 5000 milliseconds.
+        let now_before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
         dispatch_and_log(
             &engine,
             &aof,
@@ -3449,6 +3454,10 @@ mod tests {
             &mut Protocol::default(),
             1,
         );
+        let now_after = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
         aof.fsync().unwrap();
         let logged = read_aof(&dir);
         // Verify SET is logged without TTL flags
@@ -3456,8 +3465,46 @@ mod tests {
         assert!(!logged.contains("$2\r\nEX\r\n"));
         assert!(!logged.contains("$2\r\nPX\r\n"));
         // The PEXPIREAT should be based on EX (100 seconds = 100,000 ms), not PX (5000 ms).
-        // We can't check the exact timestamp due to timing, but we can verify the gap between
-        // SET and PEXPIREAT was computed from 100s not 5s by parsing the millisecond delta.
+        // Parse the PEXPIREAT timestamp from the AOF and verify the delta from now is close to
+        // 100,000 ms (EX wins), not 5,000 ms (which would indicate the buggy PX logic).
         assert!(logged.contains("PEXPIREAT"));
+        // Find the PEXPIREAT frame and extract the target timestamp.
+        // RESP format: *3\r\n$9\r\nPEXPIREAT\r\n$1\r\nk\r\n$<len>\r\n<timestamp>\r\n
+        if let Some(pexpireat_pos) = logged.find("PEXPIREAT") {
+            // Skip past "PEXPIREAT", find the key "k", then find the timestamp value.
+            if let Some(after_k) = logged[pexpireat_pos..].find("$1\r\nk\r\n") {
+                let search_from = pexpireat_pos + after_k + 7; // skip "$1\r\nk\r\n"
+                                                               // Next RESP bulk string: $<len>\r\n<value>\r\n
+                if let Some(len_pos) = logged[search_from..].find('$') {
+                    let len_start = search_from + len_pos + 1;
+                    if let Some(len_end) = logged[len_start..].find('\r') {
+                        let len_str = &logged[len_start..len_start + len_end];
+                        if let Ok(timestamp_len) = len_str.parse::<usize>() {
+                            let timestamp_start = len_start + len_end + 2; // skip "\r\n"
+                            let timestamp_end = timestamp_start + timestamp_len;
+                            if timestamp_end <= logged.len() {
+                                let timestamp_str = &logged[timestamp_start..timestamp_end];
+                                if let Ok(target_unix_ms) = timestamp_str.parse::<i64>() {
+                                    // Delta from now should be close to 100_000ms (100 seconds).
+                                    let delta = target_unix_ms - now_before;
+                                    // Allow 5-second tolerance for test execution time.
+                                    let expected_delta = 100_000i64;
+                                    let tolerance = 5_000i64;
+                                    assert!(
+                                        (delta - expected_delta).abs() < tolerance,
+                                        "PEXPIREAT delta {} not close to EX=100s ({} ms); \
+                                         indicates buggy PX precedence (would be ~5000 ms)",
+                                        delta,
+                                        expected_delta
+                                    );
+                                    return; // Test passed
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        panic!("Could not parse PEXPIREAT timestamp from AOF");
     }
 }
