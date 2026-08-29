@@ -341,6 +341,18 @@ pub fn dispatch(engine: &Engine, frame: Frame, protocol: &mut Protocol, client_i
             require_args!(rest, 1, "type");
             Frame::Simple(commands::keys::key_type(engine, &rest[0]).into())
         }
+        "KEYS" => {
+            require_args!(rest, 1, "keys");
+            let pattern = &rest[0];
+            Frame::Array(
+                engine
+                    .keys()
+                    .into_iter()
+                    .filter(|k| engine::glob::glob_match(pattern, k))
+                    .map(Frame::Bulk)
+                    .collect(),
+            )
+        }
         "RANDOMKEY" => match commands::keys::randomkey(engine) {
             Some(k) => Frame::Bulk(k),
             None => Frame::Null,
@@ -1098,6 +1110,54 @@ mod tests {
         assert_eq!(
             dispatch(&engine, cmd(&[b"RANDOMKEY"]), &mut Protocol::default(), 1),
             Frame::Null
+        );
+    }
+
+    #[test]
+    fn keys_returns_only_matching_keys() {
+        let engine = Engine::new();
+        dispatch(
+            &engine,
+            cmd(&[b"SET", b"user:1", b"a"]),
+            &mut Protocol::default(),
+            1,
+        );
+        dispatch(
+            &engine,
+            cmd(&[b"SET", b"user:2", b"b"]),
+            &mut Protocol::default(),
+            1,
+        );
+        dispatch(
+            &engine,
+            cmd(&[b"SET", b"session:1", b"c"]),
+            &mut Protocol::default(),
+            1,
+        );
+        let Frame::Array(mut items) = dispatch(
+            &engine,
+            cmd(&[b"KEYS", b"user:*"]),
+            &mut Protocol::default(),
+            1,
+        ) else {
+            panic!("expected Array")
+        };
+        items.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+        assert_eq!(
+            items,
+            vec![
+                Frame::Bulk(Bytes::from_static(b"user:1")),
+                Frame::Bulk(Bytes::from_static(b"user:2")),
+            ]
+        );
+    }
+
+    #[test]
+    fn keys_on_empty_keyspace_returns_empty_array() {
+        let engine = Engine::new();
+        assert_eq!(
+            dispatch(&engine, cmd(&[b"KEYS", b"*"]), &mut Protocol::default(), 1),
+            Frame::Array(vec![])
         );
     }
 
