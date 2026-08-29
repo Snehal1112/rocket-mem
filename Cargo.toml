@@ -11,3 +11,4 @@ bytes = "1"
 thiserror = "1"
 tracing = "0.1"
 parking_lot = "0.12"
+tokio-util = { version = "0.7", features = ["codec"] }
