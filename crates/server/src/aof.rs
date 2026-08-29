@@ -104,10 +104,48 @@ pub const WRITE_COMMANDS: &[&str] = &[
     "ZINCRBY",
 ];
 
+/// Replays every command in the AOF at `path` against `engine`, via the plain (non-logging)
+/// `dispatcher::dispatch` — never `dispatch_and_log`, which would re-append what's being
+/// replayed. A missing file is a no-op (nothing to recover on first run). A corrupt or
+/// incomplete final frame stops replay at the last fully-decoded frame and truncates the
+/// file on disk to that exact byte offset — see this plan's Global Constraints for why an
+/// in-memory-only skip isn't sufficient.
+pub fn replay(path: &Path, engine: &engine::Engine) -> std::io::Result<()> {
+    use tokio_util::codec::Decoder;
+
+    let raw = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+
+    let mut buf = bytes::BytesMut::from(&raw[..]);
+    let mut codec = protocol::codec::RespCodec::default();
+    let mut valid_len = 0usize;
+    loop {
+        let before = buf.len();
+        match codec.decode(&mut buf) {
+            Ok(Some(frame)) => {
+                valid_len += before - buf.len();
+                let mut protocol = protocol::codec::Protocol::default();
+                crate::dispatcher::dispatch(engine, frame, &mut protocol, 0);
+            }
+            Ok(None) | Err(_) => break, // incomplete or corrupt tail — stop here, keep what decoded
+        }
+    }
+
+    if valid_len < raw.len() {
+        let file = OpenOptions::new().write(true).open(path)?;
+        file.set_len(valid_len as u64)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use bytes::Bytes;
+    use engine::{Engine, Value};
     use protocol::Frame;
     use std::io::Read;
 
@@ -118,6 +156,107 @@ mod tests {
                 .map(|p| Frame::Bulk(Bytes::copy_from_slice(p)))
                 .collect(),
         )
+    }
+
+    fn write_raw(path: &std::path::Path, bytes: &[u8]) {
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap()
+            .write_all(bytes)
+            .unwrap();
+    }
+
+    #[test]
+    fn replay_on_a_missing_file_is_a_no_op_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does-not-exist.aof");
+        let engine = Engine::new();
+        replay(&path, &engine).unwrap();
+        assert!(engine.keys().is_empty());
+    }
+
+    #[test]
+    fn replay_reconstructs_state_from_a_well_formed_aof() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.aof");
+        write_raw(
+            &path,
+            b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n*3\r\n$3\r\nSET\r\n$1\r\nb\r\n$1\r\n2\r\n",
+        );
+        let engine = Engine::new();
+        replay(&path, &engine).unwrap();
+        assert_eq!(
+            engine.get(b"a"),
+            Some(Value::String(bytes::Bytes::from_static(b"1")))
+        );
+        assert_eq!(
+            engine.get(b"b"),
+            Some(Value::String(bytes::Bytes::from_static(b"2")))
+        );
+    }
+
+    #[test]
+    fn replay_recovers_every_valid_command_before_a_corrupt_tail_without_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.aof");
+        write_raw(&path, b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n");
+        write_raw(&path, b"*3\r\n$3\r\nSET\r\n$1\r\nb\r\n$3\r\ngar"); // truncated mid-bulk-body
+        let engine = Engine::new();
+        replay(&path, &engine).unwrap(); // must not panic
+        assert_eq!(
+            engine.get(b"a"),
+            Some(Value::String(bytes::Bytes::from_static(b"1")))
+        );
+        assert_eq!(engine.get(b"b"), None); // the truncated command never applied
+    }
+
+    #[test]
+    fn replay_truncates_the_corrupt_tail_off_the_file_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.aof");
+        let valid = b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n";
+        write_raw(&path, valid);
+        write_raw(&path, b"*3\r\n$3\r\nSET\r\n$1\r\nb\r\n$3\r\ngar"); // truncated mid-bulk-body
+        let engine = Engine::new();
+        replay(&path, &engine).unwrap();
+
+        let on_disk = std::fs::read(&path).unwrap();
+        assert_eq!(on_disk, valid); // corrupt bytes physically removed, not just skipped in memory
+
+        // proves future appends land cleanly right after the last valid frame, not after garbage
+        let writer = AofWriter::open(&path, FsyncPolicy::Never).unwrap();
+        writer
+            .append(protocol::Frame::Array(vec![
+                protocol::Frame::Bulk(bytes::Bytes::from_static(b"SET")),
+                protocol::Frame::Bulk(bytes::Bytes::from_static(b"c")),
+                protocol::Frame::Bulk(bytes::Bytes::from_static(b"3")),
+            ]))
+            .unwrap();
+        writer.fsync().unwrap();
+        let engine2 = Engine::new();
+        replay(&path, &engine2).unwrap();
+        assert_eq!(
+            engine2.get(b"a"),
+            Some(Value::String(bytes::Bytes::from_static(b"1")))
+        );
+        assert_eq!(
+            engine2.get(b"c"),
+            Some(Value::String(bytes::Bytes::from_static(b"3")))
+        );
+    }
+
+    #[test]
+    fn replay_on_a_fully_well_formed_file_does_not_truncate_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.aof");
+        let valid = b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n";
+        write_raw(&path, valid);
+        let engine = Engine::new();
+        replay(&path, &engine).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), valid);
     }
 
     #[test]
