@@ -51,6 +51,12 @@ impl AofWriter {
         guard.flush()?;
         guard.get_ref().sync_data()
     }
+
+    /// The fsync policy this writer was opened with. Never changes after `open`, so callers
+    /// (e.g. `connection.rs`'s periodic fsync loop) may cache it rather than re-checking.
+    pub fn policy(&self) -> FsyncPolicy {
+        self.policy
+    }
 }
 
 /// Commands whose successful execution mutates the keyspace and must be replayed on

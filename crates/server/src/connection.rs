@@ -39,14 +39,21 @@ async fn active_expire_loop(engine: Arc<Engine>) {
 }
 
 /// `FsyncPolicy::EverySecond`'s periodic fsync — `Always` already fsyncs inline inside
-/// `AofWriter::append`, and `Never` relies on the OS, so this loop firing harmlessly for
-/// those two policies too (fsync is idempotent and cheap when there's nothing new to flush)
-/// keeps this loop unconditional rather than needing to know which policy is active.
+/// `AofWriter::append`, so this loop firing harmlessly for that policy too (fsync is
+/// idempotent and cheap when there's nothing new to flush) is fine. `Never` is different:
+/// it's meant to defer entirely to the OS, so this loop must skip calling `fsync` for it —
+/// otherwise `Never` degrades into `EverySecond` in practice, which is what `AofWriter::policy`
+/// exists to let this loop check.
 async fn periodic_fsync_loop(aof: Arc<AofWriter>) {
+    if aof.policy() == crate::aof::FsyncPolicy::Never {
+        return;
+    }
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
     loop {
         interval.tick().await;
-        let _ = aof.fsync();
+        if let Err(e) = aof.fsync() {
+            eprintln!("aof fsync failed: {e}");
+        }
     }
 }
 
@@ -140,7 +147,7 @@ mod tests {
             Frame::Simple("OK".into())
         );
 
-        // give the (Always-policy, synchronous-fsync) append a moment to land on disk
+        // give the (Always-policy, synchronous-fsync) append a moment to land on disk.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let contents = std::fs::read_to_string(&aof_path).unwrap();
         assert_eq!(contents, "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n");

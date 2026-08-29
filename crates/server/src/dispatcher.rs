@@ -987,8 +987,12 @@ pub fn dispatch_and_log(
     // PEXPIREAT — on replay the key would live forever, silently dropping the TTL. Full
     // crash/corrupt-tail recovery semantics are scoped to Task 06 (06-aof-replay-and-corrupt-recovery.md).
     for frame_to_log in to_log {
-        // a logging failure must not fail the client's reply
-        let _ = aof.append(frame_to_log);
+        // A logging failure must not fail the client's reply, but it must not be silently
+        // swallowed either -- surface it so an operator watching stderr/logs can notice a
+        // full disk or I/O error instead of discovering it only on replay.
+        if let Err(e) = aof.append(frame_to_log) {
+            eprintln!("aof append failed: {e}");
+        }
         // fsync timing for Always lives inside AofWriter::append itself; EverySecond's
         // periodic fsync loop lives in this plan's Task 2 (connection.rs); Never does
         // nothing here.
@@ -1019,8 +1023,8 @@ fn rewrite_expire_family_to_pexpireat(items: &[Frame]) -> Option<Frame> {
         .ok()?
         .as_millis() as i64;
     let target_unix_ms = match name_upper.as_str() {
-        "EXPIRE" => now_ms + n.saturating_mul(1000),
-        "PEXPIRE" => now_ms + n,
+        "EXPIRE" => now_ms.saturating_add(n.saturating_mul(1000)),
+        "PEXPIRE" => now_ms.saturating_add(n),
         "EXPIREAT" => n.saturating_mul(1000),
         "PEXPIREAT" => n,
         _ => return None,
@@ -1118,7 +1122,7 @@ fn rewrite_set_ttl_to_pexpireat(items: &[Frame]) -> Option<Vec<Frame>> {
         Frame::Array(vec![
             Frame::Bulk(Bytes::from_static(b"PEXPIREAT")),
             Frame::Bulk(key.clone()),
-            Frame::Bulk(Bytes::from((now_ms + ttl_ms).to_string())),
+            Frame::Bulk(Bytes::from(now_ms.saturating_add(ttl_ms).to_string())),
         ]),
     ])
 }
@@ -3378,8 +3382,77 @@ mod tests {
         assert_eq!(read_aof(&dir), ""); // Frame::Null reply — nothing was popped, nothing to log
     }
 
+    /// Parses the absolute-ms target out of a logged `PEXPIREAT <key> <ms>` frame in raw RESP
+    /// wire bytes. Shared by tests that need to assert on the *computed* timestamp rather than
+    /// merely that a PEXPIREAT is present — a rewrite that computes a wrong-but-present
+    /// PEXPIREAT would otherwise still pass.
+    fn parse_logged_pexpireat_ms(logged: &str, key: &str) -> i64 {
+        let pexpireat_pos = logged.find("PEXPIREAT").expect("no PEXPIREAT in log");
+        let key_marker = format!("${}\r\n{}\r\n", key.len(), key);
+        let after_key = logged[pexpireat_pos..]
+            .find(&key_marker)
+            .expect("no matching key after PEXPIREAT");
+        let search_from = pexpireat_pos + after_key + key_marker.len();
+        // Next RESP bulk string: $<len>\r\n<value>\r\n
+        let len_pos = logged[search_from..]
+            .find('$')
+            .expect("no length marker after key");
+        let len_start = search_from + len_pos + 1;
+        let len_end = logged[len_start..]
+            .find('\r')
+            .expect("no CR after bulk length");
+        let timestamp_len: usize = logged[len_start..len_start + len_end]
+            .parse()
+            .expect("bulk length is not a number");
+        let timestamp_start = len_start + len_end + 2; // skip "\r\n"
+        let timestamp_end = timestamp_start + timestamp_len;
+        logged[timestamp_start..timestamp_end]
+            .parse()
+            .expect("PEXPIREAT value is not an integer")
+    }
+
     #[test]
     fn dispatch_and_log_rewrites_expire_to_an_absolute_pexpireat() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let engine = Engine::new();
+        let (dir, aof) = test_aof();
+        dispatch_and_log(
+            &engine,
+            &aof,
+            cmd(&[b"SET", b"k", b"v"]),
+            &mut Protocol::default(),
+            1,
+        );
+        let now_before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        dispatch_and_log(
+            &engine,
+            &aof,
+            cmd(&[b"EXPIRE", b"k", b"100"]),
+            &mut Protocol::default(),
+            1,
+        );
+        aof.fsync().unwrap();
+        let logged = read_aof(&dir);
+        assert!(logged.contains("PEXPIREAT"));
+        assert!(!logged.contains("$6\r\nEXPIRE\r\n")); // the relative form never hits the log
+
+        // EXPIRE k 100 -> PEXPIREAT delta from "now" should be close to 100_000ms.
+        let target_ms = parse_logged_pexpireat_ms(&logged, "k");
+        let delta = target_ms - now_before;
+        assert!(
+            (delta - 100_000).abs() < 5_000,
+            "PEXPIREAT delta {delta} not close to the expected 100_000ms"
+        );
+    }
+
+    #[test]
+    fn dispatch_and_log_rewrites_expireat_to_an_exact_absolute_pexpireat() {
+        // EXPIREAT/PEXPIREAT take a structurally different, purely-absolute branch (a plain
+        // seconds->ms conversion with no `now_ms` term at all), so unlike EXPIRE/PEXPIRE this
+        // can be asserted as an exact value rather than a delta-from-now with tolerance.
         let engine = Engine::new();
         let (dir, aof) = test_aof();
         dispatch_and_log(
@@ -3392,14 +3465,15 @@ mod tests {
         dispatch_and_log(
             &engine,
             &aof,
-            cmd(&[b"EXPIRE", b"k", b"100"]),
+            cmd(&[b"EXPIREAT", b"k", b"2000000000"]),
             &mut Protocol::default(),
             1,
         );
         aof.fsync().unwrap();
         let logged = read_aof(&dir);
         assert!(logged.contains("PEXPIREAT"));
-        assert!(!logged.contains("$6\r\nEXPIRE\r\n")); // the relative form never hits the log
+        let target_ms = parse_logged_pexpireat_ms(&logged, "k");
+        assert_eq!(target_ms, 2_000_000_000_000);
     }
 
     #[test]
@@ -3454,10 +3528,6 @@ mod tests {
             &mut Protocol::default(),
             1,
         );
-        let now_after = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
         aof.fsync().unwrap();
         let logged = read_aof(&dir);
         // Verify SET is logged without TTL flags
@@ -3506,5 +3576,36 @@ mod tests {
             }
         }
         panic!("Could not parse PEXPIREAT timestamp from AOF");
+    }
+
+    #[test]
+    fn dispatch_and_log_does_not_panic_on_an_expire_ttl_that_would_overflow_i64() {
+        // Regression test: `now_ms + n.saturating_mul(1000)` used to be a plain, panicking
+        // (debug) / wrapping (release) addition in rewrite_expire_family_to_pexpireat. A huge
+        // but syntactically valid TTL like this one drives now_ms + (n * 1000) past i64::MAX,
+        // which previously panicked live against the built server:
+        //   SET k v -> +OK
+        //   EXPIRE k 10000000000000000 -> connection dropped, no reply
+        //   thread panicked at dispatcher.rs:1022:21: attempt to add with overflow
+        // Completing without panicking proves the fix; the resulting (saturated) timestamp
+        // isn't a meaningful real-world value, so it's not asserted on.
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        dispatch_and_log(
+            &engine,
+            &aof,
+            cmd(&[b"SET", b"k", b"v"]),
+            &mut Protocol::default(),
+            1,
+        );
+        let reply = dispatch_and_log(
+            &engine,
+            &aof,
+            cmd(&[b"EXPIRE", b"k", b"10000000000000000"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(reply, Frame::Integer(1)); // key existed, so the TTL was applied
+        aof.fsync().unwrap();
     }
 }
