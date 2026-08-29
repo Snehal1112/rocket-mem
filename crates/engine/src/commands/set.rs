@@ -10,10 +10,11 @@ fn get_set(engine: &Engine, key: &[u8]) -> Result<HashSet<Bytes>, common::Engine
     }
 }
 
-pub fn sadd(engine: &Engine, key: Bytes, member: Bytes) {
-    let mut set = get_set(engine, &key).unwrap_or_default();
+pub fn sadd(engine: &Engine, key: Bytes, member: Bytes) -> Result<(), common::EngineError> {
+    let mut set = get_set(engine, &key)?;
     set.insert(member);
     engine.set(key, Value::Set(set));
+    Ok(())
 }
 
 pub fn srem(engine: &Engine, key: &[u8], member: &[u8]) -> Result<bool, common::EngineError> {
@@ -44,7 +45,7 @@ mod tests {
     #[test]
     fn sadd_then_sismember_is_true() {
         let engine = Engine::new();
-        sadd(&engine, Bytes::from_static(b"s"), Bytes::from_static(b"x"));
+        sadd(&engine, Bytes::from_static(b"s"), Bytes::from_static(b"x")).unwrap();
         assert!(sismember(&engine, b"s", b"x").unwrap());
         assert!(!sismember(&engine, b"s", b"y").unwrap());
     }
@@ -52,7 +53,7 @@ mod tests {
     #[test]
     fn srem_removes_member_and_reports_it_existed() {
         let engine = Engine::new();
-        sadd(&engine, Bytes::from_static(b"s"), Bytes::from_static(b"x"));
+        sadd(&engine, Bytes::from_static(b"s"), Bytes::from_static(b"x")).unwrap();
         assert!(srem(&engine, b"s", b"x").unwrap());
         assert!(!srem(&engine, b"s", b"x").unwrap());
     }
@@ -60,8 +61,15 @@ mod tests {
     #[test]
     fn scard_counts_members() {
         let engine = Engine::new();
-        sadd(&engine, Bytes::from_static(b"s"), Bytes::from_static(b"x"));
-        sadd(&engine, Bytes::from_static(b"s"), Bytes::from_static(b"y"));
+        sadd(&engine, Bytes::from_static(b"s"), Bytes::from_static(b"x")).unwrap();
+        sadd(&engine, Bytes::from_static(b"s"), Bytes::from_static(b"y")).unwrap();
         assert_eq!(scard(&engine, b"s").unwrap(), 2);
+    }
+
+    #[test]
+    fn sadd_on_string_key_returns_wrongtype() {
+        let engine = Engine::new();
+        engine.set(Bytes::from_static(b"k"), Value::String(Bytes::from_static(b"v")));
+        assert_eq!(sadd(&engine, Bytes::from_static(b"k"), Bytes::from_static(b"x")).unwrap_err(), common::EngineError::WrongType);
     }
 }

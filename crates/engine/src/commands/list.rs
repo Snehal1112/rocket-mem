@@ -10,16 +10,18 @@ fn get_list(engine: &Engine, key: &[u8]) -> Result<VecDeque<Bytes>, common::Engi
     }
 }
 
-pub fn rpush(engine: &Engine, key: Bytes, val: Bytes) {
-    let mut list = get_list(engine, &key).unwrap_or_default();
+pub fn rpush(engine: &Engine, key: Bytes, val: Bytes) -> Result<(), common::EngineError> {
+    let mut list = get_list(engine, &key)?;
     list.push_back(val);
     engine.set(key, Value::List(list));
+    Ok(())
 }
 
-pub fn lpush(engine: &Engine, key: Bytes, val: Bytes) {
-    let mut list = get_list(engine, &key).unwrap_or_default();
+pub fn lpush(engine: &Engine, key: Bytes, val: Bytes) -> Result<(), common::EngineError> {
+    let mut list = get_list(engine, &key)?;
     list.push_front(val);
     engine.set(key, Value::List(list));
+    Ok(())
 }
 
 pub fn rpop(engine: &Engine, key: &[u8]) -> Result<Option<Bytes>, common::EngineError> {
@@ -59,8 +61,8 @@ mod tests {
     #[test]
     fn rpush_then_lrange_returns_in_insertion_order() {
         let engine = Engine::new();
-        rpush(&engine, Bytes::from_static(b"l"), Bytes::from_static(b"a"));
-        rpush(&engine, Bytes::from_static(b"l"), Bytes::from_static(b"b"));
+        rpush(&engine, Bytes::from_static(b"l"), Bytes::from_static(b"a")).unwrap();
+        rpush(&engine, Bytes::from_static(b"l"), Bytes::from_static(b"b")).unwrap();
         let items = lrange(&engine, b"l", 0, -1).unwrap();
         assert_eq!(items, vec![Bytes::from_static(b"a"), Bytes::from_static(b"b")]);
     }
@@ -68,8 +70,8 @@ mod tests {
     #[test]
     fn lpush_prepends() {
         let engine = Engine::new();
-        rpush(&engine, Bytes::from_static(b"l"), Bytes::from_static(b"b"));
-        lpush(&engine, Bytes::from_static(b"l"), Bytes::from_static(b"a"));
+        rpush(&engine, Bytes::from_static(b"l"), Bytes::from_static(b"b")).unwrap();
+        lpush(&engine, Bytes::from_static(b"l"), Bytes::from_static(b"a")).unwrap();
         let items = lrange(&engine, b"l", 0, -1).unwrap();
         assert_eq!(items, vec![Bytes::from_static(b"a"), Bytes::from_static(b"b")]);
     }
@@ -77,9 +79,23 @@ mod tests {
     #[test]
     fn rpop_returns_and_removes_last_element() {
         let engine = Engine::new();
-        rpush(&engine, Bytes::from_static(b"l"), Bytes::from_static(b"a"));
-        rpush(&engine, Bytes::from_static(b"l"), Bytes::from_static(b"b"));
+        rpush(&engine, Bytes::from_static(b"l"), Bytes::from_static(b"a")).unwrap();
+        rpush(&engine, Bytes::from_static(b"l"), Bytes::from_static(b"b")).unwrap();
         assert_eq!(rpop(&engine, b"l").unwrap(), Some(Bytes::from_static(b"b")));
         assert_eq!(llen(&engine, b"l").unwrap(), 1);
+    }
+
+    #[test]
+    fn rpush_on_string_key_returns_wrongtype() {
+        let engine = Engine::new();
+        engine.set(Bytes::from_static(b"k"), Value::String(Bytes::from_static(b"v")));
+        assert_eq!(rpush(&engine, Bytes::from_static(b"k"), Bytes::from_static(b"x")).unwrap_err(), common::EngineError::WrongType);
+    }
+
+    #[test]
+    fn lpush_on_string_key_returns_wrongtype() {
+        let engine = Engine::new();
+        engine.set(Bytes::from_static(b"k"), Value::String(Bytes::from_static(b"v")));
+        assert_eq!(lpush(&engine, Bytes::from_static(b"k"), Bytes::from_static(b"x")).unwrap_err(), common::EngineError::WrongType);
     }
 }

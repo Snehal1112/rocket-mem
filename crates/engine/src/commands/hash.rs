@@ -2,14 +2,15 @@ use bytes::Bytes;
 use std::collections::HashMap;
 use crate::{Engine, Value};
 
-pub fn hset(engine: &Engine, key: Bytes, field: Bytes, val: Bytes) {
+pub fn hset(engine: &Engine, key: Bytes, field: Bytes, val: Bytes) -> Result<(), common::EngineError> {
     let mut map = match engine.get(&key) {
         Some(Value::Hash(m)) => m,
-        Some(_) => return, // caller (Sprint 2 dispatcher) is responsible for surfacing WRONGTYPE before calling
+        Some(_) => return Err(common::EngineError::WrongType),
         None => HashMap::new(),
     };
     map.insert(field, val);
     engine.set(key, Value::Hash(map));
+    Ok(())
 }
 
 pub fn hget(engine: &Engine, key: &[u8], field: &[u8]) -> Result<Option<Bytes>, common::EngineError> {
@@ -57,8 +58,16 @@ mod tests {
     #[test]
     fn hset_then_hget_round_trips() {
         let engine = Engine::new();
-        hset(&engine, Bytes::from_static(b"h"), Bytes::from_static(b"field"), Bytes::from_static(b"val"));
+        hset(&engine, Bytes::from_static(b"h"), Bytes::from_static(b"field"), Bytes::from_static(b"val")).unwrap();
         assert_eq!(hget(&engine, b"h", b"field").unwrap(), Some(Bytes::from_static(b"val")));
+    }
+
+    #[test]
+    fn hset_on_string_key_returns_wrongtype() {
+        let engine = Engine::new();
+        engine.set(Bytes::from_static(b"k"), Value::String(Bytes::from_static(b"v")));
+        let err = hset(&engine, Bytes::from_static(b"k"), Bytes::from_static(b"f"), Bytes::from_static(b"v")).unwrap_err();
+        assert_eq!(err, common::EngineError::WrongType);
     }
 
     #[test]
@@ -71,7 +80,7 @@ mod tests {
     #[test]
     fn hdel_removes_field_and_reports_it_existed() {
         let engine = Engine::new();
-        hset(&engine, Bytes::from_static(b"h"), Bytes::from_static(b"f"), Bytes::from_static(b"v"));
+        hset(&engine, Bytes::from_static(b"h"), Bytes::from_static(b"f"), Bytes::from_static(b"v")).unwrap();
         assert!(hdel(&engine, b"h", b"f").unwrap());
         assert!(!hdel(&engine, b"h", b"f").unwrap());
     }
