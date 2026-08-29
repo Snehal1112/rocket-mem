@@ -1,5 +1,6 @@
 pub mod commands;
 mod engine;
+pub mod glob;
 mod shard;
 mod store;
 mod value;
