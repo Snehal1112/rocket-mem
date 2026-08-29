@@ -29,7 +29,9 @@ Concurrency model: one Tokio task per client connection, keyspace split into 16 
 
 **Sprint 1 (engine core & core data types) — done.** A protocol-agnostic, sharded storage engine with full String/Hash/List/Set command coverage and a WRONGTYPE/missing-key test matrix. No networking yet.
 
-**Sprint 2 (RESP protocol, networking & client compatibility) — in progress.** The `protocol` crate has a protocol-aware `Frame` enum (RESP2 plus RESP3's `Map`) and a `RespCodec` that encodes/decodes both, including split-read reassembly. The `server` crate has a Tokio TCP accept loop, a per-connection task, and a dispatcher wired to the full engine command surface (String/Hash/List/Set, table below), plus `PING`/`ECHO`/`SELECT`/`COMMAND`/`INFO`. `HELLO` implements full RESP2/RESP3 negotiation — reporting the current protocol, switching via `HELLO 2`/`HELLO 3`, and returning `NOPROTO`/syntax errors for unsupported versions or malformed args.
+**Sprint 2 (RESP protocol, networking & client compatibility) — done.** The `protocol` crate has a protocol-aware `Frame` enum (RESP2 plus RESP3's `Map`) and a `RespCodec` that encodes/decodes both, including split-read reassembly. The `server` crate has a Tokio TCP accept loop, a per-connection task, and a dispatcher wired to the full engine command surface (String/Hash/List/Set, table below), plus `PING`/`ECHO`/`SELECT`/`COMMAND`/`INFO`. `HELLO` implements full RESP2/RESP3 negotiation — reporting the current protocol, switching via `HELLO 2`/`HELLO 3`, and returning `NOPROTO`/syntax errors for unsupported versions or malformed args.
+
+**Sprint 3 (full command set: keys, collections & sorted sets) — done.** `KEYS` now supports glob patterns (`*`, `?`, `[abc]`); `SCAN` walks the keyspace one shard per call without blocking it the way `KEYS` can, proven safe under concurrent writes by a stress test. A new `SortedSet` type backs `ZADD`/`ZSCORE`/`ZREM`/`ZCARD`/`ZINCRBY`/`ZRANGE`/`ZRANK`. String/key commands gained `GETSET`/`MSET`/`MGET`/`MSETNX`/`RENAME`/`RENAMENX`/`TYPE`/`RANDOMKEY` — the `EXPIRE` family (`EXPIRE`/`PEXPIRE`/`EXPIREAT`/`PEXPIREAT`/`TTL`/`PTTL`/`PERSIST`) is an explicit stub returning a clear error, deferred to Sprint 4 alongside the expiry reaper it actually needs (see `docs/superpowers/specs/2026-08-29-sprint-3-spec.md`). Lists, Hashes, and Sets each gained their remaining command coverage (table below).
 
 Remaining sprints (persistence, replication, clustering, a custom protocol, ACLs/TLS) are scoped in the [sprint plan](docs/rocket-mem-sprint-plan.md) but not started.
 
@@ -37,12 +39,13 @@ Remaining sprints (persistence, replication, clustering, a custom protocol, ACLs
 
 | Type | Implemented |
 |---|---|
-| String | `GET`, `SET` (`NX`/`XX`), `APPEND`, `STRLEN`, `INCRBY` |
-| Hash | `HSET`, `HGET`, `HDEL`, `HEXISTS`, `HGETALL`, `HLEN` |
-| List | `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LRANGE`, `LLEN` |
-| Set | `SADD`, `SREM`, `SMEMBERS`, `SISMEMBER`, `SCARD` |
+| String/Key | `GET`, `SET` (`NX`/`XX`), `GETSET`, `APPEND`, `STRLEN`, `INCR`/`DECR`/`INCRBY`, `MSET`, `MGET`, `MSETNX`, `RENAME`, `RENAMENX`, `TYPE`, `RANDOMKEY`, `KEYS` (glob: `*`, `?`, `[abc]` only), `SCAN` |
+| Hash | `HSET`, `HGET`, `HDEL`, `HEXISTS`, `HGETALL`, `HLEN`, `HINCRBY`, `HKEYS`, `HVALS`, `HMGET`, `HSETNX` |
+| List | `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LRANGE`, `LLEN`, `LINDEX`, `LSET`, `LTRIM`, `LREM`, `LINSERT` |
+| Set | `SADD`, `SREM`, `SMEMBERS`, `SISMEMBER`, `SCARD`, `SINTER`, `SUNION`, `SDIFF`, `SINTERSTORE`, `SUNIONSTORE`, `SDIFFSTORE`, `SPOP`, `SRANDMEMBER` |
+| Sorted Set | `ZADD`, `ZSCORE`, `ZREM`, `ZCARD`, `ZINCRBY`, `ZRANGE`, `ZRANK` |
 
-`SET`'s `EX`/`PX` flags are intentionally deferred — there's no expiry reaper until Sprint 4, so time-based flags would be dead code until then. All of the above are exercised directly by engine tests and reachable over RESP through the dispatcher.
+`SET`'s `EX`/`PX` flags and the entire `EXPIRE` command family (`EXPIRE`/`PEXPIRE`/`EXPIREAT`/`PEXPIREAT`/`TTL`/`PTTL`/`PERSIST`) are intentionally deferred — there's no expiry reaper until Sprint 4, so time-based semantics would be silently broken (a TTL nothing ever checks) rather than dead code. `KEYS`'s glob support is intentionally partial: no character ranges (`[a-z]`), negation (`[^abc]`), or escaping. `RPUSH`/`LPUSH` still accept exactly one value per call (documented debt from `docs/phase-1-retro.md`, not yet picked up). All of the above are exercised directly by engine tests and reachable over RESP through the dispatcher.
 
 ## Workspace layout
 
@@ -50,7 +53,7 @@ Four crates under `crates/`:
 
 - **`common`** — shared `EngineError` enum (`WrongType`, `NotAnInteger`). No dependencies on the other crates.
 - **`engine`** — the storage engine: `Value` enum, 16-shard `Store`, and one free function per command under `commands/`. Everything in "Status" above lives here.
-- **`protocol`** — RESP wire format. Currently just the `Frame` type; parser/encoder is Sprint 2 work in progress.
+- **`protocol`** — RESP wire format: the `Frame` type (RESP2 plus RESP3's `Map`) and `RespCodec`, encoding/decoding both including split-read reassembly.
 - **`server`** — placeholder binary (package name `rocket-mem`); becomes the TCP listener once networking lands.
 
 ## Building & testing
