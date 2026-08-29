@@ -78,6 +78,11 @@ pub fn dispatch(engine: &Engine, frame: Frame) -> Frame {
             None => Frame::Simple("PONG".into()),
         },
         "ECHO" => Frame::Bulk(rest[0].clone()),
+        "SELECT" => Frame::Simple("OK".into()), // single logical DB only, per 2026-08-29-sprint-2-spec.md scope
+        "COMMAND" => Frame::Array(vec![]), // enough that clients probing capabilities don't choke
+        "INFO" => Frame::Bulk(Bytes::from_static(
+            b"# Server\r\nredis_version:rocket-mem-0.1.0\r\n",
+        )),
         _ => Frame::Error(format!("ERR unknown command '{name}'")),
     }
 }
@@ -192,6 +197,41 @@ mod tests {
         assert_eq!(
             dispatch(&engine, cmd(&[b"ECHO", b"hi"])),
             Frame::Bulk(Bytes::from_static(b"hi"))
+        );
+    }
+
+    #[test]
+    fn select_always_replies_ok_single_db_only() {
+        let engine = Engine::new();
+        assert_eq!(
+            dispatch(&engine, cmd(&[b"SELECT", b"0"])),
+            Frame::Simple("OK".into())
+        );
+    }
+
+    #[test]
+    fn command_replies_with_an_empty_array_rather_than_erroring() {
+        let engine = Engine::new();
+        assert_eq!(dispatch(&engine, cmd(&[b"COMMAND"])), Frame::Array(vec![]));
+    }
+
+    #[test]
+    fn info_replies_a_non_empty_bulk_string() {
+        let engine = Engine::new();
+        let Frame::Bulk(info) = dispatch(&engine, cmd(&[b"INFO"])) else {
+            panic!("expected Bulk")
+        };
+        assert!(!info.is_empty());
+    }
+
+    #[test]
+    fn hello_is_not_implemented_and_falls_through_to_unknown_command() {
+        // per 2026-08-29-sprint-2-spec.md's RESP3 decision: HELLO gets the same
+        // treatment as any other unrecognized command, on purpose
+        let engine = Engine::new();
+        assert_eq!(
+            dispatch(&engine, cmd(&[b"HELLO", b"3"])),
+            Frame::Error("ERR unknown command 'HELLO'".into())
         );
     }
 }
