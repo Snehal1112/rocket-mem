@@ -25,6 +25,17 @@ fn engine_error_to_frame(e: common::EngineError) -> Frame {
     Frame::Error(e.to_string())
 }
 
+macro_rules! require_args {
+    ($rest:expr, $n:expr, $name:expr) => {
+        if $rest.len() < $n {
+            return Frame::Error(format!(
+                "ERR wrong number of arguments for '{}' command",
+                $name
+            ));
+        }
+    };
+}
+
 pub fn dispatch(engine: &Engine, frame: Frame) -> Frame {
     let args = match frame_to_args(frame) {
         Ok(a) => a,
@@ -37,47 +48,70 @@ pub fn dispatch(engine: &Engine, frame: Frame) -> Frame {
     let rest = &args[1..];
 
     match name.as_str() {
-        "GET" => match commands::string::get(engine, &rest[0]) {
-            Ok(Some(b)) => Frame::Bulk(b),
-            Ok(None) => Frame::Null,
-            Err(e) => engine_error_to_frame(e),
-        },
+        "GET" => {
+            require_args!(rest, 1, "get");
+            match commands::string::get(engine, &rest[0]) {
+                Ok(Some(b)) => Frame::Bulk(b),
+                Ok(None) => Frame::Null,
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
         "SET" => {
+            require_args!(rest, 2, "set");
             engine.set(rest[0].clone(), Value::String(rest[1].clone()));
             Frame::Simple("OK".into())
         }
-        "APPEND" => match commands::string::append(engine, rest[0].clone(), &rest[1]) {
-            Ok(len) => Frame::Integer(len as i64),
-            Err(e) => engine_error_to_frame(e),
-        },
-        "STRLEN" => match commands::string::strlen(engine, &rest[0]) {
-            Ok(len) => Frame::Integer(len as i64),
-            Err(e) => engine_error_to_frame(e),
-        },
-        "INCR" => match commands::string::incr_by(engine, rest[0].clone(), 1) {
-            Ok(n) => Frame::Integer(n),
-            Err(e) => engine_error_to_frame(e),
-        },
-        "DECR" => match commands::string::incr_by(engine, rest[0].clone(), -1) {
-            Ok(n) => Frame::Integer(n),
-            Err(e) => engine_error_to_frame(e),
-        },
+        "APPEND" => {
+            require_args!(rest, 2, "append");
+            match commands::string::append(engine, rest[0].clone(), &rest[1]) {
+                Ok(len) => Frame::Integer(len as i64),
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
+        "STRLEN" => {
+            require_args!(rest, 1, "strlen");
+            match commands::string::strlen(engine, &rest[0]) {
+                Ok(len) => Frame::Integer(len as i64),
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
+        "INCR" => {
+            require_args!(rest, 1, "incr");
+            match commands::string::incr_by(engine, rest[0].clone(), 1) {
+                Ok(n) => Frame::Integer(n),
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
+        "DECR" => {
+            require_args!(rest, 1, "decr");
+            match commands::string::incr_by(engine, rest[0].clone(), -1) {
+                Ok(n) => Frame::Integer(n),
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
         "HSET" => {
+            require_args!(rest, 3, "hset");
             match commands::hash::hset(engine, rest[0].clone(), rest[1].clone(), rest[2].clone()) {
                 Ok(()) => Frame::Integer(1),
                 Err(e) => engine_error_to_frame(e),
             }
         }
-        "HGET" => match commands::hash::hget(engine, &rest[0], &rest[1]) {
-            Ok(Some(b)) => Frame::Bulk(b),
-            Ok(None) => Frame::Null,
-            Err(e) => engine_error_to_frame(e),
-        },
+        "HGET" => {
+            require_args!(rest, 2, "hget");
+            match commands::hash::hget(engine, &rest[0], &rest[1]) {
+                Ok(Some(b)) => Frame::Bulk(b),
+                Ok(None) => Frame::Null,
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
         "PING" => match rest.first() {
             Some(msg) => Frame::Bulk(msg.clone()),
             None => Frame::Simple("PONG".into()),
         },
-        "ECHO" => Frame::Bulk(rest[0].clone()),
+        "ECHO" => {
+            require_args!(rest, 1, "echo");
+            Frame::Bulk(rest[0].clone())
+        }
         "SELECT" => Frame::Simple("OK".into()), // single logical DB only, per 2026-08-29-sprint-2-spec.md scope
         "COMMAND" => Frame::Array(vec![]), // enough that clients probing capabilities don't choke
         "INFO" => Frame::Bulk(Bytes::from_static(
@@ -222,6 +256,33 @@ mod tests {
             panic!("expected Bulk")
         };
         assert!(!info.is_empty());
+    }
+
+    #[test]
+    fn set_with_too_few_args_returns_resp_error_not_a_panic() {
+        let engine = Engine::new();
+        assert_eq!(
+            dispatch(&engine, cmd(&[b"SET", b"onlykey"])),
+            Frame::Error("ERR wrong number of arguments for 'set' command".into())
+        );
+    }
+
+    #[test]
+    fn hset_with_too_few_args_returns_resp_error_not_a_panic() {
+        let engine = Engine::new();
+        assert_eq!(
+            dispatch(&engine, cmd(&[b"HSET", b"h", b"field"])),
+            Frame::Error("ERR wrong number of arguments for 'hset' command".into())
+        );
+    }
+
+    #[test]
+    fn echo_with_no_args_returns_resp_error_not_a_panic() {
+        let engine = Engine::new();
+        assert_eq!(
+            dispatch(&engine, cmd(&[b"ECHO"])),
+            Frame::Error("ERR wrong number of arguments for 'echo' command".into())
+        );
     }
 
     #[test]
