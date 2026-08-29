@@ -108,27 +108,50 @@ pub fn dispatch(engine: &Engine, frame: Frame, protocol: &mut Protocol, client_i
                 .iter()
                 .map(|b| String::from_utf8_lossy(b).to_ascii_uppercase())
                 .collect();
-            if flags.iter().any(|f| f == "EX" || f == "PX") {
-                return Frame::Error(
-                    "ERR syntax error: EX/PX are not supported yet (planned Sprint 4)".into(),
-                );
-            }
-            if flags.iter().any(|f| f == "NX") {
-                if commands::string::set_nx(engine, key, val) {
-                    Frame::Simple("OK".into())
-                } else {
-                    Frame::Null
+            let ex_ms: Option<i64> = if let Some(pos) = flags.iter().position(|f| f == "EX") {
+                match rest
+                    .get(2 + pos + 1)
+                    .and_then(|b| std::str::from_utf8(b).ok())
+                    .and_then(|s| s.parse::<i64>().ok())
+                {
+                    Some(secs) => Some(secs.saturating_mul(1000)),
+                    None => {
+                        return Frame::Error("ERR value is not an integer or out of range".into())
+                    }
                 }
-            } else if flags.iter().any(|f| f == "XX") {
-                if commands::string::set_xx(engine, key, val) {
-                    Frame::Simple("OK".into())
-                } else {
-                    Frame::Null
+            } else if let Some(pos) = flags.iter().position(|f| f == "PX") {
+                match rest
+                    .get(2 + pos + 1)
+                    .and_then(|b| std::str::from_utf8(b).ok())
+                    .and_then(|s| s.parse::<i64>().ok())
+                {
+                    Some(ms) => Some(ms),
+                    None => {
+                        return Frame::Error("ERR value is not an integer or out of range".into())
+                    }
                 }
             } else {
-                engine.set(key, Value::String(val));
-                Frame::Simple("OK".into())
+                None
+            };
+
+            let applied = if flags.iter().any(|f| f == "NX") {
+                commands::string::set_nx(engine, key.clone(), val)
+            } else if flags.iter().any(|f| f == "XX") {
+                commands::string::set_xx(engine, key.clone(), val)
+            } else {
+                engine.set(key.clone(), Value::String(val));
+                true
+            };
+            if !applied {
+                return Frame::Null;
             }
+            if let Some(ms) = ex_ms {
+                engine.expire_at(
+                    &key,
+                    std::time::Instant::now() + std::time::Duration::from_millis(ms.max(0) as u64),
+                );
+            }
+            Frame::Simple("OK".into())
         }
         "APPEND" => {
             require_args!(rest, 2, "append");
@@ -1284,16 +1307,86 @@ mod tests {
     }
 
     #[test]
-    fn set_with_ex_flag_returns_a_clear_not_implemented_error() {
+    fn set_with_ex_applies_a_relative_ttl_in_seconds() {
+        let engine = Engine::new();
+        dispatch(
+            &engine,
+            cmd(&[b"SET", b"k", b"v", b"EX", b"100"]),
+            &mut Protocol::default(),
+            1,
+        );
+        let Frame::Integer(secs) =
+            dispatch(&engine, cmd(&[b"TTL", b"k"]), &mut Protocol::default(), 1)
+        else {
+            panic!("expected Integer")
+        };
+        assert!((1..=100).contains(&secs));
+    }
+
+    #[test]
+    fn set_with_px_applies_a_relative_ttl_in_milliseconds() {
+        let engine = Engine::new();
+        dispatch(
+            &engine,
+            cmd(&[b"SET", b"k", b"v", b"PX", b"60000"]),
+            &mut Protocol::default(),
+            1,
+        );
+        let Frame::Integer(ms) =
+            dispatch(&engine, cmd(&[b"PTTL", b"k"]), &mut Protocol::default(), 1)
+        else {
+            panic!("expected Integer")
+        };
+        assert!((1..=60000).contains(&ms));
+    }
+
+    #[test]
+    fn set_without_ex_or_px_leaves_no_ttl() {
+        let engine = Engine::new();
+        dispatch(
+            &engine,
+            cmd(&[b"SET", b"k", b"v"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(
+            dispatch(&engine, cmd(&[b"TTL", b"k"]), &mut Protocol::default(), 1),
+            Frame::Integer(-1)
+        );
+    }
+
+    #[test]
+    fn set_with_a_non_integer_ex_value_is_a_resp_error() {
         let engine = Engine::new();
         assert_eq!(
             dispatch(
                 &engine,
-                cmd(&[b"SET", b"k", b"v", b"EX", b"10"]),
+                cmd(&[b"SET", b"k", b"v", b"EX", b"soon"]),
                 &mut Protocol::default(),
                 1
             ),
-            Frame::Error("ERR syntax error: EX/PX are not supported yet (planned Sprint 4)".into())
+            Frame::Error("ERR value is not an integer or out of range".into())
+        );
+    }
+
+    #[test]
+    fn set_overwriting_an_existing_key_with_a_ttl_clears_the_old_ttl() {
+        let engine = Engine::new();
+        dispatch(
+            &engine,
+            cmd(&[b"SET", b"k", b"old", b"EX", b"100"]),
+            &mut Protocol::default(),
+            1,
+        );
+        dispatch(
+            &engine,
+            cmd(&[b"SET", b"k", b"new"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(
+            dispatch(&engine, cmd(&[b"TTL", b"k"]), &mut Protocol::default(), 1),
+            Frame::Integer(-1)
         );
     }
 
