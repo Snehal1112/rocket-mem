@@ -73,6 +73,11 @@ pub fn dispatch(engine: &Engine, frame: Frame) -> Frame {
             Ok(None) => Frame::Null,
             Err(e) => engine_error_to_frame(e),
         },
+        "PING" => match rest.first() {
+            Some(msg) => Frame::Bulk(msg.clone()),
+            None => Frame::Simple("PONG".into()),
+        },
+        "ECHO" => Frame::Bulk(rest[0].clone()),
         _ => Frame::Error(format!("ERR unknown command '{name}'")),
     }
 }
@@ -160,6 +165,33 @@ mod tests {
         assert_eq!(
             dispatch(&engine, Frame::Array(vec![])),
             Frame::Error("ERR empty command".into())
+        );
+    }
+
+    #[test]
+    fn ping_with_no_args_replies_pong() {
+        let engine = Engine::new();
+        assert_eq!(
+            dispatch(&engine, cmd(&[b"PING"])),
+            Frame::Simple("PONG".into())
+        );
+    }
+
+    #[test]
+    fn ping_with_a_message_echoes_it_back_as_a_bulk_string() {
+        let engine = Engine::new();
+        assert_eq!(
+            dispatch(&engine, cmd(&[b"PING", b"hello"])),
+            Frame::Bulk(Bytes::from_static(b"hello"))
+        );
+    }
+
+    #[test]
+    fn echo_returns_its_argument() {
+        let engine = Engine::new();
+        assert_eq!(
+            dispatch(&engine, cmd(&[b"ECHO", b"hi"])),
+            Frame::Bulk(Bytes::from_static(b"hi"))
         );
     }
 }
