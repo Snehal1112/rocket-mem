@@ -273,4 +273,58 @@ mod tests {
         let mut buf = BytesMut::new();
         assert_eq!(RespCodec.decode(&mut buf).unwrap(), None);
     }
+
+    #[test]
+    fn decode_returns_none_on_a_bulk_string_split_mid_header() {
+        let mut buf = BytesMut::from(&b"$3\r\nfo"[..]); // header + 2 of 3 body bytes
+        assert_eq!(RespCodec.decode(&mut buf).unwrap(), None);
+        assert_eq!(&buf[..], b"$3\r\nfo"); // nothing consumed on an incomplete frame
+    }
+
+    #[test]
+    fn decode_reassembles_a_bulk_string_split_across_two_reads() {
+        let mut buf = BytesMut::from(&b"$3\r\nfo"[..]);
+        assert_eq!(RespCodec.decode(&mut buf).unwrap(), None);
+        buf.extend_from_slice(b"o\r\n"); // the rest arrives in a second read
+        let frame = RespCodec.decode(&mut buf).unwrap().unwrap();
+        assert_eq!(frame, Frame::Bulk(Bytes::from_static(b"foo")));
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn decode_reassembles_a_full_command_split_across_three_reads() {
+        // mirrors a real client sending `SET foo bar` split at arbitrary byte boundaries
+        let mut buf = BytesMut::from(&b"*3\r\n$3\r\nSET\r\n"[..]);
+        assert_eq!(RespCodec.decode(&mut buf).unwrap(), None);
+        buf.extend_from_slice(b"$3\r\nfo");
+        assert_eq!(RespCodec.decode(&mut buf).unwrap(), None);
+        buf.extend_from_slice(b"o\r\n$3\r\nbar\r\n");
+        let frame = RespCodec.decode(&mut buf).unwrap().unwrap();
+        assert_eq!(
+            frame,
+            Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"SET")),
+                Frame::Bulk(Bytes::from_static(b"foo")),
+                Frame::Bulk(Bytes::from_static(b"bar")),
+            ])
+        );
+    }
+
+    #[test]
+    fn decode_returns_none_when_only_the_array_header_has_arrived() {
+        let mut buf = BytesMut::from(&b"*2\r\n"[..]);
+        assert_eq!(RespCodec.decode(&mut buf).unwrap(), None);
+        assert_eq!(&buf[..], b"*2\r\n");
+    }
+
+    #[test]
+    fn decode_only_consumes_one_frame_when_two_full_commands_arrive_pipelined_in_one_read() {
+        let mut buf = BytesMut::from(&b"+OK\r\n+ALSO OK\r\n"[..]);
+        let first = RespCodec.decode(&mut buf).unwrap().unwrap();
+        assert_eq!(first, Frame::Simple("OK".into()));
+        assert_eq!(&buf[..], b"+ALSO OK\r\n"); // second frame untouched, ready for the next decode() call
+        let second = RespCodec.decode(&mut buf).unwrap().unwrap();
+        assert_eq!(second, Frame::Simple("ALSO OK".into()));
+        assert!(buf.is_empty());
+    }
 }
