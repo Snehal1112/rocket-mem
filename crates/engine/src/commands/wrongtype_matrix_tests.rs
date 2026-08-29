@@ -76,6 +76,7 @@ fn list_commands_reject_non_list_keys() {
         Bytes::from_static(b"k"),
         Bytes::from_static(b"x")
     ));
+    assert_wrongtype!(list::lindex(&engine_with_string_key(), b"k", 0));
 }
 
 #[test]
