@@ -286,9 +286,10 @@ pub fn dispatch(engine: &Engine, frame: Frame, protocol: &mut Protocol, client_i
         }
         "SELECT" => Frame::Simple("OK".into()), // single logical DB only, per 2026-08-29-sprint-2-spec.md scope
         "COMMAND" => Frame::Array(vec![]), // enough that clients probing capabilities don't choke
-        "INFO" => Frame::Bulk(Bytes::from_static(
-            b"# Server\r\nredis_version:rocket-mem-0.1.0\r\n",
-        )),
+        "INFO" => Frame::Bulk(Bytes::from(format!(
+            "# Server\r\nredis_version:rocket-mem-{}\r\n",
+            env!("CARGO_PKG_VERSION")
+        ))),
         "HELLO" => match rest.first() {
             None => hello_reply(*protocol, client_id),
             Some(arg) => match arg.as_ref() {
