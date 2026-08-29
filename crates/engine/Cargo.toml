@@ -7,3 +7,4 @@ version.workspace = true
 common = { path = "../common" }
 bytes.workspace = true
 parking_lot.workspace = true
+rand.workspace = true
