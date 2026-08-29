@@ -1,5 +1,6 @@
 use crate::{store::Store, Value};
 use bytes::Bytes;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -11,12 +12,24 @@ pub enum TtlStatus {
 
 pub struct Engine {
     store: Store,
+    maxmemory: Option<usize>,
+    eviction_count: AtomicUsize,
 }
 
 impl Engine {
     pub fn new() -> Self {
         Self {
             store: Store::new(16),
+            maxmemory: None,
+            eviction_count: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn with_maxmemory(bytes: usize) -> Self {
+        Self {
+            store: Store::new(16),
+            maxmemory: Some(bytes),
+            eviction_count: AtomicUsize::new(0),
         }
     }
 
@@ -24,7 +37,8 @@ impl Engine {
         self.store.get(key)
     }
     pub fn set(&self, key: Bytes, value: Value) {
-        self.store.set(key, value)
+        self.store.set(key, value);
+        self.maybe_evict();
     }
     pub fn del(&self, key: &[u8]) -> bool {
         self.store.del(key)
@@ -44,11 +58,18 @@ impl Engine {
     {
         self.store.with_ref(key, f)
     }
+    /// Also evicts, because this — not `set` — is how RPUSH/HSET/SADD/ZADD grow a value:
+    /// accounting the growth (which `Shard::with_mut` now does) without ever acting on it
+    /// would leave a pure-collection workload permanently over the ceiling. `Shard::with_mut`
+    /// has already released its write lock by the time it returns, so evicting here can't
+    /// deadlock against it.
     pub fn with_mut<F, R>(&self, key: &[u8], f: F) -> R
     where
         F: FnOnce(Option<&mut Value>) -> R,
     {
-        self.store.with_mut(key, f)
+        let result = self.store.with_mut(key, f);
+        self.maybe_evict();
+        result
     }
     pub fn expire_at(&self, key: &[u8], at: Instant) -> bool {
         self.store.expire_at(key, at)
@@ -61,6 +82,35 @@ impl Engine {
     }
     pub fn active_expire_cycle(&self, shard_idx: usize) -> usize {
         self.store.active_expire_cycle(shard_idx)
+    }
+
+    pub fn memory_used(&self) -> usize {
+        self.store.memory_used()
+    }
+
+    pub fn eviction_count(&self) -> usize {
+        self.eviction_count.load(Ordering::Relaxed)
+    }
+
+    /// Samples a handful of entries per shard and evicts the one with the oldest recorded
+    /// touch, repeating until back under budget or `MAX_EVICTION_ATTEMPTS` is hit — a bounded
+    /// loop even if the ceiling is misconfigured smaller than a single entry.
+    fn maybe_evict(&self) {
+        const MAX_EVICTION_ATTEMPTS: usize = 1000;
+        const SAMPLE_PER_SHARD: usize = 5;
+        let Some(ceiling) = self.maxmemory else {
+            return;
+        };
+        let mut attempts = 0;
+        while self.store.memory_used() > ceiling && attempts < MAX_EVICTION_ATTEMPTS {
+            let candidates = self.store.sample_for_eviction(SAMPLE_PER_SHARD);
+            let Some((key, _)) = candidates.into_iter().min_by_key(|(_, tick)| *tick) else {
+                break; // nothing left to evict
+            };
+            self.store.del(&key);
+            self.eviction_count.fetch_add(1, Ordering::Relaxed);
+            attempts += 1;
+        }
     }
 }
 
@@ -212,5 +262,80 @@ mod tests {
             keys,
             vec![Bytes::from_static(b"a"), Bytes::from_static(b"b")]
         );
+    }
+
+    #[test]
+    fn new_engine_has_no_memory_ceiling_and_never_evicts() {
+        let engine = Engine::new();
+        for i in 0..1000 {
+            engine.set(
+                Bytes::from(format!("k{i}")),
+                Value::String(Bytes::from(vec![b'x'; 100])),
+            );
+        }
+        assert_eq!(engine.eviction_count(), 0);
+    }
+
+    #[test]
+    fn with_maxmemory_keeps_memory_used_under_the_configured_ceiling() {
+        let engine = Engine::with_maxmemory(2_000);
+        for i in 0..100 {
+            engine.set(
+                Bytes::from(format!("k{i}")),
+                Value::String(Bytes::from(vec![b'x'; 100])),
+            );
+        }
+        assert!(engine.memory_used() <= 2_000);
+        assert!(engine.eviction_count() > 0);
+    }
+
+    #[test]
+    fn with_maxmemory_evicts_the_least_recently_touched_key_first() {
+        // a ceiling that comfortably fits 2 entries but not 3
+        let engine = Engine::with_maxmemory(300);
+        engine.set(
+            Bytes::from_static(b"old"),
+            Value::String(Bytes::from(vec![b'x'; 50])),
+        );
+        engine.set(
+            Bytes::from_static(b"middle"),
+            Value::String(Bytes::from(vec![b'x'; 50])),
+        );
+        engine.get(b"old"); // touch "old" so it's fresher than "middle" going into the next set
+        engine.set(
+            Bytes::from_static(b"new"),
+            Value::String(Bytes::from(vec![b'x'; 50])),
+        );
+        // "middle" is now the least-recently-touched of the three and should be the one evicted
+        // (not a strict guarantee under sampling, but true whenever "middle" is in the sample —
+        // this test uses a small enough keyspace that every key is always sampled)
+        assert_eq!(engine.get(b"middle"), None);
+        assert!(engine.get(b"old").is_some());
+        assert!(engine.get(b"new").is_some());
+    }
+
+    #[test]
+    fn with_maxmemory_also_bounds_memory_grown_in_place_not_only_through_set() {
+        // RPUSH/HSET/SADD/ZADD never call Engine::set — they grow a value through with_mut.
+        // Without eviction wired into with_mut too, this workload would blow straight past the
+        // ceiling while memory accounting silently watched it happen.
+        let engine = Engine::with_maxmemory(500);
+        engine.set(
+            Bytes::from_static(b"filler"),
+            Value::String(Bytes::from(vec![b'x'; 100])),
+        );
+        engine.set(
+            Bytes::from_static(b"list"),
+            Value::List(std::collections::VecDeque::new()),
+        );
+        for i in 0..50 {
+            engine.with_mut(b"list", |v| {
+                if let Some(Value::List(l)) = v {
+                    l.push_back(Bytes::from(format!("element-{i}")));
+                }
+            });
+        }
+        assert!(engine.memory_used() <= 500);
+        assert!(engine.eviction_count() > 0);
     }
 }

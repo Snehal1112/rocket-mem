@@ -262,7 +262,10 @@ mod tests {
     fn memory_used_sums_bytes_used_across_all_shards() {
         let store = Store::new(16);
         assert_eq!(store.memory_used(), 0);
-        store.set(Bytes::from_static(b"k"), Value::String(Bytes::from_static(b"v")));
+        store.set(
+            Bytes::from_static(b"k"),
+            Value::String(Bytes::from_static(b"v")),
+        );
         assert!(store.memory_used() > 0);
     }
 
@@ -270,7 +273,10 @@ mod tests {
     fn sample_for_eviction_collects_candidates_from_every_shard() {
         let store = Store::new(16);
         for i in 0..32 {
-            store.set(Bytes::from(format!("k{i}")), Value::String(Bytes::from_static(b"v")));
+            store.set(
+                Bytes::from(format!("k{i}")),
+                Value::String(Bytes::from_static(b"v")),
+            );
         }
         // with 32 keys spread across 16 shards, sampling 1 per shard should find at least
         // several distinct shards' worth of candidates (exact count depends on hash distribution)
