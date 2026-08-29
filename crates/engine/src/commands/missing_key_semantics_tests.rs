@@ -1,5 +1,5 @@
-use crate::Engine;
 use crate::commands::{hash, list, set, string};
+use crate::Engine;
 
 #[test]
 fn missing_key_reads_return_empty_or_none_not_errors() {

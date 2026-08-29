@@ -1,6 +1,6 @@
+use crate::{Engine, Value};
 use bytes::Bytes;
 use std::collections::HashSet;
-use crate::{Engine, Value};
 
 fn get_set(engine: &Engine, key: &[u8]) -> Result<HashSet<Bytes>, common::EngineError> {
     match engine.get(key) {
@@ -73,7 +73,13 @@ mod tests {
     #[test]
     fn sadd_on_string_key_returns_wrongtype() {
         let engine = Engine::new();
-        engine.set(Bytes::from_static(b"k"), Value::String(Bytes::from_static(b"v")));
-        assert_eq!(sadd(&engine, Bytes::from_static(b"k"), Bytes::from_static(b"x")).unwrap_err(), common::EngineError::WrongType);
+        engine.set(
+            Bytes::from_static(b"k"),
+            Value::String(Bytes::from_static(b"v")),
+        );
+        assert_eq!(
+            sadd(&engine, Bytes::from_static(b"k"), Bytes::from_static(b"x")).unwrap_err(),
+            common::EngineError::WrongType
+        );
     }
 }

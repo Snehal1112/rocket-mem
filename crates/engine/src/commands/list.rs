@@ -1,6 +1,6 @@
+use crate::{Engine, Value};
 use bytes::Bytes;
 use std::collections::VecDeque;
-use crate::{Engine, Value};
 
 fn get_list(engine: &Engine, key: &[u8]) -> Result<VecDeque<Bytes>, common::EngineError> {
     match engine.get(key) {
@@ -51,13 +51,30 @@ pub fn llen(engine: &Engine, key: &[u8]) -> Result<usize, common::EngineError> {
 }
 
 /// start/stop follow Redis semantics: negative indices count from the end, -1 is the last element.
-pub fn lrange(engine: &Engine, key: &[u8], start: i64, stop: i64) -> Result<Vec<Bytes>, common::EngineError> {
+pub fn lrange(
+    engine: &Engine,
+    key: &[u8],
+    start: i64,
+    stop: i64,
+) -> Result<Vec<Bytes>, common::EngineError> {
     let list = get_list(engine, key)?;
     let len = list.len() as i64;
-    let norm = |i: i64| -> i64 { if i < 0 { (len + i).max(0) } else { i.min(len) } };
+    let norm = |i: i64| -> i64 {
+        if i < 0 {
+            (len + i).max(0)
+        } else {
+            i.min(len)
+        }
+    };
     let (s, e) = (norm(start), norm(stop) + 1);
-    if s >= e { return Ok(Vec::new()); }
-    Ok(list.into_iter().skip(s as usize).take((e - s) as usize).collect())
+    if s >= e {
+        return Ok(Vec::new());
+    }
+    Ok(list
+        .into_iter()
+        .skip(s as usize)
+        .take((e - s) as usize)
+        .collect())
 }
 
 #[cfg(test)]
@@ -72,7 +89,10 @@ mod tests {
         rpush(&engine, Bytes::from_static(b"l"), Bytes::from_static(b"a")).unwrap();
         rpush(&engine, Bytes::from_static(b"l"), Bytes::from_static(b"b")).unwrap();
         let items = lrange(&engine, b"l", 0, -1).unwrap();
-        assert_eq!(items, vec![Bytes::from_static(b"a"), Bytes::from_static(b"b")]);
+        assert_eq!(
+            items,
+            vec![Bytes::from_static(b"a"), Bytes::from_static(b"b")]
+        );
     }
 
     #[test]
@@ -81,7 +101,10 @@ mod tests {
         rpush(&engine, Bytes::from_static(b"l"), Bytes::from_static(b"b")).unwrap();
         lpush(&engine, Bytes::from_static(b"l"), Bytes::from_static(b"a")).unwrap();
         let items = lrange(&engine, b"l", 0, -1).unwrap();
-        assert_eq!(items, vec![Bytes::from_static(b"a"), Bytes::from_static(b"b")]);
+        assert_eq!(
+            items,
+            vec![Bytes::from_static(b"a"), Bytes::from_static(b"b")]
+        );
     }
 
     #[test]
@@ -96,14 +119,26 @@ mod tests {
     #[test]
     fn rpush_on_string_key_returns_wrongtype() {
         let engine = Engine::new();
-        engine.set(Bytes::from_static(b"k"), Value::String(Bytes::from_static(b"v")));
-        assert_eq!(rpush(&engine, Bytes::from_static(b"k"), Bytes::from_static(b"x")).unwrap_err(), common::EngineError::WrongType);
+        engine.set(
+            Bytes::from_static(b"k"),
+            Value::String(Bytes::from_static(b"v")),
+        );
+        assert_eq!(
+            rpush(&engine, Bytes::from_static(b"k"), Bytes::from_static(b"x")).unwrap_err(),
+            common::EngineError::WrongType
+        );
     }
 
     #[test]
     fn lpush_on_string_key_returns_wrongtype() {
         let engine = Engine::new();
-        engine.set(Bytes::from_static(b"k"), Value::String(Bytes::from_static(b"v")));
-        assert_eq!(lpush(&engine, Bytes::from_static(b"k"), Bytes::from_static(b"x")).unwrap_err(), common::EngineError::WrongType);
+        engine.set(
+            Bytes::from_static(b"k"),
+            Value::String(Bytes::from_static(b"v")),
+        );
+        assert_eq!(
+            lpush(&engine, Bytes::from_static(b"k"), Bytes::from_static(b"x")).unwrap_err(),
+            common::EngineError::WrongType
+        );
     }
 }

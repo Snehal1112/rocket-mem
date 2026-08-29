@@ -1,5 +1,5 @@
-use bytes::Bytes;
 use crate::{shard::Shard, Value};
+use bytes::Bytes;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
@@ -9,7 +9,9 @@ pub struct Store {
 
 impl Store {
     pub fn new(shard_count: usize) -> Self {
-        Self { shards: (0..shard_count).map(|_| Shard::new()).collect() }
+        Self {
+            shards: (0..shard_count).map(|_| Shard::new()).collect(),
+        }
     }
 
     fn shard_for(&self, key: &[u8]) -> &Shard {
@@ -19,11 +21,21 @@ impl Store {
         &self.shards[idx]
     }
 
-    pub fn get(&self, key: &[u8]) -> Option<Value> { self.shard_for(key).get(key) }
-    pub fn set(&self, key: Bytes, value: Value) { self.shard_for(&key).set(key, value) }
-    pub fn del(&self, key: &[u8]) -> bool { self.shard_for(key).del(key) }
-    pub fn exists(&self, key: &[u8]) -> bool { self.shard_for(key).exists(key) }
-    pub fn keys(&self) -> Vec<Bytes> { self.shards.iter().flat_map(|s| s.keys()).collect() }
+    pub fn get(&self, key: &[u8]) -> Option<Value> {
+        self.shard_for(key).get(key)
+    }
+    pub fn set(&self, key: Bytes, value: Value) {
+        self.shard_for(&key).set(key, value)
+    }
+    pub fn del(&self, key: &[u8]) -> bool {
+        self.shard_for(key).del(key)
+    }
+    pub fn exists(&self, key: &[u8]) -> bool {
+        self.shard_for(key).exists(key)
+    }
+    pub fn keys(&self) -> Vec<Bytes> {
+        self.shards.iter().flat_map(|s| s.keys()).collect()
+    }
 
     #[cfg(test)]
     pub fn shard_key_counts(&self) -> Vec<usize> {
@@ -34,24 +46,40 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
     use crate::Value;
+    use bytes::Bytes;
 
     #[test]
     fn set_then_get_round_trips() {
         let store = Store::new(16);
-        store.set(Bytes::from_static(b"foo"), Value::String(Bytes::from_static(b"bar")));
-        assert_eq!(store.get(b"foo"), Some(Value::String(Bytes::from_static(b"bar"))));
+        store.set(
+            Bytes::from_static(b"foo"),
+            Value::String(Bytes::from_static(b"bar")),
+        );
+        assert_eq!(
+            store.get(b"foo"),
+            Some(Value::String(Bytes::from_static(b"bar")))
+        );
     }
 
     #[test]
     fn keys_distribute_across_more_than_one_shard() {
         let store = Store::new(16);
         for i in 0..1000 {
-            store.set(Bytes::from(format!("key{i}")), Value::String(Bytes::from_static(b"v")));
+            store.set(
+                Bytes::from(format!("key{i}")),
+                Value::String(Bytes::from_static(b"v")),
+            );
         }
-        let non_empty = store.shard_key_counts().into_iter().filter(|&c| c > 0).count();
-        assert!(non_empty > 1, "expected keys to spread across shards, got {non_empty} non-empty");
+        let non_empty = store
+            .shard_key_counts()
+            .into_iter()
+            .filter(|&c| c > 0)
+            .count();
+        assert!(
+            non_empty > 1,
+            "expected keys to spread across shards, got {non_empty} non-empty"
+        );
     }
 
     #[test]

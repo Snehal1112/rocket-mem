@@ -1,5 +1,5 @@
-use bytes::Bytes;
 use crate::Value;
+use bytes::Bytes;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 
@@ -9,7 +9,9 @@ pub struct Shard {
 
 impl Shard {
     pub fn new() -> Self {
-        Self { map: RwLock::new(HashMap::new()) }
+        Self {
+            map: RwLock::new(HashMap::new()),
+        }
     }
 
     pub fn get(&self, key: &[u8]) -> Option<Value> {
@@ -36,20 +38,29 @@ impl Shard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
     use crate::Value;
+    use bytes::Bytes;
 
     #[test]
     fn set_then_get_returns_value() {
         let shard = Shard::new();
-        shard.set(Bytes::from_static(b"foo"), Value::String(Bytes::from_static(b"bar")));
-        assert_eq!(shard.get(b"foo"), Some(Value::String(Bytes::from_static(b"bar"))));
+        shard.set(
+            Bytes::from_static(b"foo"),
+            Value::String(Bytes::from_static(b"bar")),
+        );
+        assert_eq!(
+            shard.get(b"foo"),
+            Some(Value::String(Bytes::from_static(b"bar")))
+        );
     }
 
     #[test]
     fn del_removes_key_and_reports_it_existed() {
         let shard = Shard::new();
-        shard.set(Bytes::from_static(b"k"), Value::String(Bytes::from_static(b"v")));
+        shard.set(
+            Bytes::from_static(b"k"),
+            Value::String(Bytes::from_static(b"v")),
+        );
         assert!(shard.del(b"k"));
         assert_eq!(shard.get(b"k"), None);
         assert!(!shard.del(b"k"));

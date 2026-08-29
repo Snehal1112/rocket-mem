@@ -1,4 +1,4 @@
-mod commands;
+pub mod commands;
 mod engine;
 mod shard;
 mod store;
