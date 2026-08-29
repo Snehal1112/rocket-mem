@@ -130,10 +130,9 @@ mod tests {
             .send(Frame::Array(vec![Frame::Bulk(Bytes::from_static(b"PING"))]))
             .await
             .unwrap();
-        // PING isn't wired until 05-stub-commands.md — expect the current "unknown command" error, not a hang or crash
-        assert!(matches!(
+        assert_eq!(
             framed.next().await.unwrap().unwrap(),
-            Frame::Error(_)
-        ));
+            Frame::Simple("PONG".into())
+        );
     }
 }
