@@ -16,6 +16,13 @@ fn missing_key_reads_return_empty_or_none_not_errors() {
     assert!(!set::sismember(&engine, b"missing", b"x").unwrap());
     assert_eq!(sorted_set::zscore(&engine, b"missing", b"m").unwrap(), None);
     assert_eq!(sorted_set::zcard(&engine, b"missing").unwrap(), 0);
+    assert_eq!(set::spop(&engine, b"missing").unwrap(), None);
+    assert_eq!(set::srandmember(&engine, b"missing").unwrap(), None);
+    assert!(
+        set::sinter(&engine, &[bytes::Bytes::from_static(b"missing")])
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]

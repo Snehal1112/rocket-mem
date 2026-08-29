@@ -98,6 +98,10 @@ fn set_commands_reject_non_set_keys() {
         Bytes::from_static(b"k"),
         Bytes::from_static(b"m")
     ));
+    let e3 = engine_with_string_key();
+    assert_wrongtype!(set::sinter(&e3, &[Bytes::from_static(b"k")]));
+    let e4 = engine_with_string_key();
+    assert_wrongtype!(set::spop(&e4, b"k"));
 }
 
 #[test]

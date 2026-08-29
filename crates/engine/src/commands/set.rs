@@ -40,6 +40,93 @@ pub fn scard(engine: &Engine, key: &[u8]) -> Result<usize, common::EngineError> 
     Ok(get_set(engine, key)?.len())
 }
 
+pub fn sinter(engine: &Engine, keys: &[Bytes]) -> Result<HashSet<Bytes>, common::EngineError> {
+    let mut sets = Vec::with_capacity(keys.len());
+    for k in keys {
+        sets.push(get_set(engine, k)?);
+    }
+    let mut iter = sets.into_iter();
+    let Some(first) = iter.next() else {
+        return Ok(HashSet::new());
+    };
+    Ok(iter.fold(first, |acc, s| acc.intersection(&s).cloned().collect()))
+}
+
+pub fn sunion(engine: &Engine, keys: &[Bytes]) -> Result<HashSet<Bytes>, common::EngineError> {
+    let mut result = HashSet::new();
+    for k in keys {
+        result.extend(get_set(engine, k)?);
+    }
+    Ok(result)
+}
+
+pub fn sdiff(engine: &Engine, keys: &[Bytes]) -> Result<HashSet<Bytes>, common::EngineError> {
+    let mut iter = keys.iter();
+    let Some(first_key) = iter.next() else {
+        return Ok(HashSet::new());
+    };
+    let mut result = get_set(engine, first_key)?;
+    for k in iter {
+        let other = get_set(engine, k)?;
+        result.retain(|m| !other.contains(m));
+    }
+    Ok(result)
+}
+
+pub fn sinterstore(
+    engine: &Engine,
+    dest: Bytes,
+    keys: &[Bytes],
+) -> Result<usize, common::EngineError> {
+    let result = sinter(engine, keys)?;
+    let len = result.len();
+    engine.set(dest, Value::Set(result));
+    Ok(len)
+}
+
+pub fn sunionstore(
+    engine: &Engine,
+    dest: Bytes,
+    keys: &[Bytes],
+) -> Result<usize, common::EngineError> {
+    let result = sunion(engine, keys)?;
+    let len = result.len();
+    engine.set(dest, Value::Set(result));
+    Ok(len)
+}
+
+pub fn sdiffstore(
+    engine: &Engine,
+    dest: Bytes,
+    keys: &[Bytes],
+) -> Result<usize, common::EngineError> {
+    let result = sdiff(engine, keys)?;
+    let len = result.len();
+    engine.set(dest, Value::Set(result));
+    Ok(len)
+}
+
+pub fn spop(engine: &Engine, key: &[u8]) -> Result<Option<Bytes>, common::EngineError> {
+    use rand::seq::IteratorRandom;
+    let mut set = match engine.get(key) {
+        None => return Ok(None),
+        Some(Value::Set(s)) => s,
+        Some(_) => return Err(common::EngineError::WrongType),
+    };
+    let Some(member) = set.iter().choose(&mut rand::thread_rng()).cloned() else {
+        return Ok(None);
+    };
+    set.remove(&member);
+    engine.set(Bytes::copy_from_slice(key), Value::Set(set));
+    Ok(Some(member))
+}
+
+pub fn srandmember(engine: &Engine, key: &[u8]) -> Result<Option<Bytes>, common::EngineError> {
+    use rand::seq::IteratorRandom;
+    let set = get_set(engine, key)?;
+    Ok(set.into_iter().choose(&mut rand::thread_rng()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -79,6 +166,124 @@ mod tests {
         );
         assert_eq!(
             sadd(&engine, Bytes::from_static(b"k"), Bytes::from_static(b"x")).unwrap_err(),
+            common::EngineError::WrongType
+        );
+    }
+
+    #[test]
+    fn sinter_returns_only_members_present_in_every_set() {
+        let engine = Engine::new();
+        sadd(&engine, Bytes::from_static(b"a"), Bytes::from_static(b"x")).unwrap();
+        sadd(&engine, Bytes::from_static(b"a"), Bytes::from_static(b"y")).unwrap();
+        sadd(&engine, Bytes::from_static(b"b"), Bytes::from_static(b"y")).unwrap();
+        sadd(&engine, Bytes::from_static(b"b"), Bytes::from_static(b"z")).unwrap();
+        let result = sinter(
+            &engine,
+            &[Bytes::from_static(b"a"), Bytes::from_static(b"b")],
+        )
+        .unwrap();
+        assert_eq!(result, HashSet::from([Bytes::from_static(b"y")]));
+    }
+
+    #[test]
+    fn sinter_with_a_missing_key_is_empty() {
+        let engine = Engine::new();
+        sadd(&engine, Bytes::from_static(b"a"), Bytes::from_static(b"x")).unwrap();
+        let result = sinter(
+            &engine,
+            &[Bytes::from_static(b"a"), Bytes::from_static(b"missing")],
+        )
+        .unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn sunion_returns_every_member_from_every_set() {
+        let engine = Engine::new();
+        sadd(&engine, Bytes::from_static(b"a"), Bytes::from_static(b"x")).unwrap();
+        sadd(&engine, Bytes::from_static(b"b"), Bytes::from_static(b"y")).unwrap();
+        let result = sunion(
+            &engine,
+            &[Bytes::from_static(b"a"), Bytes::from_static(b"b")],
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            HashSet::from([Bytes::from_static(b"x"), Bytes::from_static(b"y")])
+        );
+    }
+
+    #[test]
+    fn sdiff_returns_members_of_the_first_set_absent_from_the_rest() {
+        let engine = Engine::new();
+        sadd(&engine, Bytes::from_static(b"a"), Bytes::from_static(b"x")).unwrap();
+        sadd(&engine, Bytes::from_static(b"a"), Bytes::from_static(b"y")).unwrap();
+        sadd(&engine, Bytes::from_static(b"b"), Bytes::from_static(b"y")).unwrap();
+        let result = sdiff(
+            &engine,
+            &[Bytes::from_static(b"a"), Bytes::from_static(b"b")],
+        )
+        .unwrap();
+        assert_eq!(result, HashSet::from([Bytes::from_static(b"x")]));
+    }
+
+    #[test]
+    fn sinterstore_stores_the_result_and_returns_its_size() {
+        let engine = Engine::new();
+        sadd(&engine, Bytes::from_static(b"a"), Bytes::from_static(b"x")).unwrap();
+        sadd(&engine, Bytes::from_static(b"b"), Bytes::from_static(b"x")).unwrap();
+        let len = sinterstore(
+            &engine,
+            Bytes::from_static(b"dest"),
+            &[Bytes::from_static(b"a"), Bytes::from_static(b"b")],
+        )
+        .unwrap();
+        assert_eq!(len, 1);
+        assert_eq!(
+            smembers(&engine, b"dest").unwrap(),
+            HashSet::from([Bytes::from_static(b"x")])
+        );
+    }
+
+    #[test]
+    fn spop_removes_and_returns_a_member() {
+        let engine = Engine::new();
+        sadd(&engine, Bytes::from_static(b"s"), Bytes::from_static(b"x")).unwrap();
+        let popped = spop(&engine, b"s").unwrap();
+        assert_eq!(popped, Some(Bytes::from_static(b"x")));
+        assert_eq!(scard(&engine, b"s").unwrap(), 0);
+    }
+
+    #[test]
+    fn spop_on_missing_key_returns_none_not_an_error() {
+        let engine = Engine::new();
+        assert_eq!(spop(&engine, b"missing").unwrap(), None);
+    }
+
+    #[test]
+    fn srandmember_returns_a_member_without_removing_it() {
+        let engine = Engine::new();
+        sadd(&engine, Bytes::from_static(b"s"), Bytes::from_static(b"x")).unwrap();
+        let picked = srandmember(&engine, b"s").unwrap();
+        assert_eq!(picked, Some(Bytes::from_static(b"x")));
+        assert_eq!(scard(&engine, b"s").unwrap(), 1);
+    }
+
+    #[test]
+    fn srandmember_on_missing_key_returns_none_not_an_error() {
+        let engine = Engine::new();
+        assert_eq!(srandmember(&engine, b"missing").unwrap(), None);
+    }
+
+    #[test]
+    fn sinter_on_string_key_returns_wrongtype() {
+        let engine = Engine::new();
+        engine.set(
+            Bytes::from_static(b"k"),
+            Value::String(Bytes::from_static(b"v")),
+        );
+        assert_eq!(
+            sinter(&engine, &[Bytes::from_static(b"k")]).unwrap_err(),
             common::EngineError::WrongType
         );
     }
