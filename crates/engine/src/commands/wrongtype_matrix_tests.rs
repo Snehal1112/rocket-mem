@@ -49,6 +49,13 @@ fn string_commands_reject_non_string_keys() {
         Bytes::from_static(b"k"),
         1
     ));
+    assert_wrongtype!(string::getrange(&engine_with_hash_key(), b"k", 0, -1));
+    assert_wrongtype!(string::setrange(
+        &engine_with_list_key(),
+        Bytes::from_static(b"k"),
+        0,
+        b"x"
+    ));
 }
 
 #[test]

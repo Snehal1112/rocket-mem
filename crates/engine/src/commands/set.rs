@@ -10,11 +10,13 @@ fn get_set(engine: &Engine, key: &[u8]) -> Result<HashSet<Bytes>, common::Engine
     }
 }
 
-pub fn sadd(engine: &Engine, key: Bytes, member: Bytes) -> Result<(), common::EngineError> {
+/// Returns whether `member` was newly added (`false` if it was already present) —
+/// callers implementing variadic `SADD` sum this across members for the count Redis reports.
+pub fn sadd(engine: &Engine, key: Bytes, member: Bytes) -> Result<bool, common::EngineError> {
     let mut set = get_set(engine, &key)?;
-    set.insert(member);
+    let added = set.insert(member);
     engine.set(key, Value::Set(set));
-    Ok(())
+    Ok(added)
 }
 
 pub fn srem(engine: &Engine, key: &[u8], member: &[u8]) -> Result<bool, common::EngineError> {

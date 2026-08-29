@@ -69,6 +69,62 @@ pub fn getset(
     Ok(old)
 }
 
+/// start/end follow Redis semantics: negative indices count from the end, -1 is the last byte,
+/// out-of-range indices clamp rather than error.
+pub fn getrange(
+    engine: &Engine,
+    key: &[u8],
+    start: i64,
+    end: i64,
+) -> Result<Bytes, common::EngineError> {
+    let buf = match engine.get(key) {
+        None => return Ok(Bytes::new()),
+        Some(Value::String(b)) => b,
+        Some(_) => return Err(common::EngineError::WrongType),
+    };
+    let len = buf.len() as i64;
+    let norm = |i: i64| -> i64 {
+        if i < 0 {
+            (len + i).max(0)
+        } else {
+            i.min(len)
+        }
+    };
+    let s = norm(start);
+    let e = (norm(end) + 1).min(len);
+    if s >= e {
+        return Ok(Bytes::new());
+    }
+    Ok(buf.slice(s as usize..e as usize))
+}
+
+/// Overwrites `value` into the string starting at byte `offset`, zero-padding first if `offset`
+/// extends past the current length. Returns the string's length after the write. An empty
+/// `value` against a missing key is a documented Redis no-op — it must not create the key.
+pub fn setrange(
+    engine: &Engine,
+    key: Bytes,
+    offset: usize,
+    value: &[u8],
+) -> Result<usize, common::EngineError> {
+    let mut buf = match engine.get(&key) {
+        None => Vec::new(),
+        Some(Value::String(b)) => b.to_vec(),
+        Some(_) => return Err(common::EngineError::WrongType),
+    };
+    if value.is_empty() {
+        return Ok(buf.len());
+    }
+    let end = offset + value.len();
+    if buf.len() < end {
+        buf.resize(end, 0);
+    }
+    buf[offset..end].copy_from_slice(value);
+    let len = buf.len();
+    engine.set(key, Value::String(Bytes::from(buf)));
+    Ok(len)
+}
+
 pub fn mset(engine: &Engine, pairs: Vec<(Bytes, Bytes)>) {
     for (k, v) in pairs {
         engine.set(k, Value::String(v));
@@ -251,6 +307,102 @@ mod tests {
         engine.set(Bytes::from_static(b"h"), Value::Hash(Default::default()));
         let err = getset(&engine, Bytes::from_static(b"h"), Bytes::from_static(b"v")).unwrap_err();
         assert_eq!(err, common::EngineError::WrongType);
+    }
+
+    #[test]
+    fn getrange_on_missing_key_is_empty_not_error() {
+        let engine = Engine::new();
+        assert_eq!(getrange(&engine, b"missing", 0, -1).unwrap(), Bytes::new());
+    }
+
+    #[test]
+    fn getrange_with_positive_indices_returns_the_inclusive_slice() {
+        let engine = Engine::new();
+        engine.set(
+            Bytes::from_static(b"k"),
+            Value::String(Bytes::from_static(b"Hello World")),
+        );
+        assert_eq!(
+            getrange(&engine, b"k", 0, 4).unwrap(),
+            Bytes::from_static(b"Hello")
+        );
+    }
+
+    #[test]
+    fn getrange_with_negative_indices_counts_from_the_end() {
+        let engine = Engine::new();
+        engine.set(
+            Bytes::from_static(b"k"),
+            Value::String(Bytes::from_static(b"Hello World")),
+        );
+        assert_eq!(
+            getrange(&engine, b"k", -5, -1).unwrap(),
+            Bytes::from_static(b"World")
+        );
+    }
+
+    #[test]
+    fn getrange_past_the_end_clamps_to_empty_rather_than_panicking() {
+        let engine = Engine::new();
+        engine.set(
+            Bytes::from_static(b"k"),
+            Value::String(Bytes::from_static(b"Hello")),
+        );
+        assert_eq!(getrange(&engine, b"k", 10, 100).unwrap(), Bytes::new());
+    }
+
+    #[test]
+    fn getrange_on_hash_key_returns_wrongtype() {
+        let engine = Engine::new();
+        engine.set(Bytes::from_static(b"h"), Value::Hash(Default::default()));
+        assert_eq!(
+            getrange(&engine, b"h", 0, -1).unwrap_err(),
+            common::EngineError::WrongType
+        );
+    }
+
+    #[test]
+    fn setrange_on_missing_key_zero_pads_up_to_the_offset() {
+        let engine = Engine::new();
+        let len = setrange(&engine, Bytes::from_static(b"k"), 5, b"World").unwrap();
+        assert_eq!(len, 10);
+        assert_eq!(
+            get(&engine, b"k").unwrap(),
+            Some(Bytes::from(b"\0\0\0\0\0World".to_vec()))
+        );
+    }
+
+    #[test]
+    fn setrange_overwrites_within_an_existing_value() {
+        let engine = Engine::new();
+        engine.set(
+            Bytes::from_static(b"k"),
+            Value::String(Bytes::from_static(b"Hello World")),
+        );
+        let len = setrange(&engine, Bytes::from_static(b"k"), 6, b"Redis!").unwrap();
+        assert_eq!(len, 12);
+        assert_eq!(
+            get(&engine, b"k").unwrap(),
+            Some(Bytes::from_static(b"Hello Redis!"))
+        );
+    }
+
+    #[test]
+    fn setrange_with_an_empty_value_on_a_missing_key_does_not_create_it() {
+        let engine = Engine::new();
+        let len = setrange(&engine, Bytes::from_static(b"missing"), 0, b"").unwrap();
+        assert_eq!(len, 0);
+        assert_eq!(get(&engine, b"missing").unwrap(), None);
+    }
+
+    #[test]
+    fn setrange_on_hash_key_returns_wrongtype() {
+        let engine = Engine::new();
+        engine.set(Bytes::from_static(b"h"), Value::Hash(Default::default()));
+        assert_eq!(
+            setrange(&engine, Bytes::from_static(b"h"), 0, b"x").unwrap_err(),
+            common::EngineError::WrongType
+        );
     }
 
     #[test]

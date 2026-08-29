@@ -2,20 +2,23 @@ use crate::{Engine, Value};
 use bytes::Bytes;
 use std::collections::HashMap;
 
+/// Returns whether `field` was newly added (`false` if it already existed and was overwritten) —
+/// callers implementing variadic `HSET` sum this across pairs for the count Redis reports.
 pub fn hset(
     engine: &Engine,
     key: Bytes,
     field: Bytes,
     val: Bytes,
-) -> Result<(), common::EngineError> {
+) -> Result<bool, common::EngineError> {
     let mut map = match engine.get(&key) {
         Some(Value::Hash(m)) => m,
         Some(_) => return Err(common::EngineError::WrongType),
         None => HashMap::new(),
     };
+    let is_new = !map.contains_key(&field);
     map.insert(field, val);
     engine.set(key, Value::Hash(map));
-    Ok(())
+    Ok(is_new)
 }
 
 pub fn hget(

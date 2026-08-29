@@ -76,6 +76,16 @@ pub fn dispatch(engine: &Engine, frame: Frame, protocol: &mut Protocol, client_i
                 Err(e) => engine_error_to_frame(e),
             }
         }
+        "DEL" => {
+            require_args!(rest, 1, "del");
+            let deleted = rest.iter().filter(|k| engine.del(k)).count();
+            Frame::Integer(deleted as i64)
+        }
+        "EXISTS" => {
+            require_args!(rest, 1, "exists");
+            let count = rest.iter().filter(|k| engine.exists(k)).count();
+            Frame::Integer(count as i64)
+        }
         "SET" => {
             require_args!(rest, 2, "set");
             let key = rest[0].clone();
@@ -120,6 +130,41 @@ pub fn dispatch(engine: &Engine, frame: Frame, protocol: &mut Protocol, client_i
                 Err(e) => engine_error_to_frame(e),
             }
         }
+        "GETRANGE" => {
+            require_args!(rest, 3, "getrange");
+            let (start, end) = match (
+                std::str::from_utf8(&rest[1])
+                    .ok()
+                    .and_then(|s| s.parse::<i64>().ok()),
+                std::str::from_utf8(&rest[2])
+                    .ok()
+                    .and_then(|s| s.parse::<i64>().ok()),
+            ) {
+                (Some(a), Some(b)) => (a, b),
+                _ => return Frame::Error("ERR value is not an integer or out of range".into()),
+            };
+            match commands::string::getrange(engine, &rest[0], start, end) {
+                Ok(b) => Frame::Bulk(b),
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
+        "SETRANGE" => {
+            require_args!(rest, 3, "setrange");
+            let offset: i64 = match std::str::from_utf8(&rest[1])
+                .ok()
+                .and_then(|s| s.parse().ok())
+            {
+                Some(n) => n,
+                None => return Frame::Error("ERR value is not an integer or out of range".into()),
+            };
+            if offset < 0 {
+                return Frame::Error("ERR offset is out of range".into());
+            }
+            match commands::string::setrange(engine, rest[0].clone(), offset as usize, &rest[2]) {
+                Ok(len) => Frame::Integer(len as i64),
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
         "INCR" => {
             require_args!(rest, 1, "incr");
             match commands::string::incr_by(engine, rest[0].clone(), 1) {
@@ -136,10 +181,24 @@ pub fn dispatch(engine: &Engine, frame: Frame, protocol: &mut Protocol, client_i
         }
         "HSET" => {
             require_args!(rest, 3, "hset");
-            match commands::hash::hset(engine, rest[0].clone(), rest[1].clone(), rest[2].clone()) {
-                Ok(()) => Frame::Integer(1),
-                Err(e) => engine_error_to_frame(e),
+            let pairs = &rest[1..];
+            if pairs.len() % 2 != 0 {
+                return Frame::Error("ERR wrong number of arguments for 'hset' command".into());
             }
+            let mut added = 0i64;
+            for pair in pairs.chunks_exact(2) {
+                match commands::hash::hset(
+                    engine,
+                    rest[0].clone(),
+                    pair[0].clone(),
+                    pair[1].clone(),
+                ) {
+                    Ok(true) => added += 1,
+                    Ok(false) => {}
+                    Err(e) => return engine_error_to_frame(e),
+                }
+            }
+            Frame::Integer(added)
         }
         "HGET" => {
             require_args!(rest, 2, "hget");
@@ -179,6 +238,31 @@ pub fn dispatch(engine: &Engine, frame: Frame, protocol: &mut Protocol, client_i
                         .flat_map(|(f, v)| [Frame::Bulk(f), Frame::Bulk(v)])
                         .collect(),
                 ),
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
+        "HSCAN" => {
+            require_args!(rest, 2, "hscan");
+            // No MATCH/COUNT/NOVALUES support yet, matching the keyspace SCAN's current scope.
+            // A hash already lives fully in memory (HGETALL reads it all in one shot), so unlike
+            // keyspace SCAN there's no chunking to design here -- one call always returns
+            // everything and reports cursor "0" (done), which is a legitimate SCAN-family reply.
+            if std::str::from_utf8(&rest[1])
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .is_none()
+            {
+                return Frame::Error("ERR invalid cursor".into());
+            }
+            match commands::hash::hgetall(engine, &rest[0]) {
+                Ok(map) => Frame::Array(vec![
+                    Frame::Bulk(Bytes::from_static(b"0")),
+                    Frame::Array(
+                        map.into_iter()
+                            .flat_map(|(f, v)| [Frame::Bulk(f), Frame::Bulk(v)])
+                            .collect(),
+                    ),
+                ]),
                 Err(e) => engine_error_to_frame(e),
             }
         }
@@ -250,21 +334,25 @@ pub fn dispatch(engine: &Engine, frame: Frame, protocol: &mut Protocol, client_i
         }
         "RPUSH" => {
             require_args!(rest, 2, "rpush");
-            match commands::list::rpush(engine, rest[0].clone(), rest[1].clone()) {
-                Ok(()) => match commands::list::llen(engine, &rest[0]) {
-                    Ok(n) => Frame::Integer(n as i64),
-                    Err(e) => engine_error_to_frame(e),
-                },
+            for val in &rest[1..] {
+                if let Err(e) = commands::list::rpush(engine, rest[0].clone(), val.clone()) {
+                    return engine_error_to_frame(e);
+                }
+            }
+            match commands::list::llen(engine, &rest[0]) {
+                Ok(n) => Frame::Integer(n as i64),
                 Err(e) => engine_error_to_frame(e),
             }
         }
         "LPUSH" => {
             require_args!(rest, 2, "lpush");
-            match commands::list::lpush(engine, rest[0].clone(), rest[1].clone()) {
-                Ok(()) => match commands::list::llen(engine, &rest[0]) {
-                    Ok(n) => Frame::Integer(n as i64),
-                    Err(e) => engine_error_to_frame(e),
-                },
+            for val in &rest[1..] {
+                if let Err(e) = commands::list::lpush(engine, rest[0].clone(), val.clone()) {
+                    return engine_error_to_frame(e);
+                }
+            }
+            match commands::list::llen(engine, &rest[0]) {
+                Ok(n) => Frame::Integer(n as i64),
                 Err(e) => engine_error_to_frame(e),
             }
         }
@@ -394,18 +482,27 @@ pub fn dispatch(engine: &Engine, frame: Frame, protocol: &mut Protocol, client_i
         }
         "SADD" => {
             require_args!(rest, 2, "sadd");
-            match commands::set::sadd(engine, rest[0].clone(), rest[1].clone()) {
-                Ok(()) => Frame::Integer(1),
-                Err(e) => engine_error_to_frame(e),
+            let mut added = 0i64;
+            for member in &rest[1..] {
+                match commands::set::sadd(engine, rest[0].clone(), member.clone()) {
+                    Ok(true) => added += 1,
+                    Ok(false) => {}
+                    Err(e) => return engine_error_to_frame(e),
+                }
             }
+            Frame::Integer(added)
         }
         "SREM" => {
             require_args!(rest, 2, "srem");
-            match commands::set::srem(engine, &rest[0], &rest[1]) {
-                Ok(true) => Frame::Integer(1),
-                Ok(false) => Frame::Integer(0),
-                Err(e) => engine_error_to_frame(e),
+            let mut removed = 0i64;
+            for member in &rest[1..] {
+                match commands::set::srem(engine, &rest[0], member) {
+                    Ok(true) => removed += 1,
+                    Ok(false) => {}
+                    Err(e) => return engine_error_to_frame(e),
+                }
             }
+            Frame::Integer(removed)
         }
         "SMEMBERS" => {
             require_args!(rest, 1, "smembers");
@@ -804,6 +901,137 @@ mod tests {
     }
 
     #[test]
+    fn exists_counts_keys_that_exist_including_duplicates() {
+        let engine = Engine::new();
+        dispatch(
+            &engine,
+            cmd(&[b"SET", b"a", b"1"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"EXISTS", b"a", b"a", b"missing"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Integer(2)
+        );
+    }
+
+    #[test]
+    fn del_removes_keys_and_returns_the_count_actually_deleted() {
+        let engine = Engine::new();
+        dispatch(
+            &engine,
+            cmd(&[b"SET", b"a", b"1"]),
+            &mut Protocol::default(),
+            1,
+        );
+        dispatch(
+            &engine,
+            cmd(&[b"SET", b"b", b"2"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"DEL", b"a", b"b", b"missing"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Integer(2)
+        );
+        assert_eq!(
+            dispatch(&engine, cmd(&[b"GET", b"a"]), &mut Protocol::default(), 1),
+            Frame::Null
+        );
+    }
+
+    #[test]
+    fn getrange_returns_the_inclusive_byte_slice_through_dispatch() {
+        let engine = Engine::new();
+        dispatch(
+            &engine,
+            cmd(&[b"SET", b"k", b"Hello World"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"GETRANGE", b"k", b"0", b"4"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Bulk(Bytes::from_static(b"Hello"))
+        );
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"GETRANGE", b"k", b"-5", b"-1"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Bulk(Bytes::from_static(b"World"))
+        );
+    }
+
+    #[test]
+    fn getrange_on_a_non_integer_index_is_a_resp_error() {
+        let engine = Engine::new();
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"GETRANGE", b"k", b"notanumber", b"-1"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Error("ERR value is not an integer or out of range".into())
+        );
+    }
+
+    #[test]
+    fn setrange_overwrites_and_reports_the_new_length_through_dispatch() {
+        let engine = Engine::new();
+        dispatch(
+            &engine,
+            cmd(&[b"SET", b"k", b"Hello World"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"SETRANGE", b"k", b"6", b"Redis!"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Integer(12)
+        );
+        assert_eq!(
+            dispatch(&engine, cmd(&[b"GET", b"k"]), &mut Protocol::default(), 1),
+            Frame::Bulk(Bytes::from_static(b"Hello Redis!"))
+        );
+    }
+
+    #[test]
+    fn setrange_with_a_negative_offset_is_a_resp_error() {
+        let engine = Engine::new();
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"SETRANGE", b"k", b"-1", b"x"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Error("ERR offset is out of range".into())
+        );
+    }
+
+    #[test]
     fn dispatch_wrongtype_is_mapped_to_a_resp_error_frame() {
         let engine = Engine::new();
         dispatch(
@@ -1175,6 +1403,154 @@ mod tests {
     }
 
     #[test]
+    fn rpush_with_multiple_values_pushes_all_in_order_and_returns_final_length() {
+        let engine = Engine::new();
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"RPUSH", b"l", b"a", b"b", b"c"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Integer(3)
+        );
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"LRANGE", b"l", b"0", b"-1"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"a")),
+                Frame::Bulk(Bytes::from_static(b"b")),
+                Frame::Bulk(Bytes::from_static(b"c")),
+            ])
+        );
+    }
+
+    #[test]
+    fn lpush_with_multiple_values_prepends_each_so_the_last_argument_ends_up_first() {
+        let engine = Engine::new();
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"LPUSH", b"l", b"a", b"b", b"c"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Integer(3)
+        );
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"LRANGE", b"l", b"0", b"-1"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"c")),
+                Frame::Bulk(Bytes::from_static(b"b")),
+                Frame::Bulk(Bytes::from_static(b"a")),
+            ])
+        );
+    }
+
+    #[test]
+    fn sadd_with_multiple_members_returns_the_count_newly_added_not_total_args() {
+        let engine = Engine::new();
+        dispatch(
+            &engine,
+            cmd(&[b"SADD", b"s", b"x"]),
+            &mut Protocol::default(),
+            1,
+        );
+        // "x" is already a member, so only "y" and "z" count as newly added.
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"SADD", b"s", b"x", b"y", b"z"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Integer(2)
+        );
+        assert_eq!(
+            dispatch(&engine, cmd(&[b"SCARD", b"s"]), &mut Protocol::default(), 1),
+            Frame::Integer(3)
+        );
+    }
+
+    #[test]
+    fn srem_with_multiple_members_returns_the_count_actually_removed() {
+        let engine = Engine::new();
+        dispatch(
+            &engine,
+            cmd(&[b"SADD", b"s", b"x", b"y"]),
+            &mut Protocol::default(),
+            1,
+        );
+        // "z" was never a member, so only "x" and "y" count as removed.
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"SREM", b"s", b"x", b"y", b"z"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Integer(2)
+        );
+    }
+
+    #[test]
+    fn hset_with_multiple_pairs_returns_the_count_of_new_fields() {
+        let engine = Engine::new();
+        dispatch(
+            &engine,
+            cmd(&[b"HSET", b"h", b"a", b"1"]),
+            &mut Protocol::default(),
+            1,
+        );
+        // "a" already exists (overwritten, not counted); "b" and "c" are new.
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"HSET", b"h", b"a", b"99", b"b", b"2", b"c", b"3"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Integer(2)
+        );
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"HGET", b"h", b"a"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Bulk(Bytes::from_static(b"99"))
+        );
+        assert_eq!(
+            dispatch(&engine, cmd(&[b"HLEN", b"h"]), &mut Protocol::default(), 1),
+            Frame::Integer(3)
+        );
+    }
+
+    #[test]
+    fn hset_with_an_odd_number_of_field_value_args_is_a_resp_error() {
+        let engine = Engine::new();
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"HSET", b"h", b"a", b"1", b"b"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Error("ERR wrong number of arguments for 'hset' command".into())
+        );
+    }
+
+    #[test]
     fn hello_with_no_args_reports_current_protocol_without_switching() {
         let engine = Engine::new();
         let mut protocol = Protocol::Resp2;
@@ -1487,6 +1863,86 @@ mod tests {
                 1
             ),
             Frame::Error("ERR invalid cursor".into())
+        );
+    }
+
+    #[test]
+    fn hscan_returns_all_fields_in_one_call_with_a_done_cursor() {
+        let engine = Engine::new();
+        dispatch(
+            &engine,
+            cmd(&[b"HSET", b"h", b"a", b"1", b"b", b"2"]),
+            &mut Protocol::default(),
+            1,
+        );
+        let reply = dispatch(
+            &engine,
+            cmd(&[b"HSCAN", b"h", b"0"]),
+            &mut Protocol::default(),
+            1,
+        );
+        let Frame::Array(parts) = reply else {
+            panic!("expected Array")
+        };
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0], Frame::Bulk(Bytes::from_static(b"0")));
+        let Frame::Array(pairs) = &parts[1] else {
+            panic!("expected Array of field/value pairs")
+        };
+        assert_eq!(pairs.len(), 4); // 2 fields, flattened as field,value,field,value
+    }
+
+    #[test]
+    fn hscan_on_missing_key_returns_an_empty_array_not_an_error() {
+        let engine = Engine::new();
+        let reply = dispatch(
+            &engine,
+            cmd(&[b"HSCAN", b"missing", b"0"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(
+            reply,
+            Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"0")),
+                Frame::Array(vec![])
+            ])
+        );
+    }
+
+    #[test]
+    fn hscan_with_a_non_numeric_cursor_is_a_resp_error() {
+        let engine = Engine::new();
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"HSCAN", b"h", b"notacursor"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Error("ERR invalid cursor".into())
+        );
+    }
+
+    #[test]
+    fn hscan_on_a_string_key_returns_wrongtype() {
+        let engine = Engine::new();
+        dispatch(
+            &engine,
+            cmd(&[b"SET", b"k", b"v"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"HSCAN", b"k", b"0"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Error(
+                "WRONGTYPE Operation against a key holding the wrong kind of value".into()
+            )
         );
     }
 
