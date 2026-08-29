@@ -406,6 +406,32 @@ pub fn dispatch(engine: &Engine, frame: Frame, protocol: &mut Protocol, client_i
                 Err(e) => engine_error_to_frame(e),
             }
         }
+        "ZRANGE" => {
+            require_args!(rest, 3, "zrange");
+            let (start, stop) = match (
+                std::str::from_utf8(&rest[1])
+                    .ok()
+                    .and_then(|s| s.parse::<i64>().ok()),
+                std::str::from_utf8(&rest[2])
+                    .ok()
+                    .and_then(|s| s.parse::<i64>().ok()),
+            ) {
+                (Some(a), Some(b)) => (a, b),
+                _ => return Frame::Error("ERR value is not an integer or out of range".into()),
+            };
+            match commands::sorted_set::zrange(engine, &rest[0], start, stop) {
+                Ok(items) => Frame::Array(items.into_iter().map(Frame::Bulk).collect()),
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
+        "ZRANK" => {
+            require_args!(rest, 2, "zrank");
+            match commands::sorted_set::zrank(engine, &rest[0], &rest[1]) {
+                Ok(Some(r)) => Frame::Integer(r as i64),
+                Ok(None) => Frame::Null,
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
         "KEYS" => {
             require_args!(rest, 1, "keys");
             let pattern = &rest[0];
@@ -1477,6 +1503,95 @@ mod tests {
                 1
             ),
             Frame::Bulk(Bytes::from_static(b"5.5"))
+        );
+    }
+
+    #[test]
+    fn zrange_returns_members_in_score_order_through_dispatch() {
+        let engine = Engine::new();
+        dispatch(
+            &engine,
+            cmd(&[b"ZADD", b"z", b"5", b"alice"]),
+            &mut Protocol::default(),
+            1,
+        );
+        dispatch(
+            &engine,
+            cmd(&[b"ZADD", b"z", b"2", b"bob"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"ZRANGE", b"z", b"0", b"-1"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"bob")),
+                Frame::Bulk(Bytes::from_static(b"alice")),
+            ])
+        );
+    }
+
+    #[test]
+    fn zrange_with_a_non_integer_index_is_a_resp_error() {
+        let engine = Engine::new();
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"ZRANGE", b"z", b"notanumber", b"-1"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Error("ERR value is not an integer or out of range".into())
+        );
+    }
+
+    #[test]
+    fn zrank_returns_the_zero_based_position_through_dispatch() {
+        let engine = Engine::new();
+        dispatch(
+            &engine,
+            cmd(&[b"ZADD", b"z", b"5", b"alice"]),
+            &mut Protocol::default(),
+            1,
+        );
+        dispatch(
+            &engine,
+            cmd(&[b"ZADD", b"z", b"2", b"bob"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"ZRANK", b"z", b"bob"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Integer(0)
+        );
+    }
+
+    #[test]
+    fn zrank_on_missing_member_returns_null() {
+        let engine = Engine::new();
+        dispatch(
+            &engine,
+            cmd(&[b"ZADD", b"z", b"5", b"alice"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"ZRANK", b"z", b"missing"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Null
         );
     }
 
