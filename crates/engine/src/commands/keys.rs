@@ -47,10 +47,16 @@ mod tests {
     #[test]
     fn rename_moves_the_value_and_removes_the_source() {
         let engine = Engine::new();
-        engine.set(Bytes::from_static(b"src"), Value::String(Bytes::from_static(b"v")));
+        engine.set(
+            Bytes::from_static(b"src"),
+            Value::String(Bytes::from_static(b"v")),
+        );
         rename(&engine, b"src", Bytes::from_static(b"dst")).unwrap();
         assert!(!engine.exists(b"src"));
-        assert_eq!(engine.get(b"dst"), Some(Value::String(Bytes::from_static(b"v"))));
+        assert_eq!(
+            engine.get(b"dst"),
+            Some(Value::String(Bytes::from_static(b"v")))
+        );
     }
 
     #[test]
@@ -63,39 +69,69 @@ mod tests {
     #[test]
     fn rename_to_itself_is_a_no_op_success() {
         let engine = Engine::new();
-        engine.set(Bytes::from_static(b"k"), Value::String(Bytes::from_static(b"v")));
+        engine.set(
+            Bytes::from_static(b"k"),
+            Value::String(Bytes::from_static(b"v")),
+        );
         rename(&engine, b"k", Bytes::from_static(b"k")).unwrap();
-        assert_eq!(engine.get(b"k"), Some(Value::String(Bytes::from_static(b"v"))));
+        assert_eq!(
+            engine.get(b"k"),
+            Some(Value::String(Bytes::from_static(b"v")))
+        );
     }
 
     #[test]
     fn rename_overwrites_an_existing_destination() {
         let engine = Engine::new();
-        engine.set(Bytes::from_static(b"src"), Value::String(Bytes::from_static(b"new")));
-        engine.set(Bytes::from_static(b"dst"), Value::String(Bytes::from_static(b"old")));
+        engine.set(
+            Bytes::from_static(b"src"),
+            Value::String(Bytes::from_static(b"new")),
+        );
+        engine.set(
+            Bytes::from_static(b"dst"),
+            Value::String(Bytes::from_static(b"old")),
+        );
         rename(&engine, b"src", Bytes::from_static(b"dst")).unwrap();
-        assert_eq!(engine.get(b"dst"), Some(Value::String(Bytes::from_static(b"new"))));
+        assert_eq!(
+            engine.get(b"dst"),
+            Some(Value::String(Bytes::from_static(b"new")))
+        );
     }
 
     #[test]
     fn renamenx_fails_without_error_when_destination_exists() {
         let engine = Engine::new();
-        engine.set(Bytes::from_static(b"src"), Value::String(Bytes::from_static(b"v")));
-        engine.set(Bytes::from_static(b"dst"), Value::String(Bytes::from_static(b"existing")));
+        engine.set(
+            Bytes::from_static(b"src"),
+            Value::String(Bytes::from_static(b"v")),
+        );
+        engine.set(
+            Bytes::from_static(b"dst"),
+            Value::String(Bytes::from_static(b"existing")),
+        );
         let applied = renamenx(&engine, b"src", Bytes::from_static(b"dst")).unwrap();
         assert!(!applied);
-        assert_eq!(engine.get(b"dst"), Some(Value::String(Bytes::from_static(b"existing"))));
+        assert_eq!(
+            engine.get(b"dst"),
+            Some(Value::String(Bytes::from_static(b"existing")))
+        );
         assert!(engine.exists(b"src"));
     }
 
     #[test]
     fn renamenx_succeeds_when_destination_is_free() {
         let engine = Engine::new();
-        engine.set(Bytes::from_static(b"src"), Value::String(Bytes::from_static(b"v")));
+        engine.set(
+            Bytes::from_static(b"src"),
+            Value::String(Bytes::from_static(b"v")),
+        );
         let applied = renamenx(&engine, b"src", Bytes::from_static(b"dst")).unwrap();
         assert!(applied);
         assert!(!engine.exists(b"src"));
-        assert_eq!(engine.get(b"dst"), Some(Value::String(Bytes::from_static(b"v"))));
+        assert_eq!(
+            engine.get(b"dst"),
+            Some(Value::String(Bytes::from_static(b"v")))
+        );
     }
 
     #[test]
@@ -114,7 +150,10 @@ mod tests {
     #[test]
     fn key_type_reports_the_real_type_name_for_each_variant() {
         let engine = Engine::new();
-        engine.set(Bytes::from_static(b"s"), Value::String(Bytes::from_static(b"v")));
+        engine.set(
+            Bytes::from_static(b"s"),
+            Value::String(Bytes::from_static(b"v")),
+        );
         engine.set(Bytes::from_static(b"h"), Value::Hash(Default::default()));
         assert_eq!(key_type(&engine, b"s"), "string");
         assert_eq!(key_type(&engine, b"h"), "hash");
@@ -129,8 +168,14 @@ mod tests {
     #[test]
     fn randomkey_returns_one_of_the_existing_keys() {
         let engine = Engine::new();
-        engine.set(Bytes::from_static(b"a"), Value::String(Bytes::from_static(b"1")));
-        engine.set(Bytes::from_static(b"b"), Value::String(Bytes::from_static(b"2")));
+        engine.set(
+            Bytes::from_static(b"a"),
+            Value::String(Bytes::from_static(b"1")),
+        );
+        engine.set(
+            Bytes::from_static(b"b"),
+            Value::String(Bytes::from_static(b"2")),
+        );
         let picked = randomkey(&engine).unwrap();
         assert!(picked == Bytes::from_static(b"a") || picked == Bytes::from_static(b"b"));
     }

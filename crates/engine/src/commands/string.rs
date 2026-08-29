@@ -59,7 +59,11 @@ pub fn incr_by(engine: &Engine, key: Bytes, delta: i64) -> Result<i64, common::E
     Ok(next)
 }
 
-pub fn getset(engine: &Engine, key: Bytes, val: Bytes) -> Result<Option<Bytes>, common::EngineError> {
+pub fn getset(
+    engine: &Engine,
+    key: Bytes,
+    val: Bytes,
+) -> Result<Option<Bytes>, common::EngineError> {
     let old = get(engine, &key)?;
     engine.set(key, Value::String(val));
     Ok(old)
@@ -216,10 +220,21 @@ mod tests {
     #[test]
     fn getset_returns_old_value_and_sets_new_one() {
         let engine = Engine::new();
-        engine.set(Bytes::from_static(b"k"), Value::String(Bytes::from_static(b"old")));
-        let old = getset(&engine, Bytes::from_static(b"k"), Bytes::from_static(b"new")).unwrap();
+        engine.set(
+            Bytes::from_static(b"k"),
+            Value::String(Bytes::from_static(b"old")),
+        );
+        let old = getset(
+            &engine,
+            Bytes::from_static(b"k"),
+            Bytes::from_static(b"new"),
+        )
+        .unwrap();
         assert_eq!(old, Some(Bytes::from_static(b"old")));
-        assert_eq!(get(&engine, b"k").unwrap(), Some(Bytes::from_static(b"new")));
+        assert_eq!(
+            get(&engine, b"k").unwrap(),
+            Some(Bytes::from_static(b"new"))
+        );
     }
 
     #[test]
@@ -255,8 +270,14 @@ mod tests {
     #[test]
     fn mget_returns_none_for_missing_keys_in_order() {
         let engine = Engine::new();
-        engine.set(Bytes::from_static(b"a"), Value::String(Bytes::from_static(b"1")));
-        let result = mget(&engine, &[Bytes::from_static(b"a"), Bytes::from_static(b"missing")]);
+        engine.set(
+            Bytes::from_static(b"a"),
+            Value::String(Bytes::from_static(b"1")),
+        );
+        let result = mget(
+            &engine,
+            &[Bytes::from_static(b"a"), Bytes::from_static(b"missing")],
+        );
         assert_eq!(result, vec![Some(Bytes::from_static(b"1")), None]);
     }
 
@@ -273,7 +294,10 @@ mod tests {
     #[test]
     fn msetnx_fails_and_sets_nothing_if_any_key_already_exists() {
         let engine = Engine::new();
-        engine.set(Bytes::from_static(b"a"), Value::String(Bytes::from_static(b"existing")));
+        engine.set(
+            Bytes::from_static(b"a"),
+            Value::String(Bytes::from_static(b"existing")),
+        );
         let applied = msetnx(
             &engine,
             vec![
@@ -282,14 +306,20 @@ mod tests {
             ],
         );
         assert!(!applied);
-        assert_eq!(get(&engine, b"a").unwrap(), Some(Bytes::from_static(b"existing")));
+        assert_eq!(
+            get(&engine, b"a").unwrap(),
+            Some(Bytes::from_static(b"existing"))
+        );
         assert_eq!(get(&engine, b"b").unwrap(), None);
     }
 
     #[test]
     fn msetnx_succeeds_when_no_key_exists() {
         let engine = Engine::new();
-        let applied = msetnx(&engine, vec![(Bytes::from_static(b"a"), Bytes::from_static(b"1"))]);
+        let applied = msetnx(
+            &engine,
+            vec![(Bytes::from_static(b"a"), Bytes::from_static(b"1"))],
+        );
         assert!(applied);
         assert_eq!(get(&engine, b"a").unwrap(), Some(Bytes::from_static(b"1")));
     }
