@@ -160,3 +160,96 @@ async fn every_node_reports_the_same_three_shard_topology() {
         );
     }
 }
+
+#[tokio::test]
+async fn keys_route_to_the_shard_that_owns_their_slot() {
+    let cluster = spawn_3_shard_cluster().await;
+    // (key, slot, owning node index) -- slots are fixed by CRC16(key) % 16384
+    for (key, slot, owner) in [
+        (&b"hello"[..], 866u16, 0usize),
+        (&b"counter"[..], 6680, 1),
+        (&b"foo"[..], 12182, 2),
+    ] {
+        assert_eq!(cluster.owner_index(slot), owner);
+        let mut c = connect(cluster.addr(owner)).await;
+        assert_eq!(
+            send(&mut c, &[b"CLUSTER", b"KEYSLOT", key]).await,
+            Frame::Integer(slot as i64)
+        );
+        assert_eq!(
+            send(&mut c, &[b"SET", key, b"value"]).await,
+            Frame::Simple("OK".into())
+        );
+        assert_eq!(
+            send(&mut c, &[b"GET", key]).await,
+            Frame::Bulk(Bytes::from_static(b"value"))
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_client_hitting_the_wrong_shard_receives_moved_and_the_right_shard_serves_the_key() {
+    let cluster = spawn_3_shard_cluster().await;
+    let slot = 12182; // "foo"
+    let wrong = cluster.non_owner_index(slot);
+    let right = cluster.owner_index(slot);
+
+    let mut wrong_conn = connect(cluster.addr(wrong)).await;
+    let reply = send(&mut wrong_conn, &[b"SET", b"foo", b"bar"]).await;
+    assert_eq!(
+        reply,
+        Frame::Error(format!("MOVED {slot} {}", cluster.addr(right)))
+    );
+
+    // ...now do what a cluster-aware client does: follow the redirect.
+    let target = moved_target(&reply);
+    assert_eq!(target, cluster.addr(right));
+    let mut right_conn = connect(&target).await;
+    assert_eq!(
+        send(&mut right_conn, &[b"SET", b"foo", b"bar"]).await,
+        Frame::Simple("OK".into())
+    );
+    assert_eq!(
+        send(&mut right_conn, &[b"GET", b"foo"]).await,
+        Frame::Bulk(Bytes::from_static(b"bar"))
+    );
+
+    // and the wrong shard still refuses to read it, rather than answering a stale nil
+    assert_eq!(
+        send(&mut wrong_conn, &[b"GET", b"foo"]).await,
+        Frame::Error(format!("MOVED {slot} {}", cluster.addr(right)))
+    );
+}
+
+#[tokio::test]
+async fn a_redirected_write_leaves_no_trace_on_the_shard_that_refused_it() {
+    let cluster = spawn_3_shard_cluster().await;
+    let wrong = cluster.non_owner_index(12182);
+    let mut wrong_conn = connect(cluster.addr(wrong)).await;
+
+    let reply = send(&mut wrong_conn, &[b"SET", b"foo", b"bar"]).await;
+    assert!(matches!(reply, Frame::Error(ref m) if m.starts_with("MOVED ")));
+
+    // KEYS takes no key, so it is never redirected -- it is the honest way to ask a node what
+    // it actually stored. A redirected write must never have reached this node's engine.
+    assert_eq!(
+        send(&mut wrong_conn, &[b"KEYS", b"*"]).await,
+        Frame::Array(vec![])
+    );
+}
+
+#[tokio::test]
+async fn both_non_owning_shards_redirect_to_the_same_owner() {
+    let cluster = spawn_3_shard_cluster().await;
+    let right = cluster.owner_index(12182);
+    for i in 0..3 {
+        if i == right {
+            continue;
+        }
+        let mut c = connect(cluster.addr(i)).await;
+        assert_eq!(
+            send(&mut c, &[b"GET", b"foo"]).await,
+            Frame::Error(format!("MOVED 12182 {}", cluster.addr(right)))
+        );
+    }
+}
