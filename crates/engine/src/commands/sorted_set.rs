@@ -8,17 +8,25 @@ pub fn zadd(
     score: f64,
     member: Bytes,
 ) -> Result<bool, common::EngineError> {
-    let existed = engine.with_mut(
+    let existed = engine.with_mut_delta(
         &key,
-        |existing| -> Result<Option<bool>, common::EngineError> {
+        |existing| -> (Result<Option<bool>, common::EngineError>, isize) {
             match existing {
                 Some(Value::SortedSet(zset)) => {
                     let is_new = zset.score(&member).is_none();
                     zset.insert(member.clone(), score);
-                    Ok(Some(is_new))
+                    // A member's score is never part of `approx_size` -- only a brand-new
+                    // member changes the total size; updating an existing member's score
+                    // leaves it unchanged.
+                    let size_delta = if is_new {
+                        member.len() as isize + 24
+                    } else {
+                        0
+                    };
+                    (Ok(Some(is_new)), size_delta)
                 }
-                Some(_) => Err(common::EngineError::WrongType),
-                None => Ok(None),
+                Some(_) => (Err(common::EngineError::WrongType), 0),
+                None => (Ok(None), 0),
             }
         },
     )?;
@@ -46,10 +54,18 @@ pub fn zscore(
 }
 
 pub fn zrem(engine: &Engine, key: &[u8], member: &[u8]) -> Result<bool, common::EngineError> {
-    engine.with_mut(key, |existing| match existing {
-        None => Ok(false),
-        Some(Value::SortedSet(zset)) => Ok(zset.remove(member)),
-        Some(_) => Err(common::EngineError::WrongType),
+    engine.with_mut_delta(key, |existing| match existing {
+        None => (Ok(false), 0),
+        Some(Value::SortedSet(zset)) => {
+            let removed = zset.remove(member);
+            let size_delta = if removed {
+                -(member.len() as isize + 24)
+            } else {
+                0
+            };
+            (Ok(removed), size_delta)
+        }
+        Some(_) => (Err(common::EngineError::WrongType), 0),
     })
 }
 
@@ -67,17 +83,23 @@ pub fn zincrby(
     delta: f64,
     member: Bytes,
 ) -> Result<f64, common::EngineError> {
-    let existed = engine.with_mut(
+    let existed = engine.with_mut_delta(
         &key,
-        |existing| -> Result<Option<f64>, common::EngineError> {
+        |existing| -> (Result<Option<f64>, common::EngineError>, isize) {
             match existing {
                 Some(Value::SortedSet(zset)) => {
+                    let is_new = zset.score(&member).is_none();
                     let new_score = zset.score(&member).unwrap_or(0.0) + delta;
                     zset.insert(member.clone(), new_score);
-                    Ok(Some(new_score))
+                    let size_delta = if is_new {
+                        member.len() as isize + 24
+                    } else {
+                        0
+                    };
+                    (Ok(Some(new_score)), size_delta)
                 }
-                Some(_) => Err(common::EngineError::WrongType),
-                None => Ok(None),
+                Some(_) => (Err(common::EngineError::WrongType), 0),
+                None => (Ok(None), 0),
             }
         },
     )?;
@@ -415,5 +437,46 @@ mod tests {
             zrange(&engine, b"k", 0, -1).unwrap_err(),
             common::EngineError::WrongType
         );
+    }
+
+    /// `engine.memory_used()` after each mutation must equal independently recomputing the
+    /// entry's true size from scratch (`key.len() + Value::approx_size()`) -- proving the
+    /// delta each function reports (once converted to `with_mut_delta`) is exactly right.
+    /// Written to pass against today's `with_mut`-based code too, since this is a refactor,
+    /// not a bug fix -- it stays green through every step below.
+    fn assert_memory_used_matches_recomputed_size(engine: &Engine, key: &[u8]) {
+        let value = engine.get(key).expect("key must exist");
+        let expected = key.len() + value.approx_size();
+        assert_eq!(engine.memory_used(), expected);
+    }
+
+    #[test]
+    fn sorted_set_mutations_keep_memory_used_exactly_in_sync() {
+        let engine = Engine::new();
+        let key = Bytes::from_static(b"z");
+
+        // zadd: new member
+        zadd(&engine, key.clone(), 5.0, Bytes::from_static(b"alice")).unwrap();
+        assert_memory_used_matches_recomputed_size(&engine, &key);
+
+        // zadd: existing member, score-only update -- must not change the size
+        zadd(&engine, key.clone(), 9.0, Bytes::from_static(b"alice")).unwrap();
+        assert_memory_used_matches_recomputed_size(&engine, &key);
+
+        // zincrby: new member
+        zincrby(&engine, key.clone(), 2.0, Bytes::from_static(b"bob")).unwrap();
+        assert_memory_used_matches_recomputed_size(&engine, &key);
+
+        // zincrby: existing member, score-only update
+        zincrby(&engine, key.clone(), 3.0, Bytes::from_static(b"bob")).unwrap();
+        assert_memory_used_matches_recomputed_size(&engine, &key);
+
+        // zrem: removes an existing member
+        zrem(&engine, &key, b"alice").unwrap();
+        assert_memory_used_matches_recomputed_size(&engine, &key);
+
+        // zrem: member already absent, no-op
+        zrem(&engine, &key, b"alice").unwrap();
+        assert_memory_used_matches_recomputed_size(&engine, &key);
     }
 }
