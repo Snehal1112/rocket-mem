@@ -936,6 +936,89 @@ fn extract_write_command_name(frame: &Frame) -> Option<String> {
         .then_some(name)
 }
 
+/// Every command name this server answers -- `dispatch`'s match arms plus the interceptions
+/// `dispatch_and_log` handles (`SAVE`, `REPLICAOF`, `PSYNC`, `CLUSTER`, `SLOWLOG`). Sorted, so
+/// `binary_search` is valid; `known_commands_is_sorted_so_binary_search_works` is the guard that
+/// keeps it that way when a future sprint adds one.
+///
+/// Two consumers: `key_spec` below (an unknown command has no keys, so it falls through to
+/// dispatch's unknown-command error instead of being redirected on a slot computed from a
+/// non-key argument), and `04-prometheus-metrics.md`'s `metric_label` (which collapses anything
+/// not in this list to `other`, bounding Prometheus label cardinality).
+///
+/// **Every command added to `dispatch` from now on must be added here too.** A missing name is
+/// not a compile error: it silently becomes `KeySpec::None`, which means that command is never
+/// slot-routed in cluster mode -- it would be served by whichever node the client happened to
+/// reach, quietly breaking the routing invariant. Step 3a below is the check.
+pub(crate) const KNOWN_COMMANDS: &[&str] = &[
+    "APPEND", "CLUSTER", "COMMAND", "DECR", "DEL", "ECHO", "EXISTS", "EXPIRE", "EXPIREAT", "GET",
+    "GETRANGE", "GETSET", "HDEL", "HELLO", "HEXISTS", "HGET", "HGETALL", "HINCRBY", "HKEYS",
+    "HLEN", "HMGET", "HSCAN", "HSET", "HSETNX", "HVALS", "INCR", "INCRBY", "INFO", "KEYS",
+    "LINDEX", "LINSERT", "LLEN", "LPOP", "LPUSH", "LRANGE", "LREM", "LSET", "LTRIM", "MEMORY",
+    "MGET", "MSET", "MSETNX", "OBJECT", "PERSIST", "PEXPIRE", "PEXPIREAT", "PING", "PSYNC",
+    "PTTL", "RANDOMKEY", "RENAME", "RENAMENX", "REPLICAOF", "RPOP", "RPUSH", "SADD", "SAVE",
+    "SCAN", "SCARD", "SDIFF", "SDIFFSTORE", "SELECT", "SET", "SETRANGE", "SINTER", "SINTERSTORE",
+    "SISMEMBER", "SLOWLOG", "SMEMBERS", "SPOP", "SRANDMEMBER", "SREM", "STRLEN", "SUNION",
+    "SUNIONSTORE", "TTL", "TYPE", "ZADD", "ZCARD", "ZINCRBY", "ZRANGE", "ZRANK", "ZREM", "ZSCORE",
+];
+
+/// Which of a command's arguments are keys, for cluster-slot routing. Total over every command
+/// this server answers; `First` is the default because it is correct for ~70 of the 84, and
+/// every exception is enumerated in `key_spec`.
+enum KeySpec {
+    /// No keys at all -- never redirected. Also the answer for unknown commands.
+    None,
+    /// The first argument (`GET k`, `SET k v`, `ZADD k ...`).
+    First,
+    /// The second argument (`MEMORY USAGE k`, `OBJECT ENCODING k`).
+    Second,
+    /// Every argument (`DEL a b c`, `RENAME a b`, `SINTERSTORE dest s1 s2` -- the destination is
+    /// a key this node would write, so it must hash to the same slot as the sources).
+    All,
+    /// Arguments 0, 2, 4, ... (`MSET k1 v1 k2 v2`).
+    EveryOther,
+}
+
+fn key_spec(name: &str) -> KeySpec {
+    match name {
+        "PING" | "ECHO" | "SELECT" | "COMMAND" | "INFO" | "HELLO" | "KEYS" | "SCAN"
+        | "RANDOMKEY" | "CLUSTER" | "SAVE" | "REPLICAOF" | "PSYNC" | "SLOWLOG" => KeySpec::None,
+        "MEMORY" | "OBJECT" => KeySpec::Second,
+        "DEL" | "EXISTS" | "MGET" | "RENAME" | "RENAMENX" | "SINTER" | "SUNION" | "SDIFF"
+        | "SINTERSTORE" | "SUNIONSTORE" | "SDIFFSTORE" => KeySpec::All,
+        "MSET" | "MSETNX" => KeySpec::EveryOther,
+        _ if KNOWN_COMMANDS.binary_search(&name).is_ok() => KeySpec::First,
+        _ => KeySpec::None, // unknown command: no keys, so dispatch's own error reaches the client
+    }
+}
+
+/// The keys `frame`'s command operates on, borrowed from the frame. Empty for a malformed frame,
+/// a keyless command, or an unknown command -- all three of which must reach their normal
+/// handling rather than being redirected.
+fn command_keys(frame: &Frame) -> Vec<&Bytes> {
+    let Frame::Array(items) = frame else {
+        return Vec::new();
+    };
+    let Some(Frame::Bulk(name_bytes)) = items.first() else {
+        return Vec::new();
+    };
+    let name = String::from_utf8_lossy(name_bytes).to_ascii_uppercase();
+    let args: Vec<&Bytes> = items[1..]
+        .iter()
+        .filter_map(|f| match f {
+            Frame::Bulk(b) => Some(b),
+            _ => None,
+        })
+        .collect();
+    match key_spec(&name) {
+        KeySpec::None => Vec::new(),
+        KeySpec::First => args.into_iter().take(1).collect(),
+        KeySpec::Second => args.into_iter().skip(1).take(1).collect(),
+        KeySpec::All => args,
+        KeySpec::EveryOther => args.into_iter().step_by(2).collect(),
+    }
+}
+
 fn is_save_command(frame: &Frame) -> bool {
     let Frame::Array(items) = frame else {
         return false;
@@ -4394,5 +4477,114 @@ mod tests {
             1,
         );
         assert_eq!(reply, Frame::Simple("OK".into()));
+    }
+
+    #[test]
+    fn known_commands_is_sorted_so_binary_search_works() {
+        let mut sorted = KNOWN_COMMANDS.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(sorted, KNOWN_COMMANDS.to_vec());
+        assert!(KNOWN_COMMANDS.binary_search(&"GET").is_ok());
+        assert!(KNOWN_COMMANDS.binary_search(&"ZSCORE").is_ok());
+        assert!(KNOWN_COMMANDS.binary_search(&"NOSUCHCOMMAND").is_err());
+    }
+
+    #[test]
+    fn command_keys_finds_the_single_key_of_an_ordinary_command() {
+        assert_eq!(
+            command_keys(&cmd(&[b"GET", b"foo"])),
+            vec![&Bytes::from_static(b"foo")]
+        );
+        assert_eq!(
+            command_keys(&cmd(&[b"SET", b"foo", b"bar", b"EX", b"10"])),
+            vec![&Bytes::from_static(b"foo")]
+        );
+        assert_eq!(
+            command_keys(&cmd(&[b"HSET", b"h", b"field", b"value"])),
+            vec![&Bytes::from_static(b"h")]
+        );
+    }
+
+    #[test]
+    fn command_keys_is_empty_for_commands_that_take_no_key() {
+        for c in [
+            cmd(&[b"PING"]),
+            cmd(&[b"ECHO", b"hello"]),
+            cmd(&[b"SELECT", b"0"]),
+            cmd(&[b"COMMAND"]),
+            cmd(&[b"INFO", b"replication"]),
+            cmd(&[b"HELLO", b"3"]),
+            cmd(&[b"KEYS", b"*"]),
+            cmd(&[b"SCAN", b"0"]),
+            cmd(&[b"RANDOMKEY"]),
+            cmd(&[b"CLUSTER", b"KEYSLOT", b"foo"]),
+            cmd(&[b"SAVE"]),
+            cmd(&[b"REPLICAOF", b"NO", b"ONE"]),
+            cmd(&[b"PSYNC"]),
+            cmd(&[b"SLOWLOG", b"GET"]),
+        ] {
+            assert!(command_keys(&c).is_empty(), "expected no keys for {c:?}");
+        }
+    }
+
+    #[test]
+    fn command_keys_is_empty_for_an_unknown_command() {
+        // An unknown command must fall through to dispatch's "ERR unknown command" error, not
+        // get redirected on a slot computed from an argument that isn't a key.
+        assert!(command_keys(&cmd(&[b"NOSUCHCOMMAND", b"foo"])).is_empty());
+    }
+
+    #[test]
+    fn command_keys_takes_the_second_argument_for_memory_usage_and_object_encoding() {
+        assert_eq!(
+            command_keys(&cmd(&[b"MEMORY", b"USAGE", b"foo"])),
+            vec![&Bytes::from_static(b"foo")]
+        );
+        assert_eq!(
+            command_keys(&cmd(&[b"OBJECT", b"ENCODING", b"foo"])),
+            vec![&Bytes::from_static(b"foo")]
+        );
+        assert!(command_keys(&cmd(&[b"MEMORY"])).is_empty());
+    }
+
+    #[test]
+    fn command_keys_takes_every_argument_for_variadic_key_commands() {
+        assert_eq!(
+            command_keys(&cmd(&[b"DEL", b"a", b"b", b"c"])),
+            vec![
+                &Bytes::from_static(b"a"),
+                &Bytes::from_static(b"b"),
+                &Bytes::from_static(b"c")
+            ]
+        );
+        assert_eq!(
+            command_keys(&cmd(&[b"MGET", b"a", b"b"])),
+            vec![&Bytes::from_static(b"a"), &Bytes::from_static(b"b")]
+        );
+        assert_eq!(
+            command_keys(&cmd(&[b"RENAME", b"a", b"b"])),
+            vec![&Bytes::from_static(b"a"), &Bytes::from_static(b"b")]
+        );
+        // the destination is a key this node would WRITE, so it must be routed too
+        assert_eq!(
+            command_keys(&cmd(&[b"SINTERSTORE", b"dest", b"s1", b"s2"])),
+            vec![
+                &Bytes::from_static(b"dest"),
+                &Bytes::from_static(b"s1"),
+                &Bytes::from_static(b"s2")
+            ]
+        );
+    }
+
+    #[test]
+    fn command_keys_takes_every_other_argument_for_mset() {
+        assert_eq!(
+            command_keys(&cmd(&[b"MSET", b"a", b"1", b"b", b"2"])),
+            vec![&Bytes::from_static(b"a"), &Bytes::from_static(b"b")]
+        );
+        assert_eq!(
+            command_keys(&cmd(&[b"MSETNX", b"a", b"1", b"b", b"2"])),
+            vec![&Bytes::from_static(b"a"), &Bytes::from_static(b"b")]
+        );
     }
 }
