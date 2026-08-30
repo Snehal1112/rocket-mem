@@ -32,6 +32,12 @@ pub fn rpush(
     match existed {
         Some(len) => Ok(len),
         None => {
+            // An empty `values` on a missing key is a no-op -- it must not create a
+            // phantom empty list, matching the missing-key convention every other
+            // mutating command follows (see missing_key_semantics_tests.rs).
+            if values.is_empty() {
+                return Ok(0);
+            }
             let list: VecDeque<Bytes> = values.into_iter().collect();
             let len = list.len();
             engine.set(key, Value::List(list));
@@ -63,6 +69,12 @@ pub fn lpush(
     match existed {
         Some(len) => Ok(len),
         None => {
+            // An empty `values` on a missing key is a no-op -- it must not create a
+            // phantom empty list, matching the missing-key convention every other
+            // mutating command follows (see missing_key_semantics_tests.rs).
+            if values.is_empty() {
+                return Ok(0);
+            }
             // LPUSH with multiple values prepends each in argument order, so the *last*
             // argument ends up first (matches the dispatcher-level test and real Redis) --
             // pushing onto a fresh VecDeque front-to-back in argument order achieves that
@@ -389,6 +401,22 @@ mod tests {
                 Bytes::from_static(b"c"),
             ]
         );
+    }
+
+    #[test]
+    fn rpush_with_no_values_on_a_missing_key_does_not_create_a_phantom_list() {
+        let engine = Engine::new();
+        let len = rpush(&engine, Bytes::from_static(b"l"), vec![]).unwrap();
+        assert_eq!(len, 0);
+        assert!(!engine.exists(b"l"));
+    }
+
+    #[test]
+    fn lpush_with_no_values_on_a_missing_key_does_not_create_a_phantom_list() {
+        let engine = Engine::new();
+        let len = lpush(&engine, Bytes::from_static(b"l"), vec![]).unwrap();
+        assert_eq!(len, 0);
+        assert!(!engine.exists(b"l"));
     }
 
     #[test]
