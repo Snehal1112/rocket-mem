@@ -110,7 +110,6 @@ impl Shard {
     /// A full, point-in-time (per this one shard) projection of every unexpired entry — the
     /// building block `Store::snapshot_entries` flat-maps across all 16 shards. `Entry` itself
     /// never escapes this module; only this `(key, value, expiry)` tuple does.
-    #[allow(dead_code)]
     pub fn entries(&self) -> Vec<(Bytes, Value, Option<Instant>)> {
         self.map
             .read()
@@ -124,7 +123,6 @@ impl Shard {
     /// `Store::load_snapshot_entries` to fully replace a shard's contents rather than merge
     /// into them. `bytes_used` must be reset here, not left for the caller to reconcile,
     /// or `MAXMEMORY` accounting would silently overcount every key this call removed.
-    #[allow(dead_code)]
     pub fn clear(&self) {
         self.map.write().clear();
         self.bytes_used.store(0, Ordering::Relaxed);

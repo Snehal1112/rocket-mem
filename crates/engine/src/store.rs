@@ -88,6 +88,29 @@ impl Store {
             .collect()
     }
 
+    /// Flat-maps `Shard::entries()` across all 16 shards, each locked and released in turn —
+    /// this is NOT a whole-store point-in-time view on its own. A caller that needs one (e.g.
+    /// `SAVE`, coordinating this with an AOF offset) must hold its own external lock across the
+    /// call; see `../../specs/2026-08-30-sprint-5-spec.md`'s SAVE atomicity decision.
+    pub fn snapshot_entries(&self) -> Vec<(Bytes, Value, Option<std::time::Instant>)> {
+        self.shards.iter().flat_map(|s| s.entries()).collect()
+    }
+
+    /// Replaces every shard's contents wholesale: clears all 16 first, then re-inserts each
+    /// entry via the existing `set`/`expire_at` paths (which re-account `bytes_used` correctly,
+    /// so no separate accounting step is needed here).
+    pub fn load_snapshot_entries(&self, entries: Vec<(Bytes, Value, Option<std::time::Instant>)>) {
+        for shard in &self.shards {
+            shard.clear();
+        }
+        for (key, value, expires_at) in entries {
+            self.set(key.clone(), value);
+            if let Some(at) = expires_at {
+                self.expire_at(&key, at);
+            }
+        }
+    }
+
     #[cfg(test)]
     pub fn shard_key_counts(&self) -> Vec<usize> {
         self.shards.iter().map(|s| s.keys().len()).collect()
@@ -99,6 +122,7 @@ mod tests {
     use super::*;
     use crate::Value;
     use bytes::Bytes;
+    use crate::engine::TtlStatus;
 
     #[test]
     fn set_then_get_round_trips() {
@@ -308,5 +332,33 @@ mod tests {
         for h in handles {
             h.join().expect("worker thread panicked");
         }
+    }
+
+    #[test]
+    fn snapshot_entries_collects_keys_from_every_shard() {
+        let store = Store::new(16);
+        // enough distinct keys that DefaultHasher spreads them across multiple shards
+        for i in 0..50 {
+            store.set(Bytes::from(format!("k{i}")), Value::String(Bytes::from_static(b"v")));
+        }
+        assert_eq!(store.snapshot_entries().len(), 50);
+    }
+
+    #[test]
+    fn load_snapshot_entries_replaces_existing_state_wholesale() {
+        let store = Store::new(16);
+        store.set(Bytes::from_static(b"stale"), Value::String(Bytes::from_static(b"old")));
+
+        let at = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        store.load_snapshot_entries(vec![
+            (Bytes::from_static(b"fresh"), Value::String(Bytes::from_static(b"new")), Some(at)),
+        ]);
+
+        assert_eq!(store.get(b"stale"), None);
+        assert_eq!(store.get(b"fresh"), Some(Value::String(Bytes::from_static(b"new"))));
+        let TtlStatus::Remaining(remaining) = store.ttl(b"fresh") else {
+            panic!("expected a TTL on the loaded key")
+        };
+        assert!(remaining.as_secs() > 0 && remaining.as_secs() <= 60);
     }
 }
