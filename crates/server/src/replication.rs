@@ -87,6 +87,18 @@ pub struct ReplicationHandle {
     /// leave it `None` and their apply loops take no lock, which is correct since no `SAVE` runs
     /// against them.
     aof: Option<Arc<AofWriter>>,
+    /// The static cluster topology, when this node was started in cluster mode. `None` -- the
+    /// default for `new`/`Default`, i.e. every existing test and every standalone deployment --
+    /// means cluster mode is off: no `-MOVED`, no `-CROSSSLOT`, `cluster_enabled:0` in `INFO`.
+    /// A builder-set `Option` rather than a third `new` parameter, mirroring `with_aof` above
+    /// and for the same reason: the existing `ReplicationHandle::new`/`::default()` call sites
+    /// (all of them tests) stay untouched.
+    ///
+    /// Naming note: this struct now carries a snapshot path, an AOF handle, and a cluster
+    /// config -- it is shared *server* state, not a replication handle. Renaming it to
+    /// `ServerState` is deferred to Sprint 7, whose dual-protocol work has to touch these
+    /// signatures anyway; see ../../docs/superpowers/specs/2026-08-30-sprint-6-spec.md.
+    cluster: Option<Arc<crate::cluster::ClusterConfig>>,
 }
 
 impl ReplicationHandle {
@@ -99,6 +111,7 @@ impl ReplicationHandle {
             snapshot_path,
             generation: Arc::new(AtomicU64::new(0)),
             aof: None,
+            cluster: None,
         }
     }
 
@@ -113,6 +126,19 @@ impl ReplicationHandle {
     pub fn with_aof(mut self, aof: Arc<AofWriter>) -> Self {
         self.aof = Some(aof);
         self
+    }
+
+    /// Puts this node into cluster mode with the given static topology. Only `main.rs` and
+    /// `crates/server/tests/cluster.rs` call this; everything else leaves cluster mode off.
+    pub fn with_cluster(mut self, cluster: Arc<crate::cluster::ClusterConfig>) -> Self {
+        self.cluster = Some(cluster);
+        self
+    }
+
+    /// `None` when cluster mode is off. `dispatch_and_log`'s redirection gate short-circuits on
+    /// this before extracting any key, so a standalone node pays one `Option` check per command.
+    pub fn cluster(&self) -> Option<&Arc<crate::cluster::ClusterConfig>> {
+        self.cluster.as_ref()
     }
 
     /// For `SAVE` and (later) `PSYNC` handling, which need the shared `Engine` to snapshot
@@ -636,5 +662,26 @@ mod tests {
         handle.start_replicating("127.0.0.1:2".to_string()); // must not panic or leave two tasks running
         assert!(handle.is_replica.load(std::sync::atomic::Ordering::Relaxed));
         handle.stop_replicating();
+    }
+
+    #[test]
+    fn a_handle_is_not_in_cluster_mode_by_default() {
+        let h = ReplicationHandle::default();
+        assert!(h.cluster().is_none());
+    }
+
+    #[test]
+    fn with_cluster_puts_the_handle_into_cluster_mode() {
+        let config = crate::cluster::ClusterConfig::parse(
+            "shard-a 127.0.0.1:7001 0 8000\nshard-b 127.0.0.1:7002 8001 16383\n",
+            "shard-b",
+        )
+        .unwrap();
+        let h = ReplicationHandle::new(Arc::new(Engine::new()), "/tmp/does-not-matter".into())
+            .with_cluster(Arc::new(config));
+        let cluster = h.cluster().expect("cluster mode should be on");
+        assert_eq!(cluster.myself().id, "shard-b");
+        assert!(cluster.owns(8001));
+        assert!(!cluster.owns(8000));
     }
 }
