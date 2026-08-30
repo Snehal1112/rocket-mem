@@ -215,11 +215,13 @@ pub const WRITE_COMMANDS: &[&str] = &[
 
 /// Replays every command in the AOF at `path` against `engine`, via the plain (non-logging)
 /// `dispatcher::dispatch` — never `dispatch_and_log`, which would re-append what's being
-/// replayed. A missing file is a no-op (nothing to recover on first run). A corrupt or
-/// incomplete final frame stops replay at the last fully-decoded frame and truncates the
-/// file on disk to that exact byte offset — see this plan's Global Constraints for why an
-/// in-memory-only skip isn't sufficient.
-pub fn replay(path: &Path, engine: &engine::Engine) -> std::io::Result<()> {
+/// replayed. A missing file is a no-op (nothing to recover on first run). `start_at` is
+/// clamped to the file's actual length rather than trusted blindly, so a caller passing a
+/// stale or wrong offset degrades to "replay nothing" instead of panicking on an
+/// out-of-range slice; `aof::recover` (below) is what decides *whether* a mismatched offset
+/// should reach this function at all. A corrupt or incomplete final frame stops replay at the
+/// last fully-decoded frame and truncates the file on disk to that exact byte offset.
+pub fn replay(path: &Path, engine: &engine::Engine, start_at: u64) -> std::io::Result<()> {
     use tokio_util::codec::Decoder;
 
     let raw = match std::fs::read(path) {
@@ -228,9 +230,10 @@ pub fn replay(path: &Path, engine: &engine::Engine) -> std::io::Result<()> {
         Err(e) => return Err(e),
     };
 
-    let mut buf = bytes::BytesMut::from(&raw[..]);
+    let start = (start_at as usize).min(raw.len());
+    let mut buf = bytes::BytesMut::from(&raw[start..]);
     let mut codec = protocol::codec::RespCodec::default();
-    let mut valid_len = 0usize;
+    let mut valid_len = start;
     loop {
         let before = buf.len();
         match codec.decode(&mut buf) {
@@ -283,7 +286,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("does-not-exist.aof");
         let engine = Engine::new();
-        replay(&path, &engine).unwrap();
+        replay(&path, &engine, 0).unwrap();
         assert!(engine.keys().is_empty());
     }
 
@@ -296,7 +299,7 @@ mod tests {
             b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n*3\r\n$3\r\nSET\r\n$1\r\nb\r\n$1\r\n2\r\n",
         );
         let engine = Engine::new();
-        replay(&path, &engine).unwrap();
+        replay(&path, &engine, 0).unwrap();
         assert_eq!(
             engine.get(b"a"),
             Some(Value::String(bytes::Bytes::from_static(b"1")))
@@ -314,7 +317,7 @@ mod tests {
         write_raw(&path, b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n");
         write_raw(&path, b"*3\r\n$3\r\nSET\r\n$1\r\nb\r\n$3\r\ngar"); // truncated mid-bulk-body
         let engine = Engine::new();
-        replay(&path, &engine).unwrap(); // must not panic
+        replay(&path, &engine, 0).unwrap(); // must not panic
         assert_eq!(
             engine.get(b"a"),
             Some(Value::String(bytes::Bytes::from_static(b"1")))
@@ -330,7 +333,7 @@ mod tests {
         write_raw(&path, valid);
         write_raw(&path, b"*3\r\n$3\r\nSET\r\n$1\r\nb\r\n$3\r\ngar"); // truncated mid-bulk-body
         let engine = Engine::new();
-        replay(&path, &engine).unwrap();
+        replay(&path, &engine, 0).unwrap();
 
         let on_disk = std::fs::read(&path).unwrap();
         assert_eq!(on_disk, valid); // corrupt bytes physically removed, not just skipped in memory
@@ -346,7 +349,7 @@ mod tests {
             .unwrap();
         writer.fsync().unwrap();
         let engine2 = Engine::new();
-        replay(&path, &engine2).unwrap();
+        replay(&path, &engine2, 0).unwrap();
         assert_eq!(
             engine2.get(b"a"),
             Some(Value::String(bytes::Bytes::from_static(b"1")))
@@ -364,8 +367,56 @@ mod tests {
         let valid = b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n";
         write_raw(&path, valid);
         let engine = Engine::new();
-        replay(&path, &engine).unwrap();
+        replay(&path, &engine, 0).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), valid);
+    }
+
+    #[test]
+    fn replay_with_a_nonzero_start_at_skips_commands_before_that_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.aof");
+        let first = b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n";
+        write_raw(&path, first);
+        write_raw(&path, b"*3\r\n$3\r\nSET\r\n$1\r\nb\r\n$1\r\n2\r\n");
+
+        let engine = Engine::new();
+        replay(&path, &engine, first.len() as u64).unwrap();
+
+        assert_eq!(engine.get(b"a"), None); // before start_at -- skipped
+        assert_eq!(
+            engine.get(b"b"),
+            Some(Value::String(bytes::Bytes::from_static(b"2")))
+        );
+    }
+
+    #[test]
+    fn replay_with_a_start_at_past_the_end_of_the_file_replays_nothing_without_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.aof");
+        write_raw(&path, b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n");
+
+        let engine = Engine::new();
+        replay(&path, &engine, 999_999).unwrap(); // must not panic on an out-of-range slice
+        assert_eq!(engine.get(b"a"), None);
+    }
+
+    #[test]
+    fn replay_with_a_nonzero_start_at_still_truncates_a_corrupt_tail_from_the_true_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.aof");
+        let first = b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n";
+        write_raw(&path, first);
+        let second = b"*3\r\n$3\r\nSET\r\n$1\r\nb\r\n$1\r\n2\r\n";
+        write_raw(&path, second);
+        write_raw(&path, b"*3\r\n$3\r\nSET\r\n$1\r\nc\r\n$3\r\ngar"); // truncated mid-bulk-body
+
+        let engine = Engine::new();
+        replay(&path, &engine, first.len() as u64).unwrap();
+
+        let on_disk = std::fs::read(&path).unwrap();
+        let mut expected = first.to_vec();
+        expected.extend_from_slice(second);
+        assert_eq!(on_disk, expected); // corrupt tail removed; the skipped-over prefix stays intact
     }
 
     #[test]

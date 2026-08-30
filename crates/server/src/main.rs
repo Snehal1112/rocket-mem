@@ -8,7 +8,7 @@ async fn main() -> std::io::Result<()> {
     let aof_path = std::path::Path::new(&aof_path);
 
     let engine = Arc::new(engine::Engine::new());
-    rocket_mem::aof::replay(aof_path, &engine)?;
+    rocket_mem::aof::replay(aof_path, &engine, 0)?;
     println!("Replayed AOF from {}", aof_path.display());
 
     let aof = Arc::new(
