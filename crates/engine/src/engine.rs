@@ -71,6 +71,17 @@ impl Engine {
         self.maybe_evict();
         result
     }
+    /// Like `with_mut`, but for callers that can report their mutation's byte delta directly
+    /// instead of paying `Shard::with_mut`'s O(current collection size) before/after diff --
+    /// see `Shard::with_mut_delta`'s doc comment for why that scan matters.
+    pub fn with_mut_delta<F, R>(&self, key: &[u8], f: F) -> R
+    where
+        F: FnOnce(Option<&mut Value>) -> (R, isize),
+    {
+        let result = self.store.with_mut_delta(key, f);
+        self.maybe_evict();
+        result
+    }
     pub fn expire_at(&self, key: &[u8], at: Instant) -> bool {
         self.store.expire_at(key, at)
     }

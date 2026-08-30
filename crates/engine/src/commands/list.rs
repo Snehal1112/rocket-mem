@@ -2,30 +2,39 @@ use crate::{Engine, Value};
 use bytes::Bytes;
 use std::collections::VecDeque;
 
-// Every function below reads/mutates a list in place via `Engine::with_ref`/`with_mut`
+// Every function below reads/mutates a list in place via `Engine::with_ref`/`with_mut_delta`
 // instead of cloning the whole `VecDeque` out and writing a replacement back -- the old
 // clone-mutate-writeback pattern made every single-element push/pop O(current list length)
 // instead of O(1), which compounds into O(n²) total cost for n sequential pushes to one key
 // (confirmed by `redis-benchmark`: a single-key LPUSH benchmark visibly degraded over time
 // and didn't finish 100k requests in 60s before this fix).
+//
+// Mutating functions use `with_mut_delta`, not `with_mut`: `MAXMEMORY` byte accounting
+// (`Shard::with_mut`) re-derives its delta by calling `Value::approx_size()` -- itself an
+// O(current collection size) scan -- once before and once after every mutation, which quietly
+// reintroduced the exact same O(n²) growth this comment already warned about, just one layer
+// down. `with_mut_delta` lets each function report the delta it already knows for free (the
+// size of just the element(s) it added/removed/replaced) instead of paying for that rescan.
 
 pub fn rpush(
     engine: &Engine,
     key: Bytes,
     values: Vec<Bytes>,
 ) -> Result<usize, common::EngineError> {
-    let existed = engine.with_mut(
+    let existed = engine.with_mut_delta(
         &key,
-        |existing| -> Result<Option<usize>, common::EngineError> {
+        |existing| -> (Result<Option<usize>, common::EngineError>, isize) {
             match existing {
                 Some(Value::List(list)) => {
+                    let mut delta = 0isize;
                     for val in &values {
+                        delta += val.len() as isize + 8; // matches Value::approx_size's per-element cost
                         list.push_back(val.clone()); // Bytes clone is O(1), not a deep copy
                     }
-                    Ok(Some(list.len()))
+                    (Ok(Some(list.len())), delta)
                 }
-                Some(_) => Err(common::EngineError::WrongType),
-                None => Ok(None),
+                Some(_) => (Err(common::EngineError::WrongType), 0),
+                None => (Ok(None), 0),
             }
         },
     )?;
@@ -51,18 +60,20 @@ pub fn lpush(
     key: Bytes,
     values: Vec<Bytes>,
 ) -> Result<usize, common::EngineError> {
-    let existed = engine.with_mut(
+    let existed = engine.with_mut_delta(
         &key,
-        |existing| -> Result<Option<usize>, common::EngineError> {
+        |existing| -> (Result<Option<usize>, common::EngineError>, isize) {
             match existing {
                 Some(Value::List(list)) => {
+                    let mut delta = 0isize;
                     for val in &values {
+                        delta += val.len() as isize + 8; // matches Value::approx_size's per-element cost
                         list.push_front(val.clone());
                     }
-                    Ok(Some(list.len()))
+                    (Ok(Some(list.len())), delta)
                 }
-                Some(_) => Err(common::EngineError::WrongType),
-                None => Ok(None),
+                Some(_) => (Err(common::EngineError::WrongType), 0),
+                None => (Ok(None), 0),
             }
         },
     )?;
@@ -90,19 +101,36 @@ pub fn lpush(
     }
 }
 
+/// The removed element's own length is enough to compute the delta -- no need to rescan the
+/// rest of the list (see `Shard::with_mut_delta`).
+fn popped_delta(popped: &Option<Bytes>) -> isize {
+    match popped {
+        Some(b) => -(b.len() as isize + 8),
+        None => 0,
+    }
+}
+
 pub fn rpop(engine: &Engine, key: &[u8]) -> Result<Option<Bytes>, common::EngineError> {
-    engine.with_mut(key, |existing| match existing {
-        None => Ok(None),
-        Some(Value::List(list)) => Ok(list.pop_back()),
-        Some(_) => Err(common::EngineError::WrongType),
+    engine.with_mut_delta(key, |existing| match existing {
+        None => (Ok(None), 0),
+        Some(Value::List(list)) => {
+            let popped = list.pop_back();
+            let delta = popped_delta(&popped);
+            (Ok(popped), delta)
+        }
+        Some(_) => (Err(common::EngineError::WrongType), 0),
     })
 }
 
 pub fn lpop(engine: &Engine, key: &[u8]) -> Result<Option<Bytes>, common::EngineError> {
-    engine.with_mut(key, |existing| match existing {
-        None => Ok(None),
-        Some(Value::List(list)) => Ok(list.pop_front()),
-        Some(_) => Err(common::EngineError::WrongType),
+    engine.with_mut_delta(key, |existing| match existing {
+        None => (Ok(None), 0),
+        Some(Value::List(list)) => {
+            let popped = list.pop_front();
+            let delta = popped_delta(&popped);
+            (Ok(popped), delta)
+        }
+        Some(_) => (Err(common::EngineError::WrongType), 0),
     })
 }
 
@@ -176,19 +204,21 @@ pub fn lset(
     index: i64,
     val: Bytes,
 ) -> Result<bool, common::EngineError> {
-    engine.with_mut(&key, |existing| {
+    engine.with_mut_delta(&key, |existing| {
         let list = match existing {
-            None => return Ok(false),
+            None => return (Ok(false), 0),
             Some(Value::List(list)) => list,
-            Some(_) => return Err(common::EngineError::WrongType),
+            Some(_) => return (Err(common::EngineError::WrongType), 0),
         };
         let len = list.len() as i64;
         let idx = if index < 0 { len + index } else { index };
         if idx < 0 || idx >= len {
-            return Ok(false);
+            return (Ok(false), 0);
         }
+        // Only the replaced element's length changes -- the rest of the list is untouched.
+        let delta = val.len() as isize - list[idx as usize].len() as isize;
         list[idx as usize] = val;
-        Ok(true)
+        (Ok(true), delta)
     })
 }
 
@@ -212,11 +242,11 @@ pub fn lrem(
     count: i64,
     val: &[u8],
 ) -> Result<usize, common::EngineError> {
-    engine.with_mut(&key, |existing| {
+    engine.with_mut_delta(&key, |existing| {
         let list = match existing {
-            None => return Ok(0),
+            None => return (Ok(0), 0),
             Some(Value::List(list)) => list,
-            Some(_) => return Err(common::EngineError::WrongType),
+            Some(_) => return (Err(common::EngineError::WrongType), 0),
         };
         let mut removed = 0usize;
         if count >= 0 {
@@ -253,7 +283,10 @@ pub fn lrem(
                 list.remove(idx);
             }
         }
-        Ok(removed)
+        // Every removed item equals `val` by definition (that's the match condition above),
+        // so its length is already known without inspecting the removed items themselves.
+        let delta = -(removed as isize) * (val.len() as isize + 8);
+        (Ok(removed), delta)
     })
 }
 
@@ -264,18 +297,19 @@ pub fn linsert(
     pivot: &[u8],
     val: Bytes,
 ) -> Result<i64, common::EngineError> {
-    engine.with_mut(&key, |existing| {
+    engine.with_mut_delta(&key, |existing| {
         let list = match existing {
-            None => return Ok(0),
+            None => return (Ok(0), 0),
             Some(Value::List(list)) => list,
-            Some(_) => return Err(common::EngineError::WrongType),
+            Some(_) => return (Err(common::EngineError::WrongType), 0),
         };
         let Some(pos) = list.iter().position(|item| item.as_ref() == pivot) else {
-            return Ok(-1);
+            return (Ok(-1), 0);
         };
         let insert_at = if before { pos } else { pos + 1 };
+        let delta = val.len() as isize + 8; // matches Value::approx_size's per-element cost
         list.insert(insert_at, val);
-        Ok(list.len() as i64)
+        (Ok(list.len() as i64), delta)
     })
 }
 
@@ -740,5 +774,66 @@ mod tests {
             lindex(&engine, b"k", 0).unwrap_err(),
             common::EngineError::WrongType
         );
+    }
+
+    /// `engine.memory_used()` after each `with_mut_delta`-based mutation must equal
+    /// independently recomputing the entry's true size from scratch (`key.len() +
+    /// Value::approx_size()`) -- proving the delta each function reports is exactly right,
+    /// not just "close enough" or accidentally cancelling out over a sequence of calls.
+    fn assert_memory_used_matches_recomputed_size(engine: &Engine, key: &[u8]) {
+        let value = engine.get(key).expect("key must exist");
+        let expected = key.len() + value.approx_size();
+        assert_eq!(engine.memory_used(), expected);
+    }
+
+    #[test]
+    fn with_mut_delta_based_list_mutations_keep_memory_used_exactly_in_sync() {
+        let engine = Engine::new();
+        let key = Bytes::from_static(b"l");
+
+        rpush(
+            &engine,
+            key.clone(),
+            vec![Bytes::from_static(b"a"), Bytes::from_static(b"bb")],
+        )
+        .unwrap();
+        assert_memory_used_matches_recomputed_size(&engine, &key);
+
+        lpush(&engine, key.clone(), vec![Bytes::from_static(b"ccc")]).unwrap();
+        assert_memory_used_matches_recomputed_size(&engine, &key);
+
+        rpop(&engine, &key).unwrap();
+        assert_memory_used_matches_recomputed_size(&engine, &key);
+
+        lpop(&engine, &key).unwrap();
+        assert_memory_used_matches_recomputed_size(&engine, &key);
+
+        rpush(
+            &engine,
+            key.clone(),
+            vec![
+                Bytes::from_static(b"x"),
+                Bytes::from_static(b"y"),
+                Bytes::from_static(b"z"),
+            ],
+        )
+        .unwrap();
+        assert_memory_used_matches_recomputed_size(&engine, &key);
+
+        lset(&engine, key.clone(), 0, Bytes::from_static(b"much-longer")).unwrap();
+        assert_memory_used_matches_recomputed_size(&engine, &key);
+
+        linsert(
+            &engine,
+            key.clone(),
+            true,
+            b"y",
+            Bytes::from_static(b"inserted"),
+        )
+        .unwrap();
+        assert_memory_used_matches_recomputed_size(&engine, &key);
+
+        lrem(&engine, key.clone(), 0, b"y").unwrap();
+        assert_memory_used_matches_recomputed_size(&engine, &key);
     }
 }

@@ -51,6 +51,12 @@ impl Store {
     {
         self.shard_for(key).with_mut(key, f, &self.clock)
     }
+    pub fn with_mut_delta<F, R>(&self, key: &[u8], f: F) -> R
+    where
+        F: FnOnce(Option<&mut Value>) -> (R, isize),
+    {
+        self.shard_for(key).with_mut_delta(key, f, &self.clock)
+    }
     pub fn expire_at(&self, key: &[u8], at: std::time::Instant) -> bool {
         self.shard_for(key).expire_at(key, at)
     }

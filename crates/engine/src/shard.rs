@@ -256,6 +256,48 @@ impl Shard {
             None => f(None),
         }
     }
+
+    // Like `with_mut`, but the caller reports the exact byte delta its own mutation caused
+    // instead of `with_mut`'s before/after `Value::approx_size()` diff. `approx_size()` is a
+    // full O(current collection size) scan, so calling it twice per mutation makes every
+    // single-element list push/pop O(n) instead of O(1) -- which compounds into O(n²) total
+    // cost for n sequential pushes to one key (confirmed by `redis-benchmark`: a single-key
+    // LPUSH benchmark's throughput visibly degraded as the list grew). A pushed/popped/replaced
+    // element's own size is already known to the caller for free, so it can report the delta
+    // directly without ever walking the rest of the collection.
+    pub fn with_mut_delta<F, R>(&self, key: &[u8], f: F, clock: &AtomicU64) -> R
+    where
+        F: FnOnce(Option<&mut Value>) -> (R, isize),
+    {
+        let mut guard = self.map.write();
+        if let Some(entry) = guard.get(key) {
+            if entry.is_expired() {
+                let size = entry_size(key, &entry.value);
+                guard.remove(key);
+                self.bytes_used.fetch_sub(size, Ordering::Relaxed);
+            }
+        }
+        match guard.get_mut(key) {
+            Some(entry) => {
+                entry
+                    .last_touched
+                    .store(clock.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
+                let (result, delta) = f(Some(&mut entry.value));
+                match delta.cmp(&0) {
+                    std::cmp::Ordering::Greater => {
+                        self.bytes_used.fetch_add(delta as usize, Ordering::Relaxed);
+                    }
+                    std::cmp::Ordering::Less => {
+                        self.bytes_used
+                            .fetch_sub(delta.unsigned_abs(), Ordering::Relaxed);
+                    }
+                    std::cmp::Ordering::Equal => {}
+                }
+                result
+            }
+            None => f(None).0,
+        }
+    }
 }
 
 #[cfg(test)]
