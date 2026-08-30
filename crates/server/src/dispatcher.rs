@@ -826,10 +826,6 @@ pub fn dispatch(engine: &Engine, frame: Frame, protocol: &mut Protocol, client_i
         }
         "SELECT" => Frame::Simple("OK".into()), // single logical DB only, per 2026-08-29-sprint-2-spec.md scope
         "COMMAND" => Frame::Array(vec![]), // enough that clients probing capabilities don't choke
-        "INFO" => Frame::Bulk(Bytes::from(format!(
-            "# Server\r\nredis_version:rocket-mem-{}\r\n",
-            env!("CARGO_PKG_VERSION")
-        ))),
         "MEMORY" => {
             require_args!(rest, 1, "memory");
             let subcommand = String::from_utf8_lossy(&rest[0]).to_ascii_uppercase();
@@ -1336,6 +1332,203 @@ fn handle_cluster(
     })
 }
 
+/// Real Redis's human-readable byte format, e.g. `80.00K`. Purely cosmetic -- `used_memory` is
+/// the machine-readable field; tooling that graphs memory reads that one.
+fn human_bytes(bytes: usize) -> String {
+    const K: f64 = 1024.0;
+    let b = bytes as f64;
+    if b >= K * K * K {
+        format!("{:.2}G", b / (K * K * K))
+    } else if b >= K * K {
+        format!("{:.2}M", b / (K * K))
+    } else if b >= K {
+        format!("{:.2}K", b / K)
+    } else {
+        format!("{bytes}B")
+    }
+}
+
+/// The `INFO persistence` name for an fsync policy, matching real Redis's spelling
+/// (`always`/`everysec`/`no`) rather than this codebase's enum names.
+fn fsync_policy_name(policy: crate::aof::FsyncPolicy) -> &'static str {
+    match policy {
+        crate::aof::FsyncPolicy::Always => "always",
+        crate::aof::FsyncPolicy::EverySecond => "everysec",
+        crate::aof::FsyncPolicy::Never => "no",
+    }
+}
+
+/// Builds `INFO`'s body. `section` is `None` for "every section" (no argument, or `all`/
+/// `default`/`everything`), otherwise a lowercase section name.
+///
+/// Every field here is backed by state this server actually tracks. Fields real Redis has that
+/// this one cannot compute -- `keyspace_hits`/`keyspace_misses` (nothing counts them),
+/// `tcp_port` (the dispatcher never learns the listen address), `rdb_changes_since_last_save`
+/// -- are omitted rather than faked.
+fn info_text(
+    section: Option<&str>,
+    engine: &Engine,
+    aof: &crate::aof::AofWriter,
+    replication: &crate::replication::ReplicationHandle,
+) -> String {
+    let wanted = |name: &str| section.is_none() || section == Some(name);
+    let mut out = String::new();
+
+    if wanted("server") {
+        let uptime = replication.uptime_secs();
+        out.push_str(&format!(
+            "# Server\r\n\
+             redis_version:rocket-mem-{version}\r\n\
+             rocket_mem_version:{version}\r\n\
+             redis_mode:{mode}\r\n\
+             os:{os}\r\n\
+             arch_bits:{bits}\r\n\
+             process_id:{pid}\r\n\
+             uptime_in_seconds:{uptime}\r\n\
+             uptime_in_days:{days}\r\n\r\n",
+            version = env!("CARGO_PKG_VERSION"),
+            mode = if replication.cluster().is_some() {
+                "cluster"
+            } else {
+                "standalone"
+            },
+            os = std::env::consts::OS,
+            bits = usize::BITS,
+            pid = std::process::id(),
+            days = uptime / 86_400,
+        ));
+    }
+
+    if wanted("clients") {
+        out.push_str(&format!(
+            "# Clients\r\nconnected_clients:{}\r\n\r\n",
+            replication.connected_clients()
+        ));
+    }
+
+    if wanted("memory") {
+        let used = engine.memory_used();
+        out.push_str(&format!(
+            "# Memory\r\n\
+             used_memory:{used}\r\n\
+             used_memory_human:{}\r\n\
+             maxmemory:{}\r\n\
+             maxmemory_policy:allkeys-lru\r\n\r\n",
+            human_bytes(used),
+            engine.maxmemory().unwrap_or(0),
+        ));
+    }
+
+    if wanted("persistence") {
+        out.push_str(&format!(
+            "# Persistence\r\n\
+             aof_enabled:1\r\n\
+             aof_fsync_policy:{}\r\n\
+             rdb_last_save_time:{}\r\n\
+             rdb_bgsave_in_progress:0\r\n\r\n",
+            fsync_policy_name(aof.policy()),
+            replication.last_save_unix(),
+        ));
+    }
+
+    if wanted("stats") {
+        out.push_str(&format!(
+            "# Stats\r\n\
+             total_connections_received:{}\r\n\
+             total_commands_processed:{}\r\n\
+             expired_keys:{}\r\n\
+             evicted_keys:{}\r\n\r\n",
+            replication.total_connections(),
+            replication.total_commands(),
+            replication.expired_keys(),
+            engine.eviction_count(),
+        ));
+    }
+
+    if wanted("replication") {
+        let is_replica = replication
+            .is_replica
+            .load(std::sync::atomic::Ordering::Relaxed);
+        out.push_str("# Replication\r\n");
+        if is_replica {
+            // `slave`, not `replica`: real Redis still emits the legacy word and every client
+            // library parses for it. Matching the wire is the point.
+            out.push_str("role:slave\r\n");
+            if let Some(addr) = replication.master_addr() {
+                let (host, port) = split_addr(&addr);
+                out.push_str(&format!("master_host:{host}\r\nmaster_port:{port}\r\n"));
+            }
+            out.push_str(&format!(
+                "master_link_status:{}\r\n",
+                if replication.link_up() { "up" } else { "down" }
+            ));
+        } else {
+            out.push_str("role:master\r\n");
+            out.push_str(&format!(
+                "connected_slaves:{}\r\n",
+                replication.registry.len()
+            ));
+        }
+        out.push_str("\r\n");
+    }
+
+    if wanted("cluster") {
+        out.push_str(&format!(
+            "# Cluster\r\ncluster_enabled:{}\r\n\r\n",
+            i32::from(replication.cluster().is_some())
+        ));
+    }
+
+    if wanted("keyspace") {
+        out.push_str("# Keyspace\r\n");
+        let (keys, expires) = engine.key_counts();
+        if keys > 0 {
+            // Omitted entirely on an empty keyspace, exactly as real Redis does -- tooling
+            // treats the absence of a `db0:` line as "this database is empty".
+            out.push_str(&format!("db0:keys={keys},expires={expires},avg_ttl=0\r\n"));
+        }
+        out.push_str("\r\n");
+    }
+
+    out
+}
+
+/// Returns `Some(reply)` if `frame` was `INFO`. Lives here rather than in `dispatch` because it
+/// reads the `AofWriter` and the `ReplicationHandle`, which plain `dispatch` has no parameter
+/// for -- the same reason `SAVE`, `REPLICAOF`, and `CLUSTER` are intercepted.
+fn handle_info(
+    frame: &Frame,
+    engine: &Engine,
+    aof: &crate::aof::AofWriter,
+    replication: &crate::replication::ReplicationHandle,
+) -> Option<Frame> {
+    let Frame::Array(items) = frame else {
+        return None;
+    };
+    let Some(Frame::Bulk(name)) = items.first() else {
+        return None;
+    };
+    if !name.eq_ignore_ascii_case(b"INFO") {
+        return None;
+    }
+    let section = match items.get(1) {
+        Some(Frame::Bulk(raw)) => {
+            let requested = String::from_utf8_lossy(raw).to_ascii_lowercase();
+            match requested.as_str() {
+                "all" | "default" | "everything" => None,
+                _ => Some(requested),
+            }
+        }
+        _ => None,
+    };
+    Some(Frame::Bulk(Bytes::from(info_text(
+        section.as_deref(),
+        engine,
+        aof,
+        replication,
+    ))))
+}
+
 /// Snapshots `replication.engine()` — in production this is always the same `Arc<Engine>` as
 /// `dispatch_and_log`'s own `engine` parameter (`main.rs` constructs one `Engine`, shares it
 /// into both `serve`'s `engine` argument and `ReplicationHandle::new`), so using the handle's
@@ -1488,6 +1681,9 @@ fn dispatch_and_log_inner(
         return reply;
     }
     if let Some(reply) = handle_cluster(&frame, replication) {
+        return reply;
+    }
+    if let Some(reply) = handle_info(&frame, engine, aof, replication) {
         return reply;
     }
 
@@ -2113,11 +2309,183 @@ mod tests {
     #[test]
     fn info_replies_a_non_empty_bulk_string() {
         let engine = Engine::new();
-        let Frame::Bulk(info) = dispatch(&engine, cmd(&[b"INFO"]), &mut Protocol::default(), 1)
-        else {
+        let (_dir, aof) = test_aof();
+        let Frame::Bulk(info) = dispatch_and_log(
+            &engine,
+            &aof,
+            &ReplicationHandle::default(),
+            cmd(&[b"INFO"]),
+            &mut Protocol::default(),
+            1,
+        ) else {
             panic!("expected Bulk")
         };
         assert!(!info.is_empty());
+    }
+
+    fn info_text_for(replication: &ReplicationHandle, engine: &Engine, args: &[&[u8]]) -> String {
+        let (_dir, aof) = test_aof();
+        let mut command = vec![&b"INFO"[..]];
+        command.extend_from_slice(args);
+        let Frame::Bulk(text) = dispatch_and_log(
+            engine,
+            &aof,
+            replication,
+            cmd(&command),
+            &mut Protocol::default(),
+            1,
+        ) else {
+            panic!("INFO should reply with a Bulk string")
+        };
+        String::from_utf8(text.to_vec()).unwrap()
+    }
+
+    #[test]
+    fn info_emits_every_section_by_default() {
+        let engine = Engine::new();
+        let text = info_text_for(&ReplicationHandle::default(), &engine, &[]);
+        for header in [
+            "# Server",
+            "# Clients",
+            "# Memory",
+            "# Persistence",
+            "# Stats",
+            "# Replication",
+            "# Cluster",
+        ] {
+            assert!(text.contains(header), "missing {header} in:\n{text}");
+        }
+        assert!(text.contains("redis_version:rocket-mem-"), "{text}");
+        assert!(text.contains("redis_mode:standalone\r\n"), "{text}");
+        assert!(text.contains("maxmemory_policy:allkeys-lru\r\n"), "{text}");
+        assert!(text.contains("aof_enabled:1\r\n"), "{text}");
+        assert!(text.contains("rdb_bgsave_in_progress:0\r\n"), "{text}");
+        assert!(text.contains("aof_fsync_policy:no\r\n"), "{text}"); // test_aof uses Never
+    }
+
+    #[test]
+    fn info_with_a_section_argument_returns_only_that_section() {
+        let engine = Engine::new();
+        let text = info_text_for(&ReplicationHandle::default(), &engine, &[b"replication"]);
+        assert!(text.contains("# Replication"), "{text}");
+        assert!(text.contains("role:master\r\n"), "{text}");
+        assert!(!text.contains("# Memory"), "{text}");
+        // the section name is case-insensitive, like real Redis
+        let upper = info_text_for(&ReplicationHandle::default(), &engine, &[b"REPLICATION"]);
+        assert!(upper.contains("# Replication"), "{upper}");
+        // `all` and `default` both mean everything
+        let all = info_text_for(&ReplicationHandle::default(), &engine, &[b"all"]);
+        assert!(
+            all.contains("# Memory") && all.contains("# Replication"),
+            "{all}"
+        );
+    }
+
+    #[test]
+    fn info_reports_role_slave_on_a_replica() {
+        let engine = Engine::new();
+        let replication = ReplicationHandle::default();
+        replication
+            .is_replica
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let text = info_text_for(&replication, &engine, &[b"replication"]);
+        assert!(text.contains("role:slave\r\n"), "{text}");
+        assert!(text.contains("master_link_status:down\r\n"), "{text}");
+        assert!(!text.contains("connected_slaves:"), "{text}");
+    }
+
+    #[test]
+    fn info_reports_connected_slaves_on_a_master() {
+        let engine = Engine::new();
+        let replication = ReplicationHandle::default();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        replication.registry.register(tx);
+        let text = info_text_for(&replication, &engine, &[b"replication"]);
+        assert!(text.contains("role:master\r\n"), "{text}");
+        assert!(text.contains("connected_slaves:1\r\n"), "{text}");
+        assert!(!text.contains("master_host:"), "{text}");
+    }
+
+    #[test]
+    fn info_keyspace_line_appears_only_when_there_are_keys() {
+        let engine = Engine::new();
+        let empty = info_text_for(&ReplicationHandle::default(), &engine, &[b"keyspace"]);
+        assert!(!empty.contains("db0:"), "{empty}");
+
+        engine.set(
+            Bytes::from_static(b"a"),
+            Value::String(Bytes::from_static(b"1")),
+        );
+        engine.set(
+            Bytes::from_static(b"b"),
+            Value::String(Bytes::from_static(b"2")),
+        );
+        engine.expire_at(
+            b"b",
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+        );
+        let filled = info_text_for(&ReplicationHandle::default(), &engine, &[b"keyspace"]);
+        assert!(
+            filled.contains("db0:keys=2,expires=1,avg_ttl=0\r\n"),
+            "{filled}"
+        );
+    }
+
+    #[test]
+    fn info_reports_cluster_mode_from_the_loaded_config() {
+        let engine = Engine::new();
+        let off = info_text_for(&ReplicationHandle::default(), &engine, &[b"cluster"]);
+        assert!(off.contains("cluster_enabled:0\r\n"), "{off}");
+        let on = info_text_for(&cluster_handle("shard-a"), &engine, &[b"cluster"]);
+        assert!(on.contains("cluster_enabled:1\r\n"), "{on}");
+        let server = info_text_for(&cluster_handle("shard-a"), &engine, &[b"server"]);
+        assert!(server.contains("redis_mode:cluster\r\n"), "{server}");
+    }
+
+    #[test]
+    fn info_stats_counts_the_commands_that_ran_before_it() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let replication = ReplicationHandle::default();
+        replication.connection_opened();
+        for _ in 0..3 {
+            dispatch_and_log(
+                &engine,
+                &aof,
+                &replication,
+                cmd(&[b"PING"]),
+                &mut Protocol::default(),
+                1,
+            );
+        }
+        let text = info_text_for(&replication, &engine, &[b"stats"]);
+        // 3 PINGs; the INFO itself is counted by the wrapper only *after* the body ran
+        assert!(text.contains("total_commands_processed:3\r\n"), "{text}");
+        assert!(text.contains("total_connections_received:1\r\n"), "{text}");
+        assert!(text.contains("expired_keys:0\r\n"), "{text}");
+        assert!(text.contains("evicted_keys:0\r\n"), "{text}");
+        let clients = info_text_for(&replication, &engine, &[b"clients"]);
+        assert!(clients.contains("connected_clients:1\r\n"), "{clients}");
+    }
+
+    #[test]
+    fn info_memory_reports_a_configured_maxmemory() {
+        let engine = Engine::with_maxmemory(4_096);
+        let text = info_text_for(&ReplicationHandle::default(), &engine, &[b"memory"]);
+        assert!(text.contains("maxmemory:4096\r\n"), "{text}");
+        assert!(text.contains("used_memory:"), "{text}");
+        assert!(text.contains("used_memory_human:"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn info_reports_the_master_address_while_replicating() {
+        let engine = Engine::new();
+        let replication = ReplicationHandle::default();
+        replication.start_replicating("127.0.0.1:1".to_string()); // nothing listening; fine
+        let text = info_text_for(&replication, &engine, &[b"replication"]);
+        assert!(text.contains("master_host:127.0.0.1\r\n"), "{text}");
+        assert!(text.contains("master_port:1\r\n"), "{text}");
+        replication.stop_replicating();
     }
 
     #[test]
