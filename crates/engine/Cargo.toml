@@ -9,3 +9,6 @@ bytes.workspace = true
 parking_lot.workspace = true
 rand.workspace = true
 ordered-float.workspace = true
+serde.workspace = true
+bincode.workspace = true
+thiserror.workspace = true

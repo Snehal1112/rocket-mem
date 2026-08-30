@@ -7,7 +7,9 @@ edition = "2021"
 version = "0.1.2"
 
 [workspace.dependencies]
-bytes = "1"
+bytes = { version = "1", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
 thiserror = "1"
 tracing = "0.1"
 parking_lot = "0.12"
