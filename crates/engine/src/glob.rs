@@ -1,7 +1,8 @@
 /// Matches `text` against a Redis-style glob `pattern`. Supports `*` (any run, including
-/// empty), `?` (exactly one character), and `[abc]` (exactly one character from the listed
-/// set). Character ranges (`[a-z]`), negation (`[^abc]`), and escaping are not supported —
-/// see `docs/superpowers/specs/2026-08-29-sprint-3-spec.md` for why.
+/// empty), `?` (exactly one character), `[abc]` (one character from the listed set),
+/// `[a-z]` (one character from a range), `[^abc]`/`[!abc]` (negated set), and a top-level
+/// `\` to match the next character literally. Escaping is not supported inside `[...]`
+/// classes — see `docs/superpowers/specs/2026-08-30-tech-debt-cleanup-spec.md`.
 pub fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
     match pattern.first() {
         None => text.is_empty(),
@@ -14,14 +15,41 @@ pub fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
                 if text.is_empty() {
                     return false;
                 }
-                let class = &pattern[1..close];
-                class.contains(&text[0]) && glob_match(&pattern[close + 1..], &text[1..])
+                let mut class = &pattern[1..close];
+                let negate = matches!(class.first(), Some(b'^') | Some(b'!'));
+                if negate {
+                    class = &class[1..];
+                }
+                let matched = class_matches(class, text[0]);
+                (matched != negate) && glob_match(&pattern[close + 1..], &text[1..])
             }
             // Unterminated class: treat the '[' as a literal character.
             None => !text.is_empty() && text[0] == b'[' && glob_match(&pattern[1..], &text[1..]),
         },
         Some(&c) => !text.is_empty() && text[0] == c && glob_match(&pattern[1..], &text[1..]),
     }
+}
+
+/// Matches `c` against a bracket-class body (with any leading `^`/`!` negation marker already
+/// stripped by the caller). `lo-hi` in the middle of the class expands to a range; a lone
+/// trailing `-` (no byte after it to complete a range) is a literal hyphen.
+fn class_matches(class: &[u8], c: u8) -> bool {
+    let mut i = 0;
+    while i < class.len() {
+        if i + 2 < class.len() && class[i + 1] == b'-' {
+            let (lo, hi) = (class[i], class[i + 2]);
+            if lo <= c && c <= hi {
+                return true;
+            }
+            i += 3;
+        } else {
+            if class[i] == c {
+                return true;
+            }
+            i += 1;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -67,6 +95,46 @@ mod tests {
         assert!(glob_match(b"[abc]", b"b"));
         assert!(!glob_match(b"[abc]", b"d"));
         assert!(!glob_match(b"[abc]", b"ab"));
+    }
+
+    #[test]
+    fn bracket_class_range_matches_any_byte_in_the_range() {
+        assert!(glob_match(b"[a-c]", b"a"));
+        assert!(glob_match(b"[a-c]", b"b"));
+        assert!(glob_match(b"[a-c]", b"c"));
+        assert!(!glob_match(b"[a-c]", b"d"));
+    }
+
+    #[test]
+    fn bracket_class_range_combines_with_literal_members() {
+        assert!(glob_match(b"[a-cz]", b"z"));
+        assert!(glob_match(b"[a-cz]", b"b"));
+        assert!(!glob_match(b"[a-cz]", b"y"));
+    }
+
+    #[test]
+    fn bracket_class_trailing_hyphen_is_a_literal_hyphen() {
+        assert!(glob_match(b"[a-]", b"a"));
+        assert!(glob_match(b"[a-]", b"-"));
+        assert!(!glob_match(b"[a-]", b"b"));
+    }
+
+    #[test]
+    fn bracket_class_caret_negates_the_set() {
+        assert!(glob_match(b"[^abc]", b"d"));
+        assert!(!glob_match(b"[^abc]", b"a"));
+    }
+
+    #[test]
+    fn bracket_class_bang_negates_the_set() {
+        assert!(glob_match(b"[!abc]", b"d"));
+        assert!(!glob_match(b"[!abc]", b"a"));
+    }
+
+    #[test]
+    fn bracket_class_negated_range_excludes_the_whole_range() {
+        assert!(glob_match(b"[^a-c]", b"d"));
+        assert!(!glob_match(b"[^a-c]", b"b"));
     }
 
     #[test]
