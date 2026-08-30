@@ -2,7 +2,7 @@ use crate::aof::AofWriter;
 use engine::Engine;
 use futures_util::{SinkExt, StreamExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Holds one outbound channel per connected replica. `senders` is a plain `std::sync::Mutex`,
@@ -33,6 +33,18 @@ impl ReplicaRegistry {
     pub fn broadcast(&self, bytes: bytes::Bytes) {
         let mut senders = self.senders.lock().unwrap_or_else(|e| e.into_inner());
         senders.retain(|tx| tx.send(bytes.clone()).is_ok());
+    }
+
+    /// How many replicas are currently registered. Note this counts senders, which are pruned
+    /// lazily by `broadcast`, so a replica that died since the last write may still be counted
+    /// until the next one -- an acceptable lag for a gauge, and cheaper than probing sockets.
+    pub fn len(&self) -> usize {
+        self.senders.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    /// Required by `clippy::len_without_is_empty`, which `-D warnings` makes a hard error.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -99,6 +111,21 @@ pub struct ReplicationHandle {
     /// `ServerState` is deferred to Sprint 7, whose dual-protocol work has to touch these
     /// signatures anyway; see ../../docs/superpowers/specs/2026-08-30-sprint-6-spec.md.
     cluster: Option<Arc<crate::cluster::ClusterConfig>>,
+    /// Live client connections, kept by a Drop guard in `handle_connection` so it is decremented
+    /// on every one of that function's early returns, including the `serve_replica` path.
+    connected_clients: AtomicUsize,
+    /// Every connection ever accepted; never decremented.
+    total_connections: AtomicU64,
+    /// Every command that reached `dispatch_and_log`. Replicated commands applied through plain
+    /// `dispatch` are deliberately *not* counted -- they are not client traffic.
+    total_commands: AtomicU64,
+    /// Keys removed by the active expiry sweep. Passively expired keys (a read finding a key
+    /// already dead) are not counted: that would mean a counter on the hottest read path in the
+    /// project, inside `Shard`, for a statistic nothing gates on.
+    expired_keys: AtomicU64,
+    /// Unix seconds at which this node last applied a replicated frame; 0 if it never has. An
+    /// `Arc` because the spawned follower task is `'static` and needs its own handle.
+    last_apply_unix: Arc<AtomicI64>,
 }
 
 impl ReplicationHandle {
@@ -112,6 +139,11 @@ impl ReplicationHandle {
             generation: Arc::new(AtomicU64::new(0)),
             aof: None,
             cluster: None,
+            connected_clients: AtomicUsize::new(0),
+            total_connections: AtomicU64::new(0),
+            total_commands: AtomicU64::new(0),
+            expired_keys: AtomicU64::new(0),
+            last_apply_unix: Arc::new(AtomicI64::new(0)),
         }
     }
 
@@ -188,6 +220,44 @@ impl ReplicationHandle {
         }
         self.generation.fetch_add(1, Ordering::SeqCst);
         self.is_replica.store(false, Ordering::Relaxed);
+    }
+
+    /// Called once per accepted client connection. Bumps both the live gauge and the lifetime
+    /// total; `connection_closed` is its Drop-guarded pair.
+    pub fn connection_opened(&self) {
+        self.connected_clients.fetch_add(1, Ordering::Relaxed);
+        self.total_connections.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn connection_closed(&self) {
+        self.connected_clients.fetch_sub(1, Ordering::Relaxed);
+    }
+    pub fn connected_clients(&self) -> usize {
+        self.connected_clients.load(Ordering::Relaxed)
+    }
+    pub fn total_connections(&self) -> u64 {
+        self.total_connections.load(Ordering::Relaxed)
+    }
+    pub fn command_executed(&self) {
+        self.total_commands.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn total_commands(&self) -> u64 {
+        self.total_commands.load(Ordering::Relaxed)
+    }
+    pub fn record_expired(&self, removed: usize) {
+        if removed > 0 {
+            self.expired_keys
+                .fetch_add(removed as u64, Ordering::Relaxed);
+        }
+    }
+    pub fn expired_keys(&self) -> u64 {
+        self.expired_keys.load(Ordering::Relaxed)
+    }
+    pub fn last_apply_unix(&self) -> i64 {
+        self.last_apply_unix.load(Ordering::Relaxed)
+    }
+    /// The shared slot itself, for the spawned follower task to write into.
+    pub fn last_apply_slot(&self) -> Arc<AtomicI64> {
+        Arc::clone(&self.last_apply_unix)
     }
 }
 
@@ -662,6 +732,50 @@ mod tests {
         handle.start_replicating("127.0.0.1:2".to_string()); // must not panic or leave two tasks running
         assert!(handle.is_replica.load(std::sync::atomic::Ordering::Relaxed));
         handle.stop_replicating();
+    }
+
+    #[test]
+    fn registry_len_tracks_registered_replicas() {
+        let registry = ReplicaRegistry::default();
+        assert!(registry.is_empty());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        registry.register(tx);
+        assert_eq!(registry.len(), 1);
+    }
+
+    #[test]
+    fn connection_counters_move_with_open_and_close() {
+        let h = ReplicationHandle::default();
+        assert_eq!(h.connected_clients(), 0);
+        assert_eq!(h.total_connections(), 0);
+        h.connection_opened();
+        h.connection_opened();
+        assert_eq!(h.connected_clients(), 2);
+        assert_eq!(h.total_connections(), 2);
+        h.connection_closed();
+        assert_eq!(h.connected_clients(), 1);
+        assert_eq!(h.total_connections(), 2); // total never goes down
+    }
+
+    #[test]
+    fn command_and_expiry_counters_accumulate() {
+        let h = ReplicationHandle::default();
+        h.command_executed();
+        h.command_executed();
+        assert_eq!(h.total_commands(), 2);
+        h.record_expired(5);
+        h.record_expired(0);
+        h.record_expired(2);
+        assert_eq!(h.expired_keys(), 7);
+    }
+
+    #[test]
+    fn last_apply_unix_starts_at_zero_and_follows_the_shared_slot() {
+        let h = ReplicationHandle::default();
+        assert_eq!(h.last_apply_unix(), 0);
+        h.last_apply_slot()
+            .store(1_756_512_000, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(h.last_apply_unix(), 1_756_512_000);
     }
 
     #[test]

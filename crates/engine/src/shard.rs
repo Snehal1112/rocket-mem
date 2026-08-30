@@ -107,6 +107,25 @@ impl Shard {
             .collect()
     }
 
+    /// `(live entries, of which carry an expiry)` in one read lock and one pass. Skips entries
+    /// that are already expired but not yet reaped, matching what `keys()` and `entries()`
+    /// report, so `INFO`'s keyspace line and `KEYS *` can never disagree.
+    pub fn counts(&self) -> (usize, usize) {
+        let guard = self.map.read();
+        let mut total = 0;
+        let mut with_expiry = 0;
+        for entry in guard.values() {
+            if entry.is_expired() {
+                continue;
+            }
+            total += 1;
+            if entry.expires_at.is_some() {
+                with_expiry += 1;
+            }
+        }
+        (total, with_expiry)
+    }
+
     /// A full, point-in-time (per this one shard) projection of every unexpired entry — the
     /// building block `Store::snapshot_entries` flat-maps across all 16 shards. `Entry` itself
     /// never escapes this module; only this `(key, value, expiry)` tuple does.

@@ -39,6 +39,15 @@ impl Store {
     pub fn keys(&self) -> Vec<Bytes> {
         self.shards.iter().flat_map(|s| s.keys()).collect()
     }
+    /// Sums `Shard::counts` across all 16 shards. Each shard is locked and released in turn, so
+    /// this is a sampling read, not a point-in-time view of the whole store -- which is exactly
+    /// right for a metrics gauge and for `INFO`.
+    pub fn key_counts(&self) -> (usize, usize) {
+        self.shards.iter().fold((0, 0), |(t, e), shard| {
+            let (st, se) = shard.counts();
+            (t + st, e + se)
+        })
+    }
     pub fn with_ref<F, R>(&self, key: &[u8], f: F) -> R
     where
         F: FnOnce(Option<&Value>) -> R,
