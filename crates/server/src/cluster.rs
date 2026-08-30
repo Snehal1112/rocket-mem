@@ -205,6 +205,16 @@ impl ClusterConfig {
         let me = self.myself();
         me.first_slot <= slot && slot <= me.last_slot
     }
+
+    /// Reads the topology file at `path` and delegates to `parse`. A missing file surfaces as
+    /// the underlying `NotFound` io::Error rather than being treated as "cluster mode off":
+    /// `ROCKET_MEM_CLUSTER_CONFIG` being *set* to a path that doesn't exist is an operator
+    /// mistake, and starting up silently in standalone mode would hide it until keys started
+    /// landing on the wrong node.
+    pub fn load(path: &std::path::Path, node_id: &str) -> std::io::Result<Self> {
+        let text = std::fs::read_to_string(path)?;
+        Self::parse(&text, node_id)
+    }
 }
 
 #[cfg(test)]
@@ -383,5 +393,67 @@ shard-b 127.0.0.1:7001 8001 16383
         let config = ClusterConfig::parse("solo 127.0.0.1:6379 0 16383\n", "solo").unwrap();
         assert_eq!(config.nodes().len(), 1);
         assert_eq!(config.myself().id, "solo");
+    }
+
+    #[test]
+    fn owns_is_true_only_for_this_nodes_own_range() {
+        let config = ClusterConfig::parse(THREE_SHARDS, "shard-b").unwrap();
+        assert!(!config.owns(0));
+        assert!(!config.owns(5460));
+        assert!(config.owns(5461));
+        assert!(config.owns(10922));
+        assert!(!config.owns(10923));
+        assert!(!config.owns(16383));
+    }
+
+    #[test]
+    fn owner_of_finds_the_right_node_for_every_boundary_slot() {
+        let config = ClusterConfig::parse(THREE_SHARDS, "shard-a").unwrap();
+        assert_eq!(config.owner_of(0).id, "shard-a");
+        assert_eq!(config.owner_of(5460).id, "shard-a");
+        assert_eq!(config.owner_of(5461).id, "shard-b");
+        assert_eq!(config.owner_of(10922).id, "shard-b");
+        assert_eq!(config.owner_of(10923).id, "shard-c");
+        assert_eq!(config.owner_of(16383).id, "shard-c");
+    }
+
+    #[test]
+    fn every_slot_in_the_whole_space_has_exactly_one_owner() {
+        let config = ClusterConfig::parse(THREE_SHARDS, "shard-a").unwrap();
+        for slot in 0..SLOT_COUNT {
+            let owner = config.owner_of(slot);
+            let matches = config
+                .nodes()
+                .iter()
+                .filter(|n| n.first_slot <= slot && slot <= n.last_slot)
+                .count();
+            assert_eq!(matches, 1, "slot {slot} has {matches} owners");
+            assert!(owner.first_slot <= slot && slot <= owner.last_slot);
+        }
+    }
+
+    #[test]
+    fn the_well_known_reference_keys_land_on_the_expected_shards() {
+        let config = ClusterConfig::parse(THREE_SHARDS, "shard-a").unwrap();
+        // one key per shard, so this test would fail if any range were misparsed:
+        assert_eq!(config.owner_of(key_slot(b"hello")).id, "shard-a"); // slot 866
+        assert_eq!(config.owner_of(key_slot(b"counter")).id, "shard-b"); // slot 6680
+        assert_eq!(config.owner_of(key_slot(b"foo")).id, "shard-c"); // slot 12182
+    }
+
+    #[test]
+    fn load_reads_a_config_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cluster.conf");
+        std::fs::write(&path, THREE_SHARDS).unwrap();
+        let config = ClusterConfig::load(&path, "shard-c").unwrap();
+        assert_eq!(config.myself().id, "shard-c");
+    }
+
+    #[test]
+    fn load_surfaces_a_missing_file_as_an_io_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = ClusterConfig::load(&dir.path().join("nope.conf"), "shard-a").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
 }
