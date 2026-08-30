@@ -986,19 +986,30 @@ pub fn dispatch_and_log(
     // PEXPIREAT — on replay the key would live forever, silently dropping the TTL. Replay's
     // corrupt-tail handling (aof::replay) recovers a torn final frame, but it cannot detect
     // this case: both frames are individually well-formed, so the pair is not atomic.
+    // Every frame still gets attempted even after a failure, so whatever can land on disk
+    // does -- see the multi-frame note above about SET EX/PX's [SET, PEXPIREAT] pair.
+    let mut aof_failed = false;
     for frame_to_log in to_log {
-        // A logging failure must not fail the client's reply, but it must not be silently
-        // swallowed either -- surface it so an operator watching stderr/logs can notice a
-        // full disk or I/O error instead of discovering it only on replay. Under Always,
-        // append() returns the writer thread's real I/O result, so a failed write or fsync
-        // lands here; under EverySecond/Never the append is fire-and-forget, so this only
-        // catches a dead writer thread and the writer itself reports I/O errors on stderr.
+        // A logging failure must not fail the client's reply outright, but it must not be
+        // silently swallowed either -- surface it so an operator watching stderr/logs can
+        // notice a full disk or I/O error instead of discovering it only on replay. Under
+        // Always, append() returns the writer thread's real I/O result, so a failed write or
+        // fsync lands here and is also surfaced to the client below; under EverySecond/Never
+        // the append is fire-and-forget, so this only catches a dead writer thread and the
+        // writer itself reports I/O errors on stderr.
         if let Err(e) = aof.append(frame_to_log) {
             eprintln!("aof append failed: {e}");
+            aof_failed = true;
         }
         // fsync timing for Always lives inside AofWriter::append itself; EverySecond's
         // periodic fsync loop lives in connection.rs (periodic_fsync_loop); Never does
         // nothing here.
+    }
+    // Only Always promises the client's reply won't precede durability -- EverySecond/Never
+    // are fire-and-forget by design, so a write that hasn't landed yet is expected, not an
+    // error to report back.
+    if aof_failed && aof.policy() == crate::aof::FsyncPolicy::Always {
+        return Frame::Error("ERR failed to write to the append only file".into());
     }
     reply
 }
@@ -3383,6 +3394,51 @@ mod tests {
         );
         aof.fsync().unwrap();
         assert_eq!(read_aof(&dir), ""); // Frame::Null reply — nothing was popped, nothing to log
+    }
+
+    // `/dev/full` accepts an open and then fails every actual write with ENOSPC -- the same
+    // deterministic stand-in for a full disk used in aof.rs's own propagation tests. Linux-only.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dispatch_and_log_returns_an_error_when_an_always_policy_aof_write_fails() {
+        let engine = Engine::new();
+        let aof = AofWriter::open(std::path::Path::new("/dev/full"), FsyncPolicy::Always)
+            .expect("/dev/full opens fine; only writing to it fails");
+        let reply = dispatch_and_log(
+            &engine,
+            &aof,
+            cmd(&[b"SET", b"k", b"v"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(
+            reply,
+            Frame::Error("ERR failed to write to the append only file".into())
+        );
+        // The mutation still committed in memory -- it's durability that failed, not the write.
+        assert_eq!(
+            engine.get(b"k"),
+            Some(Value::String(Bytes::from_static(b"v")))
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dispatch_and_log_still_returns_the_normal_reply_under_never_policy_even_when_the_disk_is_full(
+    ) {
+        // EverySecond/Never are fire-and-forget by design and never promised synchronous
+        // durability, so a doomed write must not change the client-visible reply for them.
+        let engine = Engine::new();
+        let aof = AofWriter::open(std::path::Path::new("/dev/full"), FsyncPolicy::Never)
+            .expect("/dev/full opens fine; only writing to it fails");
+        let reply = dispatch_and_log(
+            &engine,
+            &aof,
+            cmd(&[b"SET", b"k", b"v"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(reply, Frame::Simple("OK".into()));
     }
 
     /// Parses the absolute-ms target out of a logged `PEXPIREAT <key> <ms>` frame in raw RESP
