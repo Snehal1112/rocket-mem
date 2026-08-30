@@ -34,20 +34,6 @@ fn format_score(score: f64) -> Bytes {
     }
 }
 
-/// `EXPIREAT`/`PEXPIREAT` give an absolute Unix timestamp; `Instant` has no epoch relationship,
-/// so the absolute target is first resolved via `SystemTime`, then re-expressed as a delta
-/// applied to `Instant::now()`. A target already in the past collapses to `Duration::ZERO`,
-/// which the very next expiry check reads as already-expired — see
-/// ../../specs/2026-08-30-sprint-4-spec.md for why this two-step conversion is necessary.
-fn instant_from_unix_ms(target_unix_ms: i64) -> std::time::Instant {
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
-    let target = UNIX_EPOCH + Duration::from_millis(target_unix_ms.max(0) as u64);
-    let delta = target
-        .duration_since(SystemTime::now())
-        .unwrap_or(Duration::ZERO);
-    std::time::Instant::now() + delta
-}
-
 fn parse_score(raw: &[u8]) -> Result<f64, Frame> {
     let score: f64 = std::str::from_utf8(raw)
         .ok()
@@ -802,7 +788,7 @@ pub fn dispatch(engine: &Engine, frame: Frame, protocol: &mut Protocol, client_i
             } else {
                 n
             };
-            match engine.expire_at(&rest[0], instant_from_unix_ms(target_unix_ms)) {
+            match engine.expire_at(&rest[0], common::instant_from_unix_ms(target_unix_ms)) {
                 true => Frame::Integer(1),
                 false => Frame::Integer(0),
             }
