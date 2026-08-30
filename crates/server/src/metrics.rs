@@ -114,7 +114,8 @@ async fn serve_one_scrape(
     };
     let request = String::from_utf8_lossy(&buf[..read]);
     let path = request.split_whitespace().nth(1).unwrap_or("");
-    let response = if path.starts_with("/metrics") {
+    // Exact-match the route: prefix matching would incorrectly 200 unrelated paths like /metricsx or /metrics-admin.
+    let response = if path == "/metrics" || path.starts_with("/metrics?") {
         refresh_sampled_gauges(&engine, &replication);
         let body = handle.render();
         format!(
@@ -193,6 +194,20 @@ mod tests {
         assert!(
             missing.starts_with("HTTP/1.1 404 Not Found\r\n"),
             "{missing}"
+        );
+
+        // Verify exact-match: /metricsx should 404, not 200 (prefix-match bug).
+        let metricsx = get(addr, "/metricsx").await;
+        assert!(
+            metricsx.starts_with("HTTP/1.1 404 Not Found\r\n"),
+            "expected 404 for /metricsx, got: {metricsx}"
+        );
+
+        // Verify query strings still work: /metrics?foo=bar should 200.
+        let with_query = get(addr, "/metrics?format=openmetrics").await;
+        assert!(
+            with_query.starts_with("HTTP/1.1 200 OK\r\n"),
+            "expected 200 for /metrics?format=openmetrics, got: {with_query}"
         );
     }
 }
