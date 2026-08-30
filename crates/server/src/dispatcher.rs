@@ -1047,6 +1047,18 @@ pub fn dispatch_and_log(
     protocol: &mut Protocol,
     client_id: u64,
 ) -> Frame {
+    // Checked before anything else in this function, including the SAVE/REPLICAOF
+    // interceptions below (both are no-ops against WRITE_COMMANDS so ordering relative to
+    // them doesn't matter) and extract_write_command_name's own later call further down (so
+    // a rejected write never touches the AOF ordering lock).
+    if replication
+        .is_replica
+        .load(std::sync::atomic::Ordering::Relaxed)
+        && extract_write_command_name(&frame).is_some()
+    {
+        return Frame::Error("READONLY You can't write against a read only replica.".into());
+    }
+
     if is_save_command(&frame) {
         return handle_save(aof, replication);
     }
@@ -4285,5 +4297,102 @@ mod tests {
             reply,
             Frame::Error("ERR wrong number of arguments for 'replicaof' command".into())
         );
+    }
+
+    #[test]
+    fn a_write_command_on_a_replica_is_rejected_with_readonly() {
+        let engine = std::sync::Arc::new(Engine::new());
+        let (_dir, aof) = test_aof();
+        let replication = ReplicationHandle::new(
+            std::sync::Arc::clone(&engine),
+            "/tmp/unused.snapshot".into(),
+        );
+        replication
+            .is_replica
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let reply = dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"SET", b"k", b"v"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(
+            reply,
+            Frame::Error("READONLY You can't write against a read only replica.".into())
+        );
+        assert_eq!(engine.get(b"k"), None); // the write must never have reached the engine
+    }
+
+    #[test]
+    fn a_read_command_on_a_replica_is_not_gated() {
+        let engine = std::sync::Arc::new(Engine::new());
+        dispatch(
+            &engine,
+            cmd(&[b"SET", b"k", b"v"]),
+            &mut Protocol::default(),
+            1,
+        );
+        let (_dir, aof) = test_aof();
+        let replication = ReplicationHandle::new(
+            std::sync::Arc::clone(&engine),
+            "/tmp/unused.snapshot".into(),
+        );
+        replication
+            .is_replica
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let reply = dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"GET", b"k"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(reply, Frame::Bulk(Bytes::from_static(b"v")));
+    }
+
+    #[test]
+    fn save_is_not_gated_on_a_replica() {
+        let engine = std::sync::Arc::new(Engine::new());
+        let (dir, aof) = test_aof();
+        let snapshot_path = dir.path().join("test.snapshot");
+        let replication = ReplicationHandle::new(std::sync::Arc::clone(&engine), snapshot_path);
+        replication
+            .is_replica
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let reply = dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"SAVE"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(reply, Frame::Simple("OK".into()));
+    }
+
+    #[test]
+    fn a_write_command_when_not_a_replica_is_unaffected() {
+        let engine = std::sync::Arc::new(Engine::new());
+        let (_dir, aof) = test_aof();
+        let replication = ReplicationHandle::new(
+            std::sync::Arc::clone(&engine),
+            "/tmp/unused.snapshot".into(),
+        );
+
+        let reply = dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"SET", b"k", b"v"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(reply, Frame::Simple("OK".into()));
     }
 }
