@@ -105,14 +105,24 @@ literal-set brackets only.
   bytes at a time when it sees a `-` in the middle position (`lo - hi`), and one byte at a time
   otherwise. A trailing lone `-` (e.g. `[a-]`) is treated as a literal hyphen, matching the
   common glob convention (there's no third byte to form a range with).
-- **Negation** — a class body starting with `^` or `!` (either accepted, since Redis's own
-  `stringmatchlen` accepts both) inverts the match: the class matches any byte *not* in the
-  (possibly-range-expanded) set.
+- **Negation** — a class body starting with `^` or `!` inverts the match: the class matches
+  any byte *not* in the (possibly-range-expanded) set. Upstream Redis's `stringmatchlen` only
+  recognizes a leading `^`; accepting `!` too is a deliberate extension beyond upstream
+  behavior for this from-scratch implementation, not a match to it.
 - **Escaping** — a `\` at the top level of the pattern (outside any `[...]`) makes the next
   byte match literally, consuming both bytes from the pattern in one step. This covers `\*`,
-  `\?`, `\[`, and `\\`. Escaping is *not* extended inside bracket classes (e.g. `[\]]`) — out
-  of scope for this fix, matching the fact that upstream Redis's own bracket-class parser has
-  the same limitation.
+  `\?`, `\[`, and `\\`. Escaping is *not* extended inside bracket classes (e.g. `[\]]`) — this
+  is a deliberate scope-narrowing for this fix, not a match to upstream: Redis's own
+  bracket-class parser does handle a `\` inside `[...]`. Out of scope here because no test in
+  this project's Sprint 3 glob work ever exercised it and adding it isn't needed to close the
+  documented gaps.
+- **Reversed ranges** — `[c-a]` (where the low byte is greater than the high byte) matches
+  nothing under `class_matches`'s `lo <= c && c <= hi` check. Upstream Redis swaps a reversed
+  range's endpoints so `[c-a]` behaves like `[a-c]`. This divergence is unintentional (an
+  oversight caught in review, not a considered decision) but is being left as-is for this fix
+  rather than expanding scope; a real `KEYS` pattern accidentally reversing a range is a rare
+  and low-consequence case (it degrades to "matches nothing" rather than matching the wrong
+  thing), and the two-line swap fix belongs in its own reviewed change.
 
 Same public signature (`glob_match(pattern: &[u8], text: &[u8]) -> bool`), same call site
 (`KEYS`'s dispatcher arm) — purely additive parsing logic plus new tests in `glob.rs`.
