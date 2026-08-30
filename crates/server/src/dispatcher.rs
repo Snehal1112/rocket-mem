@@ -950,21 +950,98 @@ fn extract_write_command_name(frame: &Frame) -> Option<String> {
 /// not a compile error: it silently becomes `KeySpec::None`, which means that command is never
 /// slot-routed in cluster mode -- it would be served by whichever node the client happened to
 /// reach, quietly breaking the routing invariant. Step 3a below is the check.
+#[allow(dead_code)] // dead_code until 02-cluster-commands-and-moved.md Task 3 wires in the real caller.
 pub(crate) const KNOWN_COMMANDS: &[&str] = &[
-    "APPEND", "CLUSTER", "COMMAND", "DECR", "DEL", "ECHO", "EXISTS", "EXPIRE", "EXPIREAT", "GET",
-    "GETRANGE", "GETSET", "HDEL", "HELLO", "HEXISTS", "HGET", "HGETALL", "HINCRBY", "HKEYS",
-    "HLEN", "HMGET", "HSCAN", "HSET", "HSETNX", "HVALS", "INCR", "INCRBY", "INFO", "KEYS",
-    "LINDEX", "LINSERT", "LLEN", "LPOP", "LPUSH", "LRANGE", "LREM", "LSET", "LTRIM", "MEMORY",
-    "MGET", "MSET", "MSETNX", "OBJECT", "PERSIST", "PEXPIRE", "PEXPIREAT", "PING", "PSYNC",
-    "PTTL", "RANDOMKEY", "RENAME", "RENAMENX", "REPLICAOF", "RPOP", "RPUSH", "SADD", "SAVE",
-    "SCAN", "SCARD", "SDIFF", "SDIFFSTORE", "SELECT", "SET", "SETRANGE", "SINTER", "SINTERSTORE",
-    "SISMEMBER", "SLOWLOG", "SMEMBERS", "SPOP", "SRANDMEMBER", "SREM", "STRLEN", "SUNION",
-    "SUNIONSTORE", "TTL", "TYPE", "ZADD", "ZCARD", "ZINCRBY", "ZRANGE", "ZRANK", "ZREM", "ZSCORE",
+    "APPEND",
+    "CLUSTER",
+    "COMMAND",
+    "DECR",
+    "DEL",
+    "ECHO",
+    "EXISTS",
+    "EXPIRE",
+    "EXPIREAT",
+    "GET",
+    "GETRANGE",
+    "GETSET",
+    "HDEL",
+    "HELLO",
+    "HEXISTS",
+    "HGET",
+    "HGETALL",
+    "HINCRBY",
+    "HKEYS",
+    "HLEN",
+    "HMGET",
+    "HSCAN",
+    "HSET",
+    "HSETNX",
+    "HVALS",
+    "INCR",
+    "INCRBY",
+    "INFO",
+    "KEYS",
+    "LINDEX",
+    "LINSERT",
+    "LLEN",
+    "LPOP",
+    "LPUSH",
+    "LRANGE",
+    "LREM",
+    "LSET",
+    "LTRIM",
+    "MEMORY",
+    "MGET",
+    "MSET",
+    "MSETNX",
+    "OBJECT",
+    "PERSIST",
+    "PEXPIRE",
+    "PEXPIREAT",
+    "PING",
+    "PSYNC",
+    "PTTL",
+    "RANDOMKEY",
+    "RENAME",
+    "RENAMENX",
+    "REPLICAOF",
+    "RPOP",
+    "RPUSH",
+    "SADD",
+    "SAVE",
+    "SCAN",
+    "SCARD",
+    "SDIFF",
+    "SDIFFSTORE",
+    "SELECT",
+    "SET",
+    "SETRANGE",
+    "SINTER",
+    "SINTERSTORE",
+    "SISMEMBER",
+    "SLOWLOG",
+    "SMEMBERS",
+    "SPOP",
+    "SRANDMEMBER",
+    "SREM",
+    "STRLEN",
+    "SUNION",
+    "SUNIONSTORE",
+    "TTL",
+    "TYPE",
+    "ZADD",
+    "ZCARD",
+    "ZINCRBY",
+    "ZRANGE",
+    "ZRANK",
+    "ZREM",
+    "ZSCORE",
 ];
 
 /// Which of a command's arguments are keys, for cluster-slot routing. Total over every command
 /// this server answers; `First` is the default because it is correct for ~70 of the 84, and
 /// every exception is enumerated in `key_spec`.
+#[allow(dead_code)] // dead_code until 02-cluster-commands-and-moved.md Task 3 wires in the real caller.
 enum KeySpec {
     /// No keys at all -- never redirected. Also the answer for unknown commands.
     None,
@@ -979,6 +1056,7 @@ enum KeySpec {
     EveryOther,
 }
 
+#[allow(dead_code)] // dead_code until 02-cluster-commands-and-moved.md Task 3 wires in the real caller.
 fn key_spec(name: &str) -> KeySpec {
     match name {
         "PING" | "ECHO" | "SELECT" | "COMMAND" | "INFO" | "HELLO" | "KEYS" | "SCAN"
@@ -995,6 +1073,7 @@ fn key_spec(name: &str) -> KeySpec {
 /// The keys `frame`'s command operates on, borrowed from the frame. Empty for a malformed frame,
 /// a keyless command, or an unknown command -- all three of which must reach their normal
 /// handling rather than being redirected.
+#[allow(dead_code)] // dead_code until 02-cluster-commands-and-moved.md Task 3 wires in the real caller.
 fn command_keys(frame: &Frame) -> Vec<&Bytes> {
     let Frame::Array(items) = frame else {
         return Vec::new();
