@@ -84,6 +84,23 @@ impl Engine {
         self.store.active_expire_cycle(shard_idx)
     }
 
+    /// A thin facade over `snapshot::serialize`, matching `Engine`'s existing role over `Store`
+    /// (see `CLAUDE.md`). `aof_offset` is opaque to `Engine` — it's only ever the caller's AOF
+    /// length, which `Engine` has no access to; see `snapshot::serialize`'s own doc comment.
+    pub fn snapshot(&self, aof_offset: u64) -> Vec<u8> {
+        crate::snapshot::serialize(&self.store, aof_offset)
+    }
+
+    /// A thin facade over `snapshot::deserialize`. Deliberately bypasses `maxmemory` eviction —
+    /// `load_snapshot_entries` goes through `Store::set`, not `Engine::set` — so a snapshot
+    /// larger than a configured ceiling lands whole and is only trimmed back under it by the
+    /// next write that calls `Engine::set`/`with_mut`. Evicting *while* loading would silently
+    /// discard keys the operator asked to restore, which is never the right behavior for a
+    /// restore path.
+    pub fn load_snapshot(&self, bytes: &[u8]) -> Result<u64, crate::snapshot::SnapshotError> {
+        crate::snapshot::deserialize(&self.store, bytes)
+    }
+
     pub fn memory_used(&self) -> usize {
         self.store.memory_used()
     }
@@ -337,5 +354,46 @@ mod tests {
         }
         assert!(engine.memory_used() <= 500);
         assert!(engine.eviction_count() > 0);
+    }
+
+    #[test]
+    fn snapshot_then_load_snapshot_round_trips_through_the_engine_facade() {
+        let engine = Engine::new();
+        engine.set(
+            Bytes::from_static(b"k"),
+            Value::String(Bytes::from_static(b"v")),
+        );
+        let bytes = engine.snapshot(7);
+
+        let engine2 = Engine::new();
+        let offset = engine2.load_snapshot(&bytes).unwrap();
+        assert_eq!(offset, 7);
+        assert_eq!(
+            engine2.get(b"k"),
+            Some(Value::String(Bytes::from_static(b"v")))
+        );
+    }
+
+    #[test]
+    fn load_snapshot_on_garbage_bytes_is_a_snapshot_error_not_a_panic() {
+        let engine = Engine::new();
+        assert!(engine.load_snapshot(&[1, 2, 3]).is_err());
+    }
+
+    #[test]
+    fn load_snapshot_bypasses_maxmemory_eviction_so_a_large_snapshot_loads_whole() {
+        // load_snapshot_entries goes through Store::set, not Engine::set -- a snapshot larger
+        // than the ceiling must land whole, not be silently trimmed on the way in
+        let engine = Engine::with_maxmemory(1); // absurdly small ceiling
+        let big = Engine::new();
+        for i in 0..20 {
+            big.set(
+                Bytes::from(format!("k{i}")),
+                Value::String(Bytes::from_static(b"some value")),
+            );
+        }
+        let bytes = big.snapshot(0);
+        engine.load_snapshot(&bytes).unwrap();
+        assert_eq!(engine.keys().len(), 20);
     }
 }
