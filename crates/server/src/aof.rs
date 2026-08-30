@@ -115,7 +115,11 @@ impl AofWriter {
     /// Acquired by `dispatcher::dispatch_and_log` around "mutate, then log" for write
     /// commands -- see the `order` field's doc comment above.
     pub fn lock_for_ordering(&self) -> std::sync::MutexGuard<'_, ()> {
-        self.order.lock().unwrap()
+        // Recover from poison rather than propagate it: this mutex will be held across
+        // arbitrary command dispatch (Task 2), so a panicking command handler must not
+        // turn into a permanent, server-wide write outage. The guarded data is `()` --
+        // there is no invariant a panicking holder could have left broken.
+        self.order.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn send(&self, msg: AofMsg) -> std::io::Result<()> {
