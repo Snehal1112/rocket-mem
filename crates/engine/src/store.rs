@@ -120,9 +120,9 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::TtlStatus;
     use crate::Value;
     use bytes::Bytes;
-    use crate::engine::TtlStatus;
 
     #[test]
     fn set_then_get_round_trips() {
@@ -339,7 +339,10 @@ mod tests {
         let store = Store::new(16);
         // enough distinct keys that DefaultHasher spreads them across multiple shards
         for i in 0..50 {
-            store.set(Bytes::from(format!("k{i}")), Value::String(Bytes::from_static(b"v")));
+            store.set(
+                Bytes::from(format!("k{i}")),
+                Value::String(Bytes::from_static(b"v")),
+            );
         }
         assert_eq!(store.snapshot_entries().len(), 50);
     }
@@ -347,15 +350,23 @@ mod tests {
     #[test]
     fn load_snapshot_entries_replaces_existing_state_wholesale() {
         let store = Store::new(16);
-        store.set(Bytes::from_static(b"stale"), Value::String(Bytes::from_static(b"old")));
+        store.set(
+            Bytes::from_static(b"stale"),
+            Value::String(Bytes::from_static(b"old")),
+        );
 
         let at = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        store.load_snapshot_entries(vec![
-            (Bytes::from_static(b"fresh"), Value::String(Bytes::from_static(b"new")), Some(at)),
-        ]);
+        store.load_snapshot_entries(vec![(
+            Bytes::from_static(b"fresh"),
+            Value::String(Bytes::from_static(b"new")),
+            Some(at),
+        )]);
 
         assert_eq!(store.get(b"stale"), None);
-        assert_eq!(store.get(b"fresh"), Some(Value::String(Bytes::from_static(b"new"))));
+        assert_eq!(
+            store.get(b"fresh"),
+            Some(Value::String(Bytes::from_static(b"new")))
+        );
         let TtlStatus::Remaining(remaining) = store.ttl(b"fresh") else {
             panic!("expected a TTL on the loaded key")
         };
