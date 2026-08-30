@@ -33,6 +33,15 @@ enum AofMsg {
 /// `Mutex<BufWriter<File>>` design had.
 const AOF_QUEUE_CAPACITY: usize = 1024;
 
+/// Encodes `frame` in RESP wire format. A free function, not a method, so `dispatch_and_log`
+/// can call it once per write and reuse the same bytes for both `append_encoded` and a
+/// replica broadcast — see the sprint-5 spec's fan-out hook decision for why.
+pub fn encode_frame(frame: &Frame) -> std::io::Result<Vec<u8>> {
+    let mut buf = bytes::BytesMut::new();
+    protocol::codec::RespCodec::default().encode(frame.clone(), &mut buf)?;
+    Ok(buf.to_vec())
+}
+
 pub struct AofWriter {
     /// Bounded at `AOF_QUEUE_CAPACITY`; see that constant for why.
     tx: mpsc::SyncSender<AofMsg>,
@@ -93,19 +102,16 @@ impl AofWriter {
         })
     }
 
-    /// Encodes `frame` in RESP wire format and sends it to the dedicated writer thread.
-    /// Under `FsyncPolicy::Always` this blocks until the write is fsynced and returns the
-    /// writer thread's actual I/O result -- matching the durability contract the caller
-    /// relies on (the client's reply must not precede durability, and a failed fsync must
-    /// not look like success). Under `EverySecond`/`Never` it returns as soon as the message
-    /// is enqueued, with no blocking I/O on the calling thread; a later I/O failure there is
-    /// only reported on stderr, since this call has already returned. Enqueueing itself can
-    /// block if the writer thread is far enough behind to fill the bounded queue -- that is
-    /// the intended backpressure, not a stall to avoid.
-    pub fn append(&self, frame: Frame) -> std::io::Result<()> {
-        let mut buf = bytes::BytesMut::new();
-        protocol::codec::RespCodec::default().encode(frame, &mut buf)?;
-        let bytes = buf.to_vec();
+    /// Sends already-encoded bytes to the writer thread -- the part of `append` that isn't
+    /// encoding. Under `FsyncPolicy::Always` this blocks until the write is fsynced and
+    /// returns the writer thread's actual I/O result -- matching the durability contract the
+    /// caller relies on (the client's reply must not precede durability, and a failed fsync
+    /// must not look like success). Under `EverySecond`/`Never` it returns as soon as the
+    /// message is enqueued, with no blocking I/O on the calling thread; a later I/O failure
+    /// there is only reported on stderr, since this call has already returned. Enqueueing
+    /// itself can block if the writer thread is far enough behind to fill the bounded queue --
+    /// that is the intended backpressure, not a stall to avoid.
+    pub fn append_encoded(&self, bytes: Vec<u8>) -> std::io::Result<()> {
         if self.policy == FsyncPolicy::Always {
             let (ack_tx, ack_rx) = mpsc::sync_channel(1);
             self.send(AofMsg::AppendAndFsync(bytes, ack_tx))?;
@@ -115,6 +121,14 @@ impl AofWriter {
         } else {
             self.send(AofMsg::Append(bytes))
         }
+    }
+
+    /// Encodes `frame` and sends it to the dedicated writer thread -- a thin wrapper over
+    /// `encode_frame` + `append_encoded`, kept for callers that pass an owned `Frame` rather
+    /// than pre-encoded bytes. See `append_encoded`'s doc comment for the
+    /// `Always`/`EverySecond`/`Never` blocking behavior, which is unchanged by this split.
+    pub fn append(&self, frame: Frame) -> std::io::Result<()> {
+        self.append_encoded(encode_frame(&frame)?)
     }
 
     /// Flushes the buffer and fsyncs the underlying file, blocking until the writer thread
@@ -470,6 +484,40 @@ mod tests {
         let mut expected = first.to_vec();
         expected.extend_from_slice(second);
         assert_eq!(on_disk, expected); // corrupt tail removed; the skipped-over prefix stays intact
+    }
+
+    #[test]
+    fn encode_frame_matches_append_s_existing_wire_format() {
+        let encoded = encode_frame(&frame(&[b"SET", b"k", b"v"])).unwrap();
+        assert_eq!(encoded, b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n");
+    }
+
+    #[test]
+    fn append_encoded_writes_pre_encoded_bytes_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.aof");
+        let writer = AofWriter::open(&path, FsyncPolicy::Never).unwrap();
+        writer
+            .append_encoded(b"raw bytes, not even valid RESP".to_vec())
+            .unwrap();
+        writer.fsync().unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"raw bytes, not even valid RESP"
+        );
+    }
+
+    #[test]
+    fn append_still_produces_the_same_output_as_before_the_split() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.aof");
+        let writer = AofWriter::open(&path, FsyncPolicy::Never).unwrap();
+        writer.append(frame(&[b"SET", b"k", b"v"])).unwrap();
+        writer.fsync().unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n"
+        );
     }
 
     #[test]
