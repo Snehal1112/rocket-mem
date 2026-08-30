@@ -253,3 +253,81 @@ async fn both_non_owning_shards_redirect_to_the_same_owner() {
         );
     }
 }
+
+#[tokio::test]
+async fn a_multi_key_command_spanning_slots_is_rejected_with_crossslot() {
+    let cluster = spawn_3_shard_cluster().await;
+    // "hello" is slot 866 (shard-a), "foo" is slot 12182 (shard-c)
+    let mut c = connect(cluster.addr(0)).await;
+    assert_eq!(
+        send(&mut c, &[b"MSET", b"hello", b"1", b"foo", b"2"]).await,
+        Frame::Error("CROSSSLOT Keys in request don't hash to the same slot".into())
+    );
+    // neither key was written anywhere
+    assert_eq!(send(&mut c, &[b"KEYS", b"*"]).await, Frame::Array(vec![]));
+    let mut owner_of_foo = connect(cluster.addr(2)).await;
+    assert_eq!(
+        send(&mut owner_of_foo, &[b"KEYS", b"*"]).await,
+        Frame::Array(vec![])
+    );
+}
+
+#[tokio::test]
+async fn hash_tagged_keys_share_one_shard_and_work_with_multi_key_commands() {
+    let cluster = spawn_3_shard_cluster().await;
+    let slot = 3443; // CRC16("user1000") % 16384
+    let owner = cluster.owner_index(slot);
+    assert_eq!(owner, 0);
+
+    let mut c = connect(cluster.addr(owner)).await;
+    assert_eq!(
+        send(&mut c, &[b"CLUSTER", b"KEYSLOT", b"{user1000}.name"]).await,
+        Frame::Integer(slot as i64)
+    );
+    assert_eq!(
+        send(&mut c, &[b"CLUSTER", b"KEYSLOT", b"{user1000}.city"]).await,
+        Frame::Integer(slot as i64)
+    );
+    assert_eq!(
+        send(
+            &mut c,
+            &[
+                b"MSET",
+                b"{user1000}.name",
+                b"ada",
+                b"{user1000}.city",
+                b"london"
+            ]
+        )
+        .await,
+        Frame::Simple("OK".into())
+    );
+    assert_eq!(
+        send(&mut c, &[b"MGET", b"{user1000}.name", b"{user1000}.city"]).await,
+        Frame::Array(vec![
+            Frame::Bulk(Bytes::from_static(b"ada")),
+            Frame::Bulk(Bytes::from_static(b"london")),
+        ])
+    );
+
+    // the same tagged keys are redirected identically from any other shard
+    let mut other = connect(cluster.addr(1)).await;
+    assert_eq!(
+        send(&mut other, &[b"GET", b"{user1000}.name"]).await,
+        Frame::Error(format!("MOVED {slot} {}", cluster.addr(owner)))
+    );
+}
+
+#[tokio::test]
+async fn keyless_commands_work_on_every_shard_without_redirection() {
+    let cluster = spawn_3_shard_cluster().await;
+    for i in 0..3 {
+        let mut c = connect(cluster.addr(i)).await;
+        assert_eq!(send(&mut c, &[b"PING"]).await, Frame::Simple("PONG".into()));
+        // CLUSTER KEYSLOT answers for any key, on any node, owned or not
+        assert_eq!(
+            send(&mut c, &[b"CLUSTER", b"KEYSLOT", b"foo"]).await,
+            Frame::Integer(12182)
+        );
+    }
+}
