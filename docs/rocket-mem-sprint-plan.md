@@ -152,6 +152,10 @@ This maps the 16-week phase plan (`rocket-mem-production-plan.md`) onto 2-week s
 
 **Sprint goal:** Data survives a `kill -9` and restart; memory stays bounded under a configured ceiling.
 
+**Status:** ✅ Complete — full P0/P1 scope shipped, plus the P2 `MEMORY`/`OBJECT` stubs. See
+`docs/superpowers/specs/2026-08-30-sprint-4-spec.md` and
+`docs/superpowers/plans/2026-08-30-sprint-4-plans/`.
+
 ### Capacity
 | | Available | Planned | Notes |
 |---|---|---|---|
@@ -176,9 +180,9 @@ This maps the 16-week phase plan (`rocket-mem-production-plan.md`) onto 2-week s
 | Eviction and expiry interact badly under concurrent load | Deadlock or memory ceiling breach | Run the eviction stress test with concurrent writers active, not in isolation |
 
 ### Definition of done
-- [ ] `kill -9` + restart test passes in CI with all keys intact
-- [ ] Corrupt-tail AOF recovery test passes without panicking
-- [ ] TTL correctness suite covers both active and passive expiry paths independently
+- [x] `kill -9` + restart test passes in CI with all keys intact
+- [x] Corrupt-tail AOF recovery test passes without panicking
+- [x] TTL correctness suite covers both active and passive expiry paths independently
 
 ### Key dates
 | Day | Event |
