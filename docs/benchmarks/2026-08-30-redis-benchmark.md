@@ -82,3 +82,36 @@ Single-node only; no cluster routing overhead is exercised (a `-MOVED` reply is 
 served command, so a cluster-mode benchmark would flatter the numbers). No concurrent-client
 scaling curve. No latency percentiles beyond what `-q` reports — the `/metrics` histogram is the
 place to read those.
+
+## Effect of the Sprint 6 optimization
+
+`perf(server): uppercase command names into a stack buffer instead of the heap` removed the
+two-to-four per-command heap allocations described in
+[`2026-08-30-flamegraph-notes.md`](2026-08-30-flamegraph-notes.md).
+
+| Workload | before | after | change |
+|---|---|---|---|
+| SET, 3B, no pipeline | 99,800.40 | 105,596.62 | +5.80% |
+| GET, 3B, no pipeline | 105,708.25 | 109,409.20 | +3.50% |
+| SET, 3B, `-P 16` | 390,624.97 | 361,010.81 | -7.58% |
+| GET, 3B, `-P 16` | 1,428,571.38 | 1,492,537.25 | +4.47% |
+
+Both runs are single samples on one machine (the "before" figures are the ones already recorded
+in the Results table above, from Task 2's run; the "after" figures come from a fresh
+`scripts/benchmark.sh` run executed for this task, `date: 2026-08-30T13:17:45Z`, same host, same
+build profile, same durability settings). Three of the four rows moved a few percent in the
+faster direction (+3.5% to +5.8%) and one — SET at 3B with `-P 16`, the row where per-command
+overhead should matter most under the plan's own reasoning — moved 7.6% in the *slower*
+direction. That mixed sign is the honest signal here: on a single-sample, shared-machine
+benchmark, a few percent of movement in either direction is well within ordinary run-to-run
+noise, and this data does not show a clean, consistent throughput win from the allocation fix.
+The allocations are provably gone from the code (that's a static fact, not a benchmark claim),
+but this particular pair of runs does not demonstrate a measurable, repeatable improvement at
+any of the four workloads — including the pipelined one where the fix's benefit was expected to
+show up most clearly.
+
+As an aside (not part of the table above, since the brief only asks for the 3B rows): the
+1024B/`-P 16` GET anomaly flagged in Task 2 is still present and essentially unchanged —
+19,493.18 req/s before vs. 19,542.70 req/s after, a 0.25% difference that is noise-level. That is
+consistent with the flamegraph notes' conclusion that the anomaly has a separate cause from the
+per-command allocations this task's fix addressed.
