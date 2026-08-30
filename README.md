@@ -51,7 +51,34 @@ design decisions (why `Entry` wraps `Value` instead of a new `Value` variant, wh
 rewrites `SPOP`→`SREM` and the `EXPIRE` family→absolute `PEXPIREAT`, why eviction samples
 instead of maintaining an exact LRU list).
 
-Remaining sprints (replication, clustering, a custom protocol, ACLs/TLS) are scoped in the
+**Sprint 5 (snapshotting & replication) — done.** `SAVE` writes a full, consistent
+point-in-time snapshot (`bincode`-encoded, atomically written via write-then-rename) to
+`ROCKET_MEM_SNAPSHOT_PATH`; startup loads that snapshot plus only the AOF bytes written
+after it — the offset is embedded in the snapshot itself — instead of Sprint 4's
+full-AOF-replay-from-empty, cutting recovery time (numbers below). `PSYNC`/`REPLICAOF <host>
+<port>` add real leader→follower replication over the server's normal RESP port: a follower
+receives a full snapshot, then applies every subsequent write the leader's AOF already logs —
+inheriting the `SPOP`→`SREM`/`EXPIRE`-family→`PEXPIREAT` rewrites for free — while rejecting
+client-originated writes of its own with a `READONLY` error until `REPLICAOF NO ONE` returns
+it to normal operation. Every (re)sync, first or after a dropped connection, is a full resync;
+there is no partial-resync/offset-resume support this sprint. See
+`docs/superpowers/specs/2026-08-30-sprint-5-spec.md` for the full set of design decisions (why
+replication piggybacks on the AOF's already-rewritten frame stream instead of a separate
+mechanism, why a follower keeps no AOF of its own, the `SAVE`/`PSYNC` atomicity arguments).
+
+Known limits, called out explicitly rather than left to be discovered: no partial resync (a
+dropped follower connection always triggers a full resnapshot, per above); no authentication
+on `PSYNC` (any client that sends it is treated as a legitimate replica — Sprint 8 is the
+first point auth exists anywhere in this project); a stalled replica's fan-out queue is
+unbounded and grows the leader's memory invisibly to `MAXMEMORY` accounting rather than
+stalling every writer; `HELLO`/`INFO` still hardcode `role: master`/a bare `# Server` section
+regardless of actual replica status.
+
+Recovery-time benchmark (5,000 keys, `cargo test -p rocket-mem --test replication
+snapshot_plus_tail_recovery -- --nocapture`): full AOF replay took `14.170081ms`, snapshot+tail took
+`10.958109ms`.
+
+Remaining sprints (clustering, a custom protocol, ACLs/TLS) are scoped in the
 [sprint plan](docs/rocket-mem-sprint-plan.md) but not started.
 
 ### Command coverage
@@ -73,14 +100,20 @@ come from `Value::type_name()`), not real Redis's actual internal
 encodings (`embstr`/`listpack`/etc.), which this engine doesn't implement. All of the above
 are exercised directly by engine tests and reachable over RESP through the dispatcher.
 
-### Running with persistence
+### Running with persistence and replication
 
-The server binary reads two environment variables at startup:
+The server binary reads three environment variables at startup:
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `ROCKET_MEM_ADDR` | `127.0.0.1:6379` | TCP address to bind |
 | `ROCKET_MEM_AOF_PATH` | `./appendonly.aof` | Append-only file path — replayed on startup if it already exists, then opened for appending with an `EverySecond` fsync policy |
+| `ROCKET_MEM_SNAPSHOT_PATH` | `./dump.snapshot` | Snapshot file path — loaded on startup if present (together with only the AOF bytes written after the offset embedded in it), written by the `SAVE` command |
+
+Turn a running node into a follower with `REPLICAOF <host> <port>` (sent over its own RESP
+connection, e.g. via `redis-cli -p <port> replicaof <host> <port>`); `REPLICAOF NO ONE`
+returns it to normal, writable operation. A follower rejects client-originated writes with a
+`READONLY` error for as long as it's replicating.
 
 ## Workspace layout
 
@@ -89,7 +122,7 @@ Four crates under `crates/`:
 - **`common`** — shared `EngineError` enum (`WrongType`, `NotAnInteger`, `NoSuchKey`). No dependencies on the other crates.
 - **`engine`** — the storage engine: `Value` enum, 16-shard `Store`, and one free function per command under `commands/`. Everything in "Status" above lives here.
 - **`protocol`** — RESP wire format: the `Frame` type (RESP2 plus RESP3's `Map`) and `RespCodec`, encoding/decoding both including split-read reassembly.
-- **`server`** — the binary (package name `rocket-mem`): Tokio TCP accept loop, per-connection task, command dispatcher, AOF writer/replayer, and the active-expiry and fsync background loops.
+- **`server`** — the binary (package name `rocket-mem`): Tokio TCP accept loop, per-connection task, command dispatcher, AOF writer/replayer, snapshotting, leader/follower replication, and the active-expiry and fsync background loops.
 
 ## Building & testing
 
