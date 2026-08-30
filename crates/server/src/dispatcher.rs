@@ -371,24 +371,14 @@ pub fn dispatch(engine: &Engine, frame: Frame, protocol: &mut Protocol, client_i
         }
         "RPUSH" => {
             require_args!(rest, 2, "rpush");
-            for val in &rest[1..] {
-                if let Err(e) = commands::list::rpush(engine, rest[0].clone(), val.clone()) {
-                    return engine_error_to_frame(e);
-                }
-            }
-            match commands::list::llen(engine, &rest[0]) {
+            match commands::list::rpush(engine, rest[0].clone(), rest[1..].to_vec()) {
                 Ok(n) => Frame::Integer(n as i64),
                 Err(e) => engine_error_to_frame(e),
             }
         }
         "LPUSH" => {
             require_args!(rest, 2, "lpush");
-            for val in &rest[1..] {
-                if let Err(e) = commands::list::lpush(engine, rest[0].clone(), val.clone()) {
-                    return engine_error_to_frame(e);
-                }
-            }
-            match commands::list::llen(engine, &rest[0]) {
+            match commands::list::lpush(engine, rest[0].clone(), rest[1..].to_vec()) {
                 Ok(n) => Frame::Integer(n as i64),
                 Err(e) => engine_error_to_frame(e),
             }
