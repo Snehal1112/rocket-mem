@@ -1145,6 +1145,164 @@ fn handle_replicaof(
     Some(Frame::Simple("OK".into()))
 }
 
+/// Splits a config `host:port` into its parts. Falls back to the whole string and port 0 on a
+/// malformed address; `ClusterConfig::parse` does not validate the address shape (it is echoed
+/// to clients verbatim, so it must not be normalized), and this is the one place that needs the
+/// halves separately.
+fn split_addr(addr: &str) -> (&str, i64) {
+    match addr.rsplit_once(':') {
+        Some((host, port)) => (host, port.parse().unwrap_or(0)),
+        None => (addr, 0),
+    }
+}
+
+/// `CLUSTER INFO`'s body. `cluster_state` is unconditionally `ok` and every epoch is
+/// unconditionally `0` because a static config has no way to know otherwise -- there is no
+/// gossip to learn a peer is down, and no epoch bumping without resharding or failover. Pinning
+/// the fields we cannot compute to the value that is true by construction beats fabricating one.
+fn cluster_info_text(cluster: Option<&std::sync::Arc<crate::cluster::ClusterConfig>>) -> String {
+    let (enabled, assigned, count) = match cluster {
+        Some(c) => (1, crate::cluster::SLOT_COUNT as u32, c.nodes().len()),
+        None => (0, 0, 0),
+    };
+    format!(
+        "cluster_enabled:{enabled}\r\n\
+         cluster_state:ok\r\n\
+         cluster_slots_assigned:{assigned}\r\n\
+         cluster_known_nodes:{count}\r\n\
+         cluster_size:{count}\r\n\
+         cluster_my_epoch:0\r\n\
+         cluster_current_epoch:0\r\n"
+    )
+}
+
+/// `CLUSTER NODES`'s body, one `\n`-terminated line per node in real Redis's space-separated
+/// format (that payload uses `\n`, not `\r\n`, inside the bulk string). The `@<cport>` cluster-bus
+/// port is the Redis convention of `port + 10000`; it is **advertised but never bound**, because
+/// there is no cluster bus -- the field is not optional in the grammar clients parse, so the
+/// conventional value is emitted and the caveat is recorded in the README. `connected` is
+/// likewise unconditional: nothing here can observe a peer disconnecting.
+fn cluster_nodes_text(cluster: Option<&std::sync::Arc<crate::cluster::ClusterConfig>>) -> String {
+    let Some(cluster) = cluster else {
+        return String::new();
+    };
+    let my_id = &cluster.myself().id;
+    cluster
+        .nodes()
+        .iter()
+        .map(|n| {
+            let (_, port) = split_addr(&n.addr);
+            let flags = if &n.id == my_id {
+                "myself,master"
+            } else {
+                "master"
+            };
+            format!(
+                "{} {}@{} {} - 0 0 0 connected {}-{}\n",
+                n.id,
+                n.addr,
+                port + 10000,
+                flags,
+                n.first_slot,
+                n.last_slot
+            )
+        })
+        .collect()
+}
+
+/// `CLUSTER SHARDS`'s reply: one entry per configured node, each an `Array` of alternating
+/// key/value frames rather than a `Map`, so RESP2 and RESP3 clients see identical output and
+/// this helper needs no `Protocol` state. `role` is always `master` and each shard has exactly
+/// one node: this sprint's cluster has no shard-level replicas. `replication-offset` is 0
+/// because this project has no replication offsets at all (Sprint 5 made every resync a full
+/// one), and the field is present only because clients parse for it.
+fn cluster_shards_reply(cluster: Option<&std::sync::Arc<crate::cluster::ClusterConfig>>) -> Frame {
+    let Some(cluster) = cluster else {
+        return Frame::Array(vec![]);
+    };
+    Frame::Array(
+        cluster
+            .nodes()
+            .iter()
+            .map(|n| {
+                let (host, port) = split_addr(&n.addr);
+                let node = Frame::Array(vec![
+                    Frame::Bulk(Bytes::from_static(b"id")),
+                    Frame::Bulk(Bytes::from(n.id.clone())),
+                    Frame::Bulk(Bytes::from_static(b"port")),
+                    Frame::Integer(port),
+                    Frame::Bulk(Bytes::from_static(b"ip")),
+                    Frame::Bulk(Bytes::from(host.to_string())),
+                    Frame::Bulk(Bytes::from_static(b"endpoint")),
+                    Frame::Bulk(Bytes::from(host.to_string())),
+                    Frame::Bulk(Bytes::from_static(b"role")),
+                    Frame::Bulk(Bytes::from_static(b"master")),
+                    Frame::Bulk(Bytes::from_static(b"replication-offset")),
+                    Frame::Integer(0),
+                    Frame::Bulk(Bytes::from_static(b"health")),
+                    Frame::Bulk(Bytes::from_static(b"online")),
+                ]);
+                Frame::Array(vec![
+                    Frame::Bulk(Bytes::from_static(b"slots")),
+                    Frame::Array(vec![
+                        Frame::Integer(n.first_slot as i64),
+                        Frame::Integer(n.last_slot as i64),
+                    ]),
+                    Frame::Bulk(Bytes::from_static(b"nodes")),
+                    Frame::Array(vec![node]),
+                ])
+            })
+            .collect(),
+    )
+}
+
+/// Returns `Some(reply)` if `frame` was a `CLUSTER` command -- handled entirely here, never
+/// reaching `dispatch` -- or `None` if it was some other command. Same interception shape as
+/// `handle_replicaof` above, and for the same reason: this needs `ReplicationHandle`, which
+/// plain `dispatch` has no parameter for.
+///
+/// `CLUSTER KEYSLOT` is answered even when cluster mode is off: it is a pure function of the
+/// key, real Redis answers it in non-cluster mode too, and making it conditional would leave
+/// this sprint's headline algorithm untestable over the wire on a plain node.
+fn handle_cluster(
+    frame: &Frame,
+    replication: &crate::replication::ReplicationHandle,
+) -> Option<Frame> {
+    let Frame::Array(items) = frame else {
+        return None;
+    };
+    let Some(Frame::Bulk(name)) = items.first() else {
+        return None;
+    };
+    if !name.eq_ignore_ascii_case(b"CLUSTER") {
+        return None;
+    }
+    let Some(Frame::Bulk(sub_bytes)) = items.get(1) else {
+        return Some(Frame::Error(
+            "ERR wrong number of arguments for 'cluster' command".into(),
+        ));
+    };
+    let sub = String::from_utf8_lossy(sub_bytes).to_ascii_uppercase();
+    let cluster = replication.cluster();
+    Some(match sub.as_str() {
+        "KEYSLOT" => match items.get(2) {
+            Some(Frame::Bulk(key)) if items.len() == 3 => {
+                Frame::Integer(crate::cluster::key_slot(key) as i64)
+            }
+            _ => Frame::Error("ERR wrong number of arguments for 'cluster|keyslot' command".into()),
+        },
+        "MYID" => Frame::Bulk(match cluster {
+            Some(c) => Bytes::from(c.myself().id.clone()),
+            // 40 zeroes: real Redis's "no cluster identity" shape, rather than inventing one.
+            None => Bytes::from("0".repeat(40)),
+        }),
+        "INFO" => Frame::Bulk(Bytes::from(cluster_info_text(cluster))),
+        "SHARDS" => cluster_shards_reply(cluster),
+        "NODES" => Frame::Bulk(Bytes::from(cluster_nodes_text(cluster))),
+        _ => Frame::Error(format!("ERR unknown CLUSTER subcommand '{sub}'")),
+    })
+}
+
 /// Snapshots `replication.engine()` — in production this is always the same `Arc<Engine>` as
 /// `dispatch_and_log`'s own `engine` parameter (`main.rs` constructs one `Engine`, shares it
 /// into both `serve`'s `engine` argument and `ReplicationHandle::new`), so using the handle's
@@ -1225,6 +1383,9 @@ pub fn dispatch_and_log(
         return handle_save(aof, replication);
     }
     if let Some(reply) = handle_replicaof(&frame, replication) {
+        return reply;
+    }
+    if let Some(reply) = handle_cluster(&frame, replication) {
         return reply;
     }
 
@@ -4664,6 +4825,286 @@ mod tests {
         assert_eq!(
             command_keys(&cmd(&[b"MSETNX", b"a", b"1", b"b", b"2"])),
             vec![&Bytes::from_static(b"a"), &Bytes::from_static(b"b")]
+        );
+    }
+
+    /// A three-shard topology whose ranges are the even thirds of the slot space, with this
+    /// process being `node_id`. Uses `ReplicationHandle::default()` (its own throwaway Engine
+    /// and the `./dump.snapshot` path) because none of these tests issue a SAVE.
+    fn cluster_handle(node_id: &str) -> ReplicationHandle {
+        let config = crate::cluster::ClusterConfig::parse(
+            "shard-a 127.0.0.1:7001 0 5460\n\
+             shard-b 127.0.0.1:7002 5461 10922\n\
+             shard-c 127.0.0.1:7003 10923 16383\n",
+            node_id,
+        )
+        .unwrap();
+        ReplicationHandle::default().with_cluster(std::sync::Arc::new(config))
+    }
+
+    #[test]
+    fn cluster_keyslot_answers_the_reference_slot_even_with_cluster_mode_off() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let reply = dispatch_and_log(
+            &engine,
+            &aof,
+            &ReplicationHandle::default(),
+            cmd(&[b"CLUSTER", b"KEYSLOT", b"foo"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(reply, Frame::Integer(12182));
+    }
+
+    #[test]
+    fn cluster_keyslot_honours_hash_tags() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let reply = dispatch_and_log(
+            &engine,
+            &aof,
+            &cluster_handle("shard-a"),
+            cmd(&[b"CLUSTER", b"KEYSLOT", b"{user1000}.following"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(reply, Frame::Integer(3443));
+    }
+
+    #[test]
+    fn cluster_keyslot_with_wrong_arity_is_an_error() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let reply = dispatch_and_log(
+            &engine,
+            &aof,
+            &cluster_handle("shard-a"),
+            cmd(&[b"CLUSTER", b"KEYSLOT"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(
+            reply,
+            Frame::Error("ERR wrong number of arguments for 'cluster|keyslot' command".into())
+        );
+    }
+
+    #[test]
+    fn cluster_myid_returns_this_nodes_id_or_a_zero_id_when_disabled() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        assert_eq!(
+            dispatch_and_log(
+                &engine,
+                &aof,
+                &cluster_handle("shard-b"),
+                cmd(&[b"CLUSTER", b"MYID"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Bulk(Bytes::from_static(b"shard-b"))
+        );
+        assert_eq!(
+            dispatch_and_log(
+                &engine,
+                &aof,
+                &ReplicationHandle::default(),
+                cmd(&[b"CLUSTER", b"MYID"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Bulk(Bytes::from("0".repeat(40)))
+        );
+    }
+
+    #[test]
+    fn cluster_info_reports_enabled_and_the_node_count() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let Frame::Bulk(text) = dispatch_and_log(
+            &engine,
+            &aof,
+            &cluster_handle("shard-a"),
+            cmd(&[b"CLUSTER", b"INFO"]),
+            &mut Protocol::default(),
+            1,
+        ) else {
+            panic!("expected Bulk")
+        };
+        let text = String::from_utf8(text.to_vec()).unwrap();
+        assert!(text.contains("cluster_enabled:1\r\n"), "{text}");
+        assert!(text.contains("cluster_state:ok\r\n"), "{text}");
+        assert!(text.contains("cluster_slots_assigned:16384\r\n"), "{text}");
+        assert!(text.contains("cluster_known_nodes:3\r\n"), "{text}");
+        assert!(text.contains("cluster_size:3\r\n"), "{text}");
+    }
+
+    #[test]
+    fn cluster_info_reports_disabled_when_no_config_was_loaded() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let Frame::Bulk(text) = dispatch_and_log(
+            &engine,
+            &aof,
+            &ReplicationHandle::default(),
+            cmd(&[b"CLUSTER", b"INFO"]),
+            &mut Protocol::default(),
+            1,
+        ) else {
+            panic!("expected Bulk")
+        };
+        let text = String::from_utf8(text.to_vec()).unwrap();
+        assert!(text.contains("cluster_enabled:0\r\n"), "{text}");
+        assert!(text.contains("cluster_known_nodes:0\r\n"), "{text}");
+    }
+
+    #[test]
+    fn cluster_nodes_lists_every_node_with_myself_flagged() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let Frame::Bulk(text) = dispatch_and_log(
+            &engine,
+            &aof,
+            &cluster_handle("shard-b"),
+            cmd(&[b"CLUSTER", b"NODES"]),
+            &mut Protocol::default(),
+            1,
+        ) else {
+            panic!("expected Bulk")
+        };
+        let text = String::from_utf8(text.to_vec()).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "{text}");
+        assert_eq!(
+            lines[0],
+            "shard-a 127.0.0.1:7001@17001 master - 0 0 0 connected 0-5460"
+        );
+        assert_eq!(
+            lines[1],
+            "shard-b 127.0.0.1:7002@17002 myself,master - 0 0 0 connected 5461-10922"
+        );
+        assert_eq!(
+            lines[2],
+            "shard-c 127.0.0.1:7003@17003 master - 0 0 0 connected 10923-16383"
+        );
+    }
+
+    #[test]
+    fn cluster_nodes_is_empty_when_cluster_mode_is_off() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        assert_eq!(
+            dispatch_and_log(
+                &engine,
+                &aof,
+                &ReplicationHandle::default(),
+                cmd(&[b"CLUSTER", b"NODES"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Bulk(Bytes::from_static(b""))
+        );
+    }
+
+    #[test]
+    fn cluster_shards_describes_every_shards_slots_and_its_one_node() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let Frame::Array(shards) = dispatch_and_log(
+            &engine,
+            &aof,
+            &cluster_handle("shard-a"),
+            cmd(&[b"CLUSTER", b"SHARDS"]),
+            &mut Protocol::default(),
+            1,
+        ) else {
+            panic!("expected Array")
+        };
+        assert_eq!(shards.len(), 3);
+        let Frame::Array(first) = &shards[0] else {
+            panic!("expected each shard to be an Array of alternating key/value frames")
+        };
+        assert_eq!(first[0], Frame::Bulk(Bytes::from_static(b"slots")));
+        assert_eq!(
+            first[1],
+            Frame::Array(vec![Frame::Integer(0), Frame::Integer(5460)])
+        );
+        assert_eq!(first[2], Frame::Bulk(Bytes::from_static(b"nodes")));
+        let Frame::Array(nodes) = &first[3] else {
+            panic!("expected a nodes array")
+        };
+        assert_eq!(nodes.len(), 1, "a shard has exactly one node this sprint");
+        let Frame::Array(node) = &nodes[0] else {
+            panic!("expected the node to be an Array of alternating key/value frames")
+        };
+        assert_eq!(node[0], Frame::Bulk(Bytes::from_static(b"id")));
+        assert_eq!(node[1], Frame::Bulk(Bytes::from_static(b"shard-a")));
+        assert_eq!(node[2], Frame::Bulk(Bytes::from_static(b"port")));
+        assert_eq!(node[3], Frame::Integer(7001));
+        assert_eq!(node[4], Frame::Bulk(Bytes::from_static(b"ip")));
+        assert_eq!(node[5], Frame::Bulk(Bytes::from_static(b"127.0.0.1")));
+        assert_eq!(node[6], Frame::Bulk(Bytes::from_static(b"endpoint")));
+        assert_eq!(node[7], Frame::Bulk(Bytes::from_static(b"127.0.0.1")));
+        assert_eq!(node[8], Frame::Bulk(Bytes::from_static(b"role")));
+        assert_eq!(node[9], Frame::Bulk(Bytes::from_static(b"master")));
+        assert_eq!(
+            node[10],
+            Frame::Bulk(Bytes::from_static(b"replication-offset"))
+        );
+        assert_eq!(node[11], Frame::Integer(0));
+        assert_eq!(node[12], Frame::Bulk(Bytes::from_static(b"health")));
+        assert_eq!(node[13], Frame::Bulk(Bytes::from_static(b"online")));
+    }
+
+    #[test]
+    fn cluster_shards_is_empty_when_cluster_mode_is_off() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        assert_eq!(
+            dispatch_and_log(
+                &engine,
+                &aof,
+                &ReplicationHandle::default(),
+                cmd(&[b"CLUSTER", b"SHARDS"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Array(vec![])
+        );
+    }
+
+    #[test]
+    fn an_unknown_cluster_subcommand_is_an_error() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        assert_eq!(
+            dispatch_and_log(
+                &engine,
+                &aof,
+                &cluster_handle("shard-a"),
+                cmd(&[b"CLUSTER", b"RESHARD"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Error("ERR unknown CLUSTER subcommand 'RESHARD'".into())
+        );
+    }
+
+    #[test]
+    fn cluster_with_no_subcommand_is_an_arity_error() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        assert_eq!(
+            dispatch_and_log(
+                &engine,
+                &aof,
+                &cluster_handle("shard-a"),
+                cmd(&[b"CLUSTER"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Error("ERR wrong number of arguments for 'cluster' command".into())
         );
     }
 }
