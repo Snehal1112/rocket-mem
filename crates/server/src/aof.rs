@@ -253,6 +253,59 @@ pub fn replay(path: &Path, engine: &engine::Engine, start_at: u64) -> std::io::R
     Ok(())
 }
 
+/// Orchestrates startup recovery: loads `snapshot_path` if it exists and decodes cleanly,
+/// checks whether its embedded AOF offset still fits within `aof_path`'s actual length, and
+/// either replays just the AOF tail after that offset (the fast path) or falls back to a full
+/// replay from byte 0 on a completely fresh `Engine` (the safe path, taken when there's no
+/// snapshot, the snapshot is unreadable, or its offset no longer corresponds to this AOF).
+/// See `../../docs/superpowers/specs/2026-08-30-sprint-5-spec.md` for why the "no compaction"
+/// constraint is what makes "byte 0 onward is always the complete history" always true, and
+/// therefore why the fallback is always correct rather than merely convenient.
+pub fn recover(aof_path: &Path, snapshot_path: &Path) -> std::io::Result<engine::Engine> {
+    let engine = engine::Engine::new();
+    let start_at = match std::fs::read(snapshot_path) {
+        Ok(bytes) => match engine.load_snapshot(&bytes) {
+            Ok(offset) => {
+                // A missing AOF is distinct from a zero-length one: the former means the
+                // snapshot alone is the recovered state (per the spec's hybrid-recovery
+                // decision), the latter means the offset genuinely overshoots and the
+                // snapshot/AOF pair has diverged.
+                let aof_len = match std::fs::metadata(aof_path) {
+                    Ok(m) => Some(m.len()),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(e) => return Err(e),
+                };
+                match aof_len {
+                    None => return Ok(engine),
+                    Some(len) if offset > len => {
+                        eprintln!(
+                            "snapshot at {} names an AOF offset ({offset}) past the AOF's \
+                             actual length ({len}) -- discarding the snapshot and replaying \
+                             the full AOF from byte 0 instead",
+                            snapshot_path.display()
+                        );
+                        let fresh = engine::Engine::new();
+                        replay(aof_path, &fresh, 0)?;
+                        return Ok(fresh);
+                    }
+                    Some(_) => offset,
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "snapshot at {} is unreadable ({e}); falling back to full AOF replay",
+                    snapshot_path.display()
+                );
+                0
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(e) => return Err(e),
+    };
+    replay(aof_path, &engine, start_at)?;
+    Ok(engine)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -593,5 +646,119 @@ mod tests {
         let offset = writer.current_offset().unwrap();
         assert_eq!(offset, std::fs::metadata(&path).unwrap().len());
         assert!(offset > 0);
+    }
+
+    #[test]
+    fn recover_with_neither_file_present_returns_an_empty_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        let aof_path = dir.path().join("missing.aof");
+        let snapshot_path = dir.path().join("missing.snapshot");
+        let engine = recover(&aof_path, &snapshot_path).unwrap();
+        assert!(engine.keys().is_empty());
+    }
+
+    #[test]
+    fn recover_with_only_an_aof_replays_it_in_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let aof_path = dir.path().join("test.aof");
+        write_raw(&aof_path, b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n");
+        let snapshot_path = dir.path().join("missing.snapshot");
+
+        let engine = recover(&aof_path, &snapshot_path).unwrap();
+        assert_eq!(
+            engine.get(b"a"),
+            Some(Value::String(bytes::Bytes::from_static(b"1")))
+        );
+    }
+
+    #[test]
+    fn recover_with_a_matching_snapshot_and_offset_loads_the_snapshot_then_only_the_aof_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let aof_path = dir.path().join("test.aof");
+        let before_snapshot = b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n";
+        write_raw(&aof_path, before_snapshot);
+
+        // Build the "already snapshotted" engine, snapshot it at the AOF's current length, then
+        // append one more command after that point -- the AOF tail recover() must still pick up.
+        let snapshotted_engine = Engine::new();
+        replay(&aof_path, &snapshotted_engine, 0).unwrap();
+        let snapshot_bytes = snapshotted_engine.snapshot(before_snapshot.len() as u64);
+        let snapshot_path = dir.path().join("test.snapshot");
+        std::fs::write(&snapshot_path, snapshot_bytes).unwrap();
+
+        write_raw(&aof_path, b"*3\r\n$3\r\nSET\r\n$1\r\nb\r\n$1\r\n2\r\n");
+
+        let engine = recover(&aof_path, &snapshot_path).unwrap();
+        assert_eq!(
+            engine.get(b"a"),
+            Some(Value::String(bytes::Bytes::from_static(b"1")))
+        ); // from the snapshot
+        assert_eq!(
+            engine.get(b"b"),
+            Some(Value::String(bytes::Bytes::from_static(b"2")))
+        ); // from the AOF tail
+    }
+
+    #[test]
+    fn recover_with_an_unreadable_snapshot_falls_back_to_a_full_aof_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let aof_path = dir.path().join("test.aof");
+        write_raw(&aof_path, b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n");
+        let snapshot_path = dir.path().join("test.snapshot");
+        std::fs::write(&snapshot_path, b"not a real snapshot").unwrap(); // fewer than 8 header bytes... actually more, so it'll fail bincode decode
+
+        let engine = recover(&aof_path, &snapshot_path).unwrap();
+        assert_eq!(
+            engine.get(b"a"),
+            Some(Value::String(bytes::Bytes::from_static(b"1")))
+        );
+    }
+
+    #[test]
+    fn recover_with_a_snapshot_and_no_aof_keeps_the_snapshot_state() {
+        let dir = tempfile::tempdir().unwrap();
+        // Deliberately never created -- reproduces "SET k value; SAVE; delete the AOF; restart".
+        let aof_path = dir.path().join("missing.aof");
+        let snapshot_path = dir.path().join("test.snapshot");
+
+        let snapshotted_engine = Engine::new();
+        snapshotted_engine.set(
+            bytes::Bytes::from_static(b"k"),
+            Value::String(bytes::Bytes::from_static(b"value")),
+        );
+        // A nonzero embedded offset, as a real snapshot taken after some AOF writes would have.
+        let snapshot_bytes = snapshotted_engine.snapshot(31);
+        std::fs::write(&snapshot_path, snapshot_bytes).unwrap();
+
+        let engine = recover(&aof_path, &snapshot_path).unwrap();
+        assert_eq!(
+            engine.get(b"k"),
+            Some(Value::String(bytes::Bytes::from_static(b"value")))
+        ); // the snapshot alone is the recovered state -- a missing AOF must not discard it
+    }
+
+    #[test]
+    fn recover_with_a_snapshot_whose_offset_overshoots_the_aof_discards_it_and_replays_from_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let aof_path = dir.path().join("test.aof");
+        write_raw(&aof_path, b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n");
+
+        // A snapshot claiming an AOF offset far larger than the AOF's real (small) size --
+        // as if the AOF were deleted and recreated smaller after the snapshot was taken.
+        let stale_engine = Engine::new();
+        stale_engine.set(
+            bytes::Bytes::from_static(b"stale"),
+            Value::String(bytes::Bytes::from_static(b"old")),
+        );
+        let snapshot_bytes = stale_engine.snapshot(999_999);
+        let snapshot_path = dir.path().join("test.snapshot");
+        std::fs::write(&snapshot_path, snapshot_bytes).unwrap();
+
+        let engine = recover(&aof_path, &snapshot_path).unwrap();
+        assert_eq!(engine.get(b"stale"), None); // the mismatched snapshot's data must not survive
+        assert_eq!(
+            engine.get(b"a"),
+            Some(Value::String(bytes::Bytes::from_static(b"1")))
+        ); // full AOF replay instead
     }
 }
