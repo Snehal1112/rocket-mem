@@ -939,9 +939,15 @@ fn extract_write_command_name(frame: &Frame) -> Option<String> {
 /// Wraps `dispatch`, additionally appending successful write commands to `aof`. `dispatch`
 /// itself is never modified — see ../../docs/superpowers/specs/2026-08-30-sprint-4-spec.md
 /// for why AOF logging lives here instead of inside dispatch's own match arms.
+///
+/// `#[allow(unused_variables)]`: `replication` is threaded through by this plan's Task 2 but
+/// not read until Task 3 wires up `SAVE` interception — same reasoning as the engine crate's
+/// `pub mod commands` staying public ahead of Sprint 2's dispatcher.
+#[allow(unused_variables)]
 pub fn dispatch_and_log(
     engine: &Engine,
     aof: &crate::aof::AofWriter,
+    replication: &crate::replication::ReplicationHandle,
     frame: Frame,
     protocol: &mut Protocol,
     client_id: u64,
@@ -1160,6 +1166,7 @@ fn rewrite_set_ttl_to_pexpireat(items: &[Frame]) -> Option<Vec<Frame>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::replication::ReplicationHandle;
     use bytes::Bytes;
     use engine::Engine;
     use protocol::codec::Protocol;
@@ -3324,6 +3331,7 @@ mod tests {
         let reply = dispatch_and_log(
             &engine,
             &aof,
+            &ReplicationHandle::default(),
             cmd(&[b"SET", b"k", b"v"]),
             &mut Protocol::default(),
             1,
@@ -3340,6 +3348,7 @@ mod tests {
         dispatch_and_log(
             &engine,
             &aof,
+            &ReplicationHandle::default(),
             cmd(&[b"SET", b"k", b"v"]),
             &mut Protocol::default(),
             1,
@@ -3347,6 +3356,7 @@ mod tests {
         dispatch_and_log(
             &engine,
             &aof,
+            &ReplicationHandle::default(),
             cmd(&[b"GET", b"k"]),
             &mut Protocol::default(),
             1,
@@ -3364,6 +3374,7 @@ mod tests {
         dispatch_and_log(
             &engine,
             &aof,
+            &ReplicationHandle::default(),
             cmd(&[b"SET", b"onlykey"]),
             &mut Protocol::default(),
             1,
@@ -3379,6 +3390,7 @@ mod tests {
         dispatch_and_log(
             &engine,
             &aof,
+            &ReplicationHandle::default(),
             cmd(&[b"SADD", b"s", b"x"]),
             &mut Protocol::default(),
             1,
@@ -3386,6 +3398,7 @@ mod tests {
         let reply = dispatch_and_log(
             &engine,
             &aof,
+            &ReplicationHandle::default(),
             cmd(&[b"SPOP", b"s"]),
             &mut Protocol::default(),
             1,
@@ -3404,6 +3417,7 @@ mod tests {
         dispatch_and_log(
             &engine,
             &aof,
+            &ReplicationHandle::default(),
             cmd(&[b"SPOP", b"missing"]),
             &mut Protocol::default(),
             1,
@@ -3423,6 +3437,7 @@ mod tests {
         let reply = dispatch_and_log(
             &engine,
             &aof,
+            &ReplicationHandle::default(),
             cmd(&[b"SET", b"k", b"v"]),
             &mut Protocol::default(),
             1,
@@ -3450,6 +3465,7 @@ mod tests {
         let reply = dispatch_and_log(
             &engine,
             &aof,
+            &ReplicationHandle::default(),
             cmd(&[b"SET", b"k", b"v"]),
             &mut Protocol::default(),
             1,
@@ -3494,6 +3510,7 @@ mod tests {
         dispatch_and_log(
             &engine,
             &aof,
+            &ReplicationHandle::default(),
             cmd(&[b"SET", b"k", b"v"]),
             &mut Protocol::default(),
             1,
@@ -3505,6 +3522,7 @@ mod tests {
         dispatch_and_log(
             &engine,
             &aof,
+            &ReplicationHandle::default(),
             cmd(&[b"EXPIRE", b"k", b"100"]),
             &mut Protocol::default(),
             1,
@@ -3533,6 +3551,7 @@ mod tests {
         dispatch_and_log(
             &engine,
             &aof,
+            &ReplicationHandle::default(),
             cmd(&[b"SET", b"k", b"v"]),
             &mut Protocol::default(),
             1,
@@ -3540,6 +3559,7 @@ mod tests {
         dispatch_and_log(
             &engine,
             &aof,
+            &ReplicationHandle::default(),
             cmd(&[b"EXPIREAT", b"k", b"2000000000"]),
             &mut Protocol::default(),
             1,
@@ -3558,6 +3578,7 @@ mod tests {
         dispatch_and_log(
             &engine,
             &aof,
+            &ReplicationHandle::default(),
             cmd(&[b"EXPIRE", b"missing", b"100"]),
             &mut Protocol::default(),
             1,
@@ -3573,6 +3594,7 @@ mod tests {
         dispatch_and_log(
             &engine,
             &aof,
+            &ReplicationHandle::default(),
             cmd(&[b"SET", b"k", b"v", b"EX", b"100"]),
             &mut Protocol::default(),
             1,
@@ -3599,6 +3621,7 @@ mod tests {
         dispatch_and_log(
             &engine,
             &aof,
+            &ReplicationHandle::default(),
             cmd(&[b"SET", b"k", b"v", b"EX", b"100", b"PX", b"5000"]),
             &mut Protocol::default(),
             1,
@@ -3669,6 +3692,7 @@ mod tests {
         dispatch_and_log(
             &engine,
             &aof,
+            &ReplicationHandle::default(),
             cmd(&[b"SET", b"k", b"v"]),
             &mut Protocol::default(),
             1,
@@ -3676,6 +3700,7 @@ mod tests {
         let reply = dispatch_and_log(
             &engine,
             &aof,
+            &ReplicationHandle::default(),
             cmd(&[b"EXPIRE", b"k", b"10000000000000000"]),
             &mut Protocol::default(),
             1,

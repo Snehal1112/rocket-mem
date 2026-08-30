@@ -14,7 +14,12 @@ async fn spawn_test_server() -> (tempfile::TempDir, String) {
         )
         .unwrap(),
     );
-    tokio::spawn(rocket_mem::serve(listener, engine, aof));
+    tokio::spawn(rocket_mem::serve(
+        listener,
+        engine,
+        aof,
+        Arc::new(rocket_mem::replication::ReplicationHandle::default()),
+    ));
     (dir, format!("redis://{addr}"))
 }
 

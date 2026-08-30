@@ -22,8 +22,13 @@ async fn main() -> std::io::Result<()> {
             .expect("failed to open AOF file"),
     );
 
+    let replication = Arc::new(rocket_mem::replication::ReplicationHandle::new(
+        Arc::clone(&engine),
+        snapshot_path.to_path_buf(),
+    ));
+
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     println!("Listening on {}", listener.local_addr()?);
-    rocket_mem::serve(listener, engine, aof).await;
+    rocket_mem::serve(listener, engine, aof, replication).await;
     Ok(())
 }
