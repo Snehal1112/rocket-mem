@@ -1,7 +1,7 @@
 use protocol::Frame;
 use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Mutex};
 use std::thread;
 use tokio_util::codec::Encoder;
@@ -42,6 +42,9 @@ pub struct AofWriter {
     /// relative order their mutations committed in. See
     /// ../../docs/superpowers/specs/2026-08-30-tech-debt-cleanup-spec.md Item 2.
     order: Mutex<()>,
+    /// The file `open` was given. Read back by `current_offset` after an `fsync`, so it must
+    /// be the same path the writer thread is appending to — never mutated after `open`.
+    path: PathBuf,
 }
 
 impl AofWriter {
@@ -86,6 +89,7 @@ impl AofWriter {
             tx,
             policy,
             order: Mutex::new(()),
+            path: path.to_path_buf(),
         })
     }
 
@@ -120,6 +124,17 @@ impl AofWriter {
         let (ack_tx, ack_rx) = mpsc::sync_channel(1);
         self.send(AofMsg::Flush(ack_tx))?;
         ack_rx.recv().map_err(writer_gone)?
+    }
+
+    /// Flushes and fsyncs (via the existing `Flush` message the writer thread already handles),
+    /// then returns the file's length in bytes. The returned offset is guaranteed durable: every
+    /// byte before it is confirmed on disk. Calling this while holding
+    /// `AofWriter::lock_for_ordering()` cannot deadlock: the writer thread only ever drains its
+    /// channel and touches the file, never acquiring `order` or calling back into the dispatcher —
+    /// the worst case is a bounded wait for whatever's already queued ahead of the `Flush`.
+    pub fn current_offset(&self) -> std::io::Result<u64> {
+        self.fsync()?;
+        Ok(std::fs::metadata(&self.path)?.len())
     }
 
     /// The fsync policy this writer was opened with. Never changes after `open`.
@@ -516,5 +531,16 @@ mod tests {
             );
             i += 2;
         }
+    }
+
+    #[test]
+    fn current_offset_matches_the_file_length_after_appends_land() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.aof");
+        let writer = AofWriter::open(&path, FsyncPolicy::Never).unwrap();
+        writer.append(frame(&[b"SET", b"a", b"1"])).unwrap();
+        let offset = writer.current_offset().unwrap();
+        assert_eq!(offset, std::fs::metadata(&path).unwrap().len());
+        assert!(offset > 0);
     }
 }
