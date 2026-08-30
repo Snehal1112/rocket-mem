@@ -1098,6 +1098,39 @@ fn command_keys(frame: &Frame) -> Vec<&Bytes> {
     }
 }
 
+/// `None` = this node may handle the command. `Some(frame)` = reply with this instead, without
+/// touching the engine, the AOF, the replica fan-out, or any lock.
+///
+/// Called only from `dispatch_and_log`, never from `dispatch`: `aof::replay` and the follower
+/// apply loop call `dispatch` directly and must apply every frame they are handed regardless of
+/// slot ownership -- redirecting there would silently drop writes during recovery and
+/// replication. Keeping the check here makes that impossible by construction.
+///
+/// When cluster mode is off (the default, and every existing test), this is one `Option` check.
+fn cluster_redirect(
+    frame: &Frame,
+    replication: &crate::replication::ReplicationHandle,
+) -> Option<Frame> {
+    let cluster = replication.cluster()?;
+    let keys = command_keys(frame);
+    let mut slots = keys.into_iter().map(|k| crate::cluster::key_slot(k));
+    let first = slots.next()?; // no keys => nothing to route
+    if !slots.all(|s| s == first) {
+        // Without this, `MSET a 1 b 2` across two slots would be accepted by whichever node owns
+        // `a` and would then write `b` onto a node that does not own it -- a silent, permanent
+        // violation of the routing invariant, undetectable by any client. Hash tags are how a
+        // client legitimately keeps multi-key commands working under this rule.
+        return Some(Frame::Error(
+            "CROSSSLOT Keys in request don't hash to the same slot".into(),
+        ));
+    }
+    if cluster.owns(first) {
+        return None;
+    }
+    let owner = cluster.owner_of(first);
+    Some(Frame::Error(format!("MOVED {first} {}", owner.addr)))
+}
+
 fn is_save_command(frame: &Frame) -> bool {
     let Frame::Array(items) = frame else {
         return false;
@@ -1367,6 +1400,14 @@ pub fn dispatch_and_log(
     protocol: &mut Protocol,
     client_id: u64,
 ) -> Frame {
+    // Checked before everything else, including the -READONLY gate below: a redirect says which
+    // node should handle this key at all, and it must land before any lock is taken or any
+    // interception runs. See ../../docs/superpowers/specs/2026-08-30-sprint-6-spec.md for the
+    // MOVED-beats-READONLY precedence argument.
+    if let Some(redirect) = cluster_redirect(&frame, replication) {
+        return redirect;
+    }
+
     // Checked before anything else in this function, including the SAVE/REPLICAOF
     // interceptions below (both are no-ops against WRITE_COMMANDS so ordering relative to
     // them doesn't matter) and extract_write_command_name's own later call further down (so
@@ -5105,6 +5146,172 @@ mod tests {
                 1
             ),
             Frame::Error("ERR wrong number of arguments for 'cluster' command".into())
+        );
+    }
+
+    #[test]
+    fn a_key_this_node_owns_is_served_normally() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        // "hello" hashes to slot 866, which shard-a owns
+        let reply = dispatch_and_log(
+            &engine,
+            &aof,
+            &cluster_handle("shard-a"),
+            cmd(&[b"SET", b"hello", b"world"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(reply, Frame::Simple("OK".into()));
+    }
+
+    #[test]
+    fn a_key_this_node_does_not_own_is_redirected_with_moved() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        // "foo" hashes to slot 12182, which shard-c owns
+        let reply = dispatch_and_log(
+            &engine,
+            &aof,
+            &cluster_handle("shard-a"),
+            cmd(&[b"GET", b"foo"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(reply, Frame::Error("MOVED 12182 127.0.0.1:7003".into()));
+    }
+
+    #[test]
+    fn a_redirected_write_never_reaches_the_engine() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let reply = dispatch_and_log(
+            &engine,
+            &aof,
+            &cluster_handle("shard-a"),
+            cmd(&[b"SET", b"foo", b"bar"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(reply, Frame::Error("MOVED 12182 127.0.0.1:7003".into()));
+        assert_eq!(engine.get(b"foo"), None); // nothing was written
+    }
+
+    #[test]
+    fn keys_spanning_two_slots_are_rejected_with_crossslot() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        // "hello" is slot 866, "foo" is slot 12182
+        let reply = dispatch_and_log(
+            &engine,
+            &aof,
+            &cluster_handle("shard-a"),
+            cmd(&[b"MSET", b"hello", b"1", b"foo", b"2"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(
+            reply,
+            Frame::Error("CROSSSLOT Keys in request don't hash to the same slot".into())
+        );
+        assert_eq!(engine.get(b"hello"), None);
+    }
+
+    #[test]
+    fn a_hash_tag_keeps_a_multi_key_command_on_one_slot() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        // both keys hash on "user1000" => slot 3443, owned by shard-a
+        let reply = dispatch_and_log(
+            &engine,
+            &aof,
+            &cluster_handle("shard-a"),
+            cmd(&[
+                b"MSET",
+                b"{user1000}.name",
+                b"ada",
+                b"{user1000}.city",
+                b"london",
+            ]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(reply, Frame::Simple("OK".into()));
+        assert_eq!(
+            engine.get(b"{user1000}.city"),
+            Some(engine::Value::String(Bytes::from_static(b"london")))
+        );
+    }
+
+    #[test]
+    fn keyless_commands_are_never_redirected() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let handle = cluster_handle("shard-a");
+        for (command, expected) in [
+            (cmd(&[b"PING"]), Frame::Simple("PONG".into())),
+            (cmd(&[b"SELECT", b"0"]), Frame::Simple("OK".into())),
+            (
+                cmd(&[b"CLUSTER", b"KEYSLOT", b"foo"]),
+                Frame::Integer(12182),
+            ),
+        ] {
+            assert_eq!(
+                dispatch_and_log(&engine, &aof, &handle, command, &mut Protocol::default(), 1),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn nothing_is_redirected_when_cluster_mode_is_off() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let reply = dispatch_and_log(
+            &engine,
+            &aof,
+            &ReplicationHandle::default(),
+            cmd(&[b"MSET", b"hello", b"1", b"foo", b"2"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(reply, Frame::Simple("OK".into()));
+    }
+
+    #[test]
+    fn moved_takes_precedence_over_readonly_on_a_node_that_is_both() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let handle = cluster_handle("shard-a");
+        handle
+            .is_replica
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        // A write to a key this node doesn't own, on a node that is also a read-only follower.
+        // MOVED wins: READONLY would send a cluster-aware client into a retry loop against a
+        // node that will never accept this key, while MOVED sends it to the owner, where a
+        // READONLY (if that node is also a follower) is actionable.
+        assert_eq!(
+            dispatch_and_log(
+                &engine,
+                &aof,
+                &handle,
+                cmd(&[b"SET", b"foo", b"bar"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Error("MOVED 12182 127.0.0.1:7003".into())
+        );
+        // ...and a write to a key it DOES own still gets the READONLY it deserves
+        assert_eq!(
+            dispatch_and_log(
+                &engine,
+                &aof,
+                &handle,
+                cmd(&[b"SET", b"hello", b"world"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Error("READONLY You can't write against a read only replica.".into())
         );
     }
 }
