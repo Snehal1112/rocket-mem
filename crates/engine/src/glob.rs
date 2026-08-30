@@ -6,6 +6,10 @@
 pub fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
     match pattern.first() {
         None => text.is_empty(),
+        Some(b'\\') if pattern.len() > 1 => {
+            let literal = pattern[1];
+            !text.is_empty() && text[0] == literal && glob_match(&pattern[2..], &text[1..])
+        }
         Some(b'*') => {
             glob_match(&pattern[1..], text) || (!text.is_empty() && glob_match(pattern, &text[1..]))
         }
@@ -141,5 +145,36 @@ mod tests {
     fn combined_pattern_matches_realistically() {
         assert!(glob_match(b"user:???:[ab]*", b"user:123:a-session"));
         assert!(!glob_match(b"user:???:[ab]*", b"user:123:c-session"));
+    }
+
+    #[test]
+    fn backslash_escapes_a_star_to_match_it_literally() {
+        assert!(glob_match(b"a\\*b", b"a*b"));
+        assert!(!glob_match(b"a\\*b", b"axb"));
+    }
+
+    #[test]
+    fn backslash_escapes_a_question_mark_to_match_it_literally() {
+        assert!(glob_match(b"a\\?b", b"a?b"));
+        assert!(!glob_match(b"a\\?b", b"axb"));
+    }
+
+    #[test]
+    fn backslash_escapes_an_open_bracket_to_match_it_literally() {
+        assert!(glob_match(b"a\\[b", b"a[b"));
+        assert!(!glob_match(b"a\\[b", b"axb"));
+    }
+
+    #[test]
+    fn backslash_escapes_itself_to_match_a_literal_backslash() {
+        assert!(glob_match(b"a\\\\b", b"a\\b"));
+        assert!(!glob_match(b"a\\\\b", b"axb"));
+    }
+
+    #[test]
+    fn trailing_backslash_with_nothing_after_it_matches_as_a_literal_backslash() {
+        // No second byte to escape -- falls through to matching '\' itself literally.
+        assert!(glob_match(b"a\\", b"a\\"));
+        assert!(!glob_match(b"a\\", b"a"));
     }
 }
