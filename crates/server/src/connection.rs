@@ -90,6 +90,10 @@ async fn handle_connection(
             Some(Ok(frame)) => frame,
             Some(Err(_)) | None => return, // malformed input or a dropped connection — end this task quietly
         };
+        if is_psync_command(&frame) {
+            serve_replica(framed, &aof, &replication).await;
+            return; // serve_replica never returns until the replica connection dies
+        }
         let response = dispatcher::dispatch_and_log(
             &engine,
             &aof,
@@ -116,6 +120,75 @@ async fn handle_connection(
                     return;
                 }
             }
+        }
+    }
+}
+
+fn is_psync_command(frame: &protocol::Frame) -> bool {
+    let protocol::Frame::Array(items) = frame else {
+        return false;
+    };
+    let Some(protocol::Frame::Bulk(name)) = items.first() else {
+        return false;
+    };
+    name.eq_ignore_ascii_case(b"PSYNC")
+}
+
+/// Takes ownership of `framed`'s underlying socket and never returns until the replica
+/// connection dies. `PSYNC` has no reply frame of its own — the length-prefixed snapshot blob
+/// (not a RESP value) stands in for one.
+async fn serve_replica(
+    framed: Framed<tokio::net::TcpStream, RespCodec>,
+    aof: &AofWriter,
+    replication: &crate::replication::ReplicationHandle,
+) {
+    use tokio::io::AsyncWriteExt;
+
+    // ONE critical section: snapshot + register, so no write can slip between them. Taken
+    // separately, a write committing after the snapshot walk but before registration would
+    // reach neither the blob nor the stream -- lost permanently, unrepairable by reconnect,
+    // since a reconnect just snapshots a leader that has already moved past it. Lock
+    // ordering: lock_for_ordering() before the registry's own mutex, matching this plan's
+    // Global Constraints and the fan-out hook in dispatcher.rs, the only other place both
+    // are taken.
+    let (snapshot_bytes, mut rx) = {
+        let _order_guard = aof.lock_for_ordering();
+        let bytes = replication.engine().snapshot(0); // 0: a follower keeps no AOF, so the header is moot
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<bytes::Bytes>();
+        replication.registry.register(tx);
+        (bytes, rx)
+    };
+
+    // Reclaim the raw socket. Any bytes already buffered for a reply this connection never
+    // got to send (there shouldn't be any at this point -- PSYNC is answered with the blob
+    // below, not a normal `feed`/`flush` reply -- but flushing defensively costs nothing) are
+    // written out first so nothing already-queued is silently dropped.
+    let mut parts = framed.into_parts();
+    if !parts.write_buf.is_empty() && parts.io.write_all(&parts.write_buf).await.is_err() {
+        return;
+    }
+    let io = &mut parts.io;
+
+    if io
+        .write_all(&(snapshot_bytes.len() as u64).to_le_bytes())
+        .await
+        .is_err()
+    {
+        return;
+    }
+    if io.write_all(&snapshot_bytes).await.is_err() {
+        return;
+    }
+
+    // Drain replicated writes onto the raw socket forever -- this connection never reads
+    // again once PSYNC has been handled. A closed channel (this task's own sender side was
+    // dropped, e.g. the process is shutting down) ends the loop cleanly; a write error means
+    // the replica disconnected, which `ReplicaRegistry::broadcast`'s retain-based pruning
+    // already handles from the registry's side on its next send -- this loop returning is
+    // this connection's own half of that same cleanup.
+    while let Some(bytes) = rx.recv().await {
+        if io.write_all(&bytes).await.is_err() {
+            return;
         }
     }
 }
@@ -345,6 +418,136 @@ mod tests {
             .unwrap();
         assert_eq!(
             framed.next().await.unwrap().unwrap(),
+            Frame::Simple("PONG".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn psync_sends_a_length_prefixed_snapshot_then_streams_subsequent_writes() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let engine = Arc::new(Engine::new());
+        engine.set(
+            Bytes::from_static(b"k"),
+            engine::Value::String(Bytes::from_static(b"v")),
+        );
+        let (_dir, aof) = test_aof();
+        let replication = Arc::new(crate::replication::ReplicationHandle::new(
+            Arc::clone(&engine),
+            std::env::temp_dir().join("psync-test-unused.snapshot"),
+        ));
+        tokio::spawn(serve(
+            listener,
+            Arc::clone(&engine),
+            Arc::clone(&aof),
+            Arc::clone(&replication),
+        ));
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let mut framed = Framed::new(stream, RespCodec::default());
+        framed
+            .send(Frame::Array(vec![Frame::Bulk(Bytes::from_static(
+                b"PSYNC",
+            ))]))
+            .await
+            .unwrap();
+        let mut parts = framed.into_parts();
+
+        use tokio::io::AsyncReadExt;
+        let mut len_buf = [0u8; 8];
+        parts.io.read_exact(&mut len_buf).await.unwrap();
+        let len = u64::from_le_bytes(len_buf) as usize;
+        let mut blob = vec![0u8; len];
+        parts.io.read_exact(&mut blob).await.unwrap();
+
+        let loaded = Engine::new();
+        loaded.load_snapshot(&blob).unwrap();
+        assert_eq!(
+            loaded.get(b"k"),
+            Some(engine::Value::String(Bytes::from_static(b"v")))
+        );
+
+        // now drive a write through the *real* engine via a second, ordinary client connection,
+        // and prove it arrives on the replica connection's raw socket
+        let mut client = Framed::new(
+            TcpStream::connect(addr).await.unwrap(),
+            RespCodec::default(),
+        );
+        client
+            .send(Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"SET")),
+                Frame::Bulk(Bytes::from_static(b"new")),
+                Frame::Bulk(Bytes::from_static(b"value")),
+            ]))
+            .await
+            .unwrap();
+        assert_eq!(
+            client.next().await.unwrap().unwrap(),
+            Frame::Simple("OK".into())
+        );
+
+        let mut streamed = vec![0u8; b"*3\r\n$3\r\nSET\r\n$3\r\nnew\r\n$5\r\nvalue\r\n".len()];
+        parts.io.read_exact(&mut streamed).await.unwrap();
+        assert_eq!(streamed, b"*3\r\n$3\r\nSET\r\n$3\r\nnew\r\n$5\r\nvalue\r\n");
+    }
+
+    #[tokio::test]
+    async fn a_registered_replica_is_pruned_after_its_connection_drops() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let engine = Arc::new(Engine::new());
+        let (_dir, aof) = test_aof();
+        let replication = Arc::new(crate::replication::ReplicationHandle::new(
+            Arc::clone(&engine),
+            std::env::temp_dir().join("psync-test-unused-2.snapshot"),
+        ));
+        tokio::spawn(serve(
+            listener,
+            Arc::clone(&engine),
+            Arc::clone(&aof),
+            Arc::clone(&replication),
+        ));
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let mut framed = Framed::new(stream, RespCodec::default());
+        framed
+            .send(Frame::Array(vec![Frame::Bulk(Bytes::from_static(
+                b"PSYNC",
+            ))]))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await; // let serve_replica register
+        drop(framed); // disconnect the replica
+
+        // two broadcasts: the first send after a drop can still succeed on some platforms before
+        // the OS notices the close, so prune is only guaranteed observable after a second attempt
+        let mut client = Framed::new(
+            TcpStream::connect(addr).await.unwrap(),
+            RespCodec::default(),
+        );
+        for _ in 0..2 {
+            client
+                .send(Frame::Array(vec![
+                    Frame::Bulk(Bytes::from_static(b"SET")),
+                    Frame::Bulk(Bytes::from_static(b"k")),
+                    Frame::Bulk(Bytes::from_static(b"v")),
+                ]))
+                .await
+                .unwrap();
+            client.next().await.unwrap().unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        // no assertion beyond "the server is still alive and answering" -- proves broadcast's
+        // retain-based pruning didn't panic or wedge on the dropped connection
+        let mut ping = Framed::new(
+            TcpStream::connect(addr).await.unwrap(),
+            RespCodec::default(),
+        );
+        ping.send(Frame::Array(vec![Frame::Bulk(Bytes::from_static(b"PING"))]))
+            .await
+            .unwrap();
+        assert_eq!(
+            ping.next().await.unwrap().unwrap(),
             Frame::Simple("PONG".into())
         );
     }
