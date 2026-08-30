@@ -1081,10 +1081,26 @@ pub fn dispatch_and_log(
         // fsync lands here and is also surfaced to the client below; under EverySecond/Never
         // the append is fire-and-forget, so this only catches a dead writer thread and the
         // writer itself reports I/O errors on stderr.
-        if let Err(e) = aof.append(frame_to_log) {
+        let encoded = match crate::aof::encode_frame(&frame_to_log) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                eprintln!("aof encode failed: {e}");
+                aof_failed = true;
+                continue; // nothing to append or broadcast without a successful encode
+            }
+        };
+        // One clone: `append_encoded` needs an owned `Vec<u8>` for the writer-thread channel
+        // (AofMsg's existing shape, unchanged this sprint), while `broadcast` needs its own
+        // `Bytes` handle. A small, accepted per-write-command cost rather than widening AofMsg's
+        // channel type just for this sprint.
+        if let Err(e) = aof.append_encoded(encoded.clone()) {
             eprintln!("aof append failed: {e}");
             aof_failed = true;
         }
+        // Broadcast regardless of the append's result: the engine mutation already committed, so
+        // a leader that fails to log a write locally must not also withhold it from its
+        // replicas -- that would diverge them permanently over a purely local disk problem.
+        replication.registry.broadcast(bytes::Bytes::from(encoded));
         // fsync timing for Always lives inside AofWriter::append itself; EverySecond's
         // periodic fsync loop lives in connection.rs (periodic_fsync_loop); Never does
         // nothing here.
@@ -3401,6 +3417,110 @@ mod tests {
         assert_eq!(reply, Frame::Simple("OK".into()));
         aof.fsync().unwrap();
         assert_eq!(read_aof(&dir), "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n");
+    }
+
+    #[test]
+    fn dispatch_and_log_fans_out_a_write_command_to_registered_replicas() {
+        let engine = std::sync::Arc::new(Engine::new());
+        let (dir, aof) = test_aof();
+        let replication = ReplicationHandle::new(
+            std::sync::Arc::clone(&engine),
+            dir.path().join("unused.snapshot"),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        replication.registry.register(tx);
+
+        dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"SET", b"k", b"v"]),
+            &mut Protocol::default(),
+            1,
+        );
+
+        let received = rx.try_recv().unwrap();
+        assert_eq!(
+            received.as_ref(),
+            b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n"
+        );
+    }
+
+    #[test]
+    fn dispatch_and_log_fans_out_spops_rewrite_not_the_original_command() {
+        let engine = std::sync::Arc::new(Engine::new());
+        dispatch(
+            &engine,
+            cmd(&[b"SADD", b"s", b"only-member"]),
+            &mut Protocol::default(),
+            1,
+        );
+        let (dir, aof) = test_aof();
+        let replication = ReplicationHandle::new(
+            std::sync::Arc::clone(&engine),
+            dir.path().join("unused.snapshot"),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        replication.registry.register(tx);
+
+        dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"SPOP", b"s"]),
+            &mut Protocol::default(),
+            1,
+        );
+
+        let received = rx.try_recv().unwrap();
+        assert_eq!(
+            received.as_ref(),
+            b"*3\r\n$4\r\nSREM\r\n$1\r\ns\r\n$11\r\nonly-member\r\n"
+        );
+    }
+
+    #[test]
+    fn dispatch_and_log_with_no_registered_replicas_still_succeeds() {
+        let engine = std::sync::Arc::new(Engine::new());
+        let (dir, aof) = test_aof();
+        let replication = ReplicationHandle::new(
+            std::sync::Arc::clone(&engine),
+            dir.path().join("unused.snapshot"),
+        );
+        let reply = dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"SET", b"k", b"v"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(reply, Frame::Simple("OK".into()));
+    }
+
+    #[test]
+    fn dispatch_and_log_broadcasts_even_when_the_read_only_command_is_not_a_write() {
+        // a read-only command has no to_log entries at all -- broadcast must simply not be
+        // reached for it, not error
+        let engine = std::sync::Arc::new(Engine::new());
+        let (dir, aof) = test_aof();
+        let replication = ReplicationHandle::new(
+            std::sync::Arc::clone(&engine),
+            dir.path().join("unused.snapshot"),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        replication.registry.register(tx);
+
+        dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"GET", b"k"]),
+            &mut Protocol::default(),
+            1,
+        );
+
+        assert!(rx.try_recv().is_err()); // nothing was broadcast for a read
     }
 
     #[test]
