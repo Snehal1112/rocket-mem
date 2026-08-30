@@ -100,7 +100,8 @@ why `INFO`/`HELLO` moved out of `dispatch`).
 Known limits, called out explicitly rather than left to be discovered: **there is no cluster bus
 and no gossip** — nodes never talk to each other, so `CLUSTER NODES` reports every configured node
 as `connected` and `cluster_state` is always `ok`, because a static config cannot honestly say
-otherwise; **no live resharding and no failover** (slot ownership is fixed at process start;
+otherwise, and the `@<port+10000>` cluster-bus port shown in `CLUSTER NODES` is advertised by
+convention but never bound; **no live resharding and no failover** (slot ownership is fixed at process start;
 `CLUSTER SETSLOT`, `MIGRATE`, and `ASK`/`ASKING` redirection do not exist, and `ASK` would have
 nothing to cover without migrations); **no request forwarding** — a `-MOVED` reply requires the
 *client* to reconnect, this server never proxies to another shard; `CLUSTER SLOTS` is not

@@ -115,3 +115,12 @@ As an aside (not part of the table above, since the brief only asks for the 3B r
 19,493.18 req/s before vs. 19,542.70 req/s after, a 0.25% difference that is noise-level. That is
 consistent with the flamegraph notes' conclusion that the anomaly has a separate cause from the
 per-command allocations this task's fix addressed.
+
+One more scope note: the allocations removed above are only the ones at the four sites this task
+targeted (`dispatch`, `extract_write_command_name`, and `command_keys`, plus the buffer this fix
+introduced). The observability wrapper added by an earlier Sprint 6 task, `dispatch_and_log`'s
+`metric_label` function in `crates/server/src/dispatcher.rs`, still allocates 2-3 `String`s per
+command via `to_ascii_lowercase()` and two `.clone()` calls feeding the `metrics` crate's
+counter/histogram macros — that function was never touched by this optimization. It is a real
+remaining opportunity for a future pass, e.g. a parallel lowercase-name lookup table keyed by the
+same `KNOWN_COMMANDS` index, which would avoid the allocation entirely.

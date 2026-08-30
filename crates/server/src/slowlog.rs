@@ -1,6 +1,5 @@
 use bytes::Bytes;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -26,20 +25,32 @@ pub struct SlowLogEntry {
     pub arg_count: usize,
 }
 
-/// A bounded ring of recently-slow commands. `entries` is a plain `std::sync::Mutex`: every
-/// access is a push or a drain measured in nanoseconds and never held across an `.await`,
-/// matching `ReplicaRegistry`'s choice for the same reason.
+/// `entries` and `next_id` together, guarded by one `Mutex` -- see `SlowLog`'s doc comment for
+/// why they can't be two separately-locked fields.
+struct SlowLogState {
+    entries: VecDeque<SlowLogEntry>,
+    next_id: u64,
+}
+
+/// A bounded ring of recently-slow commands. `state` is a plain `std::sync::Mutex`: every access
+/// is a push or a drain measured in nanoseconds and never held across an `.await`, matching
+/// `ReplicaRegistry`'s choice for the same reason. `entries` and `next_id` share the one lock
+/// (rather than `next_id` being a separate `AtomicU64`) so that assigning an entry's id and
+/// pushing it into the deque happen as a single critical section -- otherwise two threads
+/// racing through `maybe_record` could be assigned ids in one order but push in the other,
+/// leaving `get()`'s "newest first" order occasionally disagreeing with id order.
 pub struct SlowLog {
-    entries: Mutex<VecDeque<SlowLogEntry>>,
-    next_id: AtomicU64,
+    state: Mutex<SlowLogState>,
     threshold: Duration,
 }
 
 impl SlowLog {
     pub fn with_threshold(threshold: Duration) -> Self {
         Self {
-            entries: Mutex::new(VecDeque::with_capacity(SLOWLOG_CAPACITY)),
-            next_id: AtomicU64::new(0),
+            state: Mutex::new(SlowLogState {
+                entries: VecDeque::with_capacity(SLOWLOG_CAPACITY),
+                next_id: 0,
+            }),
             threshold,
         }
     }
@@ -58,30 +69,36 @@ impl SlowLog {
         if self.threshold.is_zero() || elapsed < self.threshold {
             return;
         }
+        let unix_time_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let duration_micros = elapsed.as_micros().min(i64::MAX as u128) as i64;
+
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let entry = SlowLogEntry {
-            id: self.next_id.fetch_add(1, Ordering::Relaxed),
-            unix_time_secs: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0),
-            duration_micros: elapsed.as_micros().min(i64::MAX as u128) as i64,
+            id: state.next_id,
+            unix_time_secs,
+            duration_micros,
             command: command.to_string(),
             key,
             arg_count,
         };
-        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        if entries.len() == SLOWLOG_CAPACITY {
-            entries.pop_front();
+        state.next_id += 1;
+        if state.entries.len() == SLOWLOG_CAPACITY {
+            state.entries.pop_front();
         }
-        entries.push_back(entry);
+        state.entries.push_back(entry);
+        drop(state);
         ::metrics::counter!("rocket_mem_slowlog_entries_total").increment(1);
     }
 
     /// Up to `count` entries, newest first -- the order real Redis returns them in.
     pub fn get(&self, count: usize) -> Vec<SlowLogEntry> {
-        self.entries
+        self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .entries
             .iter()
             .rev()
             .take(count)
@@ -90,7 +107,11 @@ impl SlowLog {
     }
 
     pub fn len(&self) -> usize {
-        self.entries.lock().unwrap_or_else(|e| e.into_inner()).len()
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entries
+            .len()
     }
 
     /// Required by `clippy::len_without_is_empty`, which `-D warnings` makes a hard error.
@@ -99,9 +120,10 @@ impl SlowLog {
     }
 
     pub fn reset(&self) {
-        self.entries
+        self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .entries
             .clear();
     }
 }
@@ -191,6 +213,41 @@ mod tests {
         // ids are monotonic across a reset, matching real Redis -- an operator correlating a
         // logged id with a later GET must not find it reused.
         assert_eq!(log.get(1)[0].id, 1);
+    }
+
+    #[test]
+    fn concurrent_maybe_record_calls_keep_id_and_insertion_order_in_agreement() {
+        // Id assignment and the deque push happen under the same lock (see SlowLog's doc
+        // comment), so no interleaving of concurrent callers can produce an entry whose id
+        // doesn't match its physical position in the ring. Without that, two threads racing
+        // through maybe_record could grab ids in one order but push in the other, and get()
+        // (newest first) would occasionally disagree with id order.
+        let log = std::sync::Arc::new(SlowLog::with_threshold(Duration::from_micros(1)));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let log = std::sync::Arc::clone(&log);
+                std::thread::spawn(move || {
+                    for _ in 0..10 {
+                        log.maybe_record("SET", None, 1, Duration::from_millis(1));
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+
+        // 80 entries recorded, comfortably under SLOWLOG_CAPACITY (128), so none were evicted.
+        let all = log.get(80);
+        assert_eq!(all.len(), 80);
+        for pair in all.windows(2) {
+            assert!(
+                pair[0].id > pair[1].id,
+                "entries must be strictly descending by id, newest first: {} then {}",
+                pair[0].id,
+                pair[1].id
+            );
+        }
     }
 
     #[test]

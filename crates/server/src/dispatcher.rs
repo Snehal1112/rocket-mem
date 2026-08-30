@@ -976,7 +976,6 @@ fn extract_write_command_name(frame: &Frame) -> Option<CommandName> {
 /// not a compile error: it silently becomes `KeySpec::None`, which means that command is never
 /// slot-routed in cluster mode -- it would be served by whichever node the client happened to
 /// reach, quietly breaking the routing invariant. Step 3a below is the check.
-#[allow(dead_code)] // dead_code until 02-cluster-commands-and-moved.md Task 3 wires in the real caller.
 pub(crate) const KNOWN_COMMANDS: &[&str] = &[
     "APPEND",
     "CLUSTER",
@@ -1067,7 +1066,6 @@ pub(crate) const KNOWN_COMMANDS: &[&str] = &[
 /// Which of a command's arguments are keys, for cluster-slot routing. Total over every command
 /// this server answers; `First` is the default because it is correct for ~70 of the 84, and
 /// every exception is enumerated in `key_spec`.
-#[allow(dead_code)] // dead_code until 02-cluster-commands-and-moved.md Task 3 wires in the real caller.
 enum KeySpec {
     /// No keys at all -- never redirected. Also the answer for unknown commands.
     None,
@@ -1082,7 +1080,6 @@ enum KeySpec {
     EveryOther,
 }
 
-#[allow(dead_code)] // dead_code until 02-cluster-commands-and-moved.md Task 3 wires in the real caller.
 fn key_spec(name: &str) -> KeySpec {
     match name {
         "PING" | "ECHO" | "SELECT" | "COMMAND" | "INFO" | "HELLO" | "KEYS" | "SCAN"
@@ -1099,7 +1096,6 @@ fn key_spec(name: &str) -> KeySpec {
 /// The keys `frame`'s command operates on, borrowed from the frame. Empty for a malformed frame,
 /// a keyless command, or an unknown command -- all three of which must reach their normal
 /// handling rather than being redirected.
-#[allow(dead_code)] // dead_code until 02-cluster-commands-and-moved.md Task 3 wires in the real caller.
 fn command_keys(frame: &Frame) -> Vec<&Bytes> {
     let Frame::Array(items) = frame else {
         return Vec::new();
@@ -1627,8 +1623,8 @@ fn handle_hello(
 
 /// Renders one slow-log entry's argument array. The entry carries only the command name and its
 /// first argument, so anything beyond that is summarised with real Redis's own truncation
-/// marker -- a shape real Redis itself emits (it truncates at 32 arguments), so tooling parses
-/// it without special-casing.
+/// marker -- a shape real Redis itself emits (it truncates at 31 arguments, reserving the 32nd
+/// slot for the truncation marker itself), so tooling parses it without special-casing.
 fn slowlog_args_frame(entry: &crate::slowlog::SlowLogEntry) -> Frame {
     let mut args = vec![Frame::Bulk(Bytes::from(entry.command.clone()))];
     let shown = usize::from(entry.key.is_some());
@@ -1870,10 +1866,10 @@ fn dispatch_and_log_inner(
         return redirect;
     }
 
-    // Checked before anything else in this function, including the SAVE/REPLICAOF
-    // interceptions below (both are no-ops against WRITE_COMMANDS so ordering relative to
-    // them doesn't matter) and extract_write_command_name's own later call further down (so
-    // a rejected write never touches the AOF ordering lock).
+    // Checked before the SAVE/REPLICAOF interceptions below, and immediately after the
+    // cluster redirect above (both interceptions are no-ops against WRITE_COMMANDS so
+    // ordering relative to them doesn't matter) and extract_write_command_name's own later
+    // call further down (so a rejected write never touches the AOF ordering lock).
     if replication
         .is_replica
         .load(std::sync::atomic::Ordering::Relaxed)
