@@ -844,6 +844,36 @@ pub fn dispatch(engine: &Engine, frame: Frame, protocol: &mut Protocol, client_i
             "# Server\r\nredis_version:rocket-mem-{}\r\n",
             env!("CARGO_PKG_VERSION")
         ))),
+        "MEMORY" => {
+            require_args!(rest, 1, "memory");
+            let subcommand = String::from_utf8_lossy(&rest[0]).to_ascii_uppercase();
+            match subcommand.as_str() {
+                "USAGE" => {
+                    require_args!(rest, 2, "memory usage");
+                    // with_ref, not get: sizing a value must not first clone the whole thing out
+                    match engine.with_ref(&rest[1], |v| v.map(|v| v.approx_size())) {
+                        Some(n) => Frame::Integer(n as i64),
+                        None => Frame::Null,
+                    }
+                }
+                _ => Frame::Error(format!("ERR unknown MEMORY subcommand '{subcommand}'")),
+            }
+        }
+        "OBJECT" => {
+            require_args!(rest, 1, "object");
+            let subcommand = String::from_utf8_lossy(&rest[0]).to_ascii_uppercase();
+            match subcommand.as_str() {
+                "ENCODING" => {
+                    require_args!(rest, 2, "object encoding");
+                    // `type_name` returns &'static str, so nothing borrows past the closure
+                    match engine.with_ref(&rest[1], |v| v.map(|v| v.type_name())) {
+                        Some(name) => Frame::Bulk(Bytes::from(name)),
+                        None => Frame::Error("ERR no such key".into()),
+                    }
+                }
+                _ => Frame::Error(format!("ERR unknown OBJECT subcommand '{subcommand}'")),
+            }
+        }
         "HELLO" => match rest.first() {
             None => hello_reply(*protocol, client_id),
             Some(arg) => match arg.as_ref() {
@@ -3666,5 +3696,116 @@ mod tests {
         );
         assert_eq!(reply, Frame::Integer(1)); // key existed, so the TTL was applied
         aof.fsync().unwrap();
+    }
+
+    #[test]
+    fn memory_usage_reports_the_approximate_size_of_an_existing_key() {
+        let engine = Engine::new();
+        dispatch(
+            &engine,
+            cmd(&[b"SET", b"k", b"v"]),
+            &mut Protocol::default(),
+            1,
+        );
+        let Frame::Integer(n) = dispatch(
+            &engine,
+            cmd(&[b"MEMORY", b"USAGE", b"k"]),
+            &mut Protocol::default(),
+            1,
+        ) else {
+            panic!("expected Integer")
+        };
+        assert!(n > 0);
+    }
+
+    #[test]
+    fn memory_usage_on_a_missing_key_returns_null() {
+        let engine = Engine::new();
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"MEMORY", b"USAGE", b"missing"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Null
+        );
+    }
+
+    #[test]
+    fn memory_with_an_unknown_subcommand_is_a_resp_error() {
+        let engine = Engine::new();
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"MEMORY", b"NOPE"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Error("ERR unknown MEMORY subcommand 'NOPE'".into())
+        );
+    }
+
+    #[test]
+    fn object_encoding_reports_a_type_derived_name_for_each_value_type() {
+        let engine = Engine::new();
+        dispatch(
+            &engine,
+            cmd(&[b"SET", b"s", b"v"]),
+            &mut Protocol::default(),
+            1,
+        );
+        dispatch(
+            &engine,
+            cmd(&[b"RPUSH", b"l", b"v"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"OBJECT", b"ENCODING", b"s"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Bulk(Bytes::from_static(b"string"))
+        );
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"OBJECT", b"ENCODING", b"l"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Bulk(Bytes::from_static(b"list"))
+        );
+    }
+
+    #[test]
+    fn object_encoding_on_a_missing_key_is_a_resp_error() {
+        let engine = Engine::new();
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"OBJECT", b"ENCODING", b"missing"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Error("ERR no such key".into())
+        );
+    }
+
+    #[test]
+    fn object_with_an_unknown_subcommand_is_a_resp_error() {
+        let engine = Engine::new();
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"OBJECT", b"NOPE", b"k"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Error("ERR unknown OBJECT subcommand 'NOPE'".into())
+        );
     }
 }
