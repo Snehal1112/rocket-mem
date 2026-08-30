@@ -117,6 +117,20 @@ impl Engine {
         self.store.memory_used()
     }
 
+    /// The configured `MAXMEMORY` ceiling, if any. `INFO`'s memory section reports it; note the
+    /// shipped binary always answers `None`, because `main.rs` builds its `Engine` through
+    /// `aof::recover`, which calls `Engine::new()`. Wiring a `ROCKET_MEM_MAXMEMORY` env var is
+    /// deliberately out of this sprint's scope; the gap is recorded in the README.
+    pub fn maxmemory(&self) -> Option<usize> {
+        self.maxmemory
+    }
+
+    /// `(live keys, of which carry an expiry)`. A thin facade over `Store`, matching `Engine`'s
+    /// established role. Feeds the `rocket_mem_keys` gauges and `INFO`'s keyspace section.
+    pub fn key_counts(&self) -> (usize, usize) {
+        self.store.key_counts()
+    }
+
     pub fn eviction_count(&self) -> usize {
         self.eviction_count.load(Ordering::Relaxed)
     }
@@ -155,6 +169,12 @@ mod tests {
     use crate::Value;
     use bytes::Bytes;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn maxmemory_reports_the_configured_ceiling_or_none() {
+        assert_eq!(Engine::new().maxmemory(), None);
+        assert_eq!(Engine::with_maxmemory(4_096).maxmemory(), Some(4_096));
+    }
 
     #[test]
     fn ttl_on_a_missing_key_is_no_such_key() {
@@ -391,6 +411,38 @@ mod tests {
     fn load_snapshot_on_garbage_bytes_is_a_snapshot_error_not_a_panic() {
         let engine = Engine::new();
         assert!(engine.load_snapshot(&[1, 2, 3]).is_err());
+    }
+
+    #[test]
+    fn key_counts_reports_live_keys_and_how_many_have_an_expiry() {
+        let engine = Engine::new();
+        engine.set(
+            Bytes::from_static(b"a"),
+            Value::String(Bytes::from_static(b"1")),
+        );
+        engine.set(
+            Bytes::from_static(b"b"),
+            Value::String(Bytes::from_static(b"2")),
+        );
+        engine.expire_at(
+            b"b",
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+        );
+        assert_eq!(engine.key_counts(), (2, 1));
+    }
+
+    #[test]
+    fn key_counts_ignores_already_expired_keys() {
+        let engine = Engine::new();
+        engine.set(
+            Bytes::from_static(b"gone"),
+            Value::String(Bytes::from_static(b"1")),
+        );
+        engine.expire_at(
+            b"gone",
+            std::time::Instant::now() - std::time::Duration::from_secs(1),
+        );
+        assert_eq!(engine.key_counts(), (0, 0));
     }
 
     #[test]

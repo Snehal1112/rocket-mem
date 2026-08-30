@@ -245,6 +245,10 @@ This maps the 16-week phase plan (`rocket-mem-production-plan.md`) onto 2-week s
 
 **Sprint goal:** Keys route deterministically across a 3-shard cluster; a benchmark report shows throughput in the same ballpark as real Redis.
 
+**Status:** ✅ Complete — full P0/P1/P2 scope shipped. See
+`docs/superpowers/specs/2026-08-30-sprint-6-spec.md` and
+`docs/superpowers/plans/2026-08-30-sprint-6-plans/`.
+
 ### Capacity
 | | Available | Planned | Notes |
 |---|---|---|---|
@@ -269,9 +273,9 @@ This maps the 16-week phase plan (`rocket-mem-production-plan.md`) onto 2-week s
 | Full Redis Cluster protocol scope-creeps in | Multi-month feature disguised as a sprint item | Stick to the static hash-slot assignment already scoped — live resharding stays out of v1, as decided in the master plan |
 
 ### Definition of done
-- [ ] 3-shard cluster test passes: keys route by hash slot, cluster-aware client finds them via `MOVED`
-- [ ] Benchmark report committed to the repo, including where you're slower than real Redis and why
-- [ ] Prometheus metrics visible and scraping correctly
+- [x] 3-shard cluster test passes: keys route by hash slot, cluster-aware client finds them via `MOVED`
+- [x] Benchmark report committed to the repo, including where you're slower than real Redis and why
+- [x] Prometheus metrics visible and scraping correctly
 
 ### Key dates
 | Day | Event |

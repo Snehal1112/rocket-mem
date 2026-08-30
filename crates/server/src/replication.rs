@@ -2,8 +2,18 @@ use crate::aof::AofWriter;
 use engine::Engine;
 use futures_util::{SinkExt, StreamExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+
+/// Unix seconds now, or 0 if the system clock is somehow before the epoch. Never panics: a
+/// bogus clock must not take down a server over a metrics field. Used by `record_save` and by
+/// `sync_once`'s last-apply stamp, so there is exactly one implementation of this expression.
+fn unix_now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
 
 /// Holds one outbound channel per connected replica. `senders` is a plain `std::sync::Mutex`,
 /// not `tokio::sync::Mutex`: every access is a quick, synchronous push/retain, never held
@@ -33,6 +43,18 @@ impl ReplicaRegistry {
     pub fn broadcast(&self, bytes: bytes::Bytes) {
         let mut senders = self.senders.lock().unwrap_or_else(|e| e.into_inner());
         senders.retain(|tx| tx.send(bytes.clone()).is_ok());
+    }
+
+    /// How many replicas are currently registered. Note this counts senders, which are pruned
+    /// lazily by `broadcast`, so a replica that died since the last write may still be counted
+    /// until the next one -- an acceptable lag for a gauge, and cheaper than probing sockets.
+    pub fn len(&self) -> usize {
+        self.senders.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    /// Required by `clippy::len_without_is_empty`, which `-D warnings` makes a hard error.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -87,6 +109,55 @@ pub struct ReplicationHandle {
     /// leave it `None` and their apply loops take no lock, which is correct since no `SAVE` runs
     /// against them.
     aof: Option<Arc<AofWriter>>,
+    /// The static cluster topology, when this node was started in cluster mode. `None` -- the
+    /// default for `new`/`Default`, i.e. every existing test and every standalone deployment --
+    /// means cluster mode is off: no `-MOVED`, no `-CROSSSLOT`, `cluster_enabled:0` in `INFO`.
+    /// A builder-set `Option` rather than a third `new` parameter, mirroring `with_aof` above
+    /// and for the same reason: the existing `ReplicationHandle::new`/`::default()` call sites
+    /// (all of them tests) stay untouched.
+    ///
+    /// Naming note: this struct now carries a snapshot path, an AOF handle, and a cluster
+    /// config -- it is shared *server* state, not a replication handle. Renaming it to
+    /// `ServerState` is deferred to Sprint 7, whose dual-protocol work has to touch these
+    /// signatures anyway; see ../../docs/superpowers/specs/2026-08-30-sprint-6-spec.md.
+    cluster: Option<Arc<crate::cluster::ClusterConfig>>,
+    /// Live client connections, kept by a Drop guard in `handle_connection` so it is decremented
+    /// on every one of that function's early returns, including the `serve_replica` path.
+    connected_clients: AtomicUsize,
+    /// Every connection ever accepted; never decremented.
+    total_connections: AtomicU64,
+    /// Every command that reached `dispatch_and_log`. Replicated commands applied through plain
+    /// `dispatch` are deliberately *not* counted -- they are not client traffic.
+    total_commands: AtomicU64,
+    /// Keys removed by the active expiry sweep. Passively expired keys (a read finding a key
+    /// already dead) are not counted: that would mean a counter on the hottest read path in the
+    /// project, inside `Shard`, for a statistic nothing gates on.
+    expired_keys: AtomicU64,
+    /// Unix seconds at which this node last applied a replicated frame; 0 if it never has. An
+    /// `Arc` because the spawned follower task is `'static` and needs its own handle.
+    last_apply_unix: Arc<AtomicI64>,
+    /// When this handle was built, which for `main.rs`'s single handle is process start. Feeds
+    /// `INFO`'s `uptime_in_seconds`.
+    started_at: std::time::Instant,
+    /// Unix seconds of the last successful `SAVE`; 0 if none has run in this process. This is
+    /// per-process state, not read back from the snapshot file: the file has no timestamp field
+    /// (Sprint 5 deliberately gave it no header beyond the AOF offset), so reporting anything
+    /// else would be a guess.
+    last_save_unix: AtomicI64,
+    /// `Some(host:port)` while this node is a follower. Set by `start_replicating`, cleared by
+    /// `stop_replicating`; feeds `INFO`'s `master_host`/`master_port`.
+    master_addr: Mutex<Option<String>>,
+    /// Whether the follower's link to its leader is currently up -- set true once a sync has
+    /// loaded a snapshot, false when that connection ends or fails. An `Arc` because the spawned
+    /// follower task is `'static`. This is the honest counterpart to real Redis's
+    /// `master_link_status`: it tracks the connection, not a byte offset, because this project
+    /// has no replication offsets at all.
+    link_up: Arc<AtomicBool>,
+    /// Recently-slow commands, recorded by the `dispatch_and_log` wrapper. A plain field, not an
+    /// `Option`: it is always present and always cheap when nothing is slow, so there is nothing
+    /// to configure away. `main.rs` sets its threshold from the environment via
+    /// `with_slowlog_threshold`; `new`/`Default` use the 10ms default.
+    pub slowlog: crate::slowlog::SlowLog,
 }
 
 impl ReplicationHandle {
@@ -99,6 +170,17 @@ impl ReplicationHandle {
             snapshot_path,
             generation: Arc::new(AtomicU64::new(0)),
             aof: None,
+            cluster: None,
+            connected_clients: AtomicUsize::new(0),
+            total_connections: AtomicU64::new(0),
+            total_commands: AtomicU64::new(0),
+            expired_keys: AtomicU64::new(0),
+            last_apply_unix: Arc::new(AtomicI64::new(0)),
+            started_at: std::time::Instant::now(),
+            last_save_unix: AtomicI64::new(0),
+            master_addr: Mutex::new(None),
+            link_up: Arc::new(AtomicBool::new(false)),
+            slowlog: crate::slowlog::SlowLog::default(),
         }
     }
 
@@ -113,6 +195,27 @@ impl ReplicationHandle {
     pub fn with_aof(mut self, aof: Arc<AofWriter>) -> Self {
         self.aof = Some(aof);
         self
+    }
+
+    /// Puts this node into cluster mode with the given static topology. Only `main.rs` and
+    /// `crates/server/tests/cluster.rs` call this; everything else leaves cluster mode off.
+    pub fn with_cluster(mut self, cluster: Arc<crate::cluster::ClusterConfig>) -> Self {
+        self.cluster = Some(cluster);
+        self
+    }
+
+    /// Overrides the slow-log threshold. `Duration::ZERO` disables recording entirely -- see
+    /// ../../docs/superpowers/specs/2026-08-30-sprint-6-spec.md for why that differs from real
+    /// Redis's meaning for 0.
+    pub fn with_slowlog_threshold(mut self, threshold: std::time::Duration) -> Self {
+        self.slowlog = crate::slowlog::SlowLog::with_threshold(threshold);
+        self
+    }
+
+    /// `None` when cluster mode is off. `dispatch_and_log`'s redirection gate short-circuits on
+    /// this before extracting any key, so a standalone node pays one `Option` check per command.
+    pub fn cluster(&self) -> Option<&Arc<crate::cluster::ClusterConfig>> {
+        self.cluster.as_ref()
     }
 
     /// For `SAVE` and (later) `PSYNC` handling, which need the shared `Engine` to snapshot
@@ -142,12 +245,17 @@ impl ReplicationHandle {
         let engine = Arc::clone(&self.engine);
         let generation = Arc::clone(&self.generation);
         let aof = self.aof.clone();
+        let last_apply = self.last_apply_slot();
+        *self.master_addr.lock().unwrap_or_else(|e| e.into_inner()) = Some(host_port.clone());
+        let link_up = self.link_up_slot();
         *task = Some(tokio::spawn(replication_client_loop(
             host_port,
             engine,
             generation,
             my_generation,
             aof,
+            last_apply,
+            link_up,
         )));
         self.is_replica.store(true, Ordering::Relaxed);
     }
@@ -162,6 +270,71 @@ impl ReplicationHandle {
         }
         self.generation.fetch_add(1, Ordering::SeqCst);
         self.is_replica.store(false, Ordering::Relaxed);
+        *self.master_addr.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.link_up.store(false, Ordering::Relaxed);
+    }
+
+    /// Called once per accepted client connection. Bumps both the live gauge and the lifetime
+    /// total; `connection_closed` is its Drop-guarded pair.
+    pub fn connection_opened(&self) {
+        self.connected_clients.fetch_add(1, Ordering::Relaxed);
+        self.total_connections.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn connection_closed(&self) {
+        self.connected_clients.fetch_sub(1, Ordering::Relaxed);
+    }
+    pub fn connected_clients(&self) -> usize {
+        self.connected_clients.load(Ordering::Relaxed)
+    }
+    pub fn total_connections(&self) -> u64 {
+        self.total_connections.load(Ordering::Relaxed)
+    }
+    pub fn command_executed(&self) {
+        self.total_commands.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn total_commands(&self) -> u64 {
+        self.total_commands.load(Ordering::Relaxed)
+    }
+    pub fn record_expired(&self, removed: usize) {
+        if removed > 0 {
+            self.expired_keys
+                .fetch_add(removed as u64, Ordering::Relaxed);
+        }
+    }
+    pub fn expired_keys(&self) -> u64 {
+        self.expired_keys.load(Ordering::Relaxed)
+    }
+    pub fn last_apply_unix(&self) -> i64 {
+        self.last_apply_unix.load(Ordering::Relaxed)
+    }
+    /// The shared slot itself, for the spawned follower task to write into.
+    pub fn last_apply_slot(&self) -> Arc<AtomicI64> {
+        Arc::clone(&self.last_apply_unix)
+    }
+
+    pub fn uptime_secs(&self) -> u64 {
+        self.started_at.elapsed().as_secs()
+    }
+    pub fn last_save_unix(&self) -> i64 {
+        self.last_save_unix.load(Ordering::Relaxed)
+    }
+    /// Called by `handle_save` after a snapshot has landed on disk.
+    pub fn record_save(&self) {
+        self.last_save_unix
+            .store(unix_now_secs(), Ordering::Relaxed);
+    }
+    pub fn master_addr(&self) -> Option<String> {
+        self.master_addr
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+    pub fn link_up(&self) -> bool {
+        self.link_up.load(Ordering::Relaxed)
+    }
+    /// The shared flag itself, for the spawned follower task to write into.
+    pub fn link_up_slot(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.link_up)
     }
 }
 
@@ -188,6 +361,8 @@ async fn replication_client_loop(
     generation: Arc<AtomicU64>,
     my_generation: u64,
     aof: Option<Arc<AofWriter>>,
+    last_apply: Arc<AtomicI64>,
+    link_up: Arc<AtomicBool>,
 ) {
     loop {
         if generation.load(Ordering::SeqCst) != my_generation {
@@ -199,12 +374,15 @@ async fn replication_client_loop(
             &generation,
             my_generation,
             aof.as_deref(),
+            &last_apply,
+            &link_up,
         )
         .await
         {
             Ok(()) => eprintln!("replication: connection to {host_port} closed; reconnecting"),
             Err(e) => eprintln!("replication: lost connection to {host_port}: {e}; reconnecting"),
         }
+        link_up.store(false, Ordering::Relaxed);
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
 }
@@ -221,6 +399,8 @@ async fn sync_once(
     generation: &AtomicU64,
     my_generation: u64,
     aof: Option<&AofWriter>,
+    last_apply: &AtomicI64,
+    link_up: &AtomicBool,
 ) -> std::io::Result<()> {
     let stream = tokio::net::TcpStream::connect(host_port).await?;
     let mut framed = tokio_util::codec::Framed::new(stream, protocol::codec::RespCodec::default());
@@ -248,6 +428,7 @@ async fn sync_once(
     engine
         .load_snapshot(&blob)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    link_up.store(true, Ordering::Relaxed);
 
     // From here on the leader sends plain RESP frames, byte-for-byte what its own AOF
     // received — rebuild a Framed over the same socket (whose read position is exactly past
@@ -276,6 +457,7 @@ async fn sync_once(
         if let protocol::Frame::Error(e) = reply {
             eprintln!("replication: applying a replicated command failed: {e}");
         }
+        last_apply.store(unix_now_secs(), Ordering::Relaxed);
     }
     Ok(())
 }
@@ -353,6 +535,43 @@ mod tests {
         registry.broadcast(bytes::Bytes::from_static(b"hello")); // must not panic
     }
 
+    #[test]
+    fn uptime_starts_at_zero_and_never_goes_backwards() {
+        let h = ReplicationHandle::default();
+        let first = h.uptime_secs();
+        assert!(
+            first < 2,
+            "a just-built handle should report ~0s, got {first}"
+        );
+        assert!(h.uptime_secs() >= first);
+    }
+
+    #[test]
+    fn last_save_unix_is_zero_until_a_save_records_one() {
+        let h = ReplicationHandle::default();
+        assert_eq!(h.last_save_unix(), 0);
+        h.record_save();
+        assert!(
+            h.last_save_unix() > 1_700_000_000,
+            "record_save should store a real unix timestamp, got {}",
+            h.last_save_unix()
+        );
+    }
+
+    #[tokio::test]
+    async fn master_addr_and_link_up_follow_the_replica_role() {
+        let h = ReplicationHandle::default();
+        assert_eq!(h.master_addr(), None);
+        assert!(!h.link_up());
+
+        h.start_replicating("127.0.0.1:1".to_string()); // nothing is listening; that's fine
+        assert_eq!(h.master_addr(), Some("127.0.0.1:1".to_string()));
+
+        h.stop_replicating();
+        assert_eq!(h.master_addr(), None);
+        assert!(!h.link_up());
+    }
+
     #[tokio::test]
     async fn sync_once_loads_the_snapshot_then_applies_streamed_frames() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -393,7 +612,18 @@ mod tests {
         let sync_task = {
             let engine = std::sync::Arc::clone(&engine);
             let generation = Arc::clone(&generation);
-            tokio::spawn(async move { sync_once(&host_port, &engine, &generation, 0, None).await })
+            tokio::spawn(async move {
+                sync_once(
+                    &host_port,
+                    &engine,
+                    &generation,
+                    0,
+                    None,
+                    &AtomicI64::new(0),
+                    &AtomicBool::new(false),
+                )
+                .await
+            })
         };
 
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
@@ -444,9 +674,17 @@ mod tests {
         // generation check, this would go on to call load_snapshot and clobber whatever a
         // newer task has already loaded.
         let generation = Arc::new(AtomicU64::new(1));
-        sync_once(&host_port, &engine, &generation, 0, None)
-            .await
-            .unwrap();
+        sync_once(
+            &host_port,
+            &engine,
+            &generation,
+            0,
+            None,
+            &AtomicI64::new(0),
+            &AtomicBool::new(false),
+        )
+        .await
+        .unwrap();
         fake_leader.await.unwrap();
 
         assert_eq!(engine.get(b"from-snapshot"), None); // stale task must not load its snapshot
@@ -538,9 +776,18 @@ mod tests {
             let aof = Arc::clone(&aof);
             let host_port = addr.to_string();
             let generation = Arc::new(AtomicU64::new(0));
-            tokio::spawn(
-                async move { sync_once(&host_port, &engine, &generation, 0, Some(&aof)).await },
-            )
+            tokio::spawn(async move {
+                sync_once(
+                    &host_port,
+                    &engine,
+                    &generation,
+                    0,
+                    Some(&aof),
+                    &AtomicI64::new(0),
+                    &AtomicBool::new(false),
+                )
+                .await
+            })
         };
 
         // The SAVE loop runs on a blocking thread, not a runtime worker: `handle_save` fsyncs
@@ -636,5 +883,70 @@ mod tests {
         handle.start_replicating("127.0.0.1:2".to_string()); // must not panic or leave two tasks running
         assert!(handle.is_replica.load(std::sync::atomic::Ordering::Relaxed));
         handle.stop_replicating();
+    }
+
+    #[test]
+    fn registry_len_tracks_registered_replicas() {
+        let registry = ReplicaRegistry::default();
+        assert!(registry.is_empty());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        registry.register(tx);
+        assert_eq!(registry.len(), 1);
+    }
+
+    #[test]
+    fn connection_counters_move_with_open_and_close() {
+        let h = ReplicationHandle::default();
+        assert_eq!(h.connected_clients(), 0);
+        assert_eq!(h.total_connections(), 0);
+        h.connection_opened();
+        h.connection_opened();
+        assert_eq!(h.connected_clients(), 2);
+        assert_eq!(h.total_connections(), 2);
+        h.connection_closed();
+        assert_eq!(h.connected_clients(), 1);
+        assert_eq!(h.total_connections(), 2); // total never goes down
+    }
+
+    #[test]
+    fn command_and_expiry_counters_accumulate() {
+        let h = ReplicationHandle::default();
+        h.command_executed();
+        h.command_executed();
+        assert_eq!(h.total_commands(), 2);
+        h.record_expired(5);
+        h.record_expired(0);
+        h.record_expired(2);
+        assert_eq!(h.expired_keys(), 7);
+    }
+
+    #[test]
+    fn last_apply_unix_starts_at_zero_and_follows_the_shared_slot() {
+        let h = ReplicationHandle::default();
+        assert_eq!(h.last_apply_unix(), 0);
+        h.last_apply_slot()
+            .store(1_756_512_000, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(h.last_apply_unix(), 1_756_512_000);
+    }
+
+    #[test]
+    fn a_handle_is_not_in_cluster_mode_by_default() {
+        let h = ReplicationHandle::default();
+        assert!(h.cluster().is_none());
+    }
+
+    #[test]
+    fn with_cluster_puts_the_handle_into_cluster_mode() {
+        let config = crate::cluster::ClusterConfig::parse(
+            "shard-a 127.0.0.1:7001 0 8000\nshard-b 127.0.0.1:7002 8001 16383\n",
+            "shard-b",
+        )
+        .unwrap();
+        let h = ReplicationHandle::new(Arc::new(Engine::new()), "/tmp/does-not-matter".into())
+            .with_cluster(Arc::new(config));
+        let cluster = h.cluster().expect("cluster mode should be on");
+        assert_eq!(cluster.myself().id, "shard-b");
+        assert!(cluster.owns(8001));
+        assert!(!cluster.owns(8000));
     }
 }
