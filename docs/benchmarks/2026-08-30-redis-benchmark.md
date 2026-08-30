@@ -63,6 +63,13 @@ pipeline depth. This is flagged as an anomaly rather than explained: it needs th
 (the next task in this sprint) before asserting a cause, and it stands out enough from the rest of
 the table that it should not be averaged in with the "modest, proportional" story above.
 
+The Setup section's keyspace-carryover caveat is not the explanation here: the run's own `/metrics`
+sample, captured at the end of the full run, shows `rocket_mem_keys 1` and
+`rocket_mem_memory_used_bytes 1088` — confirming the keyspace never grew beyond a single key (both
+`redis-benchmark` runs reused one key throughout, since `-r` was never passed to it). That rules
+out keyspace carryover as the cause of this specific anomaly and strengthens the case that it
+genuinely needs flamegraph profiling to explain.
+
 ## Where we are faster, if anywhere
 
 None. rocket-mem was slower than redis-server in every one of the eight workloads measured, from
