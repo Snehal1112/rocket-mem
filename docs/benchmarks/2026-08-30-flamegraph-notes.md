@@ -113,17 +113,19 @@ out of scope for this task).
 
 ## The bottleneck this sprint fixes
 
-Per-command heap allocation of the uppercased command name. Before this sprint's change the name
-was allocated by `String::from_utf8_lossy(..).to_ascii_uppercase()` in four places on every
+Per-command heap allocation of the uppercased command name. As of this profile, the name is
+allocated by `String::from_utf8_lossy(..).to_ascii_uppercase()` in four places on every
 command: `dispatch` (`crates/server/src/dispatcher.rs:67`), `extract_write_command_name`
-(`:933`), `command_name_upper` (the metrics wrapper), and `command_keys` (the cluster gate). All
-four now share one stack-allocated `CommandName`; the measured effect is in
-[`2026-08-30-redis-benchmark.md`](2026-08-30-redis-benchmark.md)'s "Effect of the Sprint 6
-optimization" section. The flat self-time table above shows `dispatch_and_log` (1.03%), `dispatch`
-(0.59%), `dispatch_and_log_inner` (0.48%), and `extract_write_command_name` (0.28%) together at
-~2.4% of self CPU time in this post-optimization build — this profile is the *after* picture (the
-optimization is already committed on this branch), not a before/after comparison; the before/after
-delta lives in the benchmark numbers, not in this single profile.
+(defined at `crates/server/src/dispatcher.rs:907`, allocating at `:914`), `command_name_upper`
+(the metrics wrapper), and `command_keys` (the cluster gate). This sprint's fix — replacing all
+four with one stack-allocated `CommandName` — has not landed yet as of this profile (that's Task 4
+of this same plan); once it lands, Task 5 will add an "Effect of the Sprint 6 optimization"
+section to [`2026-08-30-redis-benchmark.md`](2026-08-30-redis-benchmark.md) measuring it. The flat
+self-time table above shows `dispatch_and_log` (1.03%), `dispatch` (0.59%),
+`dispatch_and_log_inner` (0.48%), and `extract_write_command_name` (0.28%) together at ~2.4% of
+self CPU time in this pre-optimization build — this profile is the *before* picture, not a
+before/after comparison; the before/after delta will live in the benchmark numbers once Task 4's
+fix is measured, not in this single profile.
 
 ## Recorded, not acted on
 
