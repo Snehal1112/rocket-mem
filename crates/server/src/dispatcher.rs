@@ -1363,7 +1363,10 @@ fn handle_save(
     };
 
     match write_snapshot_atomically(replication.snapshot_path(), &bytes) {
-        Ok(()) => Frame::Simple("OK".into()),
+        Ok(()) => {
+            replication.record_save();
+            Frame::Simple("OK".into())
+        }
         Err(e) => Frame::Error(format!("ERR failed to write snapshot: {e}")),
     }
 }

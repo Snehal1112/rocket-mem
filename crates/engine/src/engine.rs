@@ -105,6 +105,14 @@ impl Engine {
         self.store.memory_used()
     }
 
+    /// The configured `MAXMEMORY` ceiling, if any. `INFO`'s memory section reports it; note the
+    /// shipped binary always answers `None`, because `main.rs` builds its `Engine` through
+    /// `aof::recover`, which calls `Engine::new()`. Wiring a `ROCKET_MEM_MAXMEMORY` env var is
+    /// deliberately out of this sprint's scope; the gap is recorded in the README.
+    pub fn maxmemory(&self) -> Option<usize> {
+        self.maxmemory
+    }
+
     /// `(live keys, of which carry an expiry)`. A thin facade over `Store`, matching `Engine`'s
     /// established role. Feeds the `rocket_mem_keys` gauges and `INFO`'s keyspace section.
     pub fn key_counts(&self) -> (usize, usize) {
@@ -149,6 +157,12 @@ mod tests {
     use crate::Value;
     use bytes::Bytes;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn maxmemory_reports_the_configured_ceiling_or_none() {
+        assert_eq!(Engine::new().maxmemory(), None);
+        assert_eq!(Engine::with_maxmemory(4_096).maxmemory(), Some(4_096));
+    }
 
     #[test]
     fn ttl_on_a_missing_key_is_no_such_key() {

@@ -5,6 +5,16 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+/// Unix seconds now, or 0 if the system clock is somehow before the epoch. Never panics: a
+/// bogus clock must not take down a server over a metrics field. Used by `record_save` and by
+/// `sync_once`'s last-apply stamp, so there is exactly one implementation of this expression.
+fn unix_now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 /// Holds one outbound channel per connected replica. `senders` is a plain `std::sync::Mutex`,
 /// not `tokio::sync::Mutex`: every access is a quick, synchronous push/retain, never held
 /// across an `.await`, so the lighter std lock is the right tool — matching `AofWriter::order`'s
@@ -126,6 +136,23 @@ pub struct ReplicationHandle {
     /// Unix seconds at which this node last applied a replicated frame; 0 if it never has. An
     /// `Arc` because the spawned follower task is `'static` and needs its own handle.
     last_apply_unix: Arc<AtomicI64>,
+    /// When this handle was built, which for `main.rs`'s single handle is process start. Feeds
+    /// `INFO`'s `uptime_in_seconds`.
+    started_at: std::time::Instant,
+    /// Unix seconds of the last successful `SAVE`; 0 if none has run in this process. This is
+    /// per-process state, not read back from the snapshot file: the file has no timestamp field
+    /// (Sprint 5 deliberately gave it no header beyond the AOF offset), so reporting anything
+    /// else would be a guess.
+    last_save_unix: AtomicI64,
+    /// `Some(host:port)` while this node is a follower. Set by `start_replicating`, cleared by
+    /// `stop_replicating`; feeds `INFO`'s `master_host`/`master_port`.
+    master_addr: Mutex<Option<String>>,
+    /// Whether the follower's link to its leader is currently up -- set true once a sync has
+    /// loaded a snapshot, false when that connection ends or fails. An `Arc` because the spawned
+    /// follower task is `'static`. This is the honest counterpart to real Redis's
+    /// `master_link_status`: it tracks the connection, not a byte offset, because this project
+    /// has no replication offsets at all.
+    link_up: Arc<AtomicBool>,
 }
 
 impl ReplicationHandle {
@@ -144,6 +171,10 @@ impl ReplicationHandle {
             total_commands: AtomicU64::new(0),
             expired_keys: AtomicU64::new(0),
             last_apply_unix: Arc::new(AtomicI64::new(0)),
+            started_at: std::time::Instant::now(),
+            last_save_unix: AtomicI64::new(0),
+            master_addr: Mutex::new(None),
+            link_up: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -201,6 +232,8 @@ impl ReplicationHandle {
         let generation = Arc::clone(&self.generation);
         let aof = self.aof.clone();
         let last_apply = self.last_apply_slot();
+        *self.master_addr.lock().unwrap_or_else(|e| e.into_inner()) = Some(host_port.clone());
+        let link_up = self.link_up_slot();
         *task = Some(tokio::spawn(replication_client_loop(
             host_port,
             engine,
@@ -208,6 +241,7 @@ impl ReplicationHandle {
             my_generation,
             aof,
             last_apply,
+            link_up,
         )));
         self.is_replica.store(true, Ordering::Relaxed);
     }
@@ -222,6 +256,8 @@ impl ReplicationHandle {
         }
         self.generation.fetch_add(1, Ordering::SeqCst);
         self.is_replica.store(false, Ordering::Relaxed);
+        *self.master_addr.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.link_up.store(false, Ordering::Relaxed);
     }
 
     /// Called once per accepted client connection. Bumps both the live gauge and the lifetime
@@ -261,6 +297,31 @@ impl ReplicationHandle {
     pub fn last_apply_slot(&self) -> Arc<AtomicI64> {
         Arc::clone(&self.last_apply_unix)
     }
+
+    pub fn uptime_secs(&self) -> u64 {
+        self.started_at.elapsed().as_secs()
+    }
+    pub fn last_save_unix(&self) -> i64 {
+        self.last_save_unix.load(Ordering::Relaxed)
+    }
+    /// Called by `handle_save` after a snapshot has landed on disk.
+    pub fn record_save(&self) {
+        self.last_save_unix
+            .store(unix_now_secs(), Ordering::Relaxed);
+    }
+    pub fn master_addr(&self) -> Option<String> {
+        self.master_addr
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+    pub fn link_up(&self) -> bool {
+        self.link_up.load(Ordering::Relaxed)
+    }
+    /// The shared flag itself, for the spawned follower task to write into.
+    pub fn link_up_slot(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.link_up)
+    }
 }
 
 /// An idle handle: no replicas registered, not a replica, no follower task running, its own
@@ -287,6 +348,7 @@ async fn replication_client_loop(
     my_generation: u64,
     aof: Option<Arc<AofWriter>>,
     last_apply: Arc<AtomicI64>,
+    link_up: Arc<AtomicBool>,
 ) {
     loop {
         if generation.load(Ordering::SeqCst) != my_generation {
@@ -299,12 +361,14 @@ async fn replication_client_loop(
             my_generation,
             aof.as_deref(),
             &last_apply,
+            &link_up,
         )
         .await
         {
             Ok(()) => eprintln!("replication: connection to {host_port} closed; reconnecting"),
             Err(e) => eprintln!("replication: lost connection to {host_port}: {e}; reconnecting"),
         }
+        link_up.store(false, Ordering::Relaxed);
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
 }
@@ -322,6 +386,7 @@ async fn sync_once(
     my_generation: u64,
     aof: Option<&AofWriter>,
     last_apply: &AtomicI64,
+    link_up: &AtomicBool,
 ) -> std::io::Result<()> {
     let stream = tokio::net::TcpStream::connect(host_port).await?;
     let mut framed = tokio_util::codec::Framed::new(stream, protocol::codec::RespCodec::default());
@@ -349,6 +414,7 @@ async fn sync_once(
     engine
         .load_snapshot(&blob)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    link_up.store(true, Ordering::Relaxed);
 
     // From here on the leader sends plain RESP frames, byte-for-byte what its own AOF
     // received — rebuild a Framed over the same socket (whose read position is exactly past
@@ -377,13 +443,7 @@ async fn sync_once(
         if let protocol::Frame::Error(e) = reply {
             eprintln!("replication: applying a replicated command failed: {e}");
         }
-        last_apply.store(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0),
-            Ordering::Relaxed,
-        );
+        last_apply.store(unix_now_secs(), Ordering::Relaxed);
     }
     Ok(())
 }
@@ -461,6 +521,43 @@ mod tests {
         registry.broadcast(bytes::Bytes::from_static(b"hello")); // must not panic
     }
 
+    #[test]
+    fn uptime_starts_at_zero_and_never_goes_backwards() {
+        let h = ReplicationHandle::default();
+        let first = h.uptime_secs();
+        assert!(
+            first < 2,
+            "a just-built handle should report ~0s, got {first}"
+        );
+        assert!(h.uptime_secs() >= first);
+    }
+
+    #[test]
+    fn last_save_unix_is_zero_until_a_save_records_one() {
+        let h = ReplicationHandle::default();
+        assert_eq!(h.last_save_unix(), 0);
+        h.record_save();
+        assert!(
+            h.last_save_unix() > 1_700_000_000,
+            "record_save should store a real unix timestamp, got {}",
+            h.last_save_unix()
+        );
+    }
+
+    #[tokio::test]
+    async fn master_addr_and_link_up_follow_the_replica_role() {
+        let h = ReplicationHandle::default();
+        assert_eq!(h.master_addr(), None);
+        assert!(!h.link_up());
+
+        h.start_replicating("127.0.0.1:1".to_string()); // nothing is listening; that's fine
+        assert_eq!(h.master_addr(), Some("127.0.0.1:1".to_string()));
+
+        h.stop_replicating();
+        assert_eq!(h.master_addr(), None);
+        assert!(!h.link_up());
+    }
+
     #[tokio::test]
     async fn sync_once_loads_the_snapshot_then_applies_streamed_frames() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -509,6 +606,7 @@ mod tests {
                     0,
                     None,
                     &AtomicI64::new(0),
+                    &AtomicBool::new(false),
                 )
                 .await
             })
@@ -569,6 +667,7 @@ mod tests {
             0,
             None,
             &AtomicI64::new(0),
+            &AtomicBool::new(false),
         )
         .await
         .unwrap();
@@ -671,6 +770,7 @@ mod tests {
                     0,
                     Some(&aof),
                     &AtomicI64::new(0),
+                    &AtomicBool::new(false),
                 )
                 .await
             })
