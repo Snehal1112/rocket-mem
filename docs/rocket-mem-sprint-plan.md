@@ -199,6 +199,10 @@ This maps the 16-week phase plan (`rocket-mem-production-plan.md`) onto 2-week s
 
 **Sprint goal:** A follower stays in sync with a leader in real time; startup time drops sharply via snapshot + incremental AOF.
 
+**Status:** ✅ Complete — full P0/P1 scope shipped. See
+`docs/superpowers/specs/2026-08-30-sprint-5-spec.md` and
+`docs/superpowers/plans/2026-08-30-sprint-5-plans/`.
+
 ### Capacity
 | | Available | Planned | Notes |
 |---|---|---|---|
@@ -222,9 +226,9 @@ This maps the 16-week phase plan (`rocket-mem-production-plan.md`) onto 2-week s
 | Snapshot format changes later break compatibility | Annoying but not fatal this early | Not worth solving now — note it as a known v1 limitation |
 
 ### Definition of done
-- [ ] Recovery time benchmark (snapshot+AOF vs full AOF replay) recorded, showing clear improvement
-- [ ] 1 leader + 2 follower integration test passes, writes visible within a bounded time window
-- [ ] Kill-and-reconnect-follower test passes (even if it falls back to full resync)
+- [x] Recovery time benchmark (snapshot+AOF vs full AOF replay) recorded, showing clear improvement
+- [x] 1 leader + 2 follower integration test passes, writes visible within a bounded time window
+- [x] Kill-and-reconnect-follower test passes (even if it falls back to full resync)
 
 ### Key dates
 | Day | Event |
