@@ -56,7 +56,7 @@ macro_rules! require_args {
     };
 }
 
-pub fn dispatch(engine: &Engine, frame: Frame, protocol: &mut Protocol, client_id: u64) -> Frame {
+pub fn dispatch(engine: &Engine, frame: Frame, _protocol: &mut Protocol, _client_id: u64) -> Frame {
     let args = match frame_to_args(frame) {
         Ok(a) => a,
         Err(e) => return e,
@@ -856,31 +856,16 @@ pub fn dispatch(engine: &Engine, frame: Frame, protocol: &mut Protocol, client_i
                 _ => Frame::Error(format!("ERR unknown OBJECT subcommand '{subcommand}'")),
             }
         }
-        "HELLO" => match rest.first() {
-            None => hello_reply(*protocol, client_id),
-            Some(arg) => match arg.as_ref() {
-                b"2" => {
-                    if rest.len() > 1 {
-                        return Frame::Error("ERR syntax error".into());
-                    }
-                    *protocol = Protocol::Resp2;
-                    hello_reply(*protocol, client_id)
-                }
-                b"3" => {
-                    if rest.len() > 1 {
-                        return Frame::Error("ERR syntax error".into());
-                    }
-                    *protocol = Protocol::Resp3;
-                    hello_reply(*protocol, client_id)
-                }
-                _ => Frame::Error("NOPROTO unsupported protocol version".into()),
-            },
-        },
         _ => Frame::Error(format!("ERR unknown command '{name}'")),
     }
 }
 
-fn hello_reply(protocol: Protocol, client_id: u64) -> Frame {
+fn hello_reply(
+    protocol: Protocol,
+    client_id: u64,
+    role: &'static str,
+    mode: &'static str,
+) -> Frame {
     Frame::Map(vec![
         (
             Frame::Bulk(Bytes::from_static(b"server")),
@@ -903,11 +888,11 @@ fn hello_reply(protocol: Protocol, client_id: u64) -> Frame {
         ),
         (
             Frame::Bulk(Bytes::from_static(b"mode")),
-            Frame::Bulk(Bytes::from_static(b"standalone")),
+            Frame::Bulk(Bytes::from(mode)),
         ),
         (
             Frame::Bulk(Bytes::from_static(b"role")),
-            Frame::Bulk(Bytes::from_static(b"master")),
+            Frame::Bulk(Bytes::from(role)),
         ),
         (
             Frame::Bulk(Bytes::from_static(b"modules")),
@@ -1529,6 +1514,70 @@ fn handle_info(
     ))))
 }
 
+/// Returns `Some(reply)` if `frame` was `HELLO`. Moved out of `dispatch` this sprint for one
+/// reason: the reply's `role` field must reflect whether this node is a follower, and only
+/// `dispatch_and_log` has the `ReplicationHandle` that knows. The protocol-switching behavior is
+/// identical to the arm it replaces, and it still mutates the caller's `&mut Protocol`, so
+/// `connection.rs`'s `framed.codec_mut().protocol = protocol` keeps working unchanged.
+///
+/// `dispatch` therefore answers `HELLO` with its unknown-command error, which is correct: its
+/// only direct callers are `aof::replay` and the follower apply loop, neither of which can ever
+/// see a `HELLO`.
+fn handle_hello(
+    frame: &Frame,
+    protocol: &mut Protocol,
+    client_id: u64,
+    replication: &crate::replication::ReplicationHandle,
+) -> Option<Frame> {
+    let Frame::Array(items) = frame else {
+        return None;
+    };
+    let Some(Frame::Bulk(name)) = items.first() else {
+        return None;
+    };
+    if !name.eq_ignore_ascii_case(b"HELLO") {
+        return None;
+    }
+    let role = if replication
+        .is_replica
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        "slave"
+    } else {
+        "master"
+    };
+    // Kept consistent with `INFO server`'s `redis_mode`, which reports the same thing.
+    let mode = if replication.cluster().is_some() {
+        "cluster"
+    } else {
+        "standalone"
+    };
+    let args = &items[1..];
+    Some(match args.first() {
+        None => hello_reply(*protocol, client_id, role, mode),
+        Some(Frame::Bulk(arg)) => match arg.as_ref() {
+            b"2" => {
+                if args.len() > 1 {
+                    return Some(Frame::Error("ERR syntax error".into()));
+                }
+                *protocol = Protocol::Resp2;
+                hello_reply(*protocol, client_id, role, mode)
+            }
+            b"3" => {
+                if args.len() > 1 {
+                    return Some(Frame::Error("ERR syntax error".into()));
+                }
+                *protocol = Protocol::Resp3;
+                hello_reply(*protocol, client_id, role, mode)
+            }
+            _ => Frame::Error("NOPROTO unsupported protocol version".into()),
+        },
+        // A non-Bulk argument was previously caught by `dispatch`'s `frame_to_args`; keep that
+        // exact error so the move changes no observable behavior.
+        Some(_) => Frame::Error("ERR invalid request, expected array of bulk strings".into()),
+    })
+}
+
 /// Snapshots `replication.engine()` — in production this is always the same `Arc<Engine>` as
 /// `dispatch_and_log`'s own `engine` parameter (`main.rs` constructs one `Engine`, shares it
 /// into both `serve`'s `engine` argument and `ReplicationHandle::new`), so using the handle's
@@ -1684,6 +1733,9 @@ fn dispatch_and_log_inner(
         return reply;
     }
     if let Some(reply) = handle_info(&frame, engine, aof, replication) {
+        return reply;
+    }
+    if let Some(reply) = handle_hello(&frame, protocol, client_id, replication) {
         return reply;
     }
 
@@ -2959,8 +3011,16 @@ mod tests {
     #[test]
     fn hello_with_no_args_reports_current_protocol_without_switching() {
         let engine = Engine::new();
+        let (_dir, aof) = test_aof();
         let mut protocol = Protocol::Resp2;
-        let reply = dispatch(&engine, cmd(&[b"HELLO"]), &mut protocol, 7);
+        let reply = dispatch_and_log(
+            &engine,
+            &aof,
+            &ReplicationHandle::default(),
+            cmd(&[b"HELLO"]),
+            &mut protocol,
+            7,
+        );
         assert_eq!(protocol, Protocol::Resp2); // unchanged
         assert_eq!(
             reply,
@@ -2994,8 +3054,16 @@ mod tests {
     #[test]
     fn hello_2_switches_protocol_to_resp2() {
         let engine = Engine::new();
+        let (_dir, aof) = test_aof();
         let mut protocol = Protocol::Resp3;
-        let reply = dispatch(&engine, cmd(&[b"HELLO", b"2"]), &mut protocol, 1);
+        let reply = dispatch_and_log(
+            &engine,
+            &aof,
+            &ReplicationHandle::default(),
+            cmd(&[b"HELLO", b"2"]),
+            &mut protocol,
+            1,
+        );
         assert_eq!(protocol, Protocol::Resp2);
         let Frame::Map(pairs) = reply else {
             panic!("expected Map")
@@ -3006,8 +3074,16 @@ mod tests {
     #[test]
     fn hello_3_switches_protocol_to_resp3() {
         let engine = Engine::new();
+        let (_dir, aof) = test_aof();
         let mut protocol = Protocol::Resp2;
-        let reply = dispatch(&engine, cmd(&[b"HELLO", b"3"]), &mut protocol, 42);
+        let reply = dispatch_and_log(
+            &engine,
+            &aof,
+            &ReplicationHandle::default(),
+            cmd(&[b"HELLO", b"3"]),
+            &mut protocol,
+            42,
+        );
         assert_eq!(protocol, Protocol::Resp3);
         assert_eq!(
             reply,
@@ -3041,12 +3117,64 @@ mod tests {
     #[test]
     fn hello_with_unsupported_protover_returns_noproto_and_leaves_protocol_unchanged() {
         let engine = Engine::new();
+        let (_dir, aof) = test_aof();
         let mut protocol = Protocol::Resp2;
-        let reply = dispatch(&engine, cmd(&[b"HELLO", b"4"]), &mut protocol, 1);
+        let reply = dispatch_and_log(
+            &engine,
+            &aof,
+            &ReplicationHandle::default(),
+            cmd(&[b"HELLO", b"4"]),
+            &mut protocol,
+            1,
+        );
         assert_eq!(protocol, Protocol::Resp2); // unchanged
         assert_eq!(
             reply,
             Frame::Error("NOPROTO unsupported protocol version".into())
+        );
+    }
+
+    #[test]
+    fn hello_reports_role_slave_on_a_replica_and_master_otherwise() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+
+        let master = ReplicationHandle::default();
+        let Frame::Map(fields) = dispatch_and_log(
+            &engine,
+            &aof,
+            &master,
+            cmd(&[b"HELLO"]),
+            &mut Protocol::default(),
+            7,
+        ) else {
+            panic!("expected Map")
+        };
+        assert!(fields.contains(&(
+            Frame::Bulk(Bytes::from_static(b"role")),
+            Frame::Bulk(Bytes::from_static(b"master"))
+        )));
+
+        let replica = ReplicationHandle::default();
+        replica
+            .is_replica
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let Frame::Map(fields) = dispatch_and_log(
+            &engine,
+            &aof,
+            &replica,
+            cmd(&[b"HELLO"]),
+            &mut Protocol::default(),
+            7,
+        ) else {
+            panic!("expected Map")
+        };
+        assert!(
+            fields.contains(&(
+                Frame::Bulk(Bytes::from_static(b"role")),
+                Frame::Bulk(Bytes::from_static(b"slave"))
+            )),
+            "{fields:?}"
         );
     }
 
@@ -4303,9 +4431,12 @@ mod tests {
     #[test]
     fn hello_with_extra_args_after_protover_is_a_syntax_error() {
         let engine = Engine::new();
+        let (_dir, aof) = test_aof();
         let mut protocol = Protocol::Resp2;
-        let reply = dispatch(
+        let reply = dispatch_and_log(
             &engine,
+            &aof,
+            &ReplicationHandle::default(),
             cmd(&[b"HELLO", b"3", b"AUTH", b"user", b"pass"]),
             &mut protocol,
             1,
