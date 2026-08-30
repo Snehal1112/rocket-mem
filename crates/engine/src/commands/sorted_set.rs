@@ -1,7 +1,7 @@
 use crate::{Engine, SortedSet, Value};
 use bytes::Bytes;
 
-/// Mutates in place via `with_mut` -- see list.rs's top-of-file note for why this matters.
+/// Mutates in place via `with_mut_delta` -- see list.rs's top-of-file note for why this matters.
 pub fn zadd(
     engine: &Engine,
     key: Bytes,

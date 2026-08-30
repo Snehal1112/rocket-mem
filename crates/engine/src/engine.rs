@@ -58,11 +58,12 @@ impl Engine {
     {
         self.store.with_ref(key, f)
     }
-    /// Also evicts, because this — not `set` — is how RPUSH/HSET/SADD/ZADD grow a value:
-    /// accounting the growth (which `Shard::with_mut` now does) without ever acting on it
-    /// would leave a pure-collection workload permanently over the ceiling. `Shard::with_mut`
-    /// has already released its write lock by the time it returns, so evicting here can't
-    /// deadlock against it.
+    /// Generic fallback for a mutation whose byte delta isn't cheaply knowable in advance --
+    /// `with_mut_delta` below is what RPUSH/HSET/SADD/ZADD actually call to grow a value in
+    /// place. Also evicts, for the same reason `with_mut_delta` does: accounting growth
+    /// (`Shard::with_mut`) without ever acting on it would leave a pure-collection workload
+    /// permanently over the ceiling. `Shard::with_mut` has already released its write lock by
+    /// the time it returns, so evicting here can't deadlock against it.
     pub fn with_mut<F, R>(&self, key: &[u8], f: F) -> R
     where
         F: FnOnce(Option<&mut Value>) -> R,
@@ -344,9 +345,9 @@ mod tests {
 
     #[test]
     fn with_maxmemory_also_bounds_memory_grown_in_place_not_only_through_set() {
-        // RPUSH/HSET/SADD/ZADD never call Engine::set — they grow a value through with_mut.
-        // Without eviction wired into with_mut too, this workload would blow straight past the
-        // ceiling while memory accounting silently watched it happen.
+        // RPUSH/HSET/SADD/ZADD never call Engine::set — they grow a value through
+        // with_mut_delta. Without eviction wired into with_mut_delta too, this workload would
+        // blow straight past the ceiling while memory accounting silently watched it happen.
         let engine = Engine::with_maxmemory(500);
         engine.set(
             Bytes::from_static(b"filler"),
@@ -357,11 +358,12 @@ mod tests {
             Value::List(std::collections::VecDeque::new()),
         );
         for i in 0..50 {
-            engine.with_mut(b"list", |v| {
-                if let Some(Value::List(l)) = v {
-                    l.push_back(Bytes::from(format!("element-{i}")));
-                }
-            });
+            crate::commands::list::rpush(
+                &engine,
+                Bytes::from_static(b"list"),
+                vec![Bytes::from(format!("element-{i}"))],
+            )
+            .unwrap();
         }
         assert!(engine.memory_used() <= 500);
         assert!(engine.eviction_count() > 0);

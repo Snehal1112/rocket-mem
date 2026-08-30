@@ -215,11 +215,11 @@ impl Shard {
         }
     }
 
-    // Re-accounts bytes_used around the closure: with_mut is how RPUSH/HSET/SADD/ZADD-style
-    // growth happens in place (see 01's note and commands/{hash,list,set,sorted_set}.rs), and
-    // unlike set() it never goes through entry_size() on its own — without this, MAXMEMORY
-    // would never see memory grow from any command that mutates a collection in place, only
-    // from whole-value SETs.
+    // Re-accounts bytes_used around the closure by diffing approx_size() before and after --
+    // the generic fallback for a mutation whose delta isn't cheaply knowable in advance. Every
+    // real command (RPUSH/HSET/SADD/ZADD) instead uses with_mut_delta, which lets the caller
+    // report its own byte delta and skip this before/after rescan (see commands/{hash,list,set,
+    // sorted_set}.rs); with_mut stays as the fallback for a future mutation that needs it.
     pub fn with_mut<F, R>(&self, key: &[u8], f: F, clock: &AtomicU64) -> R
     where
         F: FnOnce(Option<&mut Value>) -> R,

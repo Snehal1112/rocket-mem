@@ -12,7 +12,7 @@ fn get_set(engine: &Engine, key: &[u8]) -> Result<HashSet<Bytes>, common::Engine
 
 /// Adds every member in `members` in one shard-lock acquisition and returns the count newly
 /// added (duplicates within `members`, or members already present, don't count). Mutates in
-/// place via `with_mut` -- see list.rs's top-of-file note for why this matters. When `key` is
+/// place via `with_mut_delta` -- see list.rs's top-of-file note for why this matters. When `key` is
 /// missing, an empty `members` leaves it missing rather than creating a phantom empty set --
 /// see CLAUDE.md's "Missing key ≠ error" convention.
 pub fn sadd(engine: &Engine, key: Bytes, members: Vec<Bytes>) -> Result<i64, common::EngineError> {

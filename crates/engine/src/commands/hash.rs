@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 /// Returns whether `field` was newly added (`false` if it already existed and was overwritten) —
 /// callers implementing variadic `HSET` sum this across pairs for the count Redis reports.
-/// Mutates in place via `with_mut` -- see list.rs's top-of-file note for why this matters.
+/// Mutates in place via `with_mut_delta` -- see list.rs's top-of-file note for why this matters.
 pub fn hset(
     engine: &Engine,
     key: Bytes,
