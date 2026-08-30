@@ -18,3 +18,5 @@ ordered-float = "4"
 tokio-util = { version = "0.7", features = ["codec"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
 futures-util = { version = "0.3", features = ["sink"] }
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
