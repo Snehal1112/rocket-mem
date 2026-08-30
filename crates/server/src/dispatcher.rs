@@ -914,6 +914,22 @@ fn hello_reply(protocol: Protocol, client_id: u64) -> Frame {
     ])
 }
 
+/// Returns the uppercased command name from `frame` if it's one of `aof::WRITE_COMMANDS`,
+/// else `None`. Computed before `dispatch` runs, so `dispatch_and_log` knows whether to hold
+/// the AOF ordering lock without first having to inspect `reply`.
+fn extract_write_command_name(frame: &Frame) -> Option<String> {
+    let Frame::Array(items) = frame else {
+        return None;
+    };
+    let Some(Frame::Bulk(name_bytes)) = items.first() else {
+        return None;
+    };
+    let name = String::from_utf8_lossy(name_bytes).to_ascii_uppercase();
+    crate::aof::WRITE_COMMANDS
+        .contains(&name.as_str())
+        .then_some(name)
+}
+
 /// Wraps `dispatch`, additionally appending successful write commands to `aof`. `dispatch`
 /// itself is never modified — see ../../docs/superpowers/specs/2026-08-30-sprint-4-spec.md
 /// for why AOF logging lives here instead of inside dispatch's own match arms.
@@ -925,21 +941,24 @@ pub fn dispatch_and_log(
     client_id: u64,
 ) -> Frame {
     let original_frame = frame.clone();
+    let write_name = extract_write_command_name(&original_frame);
+
+    // Held across "mutate the engine, then log it" for write commands only, so two
+    // concurrent connections' AOF appends always land in the order their mutations
+    // committed in. Reads take no lock and stay fully concurrent. See
+    // ../../docs/superpowers/specs/2026-08-30-tech-debt-cleanup-spec.md Item 2.
+    let _order_guard = write_name.as_ref().map(|_| aof.lock_for_ordering());
+
     let reply = dispatch(engine, frame, protocol, client_id);
     if let Frame::Error(_) = reply {
         return reply;
     }
-
+    let Some(name) = write_name else {
+        return reply;
+    };
     let Frame::Array(items) = &original_frame else {
         return reply;
     };
-    let Some(Frame::Bulk(name_bytes)) = items.first() else {
-        return reply;
-    };
-    let name = String::from_utf8_lossy(name_bytes).to_ascii_uppercase();
-    if !crate::aof::WRITE_COMMANDS.contains(&name.as_str()) {
-        return reply;
-    }
 
     // A Vec, not an Option: `SET k v EX n` logs as *two* frames (the flagless SET plus an
     // absolute PEXPIREAT), and several cases log none at all.
