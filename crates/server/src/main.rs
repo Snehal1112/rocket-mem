@@ -22,10 +22,16 @@ async fn main() -> std::io::Result<()> {
             .expect("failed to open AOF file"),
     );
 
-    let replication = Arc::new(rocket_mem::replication::ReplicationHandle::new(
-        Arc::clone(&engine),
-        snapshot_path.to_path_buf(),
-    ));
+    // `with_aof` hands the apply loop the same `AofWriter` `serve()` gets, so a replicated
+    // multi-key write and a concurrent `SAVE` on this node serialize on one lock — see
+    // `ReplicationHandle::aof`.
+    let replication = Arc::new(
+        rocket_mem::replication::ReplicationHandle::new(
+            Arc::clone(&engine),
+            snapshot_path.to_path_buf(),
+        )
+        .with_aof(Arc::clone(&aof)),
+    );
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     println!("Listening on {}", listener.local_addr()?);

@@ -1,3 +1,4 @@
+use crate::aof::AofWriter;
 use engine::Engine;
 use futures_util::{SinkExt, StreamExt};
 use std::path::{Path, PathBuf};
@@ -74,6 +75,18 @@ pub struct ReplicationHandle {
     /// practice — closing that theoretical residual would require taking `follower_task`'s
     /// mutex around the apply itself, which isn't worth the added contention for this sprint.
     generation: Arc<AtomicU64>,
+    /// Follower side: the `AofWriter` whose `lock_for_ordering()` this node's apply loop takes
+    /// around each replicated frame it applies. This is the follower-side counterpart to
+    /// `handle_save`'s own use of that lock: a replicated multi-key command (`MSET`, `RENAME`,
+    /// `SINTERSTORE`, ...) mutates more than one shard, while `SAVE`'s `Store::snapshot_entries`
+    /// walk locks the 16 shards one at a time, so without a lock spanning the whole apply a
+    /// concurrent `SAVE` on this same node could capture such a command half-applied and write a
+    /// torn snapshot. Client-originated writes already close that race via `dispatch_and_log`;
+    /// replicated ones go through plain `dispatch` and so need this. `Option` because only
+    /// `main.rs` (via `with_aof`) has a real `AofWriter` to hand over — test-constructed handles
+    /// leave it `None` and their apply loops take no lock, which is correct since no `SAVE` runs
+    /// against them.
+    aof: Option<Arc<AofWriter>>,
 }
 
 impl ReplicationHandle {
@@ -85,7 +98,21 @@ impl ReplicationHandle {
             engine,
             snapshot_path,
             generation: Arc::new(AtomicU64::new(0)),
+            aof: None,
         }
+    }
+
+    /// Configures the `AofWriter` this node's own replication apply loop synchronizes against a
+    /// concurrent `SAVE` through — see the `aof` field's doc comment for the torn-snapshot race
+    /// this closes. A builder method rather than a third `new` parameter so the ~25 existing
+    /// `ReplicationHandle::new` call sites (all of them tests, none of which run a `SAVE`
+    /// against a follower) stay untouched. Only `main.rs` calls this, with the same `AofWriter`
+    /// `serve()` was handed. Every test-constructed handle (via `new` alone, or `Default`)
+    /// leaves this `None`, so its apply loop, if any, takes no lock — matching the pre-fix
+    /// behavior for those.
+    pub fn with_aof(mut self, aof: Arc<AofWriter>) -> Self {
+        self.aof = Some(aof);
+        self
     }
 
     /// For `SAVE` and (later) `PSYNC` handling, which need the shared `Engine` to snapshot
@@ -114,11 +141,13 @@ impl ReplicationHandle {
         let my_generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let engine = Arc::clone(&self.engine);
         let generation = Arc::clone(&self.generation);
+        let aof = self.aof.clone();
         *task = Some(tokio::spawn(replication_client_loop(
             host_port,
             engine,
             generation,
             my_generation,
+            aof,
         )));
         self.is_replica.store(true, Ordering::Relaxed);
     }
@@ -158,12 +187,21 @@ async fn replication_client_loop(
     engine: Arc<Engine>,
     generation: Arc<AtomicU64>,
     my_generation: u64,
+    aof: Option<Arc<AofWriter>>,
 ) {
     loop {
         if generation.load(Ordering::SeqCst) != my_generation {
             return; // superseded before even starting this iteration's sync
         }
-        match sync_once(&host_port, &engine, &generation, my_generation).await {
+        match sync_once(
+            &host_port,
+            &engine,
+            &generation,
+            my_generation,
+            aof.as_deref(),
+        )
+        .await
+        {
             Ok(()) => eprintln!("replication: connection to {host_port} closed; reconnecting"),
             Err(e) => eprintln!("replication: lost connection to {host_port}: {e}; reconnecting"),
         }
@@ -182,6 +220,7 @@ async fn sync_once(
     engine: &Engine,
     generation: &AtomicU64,
     my_generation: u64,
+    aof: Option<&AofWriter>,
 ) -> std::io::Result<()> {
     let stream = tokio::net::TcpStream::connect(host_port).await?;
     let mut framed = tokio_util::codec::Framed::new(stream, protocol::codec::RespCodec::default());
@@ -220,6 +259,15 @@ async fn sync_once(
         }
         let frame = result?;
         let mut protocol = protocol::codec::Protocol::default();
+        // Mutual exclusion with a concurrent SAVE on this same node: SAVE's shard-by-shard
+        // snapshot walk (Store::snapshot_entries) must not observe a multi-key replicated
+        // command (MSET, RENAME, SINTERSTORE, ...) half-applied across shards. Holding the same
+        // lock_for_ordering() handle_save already takes closes that race. Deliberately wraps
+        // only the dispatch call — not the framed.next() await, not the generation check —
+        // matching handle_save's own pattern of holding the lock across the mutating work and
+        // nothing else. None when this node has no AofWriter configured (test-only handles),
+        // which matches the pre-fix behavior for those.
+        let _order_guard = aof.map(|a| a.lock_for_ordering());
         let reply = crate::dispatcher::dispatch(engine, frame, &mut protocol, 0);
         // A leader only ever fans out a command whose local execution already succeeded, so
         // an error applying it here means the two sides have genuinely diverged (a bug, or
@@ -345,7 +393,7 @@ mod tests {
         let sync_task = {
             let engine = std::sync::Arc::clone(&engine);
             let generation = Arc::clone(&generation);
-            tokio::spawn(async move { sync_once(&host_port, &engine, &generation, 0).await })
+            tokio::spawn(async move { sync_once(&host_port, &engine, &generation, 0, None).await })
         };
 
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
@@ -396,12 +444,169 @@ mod tests {
         // generation check, this would go on to call load_snapshot and clobber whatever a
         // newer task has already loaded.
         let generation = Arc::new(AtomicU64::new(1));
-        sync_once(&host_port, &engine, &generation, 0)
+        sync_once(&host_port, &engine, &generation, 0, None)
             .await
             .unwrap();
         fake_leader.await.unwrap();
 
         assert_eq!(engine.get(b"from-snapshot"), None); // stale task must not load its snapshot
+    }
+
+    /// Proves the apply loop's `lock_for_ordering()` guard is load-bearing, not decorative.
+    /// `SAVE` is explicitly allowed on a follower, but its `Store::snapshot_entries` walk locks
+    /// the 16 shards one at a time, while a replicated multi-key command mutates several shards
+    /// with no single lock spanning the whole thing — so without the guard a `SAVE` can capture
+    /// a half-applied `MSET` and write a torn snapshot that `aof::recover` would later load
+    /// without complaint. `MSET` over 16 keys is the probe because `commands::string::mset`
+    /// takes and releases one shard write lock *per key*, making the window wide enough to hit
+    /// reliably; every key always carries the same value, so any snapshot in which two of them
+    /// disagree is proof of a torn observation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_save_racing_the_apply_loop_never_observes_a_half_applied_multi_key_write() {
+        use std::sync::atomic::AtomicBool;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const KEYS: usize = 16;
+        const SAVES: usize = 500;
+        let keys: Vec<bytes::Bytes> = (0..KEYS)
+            .map(|k| bytes::Bytes::from(format!("k{k}")))
+            .collect();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+
+        // A leader that first hands over a snapshot with every key at "0", then streams
+        // `MSET k0 <i> k1 <i> ... k15 <i>` for an ever-increasing `i` until told to stop. The
+        // socket's own backpressure paces it to whatever the follower can apply.
+        let fake_leader = {
+            let stop = Arc::clone(&stop);
+            let keys = keys.clone();
+            tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut psync_bytes = [0u8; 15];
+                socket.read_exact(&mut psync_bytes).await.unwrap();
+
+                let seed = engine::Engine::new();
+                for key in &keys {
+                    seed.set(
+                        key.clone(),
+                        engine::Value::String(bytes::Bytes::from_static(b"0")),
+                    );
+                }
+                let blob = seed.snapshot(0);
+                socket
+                    .write_all(&(blob.len() as u64).to_le_bytes())
+                    .await
+                    .unwrap();
+                socket.write_all(&blob).await.unwrap();
+
+                let mut i: u64 = 1;
+                while !stop.load(Ordering::Relaxed) {
+                    let mut parts = vec![protocol::Frame::Bulk(bytes::Bytes::from_static(b"MSET"))];
+                    for key in &keys {
+                        parts.push(protocol::Frame::Bulk(key.clone()));
+                        parts.push(protocol::Frame::Bulk(bytes::Bytes::from(i.to_string())));
+                    }
+                    let encoded = crate::aof::encode_frame(&protocol::Frame::Array(parts)).unwrap();
+                    if socket.write_all(&encoded).await.is_err() {
+                        return; // the follower went away; nothing left to stream to
+                    }
+                    i += 1;
+                }
+            })
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(engine::Engine::new());
+        let aof = Arc::new(
+            crate::aof::AofWriter::open(
+                &dir.path().join("test.aof"),
+                crate::aof::FsyncPolicy::Never,
+            )
+            .unwrap(),
+        );
+        let snapshot_path = dir.path().join("test.snapshot");
+        let replication = Arc::new(
+            ReplicationHandle::new(Arc::clone(&engine), snapshot_path.clone())
+                .with_aof(Arc::clone(&aof)),
+        );
+        replication.is_replica.store(true, Ordering::Relaxed);
+
+        let sync_task = {
+            let engine = Arc::clone(&engine);
+            let aof = Arc::clone(&aof);
+            let host_port = addr.to_string();
+            let generation = Arc::new(AtomicU64::new(0));
+            tokio::spawn(
+                async move { sync_once(&host_port, &engine, &generation, 0, Some(&aof)).await },
+            )
+        };
+
+        // The SAVE loop runs on a blocking thread, not a runtime worker: `handle_save` fsyncs
+        // and writes a file, and parking a worker on that would starve the very apply loop this
+        // test needs to be racing against.
+        let observations = {
+            let engine = Arc::clone(&engine);
+            let aof = Arc::clone(&aof);
+            let replication = Arc::clone(&replication);
+            let keys = keys.clone();
+            let snapshot_path = snapshot_path.clone();
+            let stop = Arc::clone(&stop);
+            tokio::task::spawn_blocking(move || {
+                // Wait for the first *replicated* MSET to land before sampling. Until then the
+                // apply loop may still be inside `load_snapshot`, whose own clear-then-reinsert
+                // is a separate (one-off, pre-stream) non-atomic window this test isn't about.
+                while engine.get(b"k0")
+                    == Some(engine::Value::String(bytes::Bytes::from_static(b"0")))
+                {
+                    std::thread::yield_now();
+                }
+
+                let mut observations = Vec::with_capacity(SAVES);
+                for _ in 0..SAVES {
+                    let reply = crate::dispatcher::dispatch_and_log(
+                        &engine,
+                        &aof,
+                        &replication,
+                        protocol::Frame::Array(vec![protocol::Frame::Bulk(
+                            bytes::Bytes::from_static(b"SAVE"),
+                        )]),
+                        &mut protocol::codec::Protocol::default(),
+                        1,
+                    );
+                    assert_eq!(reply, protocol::Frame::Simple("OK".into()));
+                    // Read back what this iteration actually wrote before the next SAVE
+                    // overwrites the same path, and reconstruct it the way recovery would.
+                    let bytes = std::fs::read(&snapshot_path).unwrap();
+                    let restored = engine::Engine::new();
+                    restored.load_snapshot(&bytes).unwrap();
+                    observations.push(
+                        keys.iter()
+                            .map(|k| match restored.get(k) {
+                                Some(engine::Value::String(v)) => Some(v),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>(),
+                    );
+                }
+                stop.store(true, Ordering::Relaxed);
+                observations
+            })
+            .await
+            .unwrap()
+        };
+
+        sync_task.abort();
+        fake_leader.abort();
+
+        for (n, values) in observations.iter().enumerate() {
+            let first = values[0].clone();
+            assert!(
+                values.iter().all(|v| *v == first),
+                "snapshot {n} of {SAVES} is torn: an MSET was captured half-applied, {values:?}"
+            );
+        }
     }
 
     #[tokio::test]
