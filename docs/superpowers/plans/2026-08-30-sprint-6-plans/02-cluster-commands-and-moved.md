@@ -29,7 +29,7 @@
 - Consumes: nothing.
 - Produces: `pub(crate) const KNOWN_COMMANDS: &[&str]` (sorted; also consumed by `04-prometheus-metrics.md`'s `metric_label`), `enum KeySpec`, `fn key_spec(name: &str) -> KeySpec`, and `fn command_keys(frame: &Frame) -> Vec<&Bytes>`, consumed by Task 3.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 // crates/server/src/dispatcher.rs — add to the existing tests module (starts at :1296)
@@ -143,12 +143,12 @@
     }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p rocket-mem dispatcher::tests::command_keys dispatcher::tests::known_commands`
 Expected: FAIL to compile with "cannot find function `command_keys`"/"cannot find value `KNOWN_COMMANDS`"
 
-- [ ] **Step 3: Implement the table**
+- [x] **Step 3: Implement the table**
 
 ```rust
 // crates/server/src/dispatcher.rs — add directly below `extract_write_command_name` (:937)
@@ -236,7 +236,7 @@ fn command_keys(frame: &Frame) -> Vec<&Bytes> {
 }
 ```
 
-- [ ] **Step 3a: Verify the list still matches `dispatch`'s match arms**
+- [x] **Step 3a: Verify the list still matches `dispatch`'s match arms**
 
 The list above was transcribed from `dispatch`'s match on `2026-08-30` and covers 84 names. If
 any command has been added to `dispatch` since (this repo had an uncommitted `SSCAN` arm in flight
@@ -258,12 +258,12 @@ also picks up uppercase string literals that happen to sit on a match-arm line �
 `"SELECT" => Frame::Simple("OK".into())` is the one that shows up today — so ignore anything that
 is obviously not a command name.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p rocket-mem dispatcher::tests::command_keys dispatcher::tests::known_commands`
 Expected: PASS, all 7 tests
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/server/src/dispatcher.rs
@@ -281,7 +281,7 @@ git commit -m "feat(server): add the cluster key-extraction table for slot routi
 - Consumes: `ReplicationHandle::cluster()` and `crate::cluster::{key_slot, ClusterConfig, SLOT_COUNT}` (plan 01).
 - Produces: `fn handle_cluster(frame: &Frame, replication: &ReplicationHandle) -> Option<Frame>`, reachable over the wire; consumed end-to-end by `03-cluster-integration-tests.md`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 // crates/server/src/dispatcher.rs — add to the existing tests module
@@ -566,12 +566,12 @@ git commit -m "feat(server): add the cluster key-extraction table for slot routi
     }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p rocket-mem dispatcher::tests::cluster_`
 Expected: FAIL — `CLUSTER` currently falls through to `dispatch`'s unknown-command arm, so every assertion gets `Frame::Error("ERR unknown command 'CLUSTER'")`
 
-- [ ] **Step 3: Implement the handlers**
+- [x] **Step 3: Implement the handlers**
 
 ```rust
 // crates/server/src/dispatcher.rs — add directly below `handle_replicaof` (:984)
@@ -736,7 +736,7 @@ fn handle_cluster(
 }
 ```
 
-- [ ] **Step 4: Wire the interception into `dispatch_and_log`**
+- [x] **Step 4: Wire the interception into `dispatch_and_log`**
 
 ```rust
 // crates/server/src/dispatcher.rs — inside dispatch_and_log, directly after the existing
@@ -746,12 +746,12 @@ fn handle_cluster(
     }
 ```
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [x] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo test -p rocket-mem dispatcher::tests::cluster_ dispatcher::tests::an_unknown_cluster`
 Expected: PASS, all 11 tests
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/server/src/dispatcher.rs
@@ -769,7 +769,7 @@ git commit -m "feat(server): add CLUSTER KEYSLOT/MYID/INFO/SHARDS/NODES"
 - Consumes: `command_keys` (Task 1), `crate::cluster::key_slot` and `ClusterConfig::owns`/`owner_of` (plan 01).
 - Produces: cluster-mode routing enforced for every client command; consumed end-to-end by `03-cluster-integration-tests.md`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 // crates/server/src/dispatcher.rs — add to the existing tests module
@@ -934,12 +934,12 @@ git commit -m "feat(server): add CLUSTER KEYSLOT/MYID/INFO/SHARDS/NODES"
     }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p rocket-mem dispatcher::tests::a_key_this_node dispatcher::tests::keys_spanning dispatcher::tests::moved_takes_precedence dispatcher::tests::a_redirected_write dispatcher::tests::a_hash_tag_keeps`
 Expected: FAIL — no redirection exists yet, so `GET foo` returns `Frame::Null`, `MSET` returns `+OK`, and the precedence test gets `READONLY` instead of `MOVED`
 
-- [ ] **Step 3: Implement `cluster_redirect`**
+- [x] **Step 3: Implement `cluster_redirect`**
 
 ```rust
 // crates/server/src/dispatcher.rs — add directly below `command_keys`
@@ -977,7 +977,7 @@ fn cluster_redirect(
 }
 ```
 
-- [ ] **Step 4: Put the gate first in `dispatch_and_log`**
+- [x] **Step 4: Put the gate first in `dispatch_and_log`**
 
 ```rust
 // crates/server/src/dispatcher.rs — the FIRST statement in dispatch_and_log's body, above the
@@ -991,17 +991,17 @@ fn cluster_redirect(
     }
 ```
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [x] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo test -p rocket-mem dispatcher::tests`
 Expected: PASS, every test in the module — including all pre-existing ones, which use `ReplicationHandle::default()` (cluster mode off) and so take the `None` short-circuit
 
-- [ ] **Step 6: Run the full workspace verification**
+- [x] **Step 6: Run the full workspace verification**
 
 Run: `cargo build --workspace && cargo clippy --workspace -- -D warnings && cargo fmt --all -- --check && cargo test --workspace`
 Expected: all clean/green
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add crates/server/src/dispatcher.rs

@@ -29,7 +29,7 @@
 - Consumes: the release binary built from plans 01–06.
 - Produces: `scripts/benchmark.sh`, which writes its results to stdout in the exact shape Task 2's report records.
 
-- [ ] **Step 1: Write the script**
+- [x] **Step 1: Write the script**
 
 ```bash
 #!/usr/bin/env bash
@@ -107,7 +107,7 @@ curl -s "http://127.0.0.1:9178/metrics" | grep -E '^rocket_mem_(commands_total|k
 
 Note `redis-cli -p "$ROCKET_PORT" flushall` will fail against this server (there is no `FLUSHALL`), which is why `run_case` tolerates a non-zero exit there; the real Redis side is genuinely reset between cases, and `rocket-mem`'s keyspace simply carries over, which is noted in the report as a difference in setup rather than hidden.
 
-- [ ] **Step 2: Make it executable and smoke-test the guard path**
+- [x] **Step 2: Make it executable and smoke-test the guard path**
 
 ```bash
 chmod +x scripts/benchmark.sh
@@ -117,7 +117,7 @@ PATH=/usr/bin:/bin scripts/benchmark.sh 2>&1 | head -3   # if redis isn't instal
 
 Expected: either the script runs (Redis installed), or it prints `error: 'redis-server' is not on PATH...` and exits 1 — never a confusing failure deeper in.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add scripts/benchmark.sh
@@ -135,7 +135,7 @@ git commit -m "chore(bench): add a head-to-head redis-benchmark script"
 - Consumes: `scripts/benchmark.sh` (Task 1).
 - Produces: the sprint's second DoD item, evidenced. Its "before" numbers are the baseline Task 5 compares against.
 
-- [ ] **Step 1: Run the benchmark and capture the output**
+- [x] **Step 1: Run the benchmark and capture the output**
 
 ```bash
 mkdir -p docs/benchmarks
@@ -144,7 +144,7 @@ scripts/benchmark.sh | tee /tmp/rocket-mem-bench.txt
 
 If `redis-server` is not installed, install it first (`apt install redis-server redis-tools`, `brew install redis`, or equivalent) — this DoD item cannot be satisfied without a real Redis to compare against, and inventing numbers is worse than shipping nothing.
 
-- [ ] **Step 2: Write the report from that output**
+- [x] **Step 2: Write the report from that output**
 
 Create `docs/benchmarks/2026-08-30-redis-benchmark.md` with this structure, filling every number from `/tmp/rocket-mem-bench.txt` — no value in the table may be copied from this plan:
 
@@ -203,7 +203,7 @@ scaling curve. No latency percentiles beyond what `-q` reports — the `/metrics
 place to read those.
 ```
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add docs/benchmarks/2026-08-30-redis-benchmark.md
@@ -222,7 +222,7 @@ git commit -m "docs(bench): record the Sprint 6 head-to-head benchmark against r
 - Consumes: the release binary and `scripts/benchmark.sh`.
 - Produces: the evidence Task 4's optimization is judged against.
 
-- [ ] **Step 1: Install the tooling and allow profiling**
+- [x] **Step 1: Install the tooling and allow profiling**
 
 ```bash
 cargo install flamegraph        # provides `cargo flamegraph`; a dev tool, never a Cargo dependency
@@ -230,7 +230,7 @@ cargo install flamegraph        # provides `cargo flamegraph`; a dev tool, never
 sudo sysctl -w kernel.perf_event_paranoid=1
 ```
 
-- [ ] **Step 2: Profile under the benchmark's load**
+- [x] **Step 2: Profile under the benchmark's load**
 
 ```bash
 mkdir -p docs/benchmarks
@@ -248,7 +248,7 @@ kill -INT $FLAME    # SIGINT lets cargo-flamegraph finish writing the SVG
 wait $FLAME || true
 ```
 
-- [ ] **Step 3: Read the flamegraph and write the notes**
+- [x] **Step 3: Read the flamegraph and write the notes**
 
 Create `docs/benchmarks/2026-08-30-flamegraph-notes.md`:
 
@@ -283,7 +283,7 @@ this profile is the data that decision has been waiting for since Sprint 1, not 
 on it now.>
 ```
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add docs/benchmarks/2026-08-30-flamegraph.svg docs/benchmarks/2026-08-30-flamegraph-notes.md
@@ -301,7 +301,7 @@ git commit -m "docs(bench): record the Sprint 6 flamegraph profile and its readi
 - Consumes: nothing new.
 - Produces: `pub(crate) struct CommandName` with `fn as_str(&self) -> &str`, and `fn upper_name(raw: &[u8]) -> Option<CommandName>`; `extract_write_command_name` now returns `Option<CommandName>` and `command_name_upper` returns `Option<CommandName>`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 // crates/server/src/dispatcher.rs — add to the existing tests module
@@ -341,12 +341,12 @@ git commit -m "docs(bench): record the Sprint 6 flamegraph profile and its readi
     }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p rocket-mem dispatcher::tests::upper_name dispatcher::tests::an_over_long_command_name`
 Expected: FAIL to compile with "cannot find function `upper_name`"
 
-- [ ] **Step 3: Add `CommandName` and route every name through it**
+- [x] **Step 3: Add `CommandName` and route every name through it**
 
 ```rust
 // crates/server/src/dispatcher.rs — add near the top, below `frame_to_args` (:23)
@@ -464,17 +464,17 @@ fn command_name_upper(frame: &Frame) -> Option<CommandName> {
 
 The `command_name_upper` tests added by `04-prometheus-metrics.md` change with the return type: `assert_eq!(command_name_upper(&cmd(&[b"get", b"k"])), "GET")` becomes `assert_eq!(command_name_upper(&cmd(&[b"get", b"k"])).unwrap().as_str(), "GET")`, and the two `""` cases become `assert!(command_name_upper(&Frame::Simple("nope".into())).is_none())` and `assert!(command_name_upper(&Frame::Array(vec![])).is_none())`.
 
-- [ ] **Step 4: Run the whole suite to verify nothing changed but the allocations**
+- [x] **Step 4: Run the whole suite to verify nothing changed but the allocations**
 
 Run: `cargo test --workspace`
 Expected: PASS, every test in the workspace — this is a pure optimization, so any behavioral test that changes is a bug in the change, not in the test
 
-- [ ] **Step 5: Verify the lint gate**
+- [x] **Step 5: Verify the lint gate**
 
 Run: `cargo clippy --workspace -- -D warnings && cargo fmt --all -- --check`
 Expected: clean
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/server/src/dispatcher.rs
@@ -492,13 +492,13 @@ git commit -m "perf(server): uppercase command names into a stack buffer instead
 - Consumes: `scripts/benchmark.sh`, the Task 4 optimization.
 - Produces: the before/after numbers the sprint's P1 profiling item is judged on.
 
-- [ ] **Step 1: Re-run the benchmark on the optimized build**
+- [x] **Step 1: Re-run the benchmark on the optimized build**
 
 ```bash
 scripts/benchmark.sh | tee /tmp/rocket-mem-bench-after.txt
 ```
 
-- [ ] **Step 2: Append the comparison to the report**
+- [x] **Step 2: Append the comparison to the report**
 
 Add this section to `docs/benchmarks/2026-08-30-redis-benchmark.md`, filling both columns from the two captured runs:
 
@@ -521,7 +521,7 @@ exactly that — an honest "no measurable change at this workload, though the al
 provably gone" is a better entry here than a rounded-up improvement.>
 ```
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add docs/benchmarks/2026-08-30-redis-benchmark.md

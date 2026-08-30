@@ -28,7 +28,7 @@
 - Consumes: `rocket_mem::serve`, `rocket_mem::cluster::ClusterConfig::parse`, `rocket_mem::replication::ReplicationHandle::{new, with_cluster}`, `rocket_mem::aof::{AofWriter, FsyncPolicy}`.
 - Produces: `spawn_3_shard_cluster() -> Cluster`, `Cluster::addr(usize)`, `connect(&str)`, `send(&mut Framed<..>, &[&[u8]]) -> Frame`, consumed by Tasks 2 and 3.
 
-- [ ] **Step 1: Write the harness and its first, smallest test**
+- [x] **Step 1: Write the harness and its first, smallest test**
 
 ```rust
 // crates/server/tests/cluster.rs
@@ -191,12 +191,12 @@ async fn every_node_reports_the_same_three_shard_topology() {
 }
 ```
 
-- [ ] **Step 2: Run the test to verify it passes**
+- [x] **Step 2: Run the test to verify it passes**
 
 Run: `cargo test -p rocket-mem --test cluster`
 Expected: PASS — the harness and `CLUSTER` support both already exist from plans 01 and 02, so this first test is a wiring check for the harness itself, not a red-then-green step. If it fails, the failure is in the harness (address formatting, config text, node ids), not in the server.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add crates/server/tests/cluster.rs
@@ -214,7 +214,7 @@ git commit -m "test(server): add an in-process 3-shard cluster harness"
 - Consumes: `spawn_3_shard_cluster`, `connect`, `send`, `moved_target` (Task 1).
 - Produces: the sprint's first DoD item, evidenced.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 // crates/server/tests/cluster.rs — append
@@ -312,12 +312,12 @@ async fn both_non_owning_shards_redirect_to_the_same_owner() {
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they pass**
+- [x] **Step 2: Run the tests to verify they pass**
 
 Run: `cargo test -p rocket-mem --test cluster`
 Expected: PASS, all 5 tests. If `a_client_hitting_the_wrong_shard...` fails with an unexpected `+OK` from the wrong shard, the `cluster_redirect` gate from `02-cluster-commands-and-moved.md` is not wired into `dispatch_and_log`; if it fails with the wrong address, the harness config text and the `SLOT_RANGES`/`NODE_IDS` ordering disagree.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add crates/server/tests/cluster.rs
@@ -335,7 +335,7 @@ git commit -m "test(server): prove 3-shard routing and MOVED redirection over TC
 - Consumes: the harness from Task 1.
 - Produces: nothing consumed later; this closes the routing behavior's test surface.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 // crates/server/tests/cluster.rs — append
@@ -421,17 +421,17 @@ async fn keyless_commands_work_on_every_shard_without_redirection() {
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they pass**
+- [x] **Step 2: Run the tests to verify they pass**
 
 Run: `cargo test -p rocket-mem --test cluster`
 Expected: PASS, all 8 tests
 
-- [ ] **Step 3: Run the full workspace verification**
+- [x] **Step 3: Run the full workspace verification**
 
 Run: `cargo build --workspace && cargo clippy --workspace -- -D warnings && cargo fmt --all -- --check && cargo test --workspace`
 Expected: all clean/green
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add crates/server/tests/cluster.rs

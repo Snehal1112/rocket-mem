@@ -29,7 +29,7 @@
 - Consumes: nothing.
 - Produces: `pub const SLOT_COUNT: u16` and `pub fn key_slot(key: &[u8]) -> u16` in `crate::cluster`, consumed by Task 3 (`ClusterConfig::owns`) and by `02-cluster-commands-and-moved.md`.
 
-- [ ] **Step 1: Declare the module**
+- [x] **Step 1: Declare the module**
 
 ```rust
 // crates/server/src/lib.rs — add the new module, keeping the list alphabetical
@@ -41,7 +41,7 @@ pub mod replication;
 pub use connection::serve;
 ```
 
-- [ ] **Step 2: Write the failing tests**
+- [x] **Step 2: Write the failing tests**
 
 ```rust
 // crates/server/src/cluster.rs — the whole file, for now just the tests
@@ -95,12 +95,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 3: Run the tests to verify they fail**
+- [x] **Step 3: Run the tests to verify they fail**
 
 Run: `cargo test -p rocket-mem cluster::tests`
 Expected: FAIL to compile with "cannot find function `crc16`"/"cannot find function `key_slot`"/"cannot find value `SLOT_COUNT`" — `cluster.rs` contains only the test module
 
-- [ ] **Step 4: Implement the slot algorithm**
+- [x] **Step 4: Implement the slot algorithm**
 
 ```rust
 // crates/server/src/cluster.rs — add above the tests module
@@ -154,12 +154,12 @@ pub fn key_slot(key: &[u8]) -> u16 {
 }
 ```
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [x] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo test -p rocket-mem cluster::tests`
 Expected: PASS, all 6 tests
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/server/src/lib.rs crates/server/src/cluster.rs
@@ -177,7 +177,7 @@ git commit -m "feat(server): add Redis-Cluster-compatible key_slot with CRC16 an
 - Consumes: `key_slot`/`SLOT_COUNT` (Task 1).
 - Produces: `pub struct ClusterNode { pub id: String, pub addr: String, pub first_slot: u16, pub last_slot: u16 }` and `pub struct ClusterConfig` with `pub fn parse(text: &str, node_id: &str) -> std::io::Result<Self>`, consumed by Task 3.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 // crates/server/src/cluster.rs — add to the existing tests module
@@ -312,12 +312,12 @@ shard-b 127.0.0.1:7001 8001 16383
     }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p rocket-mem cluster::tests::parse`
 Expected: FAIL to compile with "cannot find type `ClusterConfig`"
 
-- [ ] **Step 3: Implement `ClusterNode`/`ClusterConfig::parse`**
+- [x] **Step 3: Implement `ClusterNode`/`ClusterConfig::parse`**
 
 ```rust
 // crates/server/src/cluster.rs — add above the tests module
@@ -457,12 +457,12 @@ impl ClusterConfig {
 }
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p rocket-mem cluster::tests`
 Expected: FAIL — the accessors `nodes()` and `myself()` the tests call don't exist yet
 
-- [ ] **Step 5: Add the accessors**
+- [x] **Step 5: Add the accessors**
 
 ```rust
 // crates/server/src/cluster.rs — inside the existing `impl ClusterConfig` block
@@ -492,12 +492,12 @@ Expected: FAIL — the accessors `nodes()` and `myself()` the tests call don't e
     }
 ```
 
-- [ ] **Step 6: Run the tests to verify they pass**
+- [x] **Step 6: Run the tests to verify they pass**
 
 Run: `cargo test -p rocket-mem cluster::tests`
 Expected: PASS, all tests in the module
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add crates/server/src/cluster.rs
@@ -515,7 +515,7 @@ git commit -m "feat(server): add ClusterConfig parsing with strict slot-map vali
 - Consumes: `ClusterConfig::parse` (Task 2), `key_slot` (Task 1).
 - Produces: `pub fn load(path: &std::path::Path, node_id: &str) -> std::io::Result<Self>`, consumed by Task 5 (`main.rs`).
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 // crates/server/src/cluster.rs — add to the existing tests module
@@ -582,12 +582,12 @@ git commit -m "feat(server): add ClusterConfig parsing with strict slot-map vali
     }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p rocket-mem cluster::tests::load`
 Expected: FAIL to compile with "no function or associated item named `load` found" (the `owns`/`owner_of` tests already pass — they were implemented in Task 2's Step 5 and are regression cover here)
 
-- [ ] **Step 3: Implement `load`**
+- [x] **Step 3: Implement `load`**
 
 ```rust
 // crates/server/src/cluster.rs — inside the existing `impl ClusterConfig` block
@@ -602,12 +602,12 @@ Expected: FAIL to compile with "no function or associated item named `load` foun
     }
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p rocket-mem cluster::tests`
 Expected: PASS, every test in the module
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/server/src/cluster.rs
@@ -625,7 +625,7 @@ git commit -m "feat(server): add ClusterConfig::load and slot-ownership lookups"
 - Consumes: `ClusterConfig` (Tasks 2–3).
 - Produces: `ReplicationHandle::with_cluster(mut self, cluster: Arc<ClusterConfig>) -> Self` and `ReplicationHandle::cluster(&self) -> Option<&Arc<ClusterConfig>>`, consumed by `02-cluster-commands-and-moved.md` and Task 5 below.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 // crates/server/src/replication.rs — add to the existing tests module (starts at :284)
@@ -651,12 +651,12 @@ git commit -m "feat(server): add ClusterConfig::load and slot-ownership lookups"
     }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p rocket-mem replication::tests::a_handle_is_not_in_cluster replication::tests::with_cluster`
 Expected: FAIL to compile with "no method named `cluster`"/"no method named `with_cluster`"
 
-- [ ] **Step 3: Add the field and the two methods**
+- [x] **Step 3: Add the field and the two methods**
 
 ```rust
 // crates/server/src/replication.rs — add as the last field of `pub struct ReplicationHandle`
@@ -696,12 +696,12 @@ Expected: FAIL to compile with "no method named `cluster`"/"no method named `wit
     }
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p rocket-mem replication::tests`
 Expected: PASS, every test in the module
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/server/src/replication.rs
@@ -719,7 +719,7 @@ git commit -m "feat(server): thread an optional ClusterConfig through Replicatio
 - Consumes: `ClusterConfig::load` (Task 3), `ReplicationHandle::with_cluster` (Task 4).
 - Produces: a binary that starts in cluster mode when `ROCKET_MEM_CLUSTER_CONFIG` and `ROCKET_MEM_CLUSTER_NODE_ID` are both set. Nothing later in this sprint consumes it programmatically; `03-cluster-integration-tests.md` builds its configs in-process instead.
 
-- [ ] **Step 1: Add the config load and the builder call**
+- [x] **Step 1: Add the config load and the builder call**
 
 There is no unit test for `main`, which has no testable seam — the parser and the handle plumbing it calls are both covered by Tasks 2–4. Verification is Step 2's manual run.
 
@@ -775,7 +775,7 @@ There is no unit test for `main`, which has no testable seam — the parser and 
     let replication = Arc::new(handle);
 ```
 
-- [ ] **Step 2: Verify the binary starts in both modes**
+- [x] **Step 2: Verify the binary starts in both modes**
 
 ```bash
 cargo build --workspace
@@ -800,12 +800,12 @@ ROCKET_MEM_CLUSTER_CONFIG=/tmp/rm-cluster.conf timeout 2 ./target/debug/rocket-m
 
 Expected: the first prints only the existing `Recovered state ...`/`Listening on ...` lines; the second additionally prints `Cluster mode enabled: node 'shard-a' at 127.0.0.1:7001 owns slots 0-5460 of 3 nodes`; the third exits non-zero printing the `ROCKET_MEM_CLUSTER_NODE_ID is not` error.
 
-- [ ] **Step 3: Run the full workspace verification**
+- [x] **Step 3: Run the full workspace verification**
 
 Run: `cargo build --workspace && cargo clippy --workspace -- -D warnings && cargo fmt --all -- --check && cargo test --workspace`
 Expected: all clean/green
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add crates/server/src/main.rs

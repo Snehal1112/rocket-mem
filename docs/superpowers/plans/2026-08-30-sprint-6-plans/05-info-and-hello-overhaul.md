@@ -30,7 +30,7 @@
 - Consumes: `ReplicationHandle` as extended by `04-prometheus-metrics.md`.
 - Produces: `ReplicationHandle::{uptime_secs, last_save_unix, record_save, master_addr, link_up, link_up_slot}` and `Engine::maxmemory() -> Option<usize>`, all consumed by Task 2.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 // crates/engine/src/engine.rs — add to the existing tests module
@@ -78,12 +78,12 @@
     }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p engine engine::tests::maxmemory_reports && cargo test -p rocket-mem replication::tests::uptime replication::tests::last_save_unix replication::tests::master_addr_and_link_up`
 Expected: FAIL to compile — none of these methods exist yet
 
-- [ ] **Step 3: Add `Engine::maxmemory`**
+- [x] **Step 3: Add `Engine::maxmemory`**
 
 ```rust
 // crates/engine/src/engine.rs — add directly below `memory_used()` (:106)
@@ -96,7 +96,7 @@ Expected: FAIL to compile — none of these methods exist yet
     }
 ```
 
-- [ ] **Step 4: Add the `ReplicationHandle` fields**
+- [x] **Step 4: Add the `ReplicationHandle` fields**
 
 ```rust
 // crates/server/src/replication.rs — add as fields of `pub struct ReplicationHandle`
@@ -169,7 +169,7 @@ fn unix_now_secs() -> i64 {
 }
 ```
 
-- [ ] **Step 5: Maintain `master_addr` and `link_up`**
+- [x] **Step 5: Maintain `master_addr` and `link_up`**
 
 ```rust
 // crates/server/src/replication.rs — inside `start_replicating` (:136), after the existing
@@ -235,12 +235,12 @@ Lock ordering: `master_addr`'s mutex is only ever taken *inside* `follower_task`
         }
 ```
 
-- [ ] **Step 6: Run the tests to verify they pass**
+- [x] **Step 6: Run the tests to verify they pass**
 
 Run: `cargo test -p engine && cargo test -p rocket-mem replication::tests`
 Expected: PASS
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add crates/engine/src/engine.rs crates/server/src/replication.rs crates/server/src/dispatcher.rs
@@ -258,7 +258,7 @@ git commit -m "feat(server): track uptime, last-save, master address and link st
 - Consumes: everything from Task 1, `Engine::key_counts`/`memory_used`/`eviction_count`, `AofWriter::policy`, `ReplicationHandle`'s counters, `split_addr` (from `02-cluster-commands-and-moved.md`), `cluster_info_text`'s `cluster_enabled` idea (re-derived here from `replication.cluster()`).
 - Produces: `fn handle_info(...) -> Option<Frame>`; nothing later depends on it.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 // crates/server/src/dispatcher.rs — add to the existing tests module
@@ -439,12 +439,12 @@ Also migrate the existing `info_replies_a_non_empty_bulk_string` (`:1609`): keep
         };
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p rocket-mem dispatcher::tests::info_`
 Expected: FAIL — `INFO` still returns only the two-line `# Server` section from `dispatch`'s arm, so every section assertion fails
 
-- [ ] **Step 3: Implement the sections**
+- [x] **Step 3: Implement the sections**
 
 ```rust
 // crates/server/src/dispatcher.rs — add below `handle_cluster`
@@ -646,7 +646,7 @@ fn handle_info(
 }
 ```
 
-- [ ] **Step 4: Remove `dispatch`'s `INFO` arm and wire the interception**
+- [x] **Step 4: Remove `dispatch`'s `INFO` arm and wire the interception**
 
 ```rust
 // crates/server/src/dispatcher.rs — DELETE these lines from dispatch's match (:829-832)
@@ -664,12 +664,12 @@ fn handle_info(
     }
 ```
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [x] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo test -p rocket-mem dispatcher::tests::info_`
 Expected: PASS, all 10 tests (9 new plus the migrated `info_replies_a_non_empty_bulk_string`)
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/server/src/dispatcher.rs
@@ -687,7 +687,7 @@ git commit -m "feat(server): flesh out INFO with real server, memory, stats and 
 - Consumes: `ReplicationHandle::is_replica`.
 - Produces: `fn handle_hello(frame: &Frame, protocol: &mut Protocol, client_id: u64, replication: &ReplicationHandle) -> Option<Frame>` and `fn hello_reply(protocol: Protocol, client_id: u64, role: &'static str, mode: &'static str) -> Frame`.
 
-- [ ] **Step 1: Write the failing test and migrate the five existing ones**
+- [x] **Step 1: Write the failing test and migrate the five existing ones**
 
 ```rust
 // crates/server/src/dispatcher.rs — add to the existing tests module
@@ -744,12 +744,12 @@ Migrate the five existing `HELLO` tests — `hello_with_no_args_reports_current_
 
 Every assertion in those five tests stays exactly as it is: the reply shape, the protocol switching, the `NOPROTO`/syntax errors, and the `role` field's `master` value (`ReplicationHandle::default()` is not a replica) are all unchanged by the move.
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p rocket-mem dispatcher::tests::hello`
 Expected: FAIL — `hello_reports_role_slave_on_a_replica_and_master_otherwise` sees `master` for both handles, since `hello_reply` still hardcodes it
 
-- [ ] **Step 3: Move `HELLO` and make the role real**
+- [x] **Step 3: Move `HELLO` and make the role real**
 
 ```rust
 // crates/server/src/dispatcher.rs — DELETE the whole "HELLO" arm from dispatch's match
@@ -873,17 +873,17 @@ fn handle_hello(
     }
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p rocket-mem`
 Expected: PASS, every test in the crate — including `crates/server/tests/integration.rs`, whose `redis`-crate clients must still complete their handshakes
 
-- [ ] **Step 5: Run the full workspace verification**
+- [x] **Step 5: Run the full workspace verification**
 
 Run: `cargo build --workspace && cargo clippy --workspace -- -D warnings && cargo fmt --all -- --check && cargo test --workspace`
 Expected: all clean/green
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/server/src/dispatcher.rs

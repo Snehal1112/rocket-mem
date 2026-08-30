@@ -29,7 +29,7 @@
 - Consumes: nothing.
 - Produces: `pub const SLOWLOG_CAPACITY: usize`, `pub struct SlowLogEntry { pub id: u64, pub unix_time_secs: i64, pub duration_micros: i64, pub command: String, pub key: Option<Bytes>, pub arg_count: usize }`, and `SlowLog::{with_threshold, maybe_record, get, len, is_empty, reset}` plus `impl Default for SlowLog`. Consumed by Tasks 2 and 3.
 
-- [ ] **Step 1: Declare the module**
+- [x] **Step 1: Declare the module**
 
 ```rust
 // crates/server/src/lib.rs — add the module, keeping the list alphabetical
@@ -43,7 +43,7 @@ pub mod slowlog;
 pub use connection::serve;
 ```
 
-- [ ] **Step 2: Write the failing tests**
+- [x] **Step 2: Write the failing tests**
 
 ```rust
 // crates/server/src/slowlog.rs — the whole file, for now just the tests
@@ -136,12 +136,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 3: Run the tests to verify they fail**
+- [x] **Step 3: Run the tests to verify they fail**
 
 Run: `cargo test -p rocket-mem slowlog::tests`
 Expected: FAIL to compile with "cannot find type `SlowLog`"
 
-- [ ] **Step 4: Implement `SlowLog`**
+- [x] **Step 4: Implement `SlowLog`**
 
 ```rust
 // crates/server/src/slowlog.rs — add above the tests module
@@ -263,12 +263,12 @@ impl Default for SlowLog {
 }
 ```
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [x] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo test -p rocket-mem slowlog::tests`
 Expected: PASS, all 7 tests
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/server/src/lib.rs crates/server/src/slowlog.rs
@@ -288,7 +288,7 @@ git commit -m "feat(server): add a bounded slow-log ring buffer"
 - Consumes: `SlowLog` (Task 1), `command_name_upper` and the wrapper's `elapsed` (`04-prometheus-metrics.md`).
 - Produces: `ReplicationHandle::slowlog` (a public field) and `ReplicationHandle::with_slowlog_threshold(mut self, threshold: Duration) -> Self`, plus `fn command_key_and_arity(frame: &Frame) -> (Option<Bytes>, usize)` in `dispatcher.rs`. Consumed by Task 3.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 // crates/server/src/dispatcher.rs — add to the existing tests module
@@ -350,12 +350,12 @@ git commit -m "feat(server): add a bounded slow-log ring buffer"
     }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p rocket-mem dispatcher::tests::command_key_and_arity dispatcher::tests::a_slow_command dispatcher::tests::a_fast_command`
 Expected: FAIL to compile with "no method named `with_slowlog_threshold`"/"no field `slowlog`"/"cannot find function `command_key_and_arity`"
 
-- [ ] **Step 3: Add the field and the builder**
+- [x] **Step 3: Add the field and the builder**
 
 ```rust
 // crates/server/src/replication.rs — add as a field of `pub struct ReplicationHandle`
@@ -383,7 +383,7 @@ Expected: FAIL to compile with "no method named `with_slowlog_threshold`"/"no fi
     }
 ```
 
-- [ ] **Step 4: Record from the wrapper**
+- [x] **Step 4: Record from the wrapper**
 
 ```rust
 // crates/server/src/dispatcher.rs — add beside `command_name_upper`
@@ -416,7 +416,7 @@ fn command_key_and_arity(frame: &Frame) -> (Option<Bytes>, usize) {
         .maybe_record(&name, first_key, arg_count, elapsed);
 ```
 
-- [ ] **Step 5: Read the threshold in `main.rs`**
+- [x] **Step 5: Read the threshold in `main.rs`**
 
 ```rust
 // crates/server/src/main.rs — beside the other env vars, before the handle is built
@@ -434,12 +434,12 @@ fn command_key_and_arity(frame: &Frame) -> (Option<Bytes>, usize) {
     .with_slowlog_threshold(slowlog_threshold);
 ```
 
-- [ ] **Step 6: Run the tests to verify they pass**
+- [x] **Step 6: Run the tests to verify they pass**
 
 Run: `cargo test -p rocket-mem dispatcher::tests`
 Expected: PASS, every test in the module
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add crates/server/src/replication.rs crates/server/src/dispatcher.rs crates/server/src/main.rs
@@ -457,7 +457,7 @@ git commit -m "feat(server): record slow commands from the dispatch wrapper"
 - Consumes: `ReplicationHandle::slowlog` (Task 2).
 - Produces: `fn handle_slowlog(frame: &Frame, replication: &ReplicationHandle) -> Option<Frame>`; nothing later depends on it.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 // crates/server/src/dispatcher.rs — add to the existing tests module
@@ -623,12 +623,12 @@ git commit -m "feat(server): record slow commands from the dispatch wrapper"
     }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p rocket-mem dispatcher::tests::slowlog an_unknown_slowlog`
 Expected: FAIL — `SLOWLOG` currently falls through to `dispatch`'s unknown-command arm
 
-- [ ] **Step 3: Implement the interception**
+- [x] **Step 3: Implement the interception**
 
 ```rust
 // crates/server/src/dispatcher.rs — add below `handle_hello`
@@ -730,17 +730,17 @@ fn handle_slowlog(
     }
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p rocket-mem dispatcher::tests`
 Expected: PASS, every test in the module
 
-- [ ] **Step 5: Run the full workspace verification**
+- [x] **Step 5: Run the full workspace verification**
 
 Run: `cargo build --workspace && cargo clippy --workspace -- -D warnings && cargo fmt --all -- --check && cargo test --workspace`
 Expected: all clean/green
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/server/src/dispatcher.rs

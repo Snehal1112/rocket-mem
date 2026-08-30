@@ -32,7 +32,7 @@
 - Consumes: nothing.
 - Produces: `pub fn recorder_handle() -> PrometheusHandle` in `crate::metrics`, consumed by Tasks 3 and 5.
 
-- [ ] **Step 1: Add the dependencies**
+- [x] **Step 1: Add the dependencies**
 
 ```toml
 # Cargo.toml (workspace root) — append to [workspace.dependencies]
@@ -57,7 +57,7 @@ pub mod replication;
 pub use connection::serve;
 ```
 
-- [ ] **Step 2: Write the failing test**
+- [x] **Step 2: Write the failing test**
 
 ```rust
 // crates/server/src/metrics.rs — the whole file, for now just the test
@@ -80,12 +80,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 3: Run the test to verify it fails**
+- [x] **Step 3: Run the test to verify it fails**
 
 Run: `cargo test -p rocket-mem metrics::tests`
 Expected: FAIL to compile with "cannot find function `recorder_handle`"
 
-- [ ] **Step 4: Implement the recorder**
+- [x] **Step 4: Implement the recorder**
 
 ```rust
 // crates/server/src/metrics.rs — add above the tests module
@@ -131,12 +131,12 @@ pub fn recorder_handle() -> PrometheusHandle {
 }
 ```
 
-- [ ] **Step 5: Run the test to verify it passes**
+- [x] **Step 5: Run the test to verify it passes**
 
 Run: `cargo test -p rocket-mem metrics::tests`
 Expected: PASS
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add Cargo.toml Cargo.lock crates/server/Cargo.toml crates/server/src/lib.rs crates/server/src/metrics.rs
@@ -157,7 +157,7 @@ git commit -m "feat(server): install a Prometheus recorder with explicit latency
 - Consumes: nothing.
 - Produces: `Shard::counts() -> (usize, usize)`, `Store::key_counts() -> (usize, usize)`, `Engine::key_counts() -> (usize, usize)`, `ReplicaRegistry::{len, is_empty}`, and on `ReplicationHandle`: `connection_opened`, `connection_closed`, `connected_clients`, `total_connections`, `command_executed`, `total_commands`, `record_expired`, `expired_keys`, `last_apply_unix`, `last_apply_slot`. Consumed by Tasks 3–4 and by `05-info-and-hello-overhaul.md`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 // crates/engine/src/engine.rs — add to the existing tests module
@@ -241,12 +241,12 @@ git commit -m "feat(server): install a Prometheus recorder with explicit latency
     }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p engine engine::tests::key_counts && cargo test -p rocket-mem replication::tests::registry_len replication::tests::connection_counters replication::tests::command_and_expiry replication::tests::last_apply_unix`
 Expected: FAIL to compile — none of these methods exist yet
 
-- [ ] **Step 3: Implement the engine-side counts**
+- [x] **Step 3: Implement the engine-side counts**
 
 ```rust
 // crates/engine/src/shard.rs — add directly below `keys()` (:111)
@@ -292,7 +292,7 @@ Expected: FAIL to compile — none of these methods exist yet
     }
 ```
 
-- [ ] **Step 4: Implement the server-side counters**
+- [x] **Step 4: Implement the server-side counters**
 
 ```rust
 // crates/server/src/replication.rs — add to the existing `impl ReplicaRegistry` block (:17-37)
@@ -382,12 +382,12 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering}
     }
 ```
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [x] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo test -p engine engine::tests::key_counts && cargo test -p rocket-mem replication::tests`
 Expected: PASS
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/engine/src/shard.rs crates/engine/src/store.rs crates/engine/src/engine.rs crates/server/src/replication.rs
@@ -405,7 +405,7 @@ git commit -m "feat: add key counts and server-level counters for metrics"
 - Consumes: `recorder_handle` (Task 1), the counters from Task 2.
 - Produces: `pub fn refresh_sampled_gauges(engine: &Engine, replication: &ReplicationHandle)` and `pub async fn serve_metrics(listener: TcpListener, handle: PrometheusHandle, engine: Arc<Engine>, replication: Arc<ReplicationHandle>)`, consumed by Task 5 and by the integration test in Task 6.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
 // crates/server/src/metrics.rs — add to the existing tests module
@@ -457,12 +457,12 @@ git commit -m "feat: add key counts and server-level counters for metrics"
     }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test -p rocket-mem metrics::tests::the_metrics_endpoint`
 Expected: FAIL to compile with "cannot find function `serve_metrics`"
 
-- [ ] **Step 3: Implement the endpoint**
+- [x] **Step 3: Implement the endpoint**
 
 ```rust
 // crates/server/src/metrics.rs — add above the tests module
@@ -558,12 +558,12 @@ async fn serve_one_scrape(
 }
 ```
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
 Run: `cargo test -p rocket-mem metrics::tests`
 Expected: PASS, both tests
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/server/src/metrics.rs
@@ -583,7 +583,7 @@ git commit -m "feat(server): serve Prometheus metrics from a dedicated listener"
 - Consumes: `KNOWN_COMMANDS` (`02-cluster-commands-and-moved.md`), the counters from Task 2.
 - Produces: `fn command_name_upper(frame: &Frame) -> String` and `fn metric_label(name: &str) -> String` in `dispatcher.rs`, plus `dispatch_and_log_inner` with `dispatch_and_log`'s original signature — all three consumed by `06-slowlog.md`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 // crates/server/src/dispatcher.rs — add to the existing tests module
@@ -730,12 +730,12 @@ git commit -m "feat(server): serve Prometheus metrics from a dedicated listener"
     }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p rocket-mem dispatcher::tests::metric_label dispatcher::tests::command_name_upper dispatcher::tests::dispatch_and_log_counts connection::tests::serve_tracks_connected connection::tests::the_active_expiry_sweep`
 Expected: FAIL to compile with "cannot find function `metric_label`"/"cannot find function `command_name_upper`"; the two `connection` tests fail on `total_commands`/`expired_keys` being 0 once they compile
 
-- [ ] **Step 3: Split `dispatch_and_log` and instrument the wrapper**
+- [x] **Step 3: Split `dispatch_and_log` and instrument the wrapper**
 
 Rename the existing `pub fn dispatch_and_log` (`:1042`) to `fn dispatch_and_log_inner`, keeping its body and parameters **exactly** as they are, and add the new wrapper above it:
 
@@ -800,7 +800,7 @@ pub fn dispatch_and_log(
 }
 ```
 
-- [ ] **Step 4: Instrument connections and the expiry sweep**
+- [x] **Step 4: Instrument connections and the expiry sweep**
 
 ```rust
 // crates/server/src/connection.rs — add above `handle_connection` (:73)
@@ -863,12 +863,12 @@ async fn active_expire_loop(engine: Arc<Engine>, replication: Arc<ReplicationHan
         );
 ```
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [x] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo test -p rocket-mem`
 Expected: PASS, every test in the crate — the wrapper split changes no behavior, so every pre-existing `dispatch_and_log` test must still pass unchanged
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/server/src/dispatcher.rs crates/server/src/connection.rs crates/server/src/replication.rs
@@ -886,7 +886,7 @@ git commit -m "feat(server): record per-command metrics in a dispatch_and_log wr
 - Consumes: `metrics::recorder_handle`, `metrics::serve_metrics` (Tasks 1 and 3).
 - Produces: a running `/metrics` endpoint in the shipped binary; verified by Task 6's integration test and by plan 07's benchmark run.
 
-- [ ] **Step 1: Install the recorder first and bind the endpoint last**
+- [x] **Step 1: Install the recorder first and bind the endpoint last**
 
 ```rust
 // crates/server/src/main.rs — the FIRST statement of `main`, before any env var is read: the
@@ -911,7 +911,7 @@ git commit -m "feat(server): record per-command metrics in a dispatch_and_log wr
     ));
 ```
 
-- [ ] **Step 2: Verify by hand**
+- [x] **Step 2: Verify by hand**
 
 ```bash
 cargo build --workspace
@@ -929,7 +929,7 @@ kill %1
 
 Expected: `rocket_mem_commands_total{cmd="set"} 1`, `rocket_mem_commands_total{cmd="get"} 1`, several `rocket_mem_command_duration_seconds_bucket{cmd="set",le="..."}` lines, `rocket_mem_keys 1`, and a non-zero `rocket_mem_connected_clients`. (If `redis-cli` isn't installed, drive the two commands with the `tests/cluster.rs` harness style instead — Task 6's automated test covers the same ground.)
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add crates/server/src/main.rs
@@ -947,7 +947,7 @@ git commit -m "feat(server): expose /metrics from ROCKET_MEM_METRICS_ADDR"
 - Consumes: `rocket_mem::metrics::{recorder_handle, serve_metrics}`, `rocket_mem::serve`.
 - Produces: the sprint's third DoD item ("Prometheus metrics visible and scraping correctly"), evidenced.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
 // crates/server/tests/metrics.rs
@@ -1045,17 +1045,17 @@ async fn command_counts_and_latencies_appear_in_the_prometheus_output() {
 }
 ```
 
-- [ ] **Step 2: Run the test to verify it passes**
+- [x] **Step 2: Run the test to verify it passes**
 
 Run: `cargo test -p rocket-mem --test metrics`
 Expected: PASS. If a bucket assertion fails, print `body` and check whether the exporter rendered a `_sum`/`_count` summary instead of `_bucket` lines — that means `set_buckets` was dropped from `recorder_handle` in Task 1.
 
-- [ ] **Step 3: Run the full workspace verification**
+- [x] **Step 3: Run the full workspace verification**
 
 Run: `cargo build --workspace && cargo clippy --workspace -- -D warnings && cargo fmt --all -- --check && cargo test --workspace`
 Expected: all clean/green
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add crates/server/tests/metrics.rs
