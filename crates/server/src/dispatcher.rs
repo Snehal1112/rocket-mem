@@ -22,6 +22,44 @@ fn frame_to_args(frame: Frame) -> Result<Vec<Bytes>, Frame> {
         .collect()
 }
 
+/// No command this server answers is longer than 12 bytes (`SUNIONSTORE`, `SRANDMEMBER`); 32 is
+/// generous headroom that still fits comfortably on the stack.
+pub(crate) const MAX_COMMAND_NAME_LEN: usize = 32;
+
+/// A command name uppercased into a fixed stack buffer. Exists to remove the two-to-four heap
+/// allocations every single command used to pay for its own name -- `dispatch`,
+/// `extract_write_command_name`, the metrics wrapper, and the cluster routing gate each did
+/// `String::from_utf8_lossy(..).to_ascii_uppercase()` independently. See
+/// ../../docs/benchmarks/2026-08-30-flamegraph-notes.md for the profile that motivated it.
+pub(crate) struct CommandName {
+    buf: [u8; MAX_COMMAND_NAME_LEN],
+    len: usize,
+}
+
+impl CommandName {
+    pub(crate) fn as_str(&self) -> &str {
+        // `upper_name` accepts only ASCII, so this cannot fail.
+        std::str::from_utf8(&self.buf[..self.len]).expect("upper_name accepts only ASCII input")
+    }
+}
+
+/// Uppercases `raw` into a `CommandName`, or `None` if it cannot be a command name at all --
+/// longer than `MAX_COMMAND_NAME_LEN`, or non-ASCII. Both cases are necessarily unknown
+/// commands, and callers handle them on their cold path.
+pub(crate) fn upper_name(raw: &[u8]) -> Option<CommandName> {
+    if raw.len() > MAX_COMMAND_NAME_LEN || !raw.is_ascii() {
+        return None;
+    }
+    let mut buf = [0u8; MAX_COMMAND_NAME_LEN];
+    for (slot, byte) in buf.iter_mut().zip(raw) {
+        *slot = byte.to_ascii_uppercase();
+    }
+    Some(CommandName {
+        buf,
+        len: raw.len(),
+    })
+}
+
 fn engine_error_to_frame(e: common::EngineError) -> Frame {
     Frame::Error(e.to_string())
 }
@@ -64,7 +102,14 @@ pub fn dispatch(engine: &Engine, frame: Frame, _protocol: &mut Protocol, _client
     if args.is_empty() {
         return Frame::Error("ERR empty command".into());
     }
-    let name = String::from_utf8_lossy(&args[0]).to_ascii_uppercase();
+    let Some(name) = upper_name(&args[0]) else {
+        // Cold path only: a name too long or non-ASCII to be any command we know. The error text
+        // is unchanged from before this optimization -- it echoes the client's own bytes.
+        return Frame::Error(format!(
+            "ERR unknown command '{}'",
+            String::from_utf8_lossy(&args[0])
+        ));
+    };
     let rest = &args[1..];
 
     match name.as_str() {
@@ -756,7 +801,7 @@ pub fn dispatch(engine: &Engine, frame: Frame, _protocol: &mut Protocol, _client
             None => Frame::Null,
         },
         "EXPIRE" | "PEXPIRE" => {
-            require_args!(rest, 2, name.to_ascii_lowercase().as_str());
+            require_args!(rest, 2, name.as_str().to_ascii_lowercase());
             let n: i64 = match std::str::from_utf8(&rest[1])
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -764,7 +809,7 @@ pub fn dispatch(engine: &Engine, frame: Frame, _protocol: &mut Protocol, _client
                 Some(n) => n,
                 None => return Frame::Error("ERR value is not an integer or out of range".into()),
             };
-            let delta = if name == "EXPIRE" {
+            let delta = if name.as_str() == "EXPIRE" {
                 std::time::Duration::from_secs(n.max(0) as u64)
             } else {
                 std::time::Duration::from_millis(n.max(0) as u64)
@@ -775,7 +820,7 @@ pub fn dispatch(engine: &Engine, frame: Frame, _protocol: &mut Protocol, _client
             }
         }
         "EXPIREAT" | "PEXPIREAT" => {
-            require_args!(rest, 2, name.to_ascii_lowercase().as_str());
+            require_args!(rest, 2, name.as_str().to_ascii_lowercase());
             let n: i64 = match std::str::from_utf8(&rest[1])
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -783,7 +828,7 @@ pub fn dispatch(engine: &Engine, frame: Frame, _protocol: &mut Protocol, _client
                 Some(n) => n,
                 None => return Frame::Error("ERR value is not an integer or out of range".into()),
             };
-            let target_unix_ms = if name == "EXPIREAT" {
+            let target_unix_ms = if name.as_str() == "EXPIREAT" {
                 n.saturating_mul(1000)
             } else {
                 n
@@ -856,7 +901,7 @@ pub fn dispatch(engine: &Engine, frame: Frame, _protocol: &mut Protocol, _client
                 _ => Frame::Error(format!("ERR unknown OBJECT subcommand '{subcommand}'")),
             }
         }
-        _ => Frame::Error(format!("ERR unknown command '{name}'")),
+        _ => Frame::Error(format!("ERR unknown command '{}'", name.as_str())),
     }
 }
 
@@ -904,14 +949,14 @@ fn hello_reply(
 /// Returns the uppercased command name from `frame` if it's one of `aof::WRITE_COMMANDS`,
 /// else `None`. Computed before `dispatch` runs, so `dispatch_and_log` knows whether to hold
 /// the AOF ordering lock without first having to inspect `reply`.
-fn extract_write_command_name(frame: &Frame) -> Option<String> {
+fn extract_write_command_name(frame: &Frame) -> Option<CommandName> {
     let Frame::Array(items) = frame else {
         return None;
     };
     let Some(Frame::Bulk(name_bytes)) = items.first() else {
         return None;
     };
-    let name = String::from_utf8_lossy(name_bytes).to_ascii_uppercase();
+    let name = upper_name(name_bytes)?;
     crate::aof::WRITE_COMMANDS
         .contains(&name.as_str())
         .then_some(name)
@@ -1062,7 +1107,9 @@ fn command_keys(frame: &Frame) -> Vec<&Bytes> {
     let Some(Frame::Bulk(name_bytes)) = items.first() else {
         return Vec::new();
     };
-    let name = String::from_utf8_lossy(name_bytes).to_ascii_uppercase();
+    let Some(name) = upper_name(name_bytes) else {
+        return Vec::new(); // not a command name we know, so it has no keys to route
+    };
     let args: Vec<&Bytes> = items[1..]
         .iter()
         .filter_map(|f| match f {
@@ -1070,7 +1117,7 @@ fn command_keys(frame: &Frame) -> Vec<&Bytes> {
             _ => None,
         })
         .collect();
-    match key_spec(&name) {
+    match key_spec(name.as_str()) {
         KeySpec::None => Vec::new(),
         KeySpec::First => args.into_iter().take(1).collect(),
         KeySpec::Second => args.into_iter().skip(1).take(1).collect(),
@@ -1726,16 +1773,16 @@ fn write_snapshot_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::R
     Ok(())
 }
 
-/// The uppercased command name, or `""` for a frame that isn't a command array. Cheap enough to
-/// call once per command; `07-benchmark-and-flamegraph.md` is where this allocation goes away.
-fn command_name_upper(frame: &Frame) -> String {
+/// The uppercased command name, or `None` for a frame that isn't a command array. Cheap enough to
+/// call once per command -- uppercases into a stack buffer rather than allocating.
+fn command_name_upper(frame: &Frame) -> Option<CommandName> {
     let Frame::Array(items) = frame else {
-        return String::new();
+        return None;
     };
     let Some(Frame::Bulk(name)) = items.first() else {
-        return String::new();
+        return None;
     };
-    String::from_utf8_lossy(name).to_ascii_uppercase()
+    upper_name(name)
 }
 
 /// The command's first argument (cloned -- one `Bytes` refcount bump, no data copy) and how many
@@ -1783,8 +1830,9 @@ pub fn dispatch_and_log(
     client_id: u64,
 ) -> Frame {
     let name = command_name_upper(&frame); // read before `frame` is moved into the inner call
+    let name = name.as_ref().map(|n| n.as_str()).unwrap_or("");
     let (first_key, arg_count) = command_key_and_arity(&frame);
-    let label = metric_label(&name);
+    let label = metric_label(name);
     let started = std::time::Instant::now();
 
     let reply = dispatch_and_log_inner(engine, aof, replication, frame, protocol, client_id);
@@ -1799,7 +1847,7 @@ pub fn dispatch_and_log(
     }
     replication
         .slowlog
-        .maybe_record(&name, first_key, arg_count, elapsed);
+        .maybe_record(name, first_key, arg_count, elapsed);
     reply
 }
 
@@ -2110,10 +2158,53 @@ mod tests {
 
     #[test]
     fn command_name_upper_reads_the_command_name_from_any_frame_shape() {
-        assert_eq!(command_name_upper(&cmd(&[b"get", b"k"])), "GET");
-        assert_eq!(command_name_upper(&cmd(&[b"SeT", b"k", b"v"])), "SET");
-        assert_eq!(command_name_upper(&Frame::Simple("nope".into())), "");
-        assert_eq!(command_name_upper(&Frame::Array(vec![])), "");
+        assert_eq!(
+            command_name_upper(&cmd(&[b"get", b"k"])).unwrap().as_str(),
+            "GET"
+        );
+        assert_eq!(
+            command_name_upper(&cmd(&[b"SeT", b"k", b"v"]))
+                .unwrap()
+                .as_str(),
+            "SET"
+        );
+        assert!(command_name_upper(&Frame::Simple("nope".into())).is_none());
+        assert!(command_name_upper(&Frame::Array(vec![])).is_none());
+    }
+
+    #[test]
+    fn upper_name_uppercases_ascii_into_a_stack_buffer() {
+        assert_eq!(upper_name(b"get").unwrap().as_str(), "GET");
+        assert_eq!(upper_name(b"SeT").unwrap().as_str(), "SET");
+        assert_eq!(upper_name(b"ZINCRBY").unwrap().as_str(), "ZINCRBY");
+        assert_eq!(upper_name(b"").unwrap().as_str(), "");
+    }
+
+    #[test]
+    fn upper_name_rejects_names_that_cannot_be_a_command() {
+        // longer than any real command name -- necessarily unknown, and handled on the cold path
+        assert!(upper_name(&[b'a'; MAX_COMMAND_NAME_LEN + 1]).is_none());
+        // non-ASCII cannot be uppercased byte-wise, and no command name contains it
+        assert!(upper_name(&[0xff, 0xfe]).is_none());
+    }
+
+    #[test]
+    fn an_over_long_command_name_still_gets_the_normal_unknown_command_error() {
+        let engine = Engine::new();
+        let long_name = vec![b'A'; MAX_COMMAND_NAME_LEN + 1];
+        let reply = dispatch(
+            &engine,
+            Frame::Array(vec![Frame::Bulk(Bytes::from(long_name.clone()))]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(
+            reply,
+            Frame::Error(format!(
+                "ERR unknown command '{}'",
+                String::from_utf8_lossy(&long_name)
+            ))
+        );
     }
 
     /// A handle whose slow-log threshold is 1ns, so every command qualifies. Nothing else about
