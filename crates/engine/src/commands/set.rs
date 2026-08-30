@@ -16,21 +16,23 @@ fn get_set(engine: &Engine, key: &[u8]) -> Result<HashSet<Bytes>, common::Engine
 /// missing, an empty `members` leaves it missing rather than creating a phantom empty set --
 /// see CLAUDE.md's "Missing key ≠ error" convention.
 pub fn sadd(engine: &Engine, key: Bytes, members: Vec<Bytes>) -> Result<i64, common::EngineError> {
-    let existed = engine.with_mut(
+    let existed = engine.with_mut_delta(
         &key,
-        |existing| -> Result<Option<i64>, common::EngineError> {
+        |existing| -> (Result<Option<i64>, common::EngineError>, isize) {
             match existing {
                 Some(Value::Set(set)) => {
                     let mut added = 0i64;
+                    let mut size_delta = 0isize;
                     for member in &members {
                         if set.insert(member.clone()) {
                             added += 1;
+                            size_delta += member.len() as isize + 8;
                         }
                     }
-                    Ok(Some(added))
+                    (Ok(Some(added)), size_delta)
                 }
-                Some(_) => Err(common::EngineError::WrongType),
-                None => Ok(None),
+                Some(_) => (Err(common::EngineError::WrongType), 0),
+                None => (Ok(None), 0),
             }
         },
     )?;
@@ -51,18 +53,20 @@ pub fn sadd(engine: &Engine, key: Bytes, members: Vec<Bytes>) -> Result<i64, com
 /// Removes every member in `members` in one shard-lock acquisition and returns the count
 /// actually removed.
 pub fn srem(engine: &Engine, key: &[u8], members: &[Bytes]) -> Result<i64, common::EngineError> {
-    engine.with_mut(key, |existing| match existing {
-        None => Ok(0),
+    engine.with_mut_delta(key, |existing| match existing {
+        None => (Ok(0), 0),
         Some(Value::Set(set)) => {
             let mut removed = 0i64;
+            let mut size_delta = 0isize;
             for member in members {
                 if set.remove(member.as_ref()) {
                     removed += 1;
+                    size_delta -= member.len() as isize + 8;
                 }
             }
-            Ok(removed)
+            (Ok(removed), size_delta)
         }
-        Some(_) => Err(common::EngineError::WrongType),
+        Some(_) => (Err(common::EngineError::WrongType), 0),
     })
 }
 
@@ -154,17 +158,18 @@ pub fn sdiffstore(
 
 pub fn spop(engine: &Engine, key: &[u8]) -> Result<Option<Bytes>, common::EngineError> {
     use rand::seq::IteratorRandom;
-    engine.with_mut(key, |existing| {
+    engine.with_mut_delta(key, |existing| {
         let set = match existing {
-            None => return Ok(None),
+            None => return (Ok(None), 0),
             Some(Value::Set(set)) => set,
-            Some(_) => return Err(common::EngineError::WrongType),
+            Some(_) => return (Err(common::EngineError::WrongType), 0),
         };
         let Some(member) = set.iter().choose(&mut rand::thread_rng()).cloned() else {
-            return Ok(None);
+            return (Ok(None), 0);
         };
         set.remove(&member);
-        Ok(Some(member))
+        let size_delta = -(member.len() as isize + 8);
+        (Ok(Some(member)), size_delta)
     })
 }
 
@@ -495,5 +500,62 @@ mod tests {
             sinter(&engine, &[Bytes::from_static(b"k")]).unwrap_err(),
             common::EngineError::WrongType
         );
+    }
+
+    /// `engine.memory_used()` after each mutation must equal independently recomputing the
+    /// entry's true size from scratch (`key.len() + Value::approx_size()`) -- proving the
+    /// delta each function reports (once converted to `with_mut_delta`) is exactly right.
+    /// Written to pass against today's `with_mut`-based code too, since this is a refactor,
+    /// not a bug fix -- it stays green through every step below.
+    fn assert_memory_used_matches_recomputed_size(engine: &Engine, key: &[u8]) {
+        let value = engine.get(key).expect("key must exist");
+        let expected = key.len() + value.approx_size();
+        assert_eq!(engine.memory_used(), expected);
+    }
+
+    #[test]
+    fn set_mutations_keep_memory_used_exactly_in_sync() {
+        let engine = Engine::new();
+        let key = Bytes::from_static(b"s");
+
+        // sadd: two new members in one call, plus a duplicate within the same call that must
+        // not be double-counted
+        sadd(
+            &engine,
+            key.clone(),
+            vec![
+                Bytes::from_static(b"x"),
+                Bytes::from_static(b"y"),
+                Bytes::from_static(b"x"),
+            ],
+        )
+        .unwrap();
+        assert_memory_used_matches_recomputed_size(&engine, &key);
+
+        // sadd: mix of an already-present member and a genuinely new one
+        sadd(
+            &engine,
+            key.clone(),
+            vec![Bytes::from_static(b"x"), Bytes::from_static(b"z")],
+        )
+        .unwrap();
+        assert_memory_used_matches_recomputed_size(&engine, &key);
+
+        // srem: mix of a present member and one that was never a member
+        srem(
+            &engine,
+            &key,
+            &[Bytes::from_static(b"y"), Bytes::from_static(b"never-there")],
+        )
+        .unwrap();
+        assert_memory_used_matches_recomputed_size(&engine, &key);
+
+        // spop: removes one remaining member (x or z)
+        spop(&engine, &key).unwrap();
+        assert_memory_used_matches_recomputed_size(&engine, &key);
+
+        // spop: on the single remaining member
+        spop(&engine, &key).unwrap();
+        assert_memory_used_matches_recomputed_size(&engine, &key);
     }
 }
