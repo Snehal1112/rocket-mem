@@ -1100,7 +1100,7 @@ pub fn dispatch_and_log(
         // Broadcast regardless of the append's result: the engine mutation already committed, so
         // a leader that fails to log a write locally must not also withhold it from its
         // replicas -- that would diverge them permanently over a purely local disk problem.
-        replication.registry.broadcast(bytes::Bytes::from(encoded));
+        replication.registry.broadcast(Bytes::from(encoded));
         // fsync timing for Always lives inside AofWriter::append itself; EverySecond's
         // periodic fsync loop lives in connection.rs (periodic_fsync_loop); Never does
         // nothing here.
@@ -3499,7 +3499,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_and_log_broadcasts_even_when_the_read_only_command_is_not_a_write() {
+    fn dispatch_and_log_does_not_broadcast_a_read_only_command() {
         // a read-only command has no to_log entries at all -- broadcast must simply not be
         // reached for it, not error
         let engine = std::sync::Arc::new(Engine::new());
@@ -3632,6 +3632,47 @@ mod tests {
         assert_eq!(
             engine.get(b"k"),
             Some(Value::String(Bytes::from_static(b"v")))
+        );
+    }
+
+    // The single most important correctness property this task exists to guarantee: a leader
+    // that fails to log a write locally must still fan it out to replicas -- withholding it
+    // would silently diverge them over a purely local disk problem. `/dev/full` forces the AOF
+    // append to fail while the engine mutation still commits, and a replica must still see the
+    // encoded frame despite that failure.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dispatch_and_log_still_broadcasts_to_replicas_when_the_aof_append_fails() {
+        let engine = std::sync::Arc::new(Engine::new());
+        let aof = AofWriter::open(std::path::Path::new("/dev/full"), FsyncPolicy::Always)
+            .expect("/dev/full opens fine; only writing to it fails");
+        let replication = ReplicationHandle::new(
+            std::sync::Arc::clone(&engine),
+            std::path::PathBuf::from("unused.snapshot"),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        replication.registry.register(tx);
+
+        let reply = dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"SET", b"k", b"v"]),
+            &mut Protocol::default(),
+            1,
+        );
+
+        // The reply reflects the AOF failure...
+        assert_eq!(
+            reply,
+            Frame::Error("ERR failed to write to the append only file".into())
+        );
+        // ...but the replica still received the encoded frame -- broadcast is unconditional on
+        // the append's result.
+        let received = rx.try_recv().unwrap();
+        assert_eq!(
+            received.as_ref(),
+            b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n"
         );
     }
 
