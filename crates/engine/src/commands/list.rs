@@ -9,42 +9,73 @@ use std::collections::VecDeque;
 // (confirmed by `redis-benchmark`: a single-key LPUSH benchmark visibly degraded over time
 // and didn't finish 100k requests in 60s before this fix).
 
-pub fn rpush(engine: &Engine, key: Bytes, val: Bytes) -> Result<(), common::EngineError> {
-    let existed = engine.with_mut(&key, |existing| -> Result<bool, common::EngineError> {
-        match existing {
-            Some(Value::List(list)) => {
-                list.push_back(val.clone()); // Bytes clone is O(1), not a deep copy
-                Ok(true)
+pub fn rpush(
+    engine: &Engine,
+    key: Bytes,
+    values: Vec<Bytes>,
+) -> Result<usize, common::EngineError> {
+    let existed = engine.with_mut(
+        &key,
+        |existing| -> Result<Option<usize>, common::EngineError> {
+            match existing {
+                Some(Value::List(list)) => {
+                    for val in &values {
+                        list.push_back(val.clone()); // Bytes clone is O(1), not a deep copy
+                    }
+                    Ok(Some(list.len()))
+                }
+                Some(_) => Err(common::EngineError::WrongType),
+                None => Ok(None),
             }
-            Some(_) => Err(common::EngineError::WrongType),
-            None => Ok(false),
+        },
+    )?;
+    match existed {
+        Some(len) => Ok(len),
+        None => {
+            let list: VecDeque<Bytes> = values.into_iter().collect();
+            let len = list.len();
+            engine.set(key, Value::List(list));
+            Ok(len)
         }
-    })?;
-    if !existed {
-        let mut list = VecDeque::new();
-        list.push_back(val);
-        engine.set(key, Value::List(list));
     }
-    Ok(())
 }
 
-pub fn lpush(engine: &Engine, key: Bytes, val: Bytes) -> Result<(), common::EngineError> {
-    let existed = engine.with_mut(&key, |existing| -> Result<bool, common::EngineError> {
-        match existing {
-            Some(Value::List(list)) => {
-                list.push_front(val.clone());
-                Ok(true)
+pub fn lpush(
+    engine: &Engine,
+    key: Bytes,
+    values: Vec<Bytes>,
+) -> Result<usize, common::EngineError> {
+    let existed = engine.with_mut(
+        &key,
+        |existing| -> Result<Option<usize>, common::EngineError> {
+            match existing {
+                Some(Value::List(list)) => {
+                    for val in &values {
+                        list.push_front(val.clone());
+                    }
+                    Ok(Some(list.len()))
+                }
+                Some(_) => Err(common::EngineError::WrongType),
+                None => Ok(None),
             }
-            Some(_) => Err(common::EngineError::WrongType),
-            None => Ok(false),
+        },
+    )?;
+    match existed {
+        Some(len) => Ok(len),
+        None => {
+            // LPUSH with multiple values prepends each in argument order, so the *last*
+            // argument ends up first (matches the dispatcher-level test and real Redis) --
+            // pushing onto a fresh VecDeque front-to-back in argument order achieves that
+            // directly, so no reversal is needed here.
+            let mut list = VecDeque::new();
+            for val in values {
+                list.push_front(val);
+            }
+            let len = list.len();
+            engine.set(key, Value::List(list));
+            Ok(len)
         }
-    })?;
-    if !existed {
-        let mut list = VecDeque::new();
-        list.push_front(val);
-        engine.set(key, Value::List(list));
     }
-    Ok(())
 }
 
 pub fn rpop(engine: &Engine, key: &[u8]) -> Result<Option<Bytes>, common::EngineError> {
@@ -245,8 +276,18 @@ mod tests {
     #[test]
     fn rpush_then_lrange_returns_in_insertion_order() {
         let engine = Engine::new();
-        rpush(&engine, Bytes::from_static(b"l"), Bytes::from_static(b"a")).unwrap();
-        rpush(&engine, Bytes::from_static(b"l"), Bytes::from_static(b"b")).unwrap();
+        rpush(
+            &engine,
+            Bytes::from_static(b"l"),
+            vec![Bytes::from_static(b"a")],
+        )
+        .unwrap();
+        rpush(
+            &engine,
+            Bytes::from_static(b"l"),
+            vec![Bytes::from_static(b"b")],
+        )
+        .unwrap();
         let items = lrange(&engine, b"l", 0, -1).unwrap();
         assert_eq!(
             items,
@@ -257,8 +298,18 @@ mod tests {
     #[test]
     fn lpush_prepends() {
         let engine = Engine::new();
-        rpush(&engine, Bytes::from_static(b"l"), Bytes::from_static(b"b")).unwrap();
-        lpush(&engine, Bytes::from_static(b"l"), Bytes::from_static(b"a")).unwrap();
+        rpush(
+            &engine,
+            Bytes::from_static(b"l"),
+            vec![Bytes::from_static(b"b")],
+        )
+        .unwrap();
+        lpush(
+            &engine,
+            Bytes::from_static(b"l"),
+            vec![Bytes::from_static(b"a")],
+        )
+        .unwrap();
         let items = lrange(&engine, b"l", 0, -1).unwrap();
         assert_eq!(
             items,
@@ -267,10 +318,94 @@ mod tests {
     }
 
     #[test]
+    fn rpush_with_multiple_values_pushes_all_in_one_call_in_order() {
+        let engine = Engine::new();
+        let len = rpush(
+            &engine,
+            Bytes::from_static(b"l"),
+            vec![
+                Bytes::from_static(b"a"),
+                Bytes::from_static(b"b"),
+                Bytes::from_static(b"c"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(len, 3);
+        assert_eq!(
+            lrange(&engine, b"l", 0, -1).unwrap(),
+            vec![
+                Bytes::from_static(b"a"),
+                Bytes::from_static(b"b"),
+                Bytes::from_static(b"c"),
+            ]
+        );
+    }
+
+    #[test]
+    fn lpush_with_multiple_values_prepends_each_so_the_last_argument_ends_up_first() {
+        let engine = Engine::new();
+        let len = lpush(
+            &engine,
+            Bytes::from_static(b"l"),
+            vec![
+                Bytes::from_static(b"a"),
+                Bytes::from_static(b"b"),
+                Bytes::from_static(b"c"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(len, 3);
+        assert_eq!(
+            lrange(&engine, b"l", 0, -1).unwrap(),
+            vec![
+                Bytes::from_static(b"c"),
+                Bytes::from_static(b"b"),
+                Bytes::from_static(b"a"),
+            ]
+        );
+    }
+
+    #[test]
+    fn rpush_multiple_values_onto_an_existing_list_appends_after_the_existing_tail() {
+        let engine = Engine::new();
+        rpush(
+            &engine,
+            Bytes::from_static(b"l"),
+            vec![Bytes::from_static(b"a")],
+        )
+        .unwrap();
+        let len = rpush(
+            &engine,
+            Bytes::from_static(b"l"),
+            vec![Bytes::from_static(b"b"), Bytes::from_static(b"c")],
+        )
+        .unwrap();
+        assert_eq!(len, 3);
+        assert_eq!(
+            lrange(&engine, b"l", 0, -1).unwrap(),
+            vec![
+                Bytes::from_static(b"a"),
+                Bytes::from_static(b"b"),
+                Bytes::from_static(b"c"),
+            ]
+        );
+    }
+
+    #[test]
     fn rpop_returns_and_removes_last_element() {
         let engine = Engine::new();
-        rpush(&engine, Bytes::from_static(b"l"), Bytes::from_static(b"a")).unwrap();
-        rpush(&engine, Bytes::from_static(b"l"), Bytes::from_static(b"b")).unwrap();
+        rpush(
+            &engine,
+            Bytes::from_static(b"l"),
+            vec![Bytes::from_static(b"a")],
+        )
+        .unwrap();
+        rpush(
+            &engine,
+            Bytes::from_static(b"l"),
+            vec![Bytes::from_static(b"b")],
+        )
+        .unwrap();
         assert_eq!(rpop(&engine, b"l").unwrap(), Some(Bytes::from_static(b"b")));
         assert_eq!(llen(&engine, b"l").unwrap(), 1);
     }
@@ -283,7 +418,12 @@ mod tests {
             Value::String(Bytes::from_static(b"v")),
         );
         assert_eq!(
-            rpush(&engine, Bytes::from_static(b"k"), Bytes::from_static(b"x")).unwrap_err(),
+            rpush(
+                &engine,
+                Bytes::from_static(b"k"),
+                vec![Bytes::from_static(b"x")]
+            )
+            .unwrap_err(),
             common::EngineError::WrongType
         );
     }
@@ -296,7 +436,12 @@ mod tests {
             Value::String(Bytes::from_static(b"v")),
         );
         assert_eq!(
-            lpush(&engine, Bytes::from_static(b"k"), Bytes::from_static(b"x")).unwrap_err(),
+            lpush(
+                &engine,
+                Bytes::from_static(b"k"),
+                vec![Bytes::from_static(b"x")]
+            )
+            .unwrap_err(),
             common::EngineError::WrongType
         );
     }
@@ -304,8 +449,18 @@ mod tests {
     #[test]
     fn lindex_returns_the_element_at_a_positive_index() {
         let engine = Engine::new();
-        rpush(&engine, Bytes::from_static(b"l"), Bytes::from_static(b"a")).unwrap();
-        rpush(&engine, Bytes::from_static(b"l"), Bytes::from_static(b"b")).unwrap();
+        rpush(
+            &engine,
+            Bytes::from_static(b"l"),
+            vec![Bytes::from_static(b"a")],
+        )
+        .unwrap();
+        rpush(
+            &engine,
+            Bytes::from_static(b"l"),
+            vec![Bytes::from_static(b"b")],
+        )
+        .unwrap();
         assert_eq!(
             lindex(&engine, b"l", 1).unwrap(),
             Some(Bytes::from_static(b"b"))
@@ -315,8 +470,18 @@ mod tests {
     #[test]
     fn lindex_supports_negative_indices() {
         let engine = Engine::new();
-        rpush(&engine, Bytes::from_static(b"l"), Bytes::from_static(b"a")).unwrap();
-        rpush(&engine, Bytes::from_static(b"l"), Bytes::from_static(b"b")).unwrap();
+        rpush(
+            &engine,
+            Bytes::from_static(b"l"),
+            vec![Bytes::from_static(b"a")],
+        )
+        .unwrap();
+        rpush(
+            &engine,
+            Bytes::from_static(b"l"),
+            vec![Bytes::from_static(b"b")],
+        )
+        .unwrap();
         assert_eq!(
             lindex(&engine, b"l", -1).unwrap(),
             Some(Bytes::from_static(b"b"))
@@ -326,14 +491,24 @@ mod tests {
     #[test]
     fn lindex_out_of_range_returns_none_not_an_error() {
         let engine = Engine::new();
-        rpush(&engine, Bytes::from_static(b"l"), Bytes::from_static(b"a")).unwrap();
+        rpush(
+            &engine,
+            Bytes::from_static(b"l"),
+            vec![Bytes::from_static(b"a")],
+        )
+        .unwrap();
         assert_eq!(lindex(&engine, b"l", 5).unwrap(), None);
     }
 
     #[test]
     fn lset_replaces_the_element_at_index_and_reports_success() {
         let engine = Engine::new();
-        rpush(&engine, Bytes::from_static(b"l"), Bytes::from_static(b"a")).unwrap();
+        rpush(
+            &engine,
+            Bytes::from_static(b"l"),
+            vec![Bytes::from_static(b"a")],
+        )
+        .unwrap();
         assert!(lset(
             &engine,
             Bytes::from_static(b"l"),
@@ -350,7 +525,12 @@ mod tests {
     #[test]
     fn lset_out_of_range_returns_false_not_an_error() {
         let engine = Engine::new();
-        rpush(&engine, Bytes::from_static(b"l"), Bytes::from_static(b"a")).unwrap();
+        rpush(
+            &engine,
+            Bytes::from_static(b"l"),
+            vec![Bytes::from_static(b"a")],
+        )
+        .unwrap();
         assert!(!lset(
             &engine,
             Bytes::from_static(b"l"),
@@ -364,7 +544,12 @@ mod tests {
     fn ltrim_keeps_only_the_requested_range() {
         let engine = Engine::new();
         for v in [b"a", b"b", b"c", b"d"] {
-            rpush(&engine, Bytes::from_static(b"l"), Bytes::from_static(v)).unwrap();
+            rpush(
+                &engine,
+                Bytes::from_static(b"l"),
+                vec![Bytes::from_static(v)],
+            )
+            .unwrap();
         }
         ltrim(&engine, Bytes::from_static(b"l"), 1, 2).unwrap();
         assert_eq!(
@@ -377,7 +562,12 @@ mod tests {
     fn lrem_positive_count_removes_from_head_up_to_count() {
         let engine = Engine::new();
         for v in [b"a", b"x", b"b", b"x", b"c"] {
-            rpush(&engine, Bytes::from_static(b"l"), Bytes::from_static(v)).unwrap();
+            rpush(
+                &engine,
+                Bytes::from_static(b"l"),
+                vec![Bytes::from_static(v)],
+            )
+            .unwrap();
         }
         let removed = lrem(&engine, Bytes::from_static(b"l"), 1, b"x").unwrap();
         assert_eq!(removed, 1);
@@ -396,7 +586,12 @@ mod tests {
     fn lrem_negative_count_removes_from_tail_up_to_count() {
         let engine = Engine::new();
         for v in [b"a", b"x", b"b", b"x", b"c"] {
-            rpush(&engine, Bytes::from_static(b"l"), Bytes::from_static(v)).unwrap();
+            rpush(
+                &engine,
+                Bytes::from_static(b"l"),
+                vec![Bytes::from_static(v)],
+            )
+            .unwrap();
         }
         let removed = lrem(&engine, Bytes::from_static(b"l"), -1, b"x").unwrap();
         assert_eq!(removed, 1);
@@ -415,7 +610,12 @@ mod tests {
     fn lrem_zero_count_removes_every_occurrence() {
         let engine = Engine::new();
         for v in [b"a", b"x", b"b", b"x", b"c"] {
-            rpush(&engine, Bytes::from_static(b"l"), Bytes::from_static(v)).unwrap();
+            rpush(
+                &engine,
+                Bytes::from_static(b"l"),
+                vec![Bytes::from_static(v)],
+            )
+            .unwrap();
         }
         let removed = lrem(&engine, Bytes::from_static(b"l"), 0, b"x").unwrap();
         assert_eq!(removed, 2);
@@ -432,8 +632,18 @@ mod tests {
     #[test]
     fn linsert_before_pivot_shifts_the_pivot_right() {
         let engine = Engine::new();
-        rpush(&engine, Bytes::from_static(b"l"), Bytes::from_static(b"a")).unwrap();
-        rpush(&engine, Bytes::from_static(b"l"), Bytes::from_static(b"c")).unwrap();
+        rpush(
+            &engine,
+            Bytes::from_static(b"l"),
+            vec![Bytes::from_static(b"a")],
+        )
+        .unwrap();
+        rpush(
+            &engine,
+            Bytes::from_static(b"l"),
+            vec![Bytes::from_static(b"c")],
+        )
+        .unwrap();
         let len = linsert(
             &engine,
             Bytes::from_static(b"l"),
@@ -456,7 +666,12 @@ mod tests {
     #[test]
     fn linsert_pivot_not_found_returns_negative_one() {
         let engine = Engine::new();
-        rpush(&engine, Bytes::from_static(b"l"), Bytes::from_static(b"a")).unwrap();
+        rpush(
+            &engine,
+            Bytes::from_static(b"l"),
+            vec![Bytes::from_static(b"a")],
+        )
+        .unwrap();
         assert_eq!(
             linsert(
                 &engine,

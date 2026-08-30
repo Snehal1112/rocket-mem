@@ -89,7 +89,7 @@ fn list_commands_reject_non_list_keys() {
     assert_wrongtype!(list::rpush(
         &e,
         Bytes::from_static(b"k"),
-        Bytes::from_static(b"x")
+        vec![Bytes::from_static(b"x")]
     ));
     assert_wrongtype!(list::lindex(&engine_with_string_key(), b"k", 0));
 }
