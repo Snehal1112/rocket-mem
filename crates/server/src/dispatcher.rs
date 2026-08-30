@@ -1578,6 +1578,98 @@ fn handle_hello(
     })
 }
 
+/// Renders one slow-log entry's argument array. The entry carries only the command name and its
+/// first argument, so anything beyond that is summarised with real Redis's own truncation
+/// marker -- a shape real Redis itself emits (it truncates at 32 arguments), so tooling parses
+/// it without special-casing.
+fn slowlog_args_frame(entry: &crate::slowlog::SlowLogEntry) -> Frame {
+    let mut args = vec![Frame::Bulk(Bytes::from(entry.command.clone()))];
+    let shown = usize::from(entry.key.is_some());
+    if let Some(key) = &entry.key {
+        args.push(Frame::Bulk(key.clone()));
+    }
+    if entry.arg_count > shown {
+        args.push(Frame::Bulk(Bytes::from(format!(
+            "... ({} more arguments)",
+            entry.arg_count - shown
+        ))));
+    }
+    Frame::Array(args)
+}
+
+/// Returns `Some(reply)` if `frame` was `SLOWLOG`. Intercepted here, like `CLUSTER` and `INFO`,
+/// because the ring buffer lives on `ReplicationHandle`, which plain `dispatch` cannot see.
+///
+/// Three subcommands only: `GET [count]`, `LEN`, `RESET`. `SLOWLOG HELP` is out of scope for the
+/// same reason `CLUSTER SLOTS` is -- nothing in this repo consumes it.
+fn handle_slowlog(
+    frame: &Frame,
+    replication: &crate::replication::ReplicationHandle,
+) -> Option<Frame> {
+    let Frame::Array(items) = frame else {
+        return None;
+    };
+    let Some(Frame::Bulk(name)) = items.first() else {
+        return None;
+    };
+    if !name.eq_ignore_ascii_case(b"SLOWLOG") {
+        return None;
+    }
+    let Some(Frame::Bulk(sub_bytes)) = items.get(1) else {
+        return Some(Frame::Error(
+            "ERR wrong number of arguments for 'slowlog' command".into(),
+        ));
+    };
+    let sub = String::from_utf8_lossy(sub_bytes).to_ascii_uppercase();
+    Some(match sub.as_str() {
+        "GET" => {
+            // Default 10, matching real Redis. A negative count means "everything", also
+            // matching real Redis; anything unparseable is an error rather than a silent 10.
+            let count = match items.get(2) {
+                None => 10usize,
+                Some(Frame::Bulk(raw)) => match std::str::from_utf8(raw)
+                    .ok()
+                    .and_then(|s| s.parse::<i64>().ok())
+                {
+                    Some(n) if n < 0 => crate::slowlog::SLOWLOG_CAPACITY,
+                    Some(n) => n as usize,
+                    None => {
+                        return Some(Frame::Error(
+                            "ERR value is not an integer or out of range".into(),
+                        ))
+                    }
+                },
+                Some(_) => {
+                    return Some(Frame::Error(
+                        "ERR value is not an integer or out of range".into(),
+                    ))
+                }
+            };
+            Frame::Array(
+                replication
+                    .slowlog
+                    .get(count)
+                    .iter()
+                    .map(|entry| {
+                        Frame::Array(vec![
+                            Frame::Integer(entry.id as i64),
+                            Frame::Integer(entry.unix_time_secs),
+                            Frame::Integer(entry.duration_micros),
+                            slowlog_args_frame(entry),
+                        ])
+                    })
+                    .collect(),
+            )
+        }
+        "LEN" => Frame::Integer(replication.slowlog.len() as i64),
+        "RESET" => {
+            replication.slowlog.reset();
+            Frame::Simple("OK".into())
+        }
+        _ => Frame::Error(format!("ERR unknown SLOWLOG subcommand '{sub}'")),
+    })
+}
+
 /// Snapshots `replication.engine()` — in production this is always the same `Arc<Engine>` as
 /// `dispatch_and_log`'s own `engine` parameter (`main.rs` constructs one `Engine`, shares it
 /// into both `serve`'s `engine` argument and `ReplicationHandle::new`), so using the handle's
@@ -1755,6 +1847,9 @@ fn dispatch_and_log_inner(
         return reply;
     }
     if let Some(reply) = handle_hello(&frame, protocol, client_id, replication) {
+        return reply;
+    }
+    if let Some(reply) = handle_slowlog(&frame, replication) {
         return reply;
     }
 
@@ -2075,6 +2170,167 @@ mod tests {
             1,
         );
         assert!(replication.slowlog.is_empty());
+    }
+
+    #[test]
+    fn slowlog_len_counts_recorded_entries() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let replication = slowlog_handle();
+        dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"SET", b"k", b"v"]),
+            &mut Protocol::default(),
+            1,
+        );
+        // the SLOWLOG LEN command is itself recorded only *after* its reply is built, so it
+        // reports the one SET that preceded it
+        assert_eq!(
+            dispatch_and_log(
+                &engine,
+                &aof,
+                &replication,
+                cmd(&[b"SLOWLOG", b"LEN"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Integer(1)
+        );
+    }
+
+    #[test]
+    fn slowlog_get_returns_id_timestamp_duration_and_arguments() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let replication = slowlog_handle();
+        dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"LRANGE", b"mylist", b"0", b"-1"]),
+            &mut Protocol::default(),
+            1,
+        );
+
+        let Frame::Array(entries) = dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"SLOWLOG", b"GET"]),
+            &mut Protocol::default(),
+            1,
+        ) else {
+            panic!("expected Array")
+        };
+        assert_eq!(entries.len(), 1);
+        let Frame::Array(entry) = &entries[0] else {
+            panic!("expected each entry to be an Array")
+        };
+        assert_eq!(entry.len(), 4);
+        assert_eq!(entry[0], Frame::Integer(0)); // id
+        let Frame::Integer(timestamp) = entry[1] else {
+            panic!("expected an integer timestamp")
+        };
+        assert!(timestamp > 1_700_000_000);
+        assert!(matches!(entry[2], Frame::Integer(micros) if micros >= 0));
+        assert_eq!(
+            entry[3],
+            Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"LRANGE")),
+                Frame::Bulk(Bytes::from_static(b"mylist")),
+                // real Redis's own truncation marker, for the arguments the entry doesn't carry
+                Frame::Bulk(Bytes::from_static(b"... (2 more arguments)")),
+            ])
+        );
+    }
+
+    #[test]
+    fn slowlog_get_honours_an_explicit_count() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let replication = slowlog_handle();
+        for _ in 0..3 {
+            dispatch_and_log(
+                &engine,
+                &aof,
+                &replication,
+                cmd(&[b"PING"]),
+                &mut Protocol::default(),
+                1,
+            );
+        }
+        let Frame::Array(entries) = dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"SLOWLOG", b"GET", b"2"]),
+            &mut Protocol::default(),
+            1,
+        ) else {
+            panic!("expected Array")
+        };
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn slowlog_reset_replies_ok_and_empties_the_buffer() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let replication = slowlog_handle();
+        dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"PING"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(replication.slowlog.len(), 1);
+        assert_eq!(
+            dispatch_and_log(
+                &engine,
+                &aof,
+                &replication,
+                cmd(&[b"SLOWLOG", b"RESET"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Simple("OK".into())
+        );
+        // RESET emptied the buffer; the wrapper then recorded the RESET itself, so exactly one
+        // entry remains -- and it is the RESET, not the PING.
+        assert_eq!(replication.slowlog.len(), 1);
+        assert_eq!(replication.slowlog.get(1)[0].command, "SLOWLOG");
+    }
+
+    #[test]
+    fn an_unknown_slowlog_subcommand_is_an_error() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        assert_eq!(
+            dispatch_and_log(
+                &engine,
+                &aof,
+                &ReplicationHandle::default(),
+                cmd(&[b"SLOWLOG", b"HELP"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Error("ERR unknown SLOWLOG subcommand 'HELP'".into())
+        );
+        assert_eq!(
+            dispatch_and_log(
+                &engine,
+                &aof,
+                &ReplicationHandle::default(),
+                cmd(&[b"SLOWLOG"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Error("ERR wrong number of arguments for 'slowlog' command".into())
+        );
     }
 
     #[test]
