@@ -1,8 +1,9 @@
 use protocol::Frame;
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{mpsc, Mutex};
+use std::thread;
 use tokio_util::codec::Encoder;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12,51 +13,122 @@ pub enum FsyncPolicy {
     Never,
 }
 
+/// Sent to the dedicated writer thread spawned by `AofWriter::open`. `Append` is
+/// fire-and-forget (`EverySecond`/`Never`: `append()` must not block on I/O at all).
+/// `AppendAndFsync` and `Flush` both carry an ack channel so their caller can block until
+/// the writer thread confirms the data is durable -- used for `FsyncPolicy::Always` and for
+/// the explicit `fsync()` method, respectively.
+enum AofMsg {
+    Append(Vec<u8>),
+    AppendAndFsync(Vec<u8>, mpsc::SyncSender<()>),
+    Flush(mpsc::SyncSender<()>),
+}
+
 pub struct AofWriter {
-    file: Mutex<BufWriter<File>>,
+    tx: mpsc::Sender<AofMsg>,
     policy: FsyncPolicy,
+    /// Held by `dispatcher::dispatch_and_log` across "mutate the engine, then log it" for
+    /// write commands, so concurrent writers' appends always land in the AOF in the same
+    /// relative order their mutations committed in. See
+    /// ../../docs/superpowers/specs/2026-08-30-tech-debt-cleanup-spec.md Item 2.
+    order: Mutex<()>,
 }
 
 impl AofWriter {
     pub fn open(path: &Path, policy: FsyncPolicy) -> std::io::Result<Self> {
         let file = OpenOptions::new().create(true).append(true).open(path)?;
+        let mut writer = BufWriter::new(file);
+        let (tx, rx) = mpsc::channel::<AofMsg>();
+
+        thread::Builder::new()
+            .name("aof-writer".into())
+            .spawn(move || {
+                for msg in rx {
+                    match msg {
+                        AofMsg::Append(bytes) => {
+                            if let Err(e) = writer.write_all(&bytes) {
+                                eprintln!("aof append failed: {e}");
+                            }
+                        }
+                        AofMsg::AppendAndFsync(bytes, ack) => {
+                            if let Err(e) = writer
+                                .write_all(&bytes)
+                                .and_then(|_| writer.flush())
+                                .and_then(|_| writer.get_ref().sync_data())
+                            {
+                                eprintln!("aof append failed: {e}");
+                            }
+                            let _ = ack.send(());
+                        }
+                        AofMsg::Flush(ack) => {
+                            if let Err(e) =
+                                writer.flush().and_then(|_| writer.get_ref().sync_data())
+                            {
+                                eprintln!("aof fsync failed: {e}");
+                            }
+                            let _ = ack.send(());
+                        }
+                    }
+                }
+            })
+            .expect("failed to spawn aof writer thread");
+
         Ok(Self {
-            file: Mutex::new(BufWriter::new(file)),
+            tx,
             policy,
+            order: Mutex::new(()),
         })
     }
 
-    /// Encodes `frame` in RESP wire format and appends it to the file. Buffered — call
-    /// `fsync` (or rely on the `Always`/`EverySecond` policy) to guarantee durability.
+    /// Encodes `frame` in RESP wire format and sends it to the dedicated writer thread.
+    /// Under `FsyncPolicy::Always` this blocks until the write is fsynced -- matching the
+    /// durability contract the caller relies on (the client's reply must not precede
+    /// durability). Under `EverySecond`/`Never` it returns as soon as the message is
+    /// enqueued, with no blocking I/O on the calling thread.
     pub fn append(&self, frame: Frame) -> std::io::Result<()> {
         let mut buf = bytes::BytesMut::new();
-        // RespCodec's Encoder::Error is already std::io::Error, so `?` needs no mapping.
         protocol::codec::RespCodec::default().encode(frame, &mut buf)?;
-        let mut guard = self.file.lock().unwrap();
-        guard.write_all(&buf)?;
+        let bytes = buf.to_vec();
         if self.policy == FsyncPolicy::Always {
-            guard.flush()?;
-            guard.get_ref().sync_data()?;
+            let (ack_tx, ack_rx) = mpsc::sync_channel(1);
+            self.send(AofMsg::AppendAndFsync(bytes, ack_tx))?;
+            ack_rx.recv().map_err(writer_gone)
+        } else {
+            self.send(AofMsg::Append(bytes))
         }
-        Ok(())
     }
 
-    /// Flushes the buffer and fsyncs the underlying file. Called directly by tests, and on a
-    /// timer by `FsyncPolicy::EverySecond`'s periodic loop, which lives in
-    /// `05-aof-dispatch-wiring.md`'s `connection.rs`. (`06-aof-replay-and-corrupt-recovery.md`
-    /// does *not* call it — replay reads the file directly and runs before any `AofWriter`
-    /// handle is opened.)
+    /// Flushes the buffer and fsyncs the underlying file, blocking until the writer thread
+    /// confirms it's done. Called directly by tests, and on a timer by
+    /// `FsyncPolicy::EverySecond`'s periodic loop in `connection.rs`.
     pub fn fsync(&self) -> std::io::Result<()> {
-        let mut guard = self.file.lock().unwrap();
-        guard.flush()?;
-        guard.get_ref().sync_data()
+        let (ack_tx, ack_rx) = mpsc::sync_channel(1);
+        self.send(AofMsg::Flush(ack_tx))?;
+        ack_rx.recv().map_err(writer_gone)
     }
 
-    /// The fsync policy this writer was opened with. Never changes after `open`, so callers
-    /// (e.g. `connection.rs`'s periodic fsync loop) may cache it rather than re-checking.
+    /// The fsync policy this writer was opened with. Never changes after `open`.
     pub fn policy(&self) -> FsyncPolicy {
         self.policy
     }
+
+    /// Acquired by `dispatcher::dispatch_and_log` around "mutate, then log" for write
+    /// commands -- see the `order` field's doc comment above.
+    pub fn lock_for_ordering(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.order.lock().unwrap()
+    }
+
+    fn send(&self, msg: AofMsg) -> std::io::Result<()> {
+        self.tx.send(msg).map_err(|_| writer_gone_err())
+    }
+}
+
+fn writer_gone<E>(_: E) -> std::io::Error {
+    writer_gone_err()
+}
+
+fn writer_gone_err() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::BrokenPipe, "aof writer thread is gone")
 }
 
 /// Commands whose successful execution mutates the keyspace and must be replayed on
@@ -351,5 +423,47 @@ mod tests {
         assert!(!WRITE_COMMANDS.contains(&"KEYS"));
         assert!(!WRITE_COMMANDS.contains(&"TTL"));
         assert!(!WRITE_COMMANDS.contains(&"PING"));
+    }
+
+    #[test]
+    fn lock_for_ordering_serializes_concurrent_holders() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.aof");
+        let writer = std::sync::Arc::new(AofWriter::open(&path, FsyncPolicy::Never).unwrap());
+        let log: std::sync::Arc<Mutex<Vec<(usize, bool)>>> =
+            std::sync::Arc::new(Mutex::new(Vec::new()));
+
+        let mut handles = Vec::new();
+        for id in 0..4 {
+            let writer = std::sync::Arc::clone(&writer);
+            let log = std::sync::Arc::clone(&log);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..50 {
+                    let _guard = writer.lock_for_ordering();
+                    log.lock().unwrap().push((id, true)); // entered the critical section
+                    std::thread::yield_now();
+                    log.lock().unwrap().push((id, false)); // about to leave it
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Every "entered" for a given thread must be immediately followed by that same
+        // thread's "leaving" -- if lock_for_ordering() didn't provide mutual exclusion,
+        // another thread's "entered" could land between them.
+        let log = log.lock().unwrap();
+        let mut i = 0;
+        while i < log.len() {
+            let (id, entering) = log[i];
+            assert!(entering, "expected an entry at position {i}");
+            assert_eq!(
+                log[i + 1],
+                (id, false),
+                "thread {id}'s critical section was interrupted by another holder"
+            );
+            i += 2;
+        }
     }
 }
