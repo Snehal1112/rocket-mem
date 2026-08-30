@@ -993,17 +993,21 @@ pub fn dispatch_and_log(
     // Note: to_log may contain two frames (e.g., for SET ... EX/PX: [flagless SET, PEXPIREAT]).
     // Each frame is appended separately. Under FsyncPolicy::Always, each append() call fsyncs
     // independently, so a crash between appends would durably record the SET without its
-    // PEXPIREAT — on replay the key would live forever, silently dropping the TTL. Full
-    // crash/corrupt-tail recovery semantics are scoped to Task 06 (06-aof-replay-and-corrupt-recovery.md).
+    // PEXPIREAT — on replay the key would live forever, silently dropping the TTL. Replay's
+    // corrupt-tail handling (aof::replay) recovers a torn final frame, but it cannot detect
+    // this case: both frames are individually well-formed, so the pair is not atomic.
     for frame_to_log in to_log {
         // A logging failure must not fail the client's reply, but it must not be silently
         // swallowed either -- surface it so an operator watching stderr/logs can notice a
-        // full disk or I/O error instead of discovering it only on replay.
+        // full disk or I/O error instead of discovering it only on replay. Under Always,
+        // append() returns the writer thread's real I/O result, so a failed write or fsync
+        // lands here; under EverySecond/Never the append is fire-and-forget, so this only
+        // catches a dead writer thread and the writer itself reports I/O errors on stderr.
         if let Err(e) = aof.append(frame_to_log) {
             eprintln!("aof append failed: {e}");
         }
         // fsync timing for Always lives inside AofWriter::append itself; EverySecond's
-        // periodic fsync loop lives in this plan's Task 2 (connection.rs); Never does
+        // periodic fsync loop lives in connection.rs (periodic_fsync_loop); Never does
         // nothing here.
     }
     reply

@@ -14,18 +14,28 @@ pub enum FsyncPolicy {
 }
 
 /// Sent to the dedicated writer thread spawned by `AofWriter::open`. `Append` is
-/// fire-and-forget (`EverySecond`/`Never`: `append()` must not block on I/O at all).
-/// `AppendAndFsync` and `Flush` both carry an ack channel so their caller can block until
-/// the writer thread confirms the data is durable -- used for `FsyncPolicy::Always` and for
-/// the explicit `fsync()` method, respectively.
+/// fire-and-forget (`EverySecond`/`Never`: `append()` must not block on I/O at all), so its
+/// caller has already returned by the time the write happens and there is nobody left to
+/// hand an error to -- a failure there can only go to stderr. `AppendAndFsync` and `Flush`
+/// both carry an ack channel that carries the *result* of the I/O back, so their caller can
+/// block until the writer thread confirms durability and can see a real disk error -- used
+/// for `FsyncPolicy::Always` and for the explicit `fsync()` method, respectively.
 enum AofMsg {
     Append(Vec<u8>),
-    AppendAndFsync(Vec<u8>, mpsc::SyncSender<()>),
-    Flush(mpsc::SyncSender<()>),
+    AppendAndFsync(Vec<u8>, mpsc::SyncSender<std::io::Result<()>>),
+    Flush(mpsc::SyncSender<std::io::Result<()>>),
 }
 
+/// Bounds the writer thread's queue. Unbounded would let a stalled disk grow the queue
+/// without limit, each entry a heap-allocated frame invisible to the engine's `maxmemory`
+/// accounting. 1024 absorbs normal bursts without adding latency, while a sustained stall
+/// makes `send` (and therefore `append`) block -- the same natural backpressure the earlier
+/// `Mutex<BufWriter<File>>` design had.
+const AOF_QUEUE_CAPACITY: usize = 1024;
+
 pub struct AofWriter {
-    tx: mpsc::Sender<AofMsg>,
+    /// Bounded at `AOF_QUEUE_CAPACITY`; see that constant for why.
+    tx: mpsc::SyncSender<AofMsg>,
     policy: FsyncPolicy,
     /// Held by `dispatcher::dispatch_and_log` across "mutate the engine, then log it" for
     /// write commands, so concurrent writers' appends always land in the AOF in the same
@@ -38,35 +48,34 @@ impl AofWriter {
     pub fn open(path: &Path, policy: FsyncPolicy) -> std::io::Result<Self> {
         let file = OpenOptions::new().create(true).append(true).open(path)?;
         let mut writer = BufWriter::new(file);
-        let (tx, rx) = mpsc::channel::<AofMsg>();
+        let (tx, rx) = mpsc::sync_channel::<AofMsg>(AOF_QUEUE_CAPACITY);
 
         thread::Builder::new()
             .name("aof-writer".into())
             .spawn(move || {
                 for msg in rx {
                     match msg {
+                        // Fire-and-forget: the caller already returned, so stderr is the only
+                        // place an error can go.
                         AofMsg::Append(bytes) => {
                             if let Err(e) = writer.write_all(&bytes) {
                                 eprintln!("aof append failed: {e}");
                             }
                         }
+                        // The acked variants hand the real I/O result back to the waiting
+                        // caller instead of printing it, so a full disk surfaces where the
+                        // write was requested. A failed send just means the caller gave up
+                        // waiting; dropping the result is the only sensible response.
                         AofMsg::AppendAndFsync(bytes, ack) => {
-                            if let Err(e) = writer
+                            let result = writer
                                 .write_all(&bytes)
                                 .and_then(|_| writer.flush())
-                                .and_then(|_| writer.get_ref().sync_data())
-                            {
-                                eprintln!("aof append failed: {e}");
-                            }
-                            let _ = ack.send(());
+                                .and_then(|_| writer.get_ref().sync_data());
+                            let _ = ack.send(result);
                         }
                         AofMsg::Flush(ack) => {
-                            if let Err(e) =
-                                writer.flush().and_then(|_| writer.get_ref().sync_data())
-                            {
-                                eprintln!("aof fsync failed: {e}");
-                            }
-                            let _ = ack.send(());
+                            let result = writer.flush().and_then(|_| writer.get_ref().sync_data());
+                            let _ = ack.send(result);
                         }
                     }
                 }
@@ -81,10 +90,14 @@ impl AofWriter {
     }
 
     /// Encodes `frame` in RESP wire format and sends it to the dedicated writer thread.
-    /// Under `FsyncPolicy::Always` this blocks until the write is fsynced -- matching the
-    /// durability contract the caller relies on (the client's reply must not precede
-    /// durability). Under `EverySecond`/`Never` it returns as soon as the message is
-    /// enqueued, with no blocking I/O on the calling thread.
+    /// Under `FsyncPolicy::Always` this blocks until the write is fsynced and returns the
+    /// writer thread's actual I/O result -- matching the durability contract the caller
+    /// relies on (the client's reply must not precede durability, and a failed fsync must
+    /// not look like success). Under `EverySecond`/`Never` it returns as soon as the message
+    /// is enqueued, with no blocking I/O on the calling thread; a later I/O failure there is
+    /// only reported on stderr, since this call has already returned. Enqueueing itself can
+    /// block if the writer thread is far enough behind to fill the bounded queue -- that is
+    /// the intended backpressure, not a stall to avoid.
     pub fn append(&self, frame: Frame) -> std::io::Result<()> {
         let mut buf = bytes::BytesMut::new();
         protocol::codec::RespCodec::default().encode(frame, &mut buf)?;
@@ -92,19 +105,21 @@ impl AofWriter {
         if self.policy == FsyncPolicy::Always {
             let (ack_tx, ack_rx) = mpsc::sync_channel(1);
             self.send(AofMsg::AppendAndFsync(bytes, ack_tx))?;
-            ack_rx.recv().map_err(writer_gone)
+            // Two failure modes, flattened into one: the writer thread vanished (recv error),
+            // or it ran and the write itself failed (the inner result).
+            ack_rx.recv().map_err(writer_gone)?
         } else {
             self.send(AofMsg::Append(bytes))
         }
     }
 
     /// Flushes the buffer and fsyncs the underlying file, blocking until the writer thread
-    /// confirms it's done. Called directly by tests, and on a timer by
-    /// `FsyncPolicy::EverySecond`'s periodic loop in `connection.rs`.
+    /// confirms it's done and returning that thread's actual I/O result. Called directly by
+    /// tests, and on a timer by `FsyncPolicy::EverySecond`'s periodic loop in `connection.rs`.
     pub fn fsync(&self) -> std::io::Result<()> {
         let (ack_tx, ack_rx) = mpsc::sync_channel(1);
         self.send(AofMsg::Flush(ack_tx))?;
-        ack_rx.recv().map_err(writer_gone)
+        ack_rx.recv().map_err(writer_gone)?
     }
 
     /// The fsync policy this writer was opened with. Never changes after `open`.
@@ -114,6 +129,9 @@ impl AofWriter {
 
     /// Acquired by `dispatcher::dispatch_and_log` around "mutate, then log" for write
     /// commands -- see the `order` field's doc comment above.
+    #[must_use = "the returned guard must be bound and held across the whole mutate-then-log \
+                  section; dropping it immediately releases the lock and loses the AOF \
+                  ordering guarantee entirely"]
     pub fn lock_for_ordering(&self) -> std::sync::MutexGuard<'_, ()> {
         // Recover from poison rather than propagate it: this mutex will be held across
         // arbitrary command dispatch (Task 2), so a panicking command handler must not
@@ -412,6 +430,35 @@ mod tests {
             .read_to_string(&mut contents)
             .unwrap();
         assert_eq!(contents, "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n");
+    }
+
+    // `/dev/full` accepts an open and then fails every actual write with ENOSPC, which is the
+    // simplest deterministic stand-in for a full disk. It only exists on Linux, so these two
+    // tests are gated; the propagation they cover is otherwise only visible by reading the
+    // writer thread's ack type.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn append_with_always_policy_propagates_a_real_io_error_from_the_writer_thread() {
+        let writer = AofWriter::open(std::path::Path::new("/dev/full"), FsyncPolicy::Always)
+            .expect("/dev/full opens fine; only writing to it fails");
+        let err = writer
+            .append(frame(&[b"SET", b"k", b"v"]))
+            .expect_err("a write that cannot land must not report success");
+        // Not BrokenPipe: that's the "writer thread is gone" case, which this is not.
+        assert_ne!(err.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fsync_propagates_a_real_io_error_from_the_writer_thread() {
+        let writer = AofWriter::open(std::path::Path::new("/dev/full"), FsyncPolicy::Never)
+            .expect("/dev/full opens fine; only writing to it fails");
+        // Never buffers without touching the disk, so the failure surfaces at the fsync.
+        writer.append(frame(&[b"SET", b"k", b"v"])).unwrap();
+        let err = writer
+            .fsync()
+            .expect_err("a flush that cannot land must not report success");
+        assert_ne!(err.kind(), std::io::ErrorKind::BrokenPipe);
     }
 
     #[test]
