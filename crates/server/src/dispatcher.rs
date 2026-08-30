@@ -509,27 +509,17 @@ pub fn dispatch(engine: &Engine, frame: Frame, protocol: &mut Protocol, client_i
         }
         "SADD" => {
             require_args!(rest, 2, "sadd");
-            let mut added = 0i64;
-            for member in &rest[1..] {
-                match commands::set::sadd(engine, rest[0].clone(), member.clone()) {
-                    Ok(true) => added += 1,
-                    Ok(false) => {}
-                    Err(e) => return engine_error_to_frame(e),
-                }
+            match commands::set::sadd(engine, rest[0].clone(), rest[1..].to_vec()) {
+                Ok(n) => Frame::Integer(n),
+                Err(e) => engine_error_to_frame(e),
             }
-            Frame::Integer(added)
         }
         "SREM" => {
             require_args!(rest, 2, "srem");
-            let mut removed = 0i64;
-            for member in &rest[1..] {
-                match commands::set::srem(engine, &rest[0], member) {
-                    Ok(true) => removed += 1,
-                    Ok(false) => {}
-                    Err(e) => return engine_error_to_frame(e),
-                }
+            match commands::set::srem(engine, &rest[0], &rest[1..]) {
+                Ok(n) => Frame::Integer(n),
+                Err(e) => engine_error_to_frame(e),
             }
-            Frame::Integer(removed)
         }
         "SMEMBERS" => {
             require_args!(rest, 1, "smembers");

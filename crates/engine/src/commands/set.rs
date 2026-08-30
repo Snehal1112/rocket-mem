@@ -10,15 +10,25 @@ fn get_set(engine: &Engine, key: &[u8]) -> Result<HashSet<Bytes>, common::Engine
     }
 }
 
-/// Returns whether `member` was newly added (`false` if it was already present) —
-/// callers implementing variadic `SADD` sum this across members for the count Redis reports.
-/// Mutates in place via `with_mut` -- see list.rs's top-of-file note for why this matters.
-pub fn sadd(engine: &Engine, key: Bytes, member: Bytes) -> Result<bool, common::EngineError> {
+/// Adds every member in `members` in one shard-lock acquisition and returns the count newly
+/// added (duplicates within `members`, or members already present, don't count). Mutates in
+/// place via `with_mut` -- see list.rs's top-of-file note for why this matters. When `key` is
+/// missing, an empty `members` leaves it missing rather than creating a phantom empty set --
+/// see CLAUDE.md's "Missing key ≠ error" convention.
+pub fn sadd(engine: &Engine, key: Bytes, members: Vec<Bytes>) -> Result<i64, common::EngineError> {
     let existed = engine.with_mut(
         &key,
-        |existing| -> Result<Option<bool>, common::EngineError> {
+        |existing| -> Result<Option<i64>, common::EngineError> {
             match existing {
-                Some(Value::Set(set)) => Ok(Some(set.insert(member.clone()))),
+                Some(Value::Set(set)) => {
+                    let mut added = 0i64;
+                    for member in &members {
+                        if set.insert(member.clone()) {
+                            added += 1;
+                        }
+                    }
+                    Ok(Some(added))
+                }
                 Some(_) => Err(common::EngineError::WrongType),
                 None => Ok(None),
             }
@@ -27,18 +37,31 @@ pub fn sadd(engine: &Engine, key: Bytes, member: Bytes) -> Result<bool, common::
     match existed {
         Some(added) => Ok(added),
         None => {
-            let mut set = HashSet::new();
-            set.insert(member);
+            if members.is_empty() {
+                return Ok(0);
+            }
+            let set: HashSet<Bytes> = members.into_iter().collect();
+            let added = set.len() as i64;
             engine.set(key, Value::Set(set));
-            Ok(true)
+            Ok(added)
         }
     }
 }
 
-pub fn srem(engine: &Engine, key: &[u8], member: &[u8]) -> Result<bool, common::EngineError> {
+/// Removes every member in `members` in one shard-lock acquisition and returns the count
+/// actually removed.
+pub fn srem(engine: &Engine, key: &[u8], members: &[Bytes]) -> Result<i64, common::EngineError> {
     engine.with_mut(key, |existing| match existing {
-        None => Ok(false),
-        Some(Value::Set(set)) => Ok(set.remove(member)),
+        None => Ok(0),
+        Some(Value::Set(set)) => {
+            let mut removed = 0i64;
+            for member in members {
+                if set.remove(member.as_ref()) {
+                    removed += 1;
+                }
+            }
+            Ok(removed)
+        }
         Some(_) => Err(common::EngineError::WrongType),
     })
 }
@@ -160,24 +183,44 @@ mod tests {
     #[test]
     fn sadd_then_sismember_is_true() {
         let engine = Engine::new();
-        sadd(&engine, Bytes::from_static(b"s"), Bytes::from_static(b"x")).unwrap();
+        sadd(
+            &engine,
+            Bytes::from_static(b"s"),
+            vec![Bytes::from_static(b"x")],
+        )
+        .unwrap();
         assert!(sismember(&engine, b"s", b"x").unwrap());
         assert!(!sismember(&engine, b"s", b"y").unwrap());
     }
 
     #[test]
-    fn srem_removes_member_and_reports_it_existed() {
+    fn srem_removes_member_and_reports_the_count_removed() {
         let engine = Engine::new();
-        sadd(&engine, Bytes::from_static(b"s"), Bytes::from_static(b"x")).unwrap();
-        assert!(srem(&engine, b"s", b"x").unwrap());
-        assert!(!srem(&engine, b"s", b"x").unwrap());
+        sadd(
+            &engine,
+            Bytes::from_static(b"s"),
+            vec![Bytes::from_static(b"x")],
+        )
+        .unwrap();
+        assert_eq!(srem(&engine, b"s", &[Bytes::from_static(b"x")]).unwrap(), 1);
+        assert_eq!(srem(&engine, b"s", &[Bytes::from_static(b"x")]).unwrap(), 0);
     }
 
     #[test]
     fn scard_counts_members() {
         let engine = Engine::new();
-        sadd(&engine, Bytes::from_static(b"s"), Bytes::from_static(b"x")).unwrap();
-        sadd(&engine, Bytes::from_static(b"s"), Bytes::from_static(b"y")).unwrap();
+        sadd(
+            &engine,
+            Bytes::from_static(b"s"),
+            vec![Bytes::from_static(b"x")],
+        )
+        .unwrap();
+        sadd(
+            &engine,
+            Bytes::from_static(b"s"),
+            vec![Bytes::from_static(b"y")],
+        )
+        .unwrap();
         assert_eq!(scard(&engine, b"s").unwrap(), 2);
     }
 
@@ -189,18 +232,110 @@ mod tests {
             Value::String(Bytes::from_static(b"v")),
         );
         assert_eq!(
-            sadd(&engine, Bytes::from_static(b"k"), Bytes::from_static(b"x")).unwrap_err(),
+            sadd(
+                &engine,
+                Bytes::from_static(b"k"),
+                vec![Bytes::from_static(b"x")]
+            )
+            .unwrap_err(),
             common::EngineError::WrongType
         );
     }
 
     #[test]
+    fn sadd_with_multiple_members_pushes_all_in_one_call_and_returns_count_newly_added() {
+        let engine = Engine::new();
+        let added = sadd(
+            &engine,
+            Bytes::from_static(b"s"),
+            vec![
+                Bytes::from_static(b"x"),
+                Bytes::from_static(b"y"),
+                Bytes::from_static(b"x"), // duplicate within the same call
+            ],
+        )
+        .unwrap();
+        assert_eq!(added, 2);
+        assert_eq!(scard(&engine, b"s").unwrap(), 2);
+    }
+
+    #[test]
+    fn sadd_with_multiple_members_onto_an_existing_set_counts_only_the_new_ones() {
+        let engine = Engine::new();
+        sadd(
+            &engine,
+            Bytes::from_static(b"s"),
+            vec![Bytes::from_static(b"x")],
+        )
+        .unwrap();
+        let added = sadd(
+            &engine,
+            Bytes::from_static(b"s"),
+            vec![Bytes::from_static(b"x"), Bytes::from_static(b"y")],
+        )
+        .unwrap();
+        assert_eq!(added, 1);
+        assert_eq!(scard(&engine, b"s").unwrap(), 2);
+    }
+
+    #[test]
+    fn sadd_with_no_members_on_a_missing_key_does_not_create_a_phantom_set() {
+        let engine = Engine::new();
+        let added = sadd(&engine, Bytes::from_static(b"s"), vec![]).unwrap();
+        assert_eq!(added, 0);
+        assert!(!engine.exists(b"s"));
+    }
+
+    #[test]
+    fn srem_with_multiple_members_removes_all_in_one_call_and_returns_count_removed() {
+        let engine = Engine::new();
+        sadd(
+            &engine,
+            Bytes::from_static(b"s"),
+            vec![Bytes::from_static(b"x"), Bytes::from_static(b"y")],
+        )
+        .unwrap();
+        let removed = srem(
+            &engine,
+            b"s",
+            &[
+                Bytes::from_static(b"x"),
+                Bytes::from_static(b"y"),
+                Bytes::from_static(b"z"), // never a member
+            ],
+        )
+        .unwrap();
+        assert_eq!(removed, 2);
+        assert_eq!(scard(&engine, b"s").unwrap(), 0);
+    }
+
+    #[test]
     fn sinter_returns_only_members_present_in_every_set() {
         let engine = Engine::new();
-        sadd(&engine, Bytes::from_static(b"a"), Bytes::from_static(b"x")).unwrap();
-        sadd(&engine, Bytes::from_static(b"a"), Bytes::from_static(b"y")).unwrap();
-        sadd(&engine, Bytes::from_static(b"b"), Bytes::from_static(b"y")).unwrap();
-        sadd(&engine, Bytes::from_static(b"b"), Bytes::from_static(b"z")).unwrap();
+        sadd(
+            &engine,
+            Bytes::from_static(b"a"),
+            vec![Bytes::from_static(b"x")],
+        )
+        .unwrap();
+        sadd(
+            &engine,
+            Bytes::from_static(b"a"),
+            vec![Bytes::from_static(b"y")],
+        )
+        .unwrap();
+        sadd(
+            &engine,
+            Bytes::from_static(b"b"),
+            vec![Bytes::from_static(b"y")],
+        )
+        .unwrap();
+        sadd(
+            &engine,
+            Bytes::from_static(b"b"),
+            vec![Bytes::from_static(b"z")],
+        )
+        .unwrap();
         let result = sinter(
             &engine,
             &[Bytes::from_static(b"a"), Bytes::from_static(b"b")],
@@ -212,7 +347,12 @@ mod tests {
     #[test]
     fn sinter_with_a_missing_key_is_empty() {
         let engine = Engine::new();
-        sadd(&engine, Bytes::from_static(b"a"), Bytes::from_static(b"x")).unwrap();
+        sadd(
+            &engine,
+            Bytes::from_static(b"a"),
+            vec![Bytes::from_static(b"x")],
+        )
+        .unwrap();
         let result = sinter(
             &engine,
             &[Bytes::from_static(b"a"), Bytes::from_static(b"missing")],
@@ -224,8 +364,18 @@ mod tests {
     #[test]
     fn sunion_returns_every_member_from_every_set() {
         let engine = Engine::new();
-        sadd(&engine, Bytes::from_static(b"a"), Bytes::from_static(b"x")).unwrap();
-        sadd(&engine, Bytes::from_static(b"b"), Bytes::from_static(b"y")).unwrap();
+        sadd(
+            &engine,
+            Bytes::from_static(b"a"),
+            vec![Bytes::from_static(b"x")],
+        )
+        .unwrap();
+        sadd(
+            &engine,
+            Bytes::from_static(b"b"),
+            vec![Bytes::from_static(b"y")],
+        )
+        .unwrap();
         let result = sunion(
             &engine,
             &[Bytes::from_static(b"a"), Bytes::from_static(b"b")],
@@ -240,9 +390,24 @@ mod tests {
     #[test]
     fn sdiff_returns_members_of_the_first_set_absent_from_the_rest() {
         let engine = Engine::new();
-        sadd(&engine, Bytes::from_static(b"a"), Bytes::from_static(b"x")).unwrap();
-        sadd(&engine, Bytes::from_static(b"a"), Bytes::from_static(b"y")).unwrap();
-        sadd(&engine, Bytes::from_static(b"b"), Bytes::from_static(b"y")).unwrap();
+        sadd(
+            &engine,
+            Bytes::from_static(b"a"),
+            vec![Bytes::from_static(b"x")],
+        )
+        .unwrap();
+        sadd(
+            &engine,
+            Bytes::from_static(b"a"),
+            vec![Bytes::from_static(b"y")],
+        )
+        .unwrap();
+        sadd(
+            &engine,
+            Bytes::from_static(b"b"),
+            vec![Bytes::from_static(b"y")],
+        )
+        .unwrap();
         let result = sdiff(
             &engine,
             &[Bytes::from_static(b"a"), Bytes::from_static(b"b")],
@@ -254,8 +419,18 @@ mod tests {
     #[test]
     fn sinterstore_stores_the_result_and_returns_its_size() {
         let engine = Engine::new();
-        sadd(&engine, Bytes::from_static(b"a"), Bytes::from_static(b"x")).unwrap();
-        sadd(&engine, Bytes::from_static(b"b"), Bytes::from_static(b"x")).unwrap();
+        sadd(
+            &engine,
+            Bytes::from_static(b"a"),
+            vec![Bytes::from_static(b"x")],
+        )
+        .unwrap();
+        sadd(
+            &engine,
+            Bytes::from_static(b"b"),
+            vec![Bytes::from_static(b"x")],
+        )
+        .unwrap();
         let len = sinterstore(
             &engine,
             Bytes::from_static(b"dest"),
@@ -272,7 +447,12 @@ mod tests {
     #[test]
     fn spop_removes_and_returns_a_member() {
         let engine = Engine::new();
-        sadd(&engine, Bytes::from_static(b"s"), Bytes::from_static(b"x")).unwrap();
+        sadd(
+            &engine,
+            Bytes::from_static(b"s"),
+            vec![Bytes::from_static(b"x")],
+        )
+        .unwrap();
         let popped = spop(&engine, b"s").unwrap();
         assert_eq!(popped, Some(Bytes::from_static(b"x")));
         assert_eq!(scard(&engine, b"s").unwrap(), 0);
@@ -287,7 +467,12 @@ mod tests {
     #[test]
     fn srandmember_returns_a_member_without_removing_it() {
         let engine = Engine::new();
-        sadd(&engine, Bytes::from_static(b"s"), Bytes::from_static(b"x")).unwrap();
+        sadd(
+            &engine,
+            Bytes::from_static(b"s"),
+            vec![Bytes::from_static(b"x")],
+        )
+        .unwrap();
         let picked = srandmember(&engine, b"s").unwrap();
         assert_eq!(picked, Some(Bytes::from_static(b"x")));
         assert_eq!(scard(&engine, b"s").unwrap(), 1);

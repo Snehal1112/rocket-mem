@@ -103,7 +103,7 @@ fn set_commands_reject_non_set_keys() {
     assert_wrongtype!(set::sadd(
         &e,
         Bytes::from_static(b"k"),
-        Bytes::from_static(b"m")
+        vec![Bytes::from_static(b"m")]
     ));
     let e3 = engine_with_string_key();
     assert_wrongtype!(set::sinter(&e3, &[Bytes::from_static(b"k")]));
