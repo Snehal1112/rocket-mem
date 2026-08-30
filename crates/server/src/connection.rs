@@ -14,7 +14,10 @@ pub async fn serve(
     aof: Arc<AofWriter>,
     replication: Arc<ReplicationHandle>,
 ) {
-    tokio::spawn(active_expire_loop(Arc::clone(&engine)));
+    tokio::spawn(active_expire_loop(
+        Arc::clone(&engine),
+        Arc::clone(&replication),
+    ));
     tokio::spawn(periodic_fsync_loop(Arc::clone(&aof)));
 
     let mut next_client_id: u64 = 1;
@@ -41,12 +44,12 @@ pub async fn serve(
 /// Sweeps one shard per tick, rotating through all 16 — see
 /// ../../docs/superpowers/specs/2026-08-30-sprint-4-spec.md's active-expiry decision for why a
 /// whole-shard sweep (not per-key sampling) is the deliberate simplification here.
-async fn active_expire_loop(engine: Arc<Engine>) {
+async fn active_expire_loop(engine: Arc<Engine>, replication: Arc<ReplicationHandle>) {
     let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
     let mut shard_idx: usize = 0;
     loop {
         interval.tick().await;
-        engine.active_expire_cycle(shard_idx);
+        replication.record_expired(engine.active_expire_cycle(shard_idx));
         shard_idx = shard_idx.wrapping_add(1);
     }
 }
@@ -70,6 +73,17 @@ async fn periodic_fsync_loop(aof: Arc<AofWriter>) {
     }
 }
 
+/// Decrements the live-connection count on drop, so every one of `handle_connection`'s early
+/// returns -- and the `serve_replica` path, which never returns normally -- is covered without
+/// each of them having to remember.
+struct ClientGuard(Arc<ReplicationHandle>);
+
+impl Drop for ClientGuard {
+    fn drop(&mut self) {
+        self.0.connection_closed();
+    }
+}
+
 async fn handle_connection(
     socket: tokio::net::TcpStream,
     engine: Arc<Engine>,
@@ -77,6 +91,8 @@ async fn handle_connection(
     replication: Arc<ReplicationHandle>,
     client_id: u64,
 ) {
+    replication.connection_opened();
+    let _client_guard = ClientGuard(Arc::clone(&replication));
     let mut framed = Framed::new(socket, RespCodec::default());
     let mut protocol = Protocol::default();
     // Carries a frame pulled ahead by the pipelining peek below, so it isn't re-read.
@@ -209,6 +225,65 @@ mod tests {
         let path = dir.path().join("test.aof");
         let writer = crate::aof::AofWriter::open(&path, crate::aof::FsyncPolicy::Never).unwrap();
         (dir, Arc::new(writer))
+    }
+
+    #[tokio::test]
+    async fn serve_tracks_connected_clients_and_drops_the_count_on_disconnect() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let engine = Arc::new(Engine::new());
+        let (_dir, aof) = test_aof();
+        let replication = Arc::new(crate::replication::ReplicationHandle::default());
+        tokio::spawn(serve(
+            listener,
+            Arc::clone(&engine),
+            Arc::clone(&aof),
+            Arc::clone(&replication),
+        ));
+
+        let mut framed = Framed::new(
+            TcpStream::connect(addr).await.unwrap(),
+            RespCodec::default(),
+        );
+        framed
+            .send(Frame::Array(vec![Frame::Bulk(Bytes::from_static(b"PING"))]))
+            .await
+            .unwrap();
+        framed.next().await.unwrap().unwrap();
+        assert_eq!(replication.connected_clients(), 1);
+        assert_eq!(replication.total_connections(), 1);
+
+        drop(framed);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(replication.connected_clients(), 0);
+        assert_eq!(replication.total_connections(), 1); // the lifetime total never drops
+    }
+
+    #[tokio::test]
+    async fn the_active_expiry_sweep_counts_the_keys_it_removes() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let engine = Arc::new(Engine::new());
+        engine.set(
+            Bytes::from_static(b"k"),
+            engine::Value::String(Bytes::from_static(b"v")),
+        );
+        engine.expire_at(
+            b"k",
+            std::time::Instant::now() + std::time::Duration::from_millis(20),
+        );
+        let (_dir, aof) = test_aof();
+        let replication = Arc::new(crate::replication::ReplicationHandle::default());
+        tokio::spawn(serve(
+            listener,
+            Arc::clone(&engine),
+            Arc::clone(&aof),
+            Arc::clone(&replication),
+        ));
+
+        // one shard per 100ms tick, 16 shards -- 2s covers a full rotation with headroom, the
+        // same bound `serve_actively_expires_a_key_even_without_any_read_touching_it` uses.
+        tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+        assert_eq!(replication.expired_keys(), 1);
     }
 
     #[tokio::test]

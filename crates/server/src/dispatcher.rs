@@ -1389,10 +1389,68 @@ fn write_snapshot_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::R
     Ok(())
 }
 
+/// The uppercased command name, or `""` for a frame that isn't a command array. Cheap enough to
+/// call once per command; `07-benchmark-and-flamegraph.md` is where this allocation goes away.
+fn command_name_upper(frame: &Frame) -> String {
+    let Frame::Array(items) = frame else {
+        return String::new();
+    };
+    let Some(Frame::Bulk(name)) = items.first() else {
+        return String::new();
+    };
+    String::from_utf8_lossy(name).to_ascii_uppercase()
+}
+
+/// The `cmd` label value for a command name: its lowercase form if we know the command, the
+/// literal `other` otherwise. The `other` fallback is what bounds Prometheus label cardinality --
+/// without it, a client sending random command names could create unbounded series.
+fn metric_label(name: &str) -> String {
+    if KNOWN_COMMANDS.binary_search(&name).is_ok() {
+        name.to_ascii_lowercase()
+    } else {
+        "other".to_string()
+    }
+}
+
+/// Times and counts every client command, then delegates to `dispatch_and_log_inner`, which
+/// holds all the actual behavior. The split exists because the inner function has seven early
+/// returns (-MOVED, -CROSSSLOT, -READONLY, SAVE, REPLICAOF, CLUSTER, and the unknown-command
+/// fall-through) and instrumenting each one would guarantee a future eighth is missed.
+///
+/// `dispatch` itself is deliberately *not* instrumented: it is what `aof::replay` and the
+/// follower apply loop call, and counting a 5,000-frame boot-time replay as 5,000 client
+/// commands would make every dashboard lie about traffic.
+///
+/// The signature is byte-for-byte the one Sprint 5 left, so none of the ~36 call sites change.
+pub fn dispatch_and_log(
+    engine: &Engine,
+    aof: &crate::aof::AofWriter,
+    replication: &crate::replication::ReplicationHandle,
+    frame: Frame,
+    protocol: &mut Protocol,
+    client_id: u64,
+) -> Frame {
+    let name = command_name_upper(&frame); // read before `frame` is moved into the inner call
+    let label = metric_label(&name);
+    let started = std::time::Instant::now();
+
+    let reply = dispatch_and_log_inner(engine, aof, replication, frame, protocol, client_id);
+
+    let elapsed = started.elapsed();
+    replication.command_executed();
+    ::metrics::counter!("rocket_mem_commands_total", "cmd" => label.clone()).increment(1);
+    ::metrics::histogram!("rocket_mem_command_duration_seconds", "cmd" => label.clone())
+        .record(elapsed.as_secs_f64());
+    if matches!(reply, Frame::Error(_)) {
+        ::metrics::counter!("rocket_mem_command_errors_total", "cmd" => label).increment(1);
+    }
+    reply
+}
+
 /// Wraps `dispatch`, additionally appending successful write commands to `aof`. `dispatch`
 /// itself is never modified — see ../../docs/superpowers/specs/2026-08-30-sprint-4-spec.md
 /// for why AOF logging lives here instead of inside dispatch's own match arms.
-pub fn dispatch_and_log(
+fn dispatch_and_log_inner(
     engine: &Engine,
     aof: &crate::aof::AofWriter,
     replication: &crate::replication::ReplicationHandle,
@@ -1673,6 +1731,86 @@ mod tests {
                 .map(|p| Frame::Bulk(Bytes::copy_from_slice(p)))
                 .collect(),
         )
+    }
+
+    #[test]
+    fn metric_label_lowercases_known_commands_and_collapses_the_rest() {
+        assert_eq!(metric_label("GET"), "get");
+        assert_eq!(metric_label("ZINCRBY"), "zincrby");
+        assert_eq!(metric_label("CLUSTER"), "cluster");
+        // an unknown name must never become its own Prometheus series
+        assert_eq!(metric_label("DEFINITELYNOTACOMMAND"), "other");
+        assert_eq!(metric_label(""), "other");
+    }
+
+    #[test]
+    fn command_name_upper_reads_the_command_name_from_any_frame_shape() {
+        assert_eq!(command_name_upper(&cmd(&[b"get", b"k"])), "GET");
+        assert_eq!(command_name_upper(&cmd(&[b"SeT", b"k", b"v"])), "SET");
+        assert_eq!(command_name_upper(&Frame::Simple("nope".into())), "");
+        assert_eq!(command_name_upper(&Frame::Array(vec![])), "");
+    }
+
+    #[test]
+    fn dispatch_and_log_counts_every_command_it_handles() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let replication = ReplicationHandle::default();
+        for command in [
+            cmd(&[b"SET", b"k", b"v"]),
+            cmd(&[b"GET", b"k"]),
+            cmd(&[b"PING"]),
+        ] {
+            dispatch_and_log(
+                &engine,
+                &aof,
+                &replication,
+                command,
+                &mut Protocol::default(),
+                1,
+            );
+        }
+        assert_eq!(replication.total_commands(), 3);
+    }
+
+    #[test]
+    fn dispatch_and_log_still_behaves_identically_after_the_wrapper_split() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let replication = ReplicationHandle::default();
+        assert_eq!(
+            dispatch_and_log(
+                &engine,
+                &aof,
+                &replication,
+                cmd(&[b"SET", b"k", b"v"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Simple("OK".into())
+        );
+        assert_eq!(
+            dispatch_and_log(
+                &engine,
+                &aof,
+                &replication,
+                cmd(&[b"GET", b"k"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Bulk(Bytes::from_static(b"v"))
+        );
+        assert_eq!(
+            dispatch_and_log(
+                &engine,
+                &aof,
+                &replication,
+                cmd(&[b"NOPE"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Error("ERR unknown command 'NOPE'".into())
+        );
     }
 
     #[test]

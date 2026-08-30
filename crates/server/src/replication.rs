@@ -200,12 +200,14 @@ impl ReplicationHandle {
         let engine = Arc::clone(&self.engine);
         let generation = Arc::clone(&self.generation);
         let aof = self.aof.clone();
+        let last_apply = self.last_apply_slot();
         *task = Some(tokio::spawn(replication_client_loop(
             host_port,
             engine,
             generation,
             my_generation,
             aof,
+            last_apply,
         )));
         self.is_replica.store(true, Ordering::Relaxed);
     }
@@ -284,6 +286,7 @@ async fn replication_client_loop(
     generation: Arc<AtomicU64>,
     my_generation: u64,
     aof: Option<Arc<AofWriter>>,
+    last_apply: Arc<AtomicI64>,
 ) {
     loop {
         if generation.load(Ordering::SeqCst) != my_generation {
@@ -295,6 +298,7 @@ async fn replication_client_loop(
             &generation,
             my_generation,
             aof.as_deref(),
+            &last_apply,
         )
         .await
         {
@@ -317,6 +321,7 @@ async fn sync_once(
     generation: &AtomicU64,
     my_generation: u64,
     aof: Option<&AofWriter>,
+    last_apply: &AtomicI64,
 ) -> std::io::Result<()> {
     let stream = tokio::net::TcpStream::connect(host_port).await?;
     let mut framed = tokio_util::codec::Framed::new(stream, protocol::codec::RespCodec::default());
@@ -372,6 +377,13 @@ async fn sync_once(
         if let protocol::Frame::Error(e) = reply {
             eprintln!("replication: applying a replicated command failed: {e}");
         }
+        last_apply.store(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0),
+            Ordering::Relaxed,
+        );
     }
     Ok(())
 }
@@ -489,7 +501,17 @@ mod tests {
         let sync_task = {
             let engine = std::sync::Arc::clone(&engine);
             let generation = Arc::clone(&generation);
-            tokio::spawn(async move { sync_once(&host_port, &engine, &generation, 0, None).await })
+            tokio::spawn(async move {
+                sync_once(
+                    &host_port,
+                    &engine,
+                    &generation,
+                    0,
+                    None,
+                    &AtomicI64::new(0),
+                )
+                .await
+            })
         };
 
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
@@ -540,9 +562,16 @@ mod tests {
         // generation check, this would go on to call load_snapshot and clobber whatever a
         // newer task has already loaded.
         let generation = Arc::new(AtomicU64::new(1));
-        sync_once(&host_port, &engine, &generation, 0, None)
-            .await
-            .unwrap();
+        sync_once(
+            &host_port,
+            &engine,
+            &generation,
+            0,
+            None,
+            &AtomicI64::new(0),
+        )
+        .await
+        .unwrap();
         fake_leader.await.unwrap();
 
         assert_eq!(engine.get(b"from-snapshot"), None); // stale task must not load its snapshot
@@ -634,9 +663,17 @@ mod tests {
             let aof = Arc::clone(&aof);
             let host_port = addr.to_string();
             let generation = Arc::new(AtomicU64::new(0));
-            tokio::spawn(
-                async move { sync_once(&host_port, &engine, &generation, 0, Some(&aof)).await },
-            )
+            tokio::spawn(async move {
+                sync_once(
+                    &host_port,
+                    &engine,
+                    &generation,
+                    0,
+                    Some(&aof),
+                    &AtomicI64::new(0),
+                )
+                .await
+            })
         };
 
         // The SAVE loop runs on a blocking thread, not a runtime worker: `handle_save` fsyncs
