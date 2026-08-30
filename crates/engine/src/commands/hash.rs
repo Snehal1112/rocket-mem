@@ -11,17 +11,23 @@ pub fn hset(
     field: Bytes,
     val: Bytes,
 ) -> Result<bool, common::EngineError> {
-    let existed = engine.with_mut(
+    let existed = engine.with_mut_delta(
         &key,
-        |existing| -> Result<Option<bool>, common::EngineError> {
+        |existing| -> (Result<Option<bool>, common::EngineError>, isize) {
             match existing {
                 Some(Value::Hash(map)) => {
-                    let is_new = !map.contains_key(&field);
-                    map.insert(field.clone(), val.clone());
-                    Ok(Some(is_new))
+                    // `HashMap::insert` returns the field's previous value for free, so no
+                    // separate `contains_key` probe is needed -- and its length is exactly
+                    // what the delta needs when overwriting.
+                    let old = map.insert(field.clone(), val.clone());
+                    let size_delta = match &old {
+                        None => field.len() as isize + val.len() as isize + 16,
+                        Some(old_val) => val.len() as isize - old_val.len() as isize,
+                    };
+                    (Ok(Some(old.is_none())), size_delta)
                 }
-                Some(_) => Err(common::EngineError::WrongType),
-                None => Ok(None),
+                Some(_) => (Err(common::EngineError::WrongType), 0),
+                None => (Ok(None), 0),
             }
         },
     )?;
@@ -49,10 +55,17 @@ pub fn hget(
 }
 
 pub fn hdel(engine: &Engine, key: &[u8], field: &[u8]) -> Result<bool, common::EngineError> {
-    engine.with_mut(key, |existing| match existing {
-        None => Ok(false),
-        Some(Value::Hash(map)) => Ok(map.remove(field).is_some()),
-        Some(_) => Err(common::EngineError::WrongType),
+    engine.with_mut_delta(key, |existing| match existing {
+        None => (Ok(false), 0),
+        Some(Value::Hash(map)) => {
+            let removed = map.remove(field);
+            let size_delta = match &removed {
+                Some(old_val) => -(field.len() as isize + old_val.len() as isize + 16),
+                None => 0,
+            };
+            (Ok(removed.is_some()), size_delta)
+        }
+        Some(_) => (Err(common::EngineError::WrongType), 0),
     })
 }
 
@@ -86,24 +99,31 @@ pub fn hincrby(
     field: Bytes,
     delta: i64,
 ) -> Result<i64, common::EngineError> {
-    let existed = engine.with_mut(
+    let existed = engine.with_mut_delta(
         &key,
-        |existing| -> Result<Option<i64>, common::EngineError> {
+        |existing| -> (Result<Option<i64>, common::EngineError>, isize) {
             match existing {
                 Some(Value::Hash(map)) => {
-                    let current: i64 = match map.get(&field) {
-                        Some(b) => std::str::from_utf8(b)
-                            .ok()
-                            .and_then(|s| s.parse().ok())
-                            .ok_or(common::EngineError::NotAnInteger)?,
+                    let old = map.get(&field);
+                    let current: i64 = match old {
+                        Some(b) => match std::str::from_utf8(b).ok().and_then(|s| s.parse().ok()) {
+                            Some(n) => n,
+                            None => return (Err(common::EngineError::NotAnInteger), 0),
+                        },
                         None => 0,
                     };
+                    let old_len = old.map(|b| b.len());
                     let next = current + delta;
-                    map.insert(field.clone(), Bytes::from(next.to_string()));
-                    Ok(Some(next))
+                    let next_bytes = Bytes::from(next.to_string());
+                    let size_delta = match old_len {
+                        None => field.len() as isize + next_bytes.len() as isize + 16,
+                        Some(len) => next_bytes.len() as isize - len as isize,
+                    };
+                    map.insert(field.clone(), next_bytes);
+                    (Ok(Some(next)), size_delta)
                 }
-                Some(_) => Err(common::EngineError::WrongType),
-                None => Ok(None),
+                Some(_) => (Err(common::EngineError::WrongType), 0),
+                None => (Ok(None), 0),
             }
         },
     )?;
@@ -144,20 +164,21 @@ pub fn hsetnx(
     field: Bytes,
     val: Bytes,
 ) -> Result<bool, common::EngineError> {
-    let existed = engine.with_mut(
+    let existed = engine.with_mut_delta(
         &key,
-        |existing| -> Result<Option<bool>, common::EngineError> {
+        |existing| -> (Result<Option<bool>, common::EngineError>, isize) {
             match existing {
                 Some(Value::Hash(map)) => {
                     if map.contains_key(&field) {
-                        Ok(Some(false))
+                        (Ok(Some(false)), 0)
                     } else {
+                        let size_delta = field.len() as isize + val.len() as isize + 16;
                         map.insert(field.clone(), val.clone());
-                        Ok(Some(true))
+                        (Ok(Some(true)), size_delta)
                     }
                 }
-                Some(_) => Err(common::EngineError::WrongType),
-                None => Ok(None),
+                Some(_) => (Err(common::EngineError::WrongType), 0),
+                None => (Ok(None), 0),
             }
         },
     )?;
@@ -382,5 +403,79 @@ mod tests {
             hget(&engine, b"h", b"f").unwrap(),
             Some(Bytes::from_static(b"first"))
         );
+    }
+
+    /// `engine.memory_used()` after each mutation must equal independently recomputing the
+    /// entry's true size from scratch (`key.len() + Value::approx_size()`) -- proving the
+    /// delta each function reports (once converted to `with_mut_delta`) is exactly right, not
+    /// just "close enough." Written to pass against today's `with_mut`-based code too, since
+    /// this is a refactor, not a bug fix -- it stays green through every step below.
+    fn assert_memory_used_matches_recomputed_size(engine: &Engine, key: &[u8]) {
+        let value = engine.get(key).expect("key must exist");
+        let expected = key.len() + value.approx_size();
+        assert_eq!(engine.memory_used(), expected);
+    }
+
+    #[test]
+    fn hash_mutations_keep_memory_used_exactly_in_sync() {
+        let engine = Engine::new();
+        let key = Bytes::from_static(b"h");
+
+        // hset: new field
+        hset(
+            &engine,
+            key.clone(),
+            Bytes::from_static(b"f1"),
+            Bytes::from_static(b"v1"),
+        )
+        .unwrap();
+        assert_memory_used_matches_recomputed_size(&engine, &key);
+
+        // hset: overwrite an existing field with a longer value
+        hset(
+            &engine,
+            key.clone(),
+            Bytes::from_static(b"f1"),
+            Bytes::from_static(b"a-much-longer-value"),
+        )
+        .unwrap();
+        assert_memory_used_matches_recomputed_size(&engine, &key);
+
+        // hincrby: new field
+        hincrby(&engine, key.clone(), Bytes::from_static(b"counter"), 5).unwrap();
+        assert_memory_used_matches_recomputed_size(&engine, &key);
+
+        // hincrby: existing field, value grows from "5" to "15" (still 2 chars, but exercises
+        // the existing-field branch)
+        hincrby(&engine, key.clone(), Bytes::from_static(b"counter"), 10).unwrap();
+        assert_memory_used_matches_recomputed_size(&engine, &key);
+
+        // hsetnx: field absent, inserts
+        hsetnx(
+            &engine,
+            key.clone(),
+            Bytes::from_static(b"f2"),
+            Bytes::from_static(b"v2"),
+        )
+        .unwrap();
+        assert_memory_used_matches_recomputed_size(&engine, &key);
+
+        // hsetnx: field present, no-op
+        hsetnx(
+            &engine,
+            key.clone(),
+            Bytes::from_static(b"f2"),
+            Bytes::from_static(b"ignored"),
+        )
+        .unwrap();
+        assert_memory_used_matches_recomputed_size(&engine, &key);
+
+        // hdel: removes a field
+        hdel(&engine, &key, b"f2").unwrap();
+        assert_memory_used_matches_recomputed_size(&engine, &key);
+
+        // hdel: field already absent, no-op
+        hdel(&engine, &key, b"f2").unwrap();
+        assert_memory_used_matches_recomputed_size(&engine, &key);
     }
 }
