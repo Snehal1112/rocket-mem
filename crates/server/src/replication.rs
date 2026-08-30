@@ -1,6 +1,7 @@
 use engine::Engine;
+use futures_util::{SinkExt, StreamExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Holds one outbound channel per connected replica. `senders` is a plain `std::sync::Mutex`,
@@ -49,12 +50,7 @@ pub struct ReplicationHandle {
     /// sharing buys nothing.
     pub is_replica: AtomicBool,
     /// Follower side: the running `replication_client_loop`, if any — set and aborted by
-    /// `REPLICAOF`/`REPLICAOF NO ONE` in `05-replicaof-and-follower-apply-loop.md`. Not used
-    /// by this plan; present now so the struct's shape doesn't change again later.
-    /// `#[allow(dead_code)]`: write-only until `05-replicaof-and-follower-apply-loop.md` reads
-    /// it via `.lock()` in `start_replicating`/`stop_replicating` — same reasoning as the
-    /// engine crate's `pub mod commands` staying public ahead of Sprint 2's dispatcher.
-    #[allow(dead_code)]
+    /// `start_replicating`/`stop_replicating` below.
     follower_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// The engine this handle's leader-side `PSYNC` snapshots from and follower-side
     /// `replication_client_loop` applies into. An owned `Arc`, not a borrow: a spawned
@@ -64,6 +60,20 @@ pub struct ReplicationHandle {
     engine: Arc<Engine>,
     /// Where `SAVE` writes, from `ROCKET_MEM_SNAPSHOT_PATH`.
     snapshot_path: PathBuf,
+    /// Bumped under `follower_task`'s mutex every time `start_replicating`/`stop_replicating`
+    /// changes which task (if any) owns `follower_task`. A spawned task captures the
+    /// generation it was started with and checks it against this counter's live value before
+    /// applying any state. This closes a race `abort()` alone leaves open: `JoinHandle::abort`
+    /// only cancels at the task's *next* await point, so a task already mid-poll when abort()
+    /// is called can still finish that poll — e.g. complete a `read_exact` and go on to call
+    /// `load_snapshot`, clobbering a newer task's already-loaded state. `Arc` because a
+    /// spawned task is `'static` and needs its own handle to the shared counter, independent
+    /// of `self`. Note this check-then-act is still not fully atomic: a superseding task would
+    /// need to connect, `PSYNC`, and read a whole snapshot blob inside the few instructions
+    /// between a stale task's check and its `load_snapshot` call, which is not reachable in
+    /// practice — closing that theoretical residual would require taking `follower_task`'s
+    /// mutex around the apply itself, which isn't worth the added contention for this sprint.
+    generation: Arc<AtomicU64>,
 }
 
 impl ReplicationHandle {
@@ -74,6 +84,7 @@ impl ReplicationHandle {
             follower_task: Mutex::new(None),
             engine,
             snapshot_path,
+            generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -87,6 +98,42 @@ impl ReplicationHandle {
     pub fn snapshot_path(&self) -> &Path {
         &self.snapshot_path
     }
+
+    /// Cancels any currently-running replication task, then spawns a new one against
+    /// `host_port` and sets `is_replica`. The whole sequence — abort old, bump the generation,
+    /// spawn new, store, set the flag — happens under `follower_task`'s mutex, so two clients
+    /// issuing `REPLICAOF` concurrently can only serialize, never leave two apply loops racing
+    /// into the same `Engine`. Bumping the generation here (not just relying on `abort()`) is
+    /// what stops a stale task's already-in-flight poll from mutating state after this call
+    /// returns — see the `generation` field's doc comment.
+    pub fn start_replicating(&self, host_port: String) {
+        let mut task = self.follower_task.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(old) = task.take() {
+            old.abort();
+        }
+        let my_generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let engine = Arc::clone(&self.engine);
+        let generation = Arc::clone(&self.generation);
+        *task = Some(tokio::spawn(replication_client_loop(
+            host_port,
+            engine,
+            generation,
+            my_generation,
+        )));
+        self.is_replica.store(true, Ordering::Relaxed);
+    }
+
+    /// Cancels the running replication task (if any) and returns this node to normal,
+    /// writable operation. Also bumps the generation so a stale task's in-flight poll can no
+    /// longer apply state even when nothing new replaces it.
+    pub fn stop_replicating(&self) {
+        let mut task = self.follower_task.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(old) = task.take() {
+            old.abort();
+        }
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        self.is_replica.store(false, Ordering::Relaxed);
+    }
 }
 
 /// An idle handle: no replicas registered, not a replica, no follower task running, its own
@@ -98,6 +145,91 @@ impl Default for ReplicationHandle {
     fn default() -> Self {
         Self::new(Arc::new(Engine::new()), PathBuf::from("./dump.snapshot"))
     }
+}
+
+/// Connects to `host_port`, syncs, applies the leader's stream forever, and reconnects (after
+/// a fixed ~1s backoff) on any failure — including the leader simply closing the connection.
+/// There is no distinction between "first sync" and "resync after disconnect": both run this
+/// same loop body. `generation`/`my_generation` let this task detect it has been superseded by
+/// a later `start_replicating`/`stop_replicating` call and stop applying state — see
+/// `ReplicationHandle::generation`'s doc comment.
+async fn replication_client_loop(
+    host_port: String,
+    engine: Arc<Engine>,
+    generation: Arc<AtomicU64>,
+    my_generation: u64,
+) {
+    loop {
+        if generation.load(Ordering::SeqCst) != my_generation {
+            return; // superseded before even starting this iteration's sync
+        }
+        match sync_once(&host_port, &engine, &generation, my_generation).await {
+            Ok(()) => eprintln!("replication: connection to {host_port} closed; reconnecting"),
+            Err(e) => eprintln!("replication: lost connection to {host_port}: {e}; reconnecting"),
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+}
+
+/// One full sync: connect, `PSYNC`, load the snapshot, then apply every subsequent frame
+/// until the connection ends (cleanly or with an error). Never called `dispatch_and_log` —
+/// see this plan's Global Constraints. Checks `generation` against `my_generation` immediately
+/// before `load_snapshot` and before each `dispatch` call, bailing out the moment this task has
+/// been superseded rather than after a whole `sync_once` call — see
+/// `ReplicationHandle::generation`'s doc comment for why `abort()` alone isn't sufficient.
+async fn sync_once(
+    host_port: &str,
+    engine: &Engine,
+    generation: &AtomicU64,
+    my_generation: u64,
+) -> std::io::Result<()> {
+    let stream = tokio::net::TcpStream::connect(host_port).await?;
+    let mut framed = tokio_util::codec::Framed::new(stream, protocol::codec::RespCodec::default());
+    framed
+        .send(protocol::Frame::Array(vec![protocol::Frame::Bulk(
+            bytes::Bytes::from_static(b"PSYNC"),
+        )]))
+        .await?;
+
+    // Reclaim the raw socket to read the length-prefixed snapshot blob, which is NOT a RESP
+    // frame — decoding it through RespCodec would desync the stream entirely. `read_buf` is
+    // guaranteed empty here: this Framed has never had `next()`/`decode` called on it, only
+    // `send()`, so nothing has been read from the socket yet on the codec side.
+    let mut parts = framed.into_parts();
+    use tokio::io::AsyncReadExt;
+    let mut len_buf = [0u8; 8];
+    parts.io.read_exact(&mut len_buf).await?;
+    let len = u64::from_le_bytes(len_buf) as usize;
+    let mut blob = vec![0u8; len];
+    parts.io.read_exact(&mut blob).await?;
+
+    if generation.load(Ordering::SeqCst) != my_generation {
+        return Ok(()); // superseded while reading the blob -- do not clobber the newer task's state
+    }
+    engine
+        .load_snapshot(&blob)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+
+    // From here on the leader sends plain RESP frames, byte-for-byte what its own AOF
+    // received — rebuild a Framed over the same socket (whose read position is exactly past
+    // the blob) to resume decoding normally.
+    let mut framed = tokio_util::codec::Framed::from_parts(parts);
+    while let Some(result) = framed.next().await {
+        if generation.load(Ordering::SeqCst) != my_generation {
+            return Ok(()); // superseded -- stop applying frames to state a newer task now owns
+        }
+        let frame = result?;
+        let mut protocol = protocol::codec::Protocol::default();
+        let reply = crate::dispatcher::dispatch(engine, frame, &mut protocol, 0);
+        // A leader only ever fans out a command whose local execution already succeeded, so
+        // an error applying it here means the two sides have genuinely diverged (a bug, or
+        // version skew) — logged and skipped, not a reason to tear down and resync, which
+        // would just reproduce the same error against the same divergence.
+        if let protocol::Frame::Error(e) = reply {
+            eprintln!("replication: applying a replicated command failed: {e}");
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -171,5 +303,133 @@ mod tests {
     fn broadcast_with_no_registered_replicas_does_nothing() {
         let registry = ReplicaRegistry::default();
         registry.broadcast(bytes::Bytes::from_static(b"hello")); // must not panic
+    }
+
+    #[tokio::test]
+    async fn sync_once_loads_the_snapshot_then_applies_streamed_frames() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let fake_leader = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            // consume the PSYNC frame the follower sends: `*1\r\n$5\r\nPSYNC\r\n` is exactly 15 bytes
+            let mut psync_bytes = [0u8; 15];
+            socket.read_exact(&mut psync_bytes).await.unwrap();
+
+            let snapshot_engine = engine::Engine::new();
+            snapshot_engine.set(
+                bytes::Bytes::from_static(b"from-snapshot"),
+                engine::Value::String(bytes::Bytes::from_static(b"v")),
+            );
+            let blob = snapshot_engine.snapshot(0);
+            socket
+                .write_all(&(blob.len() as u64).to_le_bytes())
+                .await
+                .unwrap();
+            socket.write_all(&blob).await.unwrap();
+
+            socket
+                .write_all(b"*3\r\n$3\r\nSET\r\n$11\r\nfrom-stream\r\n$1\r\nv\r\n")
+                .await
+                .unwrap();
+            // keep the socket open long enough for the follower to read and apply that frame
+            // before this task (and its socket) drops
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        });
+
+        let engine = std::sync::Arc::new(engine::Engine::new());
+        let host_port = addr.to_string();
+        let generation = Arc::new(AtomicU64::new(0));
+        let sync_task = {
+            let engine = std::sync::Arc::clone(&engine);
+            let generation = Arc::clone(&generation);
+            tokio::spawn(async move { sync_once(&host_port, &engine, &generation, 0).await })
+        };
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        sync_task.abort();
+        fake_leader.await.unwrap();
+
+        assert_eq!(
+            engine.get(b"from-snapshot"),
+            Some(engine::Value::String(bytes::Bytes::from_static(b"v")))
+        );
+        assert_eq!(
+            engine.get(b"from-stream"),
+            Some(engine::Value::String(bytes::Bytes::from_static(b"v")))
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_once_does_not_load_the_snapshot_when_its_generation_is_already_stale() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let fake_leader = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut psync_bytes = [0u8; 15];
+            socket.read_exact(&mut psync_bytes).await.unwrap();
+
+            let snapshot_engine = engine::Engine::new();
+            snapshot_engine.set(
+                bytes::Bytes::from_static(b"from-snapshot"),
+                engine::Value::String(bytes::Bytes::from_static(b"v")),
+            );
+            let blob = snapshot_engine.snapshot(0);
+            socket
+                .write_all(&(blob.len() as u64).to_le_bytes())
+                .await
+                .unwrap();
+            socket.write_all(&blob).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        });
+
+        let engine = engine::Engine::new();
+        let host_port = addr.to_string();
+        // The shared counter is already ahead of the generation this call is running as --
+        // simulating a task that has been superseded by a newer start_replicating/
+        // stop_replicating call before it even finished reading the blob. Without the
+        // generation check, this would go on to call load_snapshot and clobber whatever a
+        // newer task has already loaded.
+        let generation = Arc::new(AtomicU64::new(1));
+        sync_once(&host_port, &engine, &generation, 0)
+            .await
+            .unwrap();
+        fake_leader.await.unwrap();
+
+        assert_eq!(engine.get(b"from-snapshot"), None); // stale task must not load its snapshot
+    }
+
+    #[tokio::test]
+    async fn start_replicating_sets_is_replica_and_stop_replicating_clears_it() {
+        let handle = ReplicationHandle::new(
+            std::sync::Arc::new(engine::Engine::new()),
+            "/tmp/unused.snapshot".into(),
+        );
+        assert!(!handle.is_replica.load(std::sync::atomic::Ordering::Relaxed));
+
+        // "127.0.0.1:1" is a real address nothing listens on — start_replicating doesn't wait
+        // for the connection to succeed, so this returns immediately regardless
+        handle.start_replicating("127.0.0.1:1".to_string());
+        assert!(handle.is_replica.load(std::sync::atomic::Ordering::Relaxed));
+
+        handle.stop_replicating();
+        assert!(!handle.is_replica.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn start_replicating_twice_cancels_the_first_task_before_starting_the_second() {
+        let handle = ReplicationHandle::new(
+            std::sync::Arc::new(engine::Engine::new()),
+            "/tmp/unused.snapshot".into(),
+        );
+        handle.start_replicating("127.0.0.1:1".to_string());
+        handle.start_replicating("127.0.0.1:2".to_string()); // must not panic or leave two tasks running
+        assert!(handle.is_replica.load(std::sync::atomic::Ordering::Relaxed));
+        handle.stop_replicating();
     }
 }
