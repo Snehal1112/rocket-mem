@@ -28,7 +28,7 @@
 - Consumes: nothing from other tasks in this plan.
 - Produces: `common::instant_from_unix_ms(i64) -> std::time::Instant` and `common::unix_ms_from_instant(std::time::Instant) -> i64`, both `pub`, both used by Task 4 below and (unchanged in behavior) by `dispatcher.rs`'s existing `EXPIREAT`/`PEXPIREAT` arm.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 // crates/common/src/lib.rs — add to the existing tests module
@@ -59,12 +59,12 @@ fn unix_ms_from_instant_of_a_past_instant_is_less_than_now() {
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p common`
 Expected: FAIL with "cannot find function `instant_from_unix_ms`/`unix_ms_from_instant` in this scope"
 
-- [ ] **Step 3: Move `instant_from_unix_ms` and add its inverse**
+- [x] **Step 3: Move `instant_from_unix_ms` and add its inverse**
 
 Delete the existing private function from `crates/server/src/dispatcher.rs:42-49` entirely, then add both functions to `crates/common/src/lib.rs`, above the existing `EngineError` enum:
 
@@ -113,12 +113,12 @@ match engine.expire_at(&rest[0], common::instant_from_unix_ms(target_unix_ms)) {
 
 `dispatcher.rs` already has `common` in scope as a dependency (see `crates/server/Cargo.toml`), so no new `Cargo.toml` edit is needed for this step.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p common && cargo test -p rocket-mem`
 Expected: PASS, including every existing `EXPIREAT`/`PEXPIREAT` dispatcher test (unchanged behavior, just relocated)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/common/src/lib.rs crates/server/src/dispatcher.rs
@@ -136,7 +136,7 @@ git commit -m "refactor(common): move Instant<->unix-ms conversion out of dispat
 - Consumes: `Entry` (private, unchanged), `entry_size` (private, unchanged).
 - Produces: `Shard::entries(&self) -> Vec<(Bytes, Value, Option<Instant>)>` and `Shard::clear(&self)`, both `pub`, both used by Task 3.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 // crates/engine/src/shard.rs — add to the existing tests module
@@ -178,12 +178,12 @@ fn clear_empties_the_map_and_resets_bytes_used() {
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p engine shard::tests`
 Expected: FAIL with "no method named `entries`/`clear` found for struct `Shard`"
 
-- [ ] **Step 3: Implement `entries`/`clear`**
+- [x] **Step 3: Implement `entries`/`clear`**
 
 Add both methods to `crates/engine/src/shard.rs`, next to the existing `keys` method:
 
@@ -211,12 +211,12 @@ pub fn clear(&self) {
 }
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p engine shard::tests`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/engine/src/shard.rs
@@ -234,7 +234,7 @@ git commit -m "feat(engine): add Shard::entries and Shard::clear"
 - Consumes: `Shard::entries`/`Shard::clear` (Task 2), `Store::set`/`Store::expire_at` (existing).
 - Produces: `Store::snapshot_entries(&self) -> Vec<(Bytes, Value, Option<Instant>)>` and `Store::load_snapshot_entries(&self, entries: Vec<(Bytes, Value, Option<Instant>)>)`, both `pub`, both used by Task 4.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 // crates/engine/src/store.rs — add to the existing tests module
@@ -269,12 +269,12 @@ fn load_snapshot_entries_replaces_existing_state_wholesale() {
 
 Note: `store.rs`'s existing tests module already imports `engine::TtlStatus` indirectly via `crate::engine::TtlStatus` — use whichever path the file's existing tests already use (check the top of `store.rs`'s `#[cfg(test)] mod tests` block before writing this).
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p engine store::tests`
 Expected: FAIL with "no method named `snapshot_entries`/`load_snapshot_entries` found for struct `Store`"
 
-- [ ] **Step 3: Implement `snapshot_entries`/`load_snapshot_entries`**
+- [x] **Step 3: Implement `snapshot_entries`/`load_snapshot_entries`**
 
 Add both methods to `crates/engine/src/store.rs`, next to the existing `keys` method:
 
@@ -304,12 +304,12 @@ pub fn load_snapshot_entries(&self, entries: Vec<(Bytes, Value, Option<std::time
 }
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p engine store::tests`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/engine/src/store.rs
@@ -330,7 +330,7 @@ git commit -m "feat(engine): add Store::snapshot_entries and load_snapshot_entri
 - Consumes: `common::instant_from_unix_ms`/`unix_ms_from_instant` (Task 1), `Store::snapshot_entries`/`load_snapshot_entries` (Task 3), `Value`/`SortedSet` (existing, `crates/engine/src/value.rs`).
 - Produces: `snapshot::serialize(store: &Store, aof_offset: u64) -> Vec<u8>`, `snapshot::deserialize(store: &Store, bytes: &[u8]) -> Result<u64, SnapshotError>`, both crate-private (`pub(crate)` visibility is implied by `snapshot` staying a non-`pub` module — see Task 5), used by Task 5. `SnapshotError` is `pub` and re-exported from `lib.rs` in Task 5.
 
-- [ ] **Step 1: Add the new dependencies**
+- [x] **Step 1: Add the new dependencies**
 
 ```toml
 # Cargo.toml (workspace root) — add to [workspace.dependencies]
@@ -351,7 +351,7 @@ bincode.workspace = true
 thiserror.workspace = true
 ```
 
-- [ ] **Step 2: Write the failing tests**
+- [x] **Step 2: Write the failing tests**
 
 ```rust
 // crates/engine/src/snapshot.rs — new file, tests module at the bottom
@@ -453,12 +453,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p engine snapshot::tests`
 Expected: FAIL with "module `snapshot` doesn't exist" — `crates/engine/src/snapshot.rs` isn't declared in `lib.rs` yet; the next step creates the file, and Task 5 wires the module declaration. For this step only, temporarily add `mod snapshot;` to the top of `crates/engine/src/lib.rs` so the test file compiles in isolation — Task 5's Step 3 replaces this with the real, permanent module declaration plus the `SnapshotError` re-export, so don't commit this temporary line.
 
-- [ ] **Step 3: Implement `snapshot.rs`**
+- [x] **Step 3: Implement `snapshot.rs`**
 
 ```rust
 // crates/engine/src/snapshot.rs
@@ -589,12 +589,12 @@ pub fn deserialize(store: &Store, bytes: &[u8]) -> Result<u64, SnapshotError> {
 
 `engine` doesn't yet depend on `common` — check `crates/engine/Cargo.toml`'s `[dependencies]` before this step; if `common` isn't listed, add `common = { path = "../common" }` alongside `serde`/`bincode`/`thiserror` from Step 1 above (it's likely already there, since `EngineError` — from `common` — is `engine`'s existing error type; confirm rather than assume).
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p engine snapshot::tests`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add Cargo.toml crates/engine/Cargo.toml crates/engine/src/snapshot.rs
@@ -613,7 +613,7 @@ git commit -m "feat(engine): add bincode-based snapshot serialization"
 - Consumes: `snapshot::serialize`/`deserialize` (Task 4).
 - Produces: `Engine::snapshot(&self, aof_offset: u64) -> Vec<u8>` and `Engine::load_snapshot(&self, bytes: &[u8]) -> Result<u64, SnapshotError>`, both `pub`, both consumed by `04-replica-registry-and-leader-fanout.md`'s `SAVE`/`PSYNC` handling and `02-hybrid-recovery-and-aof-offset.md`'s startup path. `SnapshotError` becomes reachable as `engine::SnapshotError`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 // crates/engine/src/engine.rs — add to the existing tests module
@@ -650,12 +650,12 @@ fn load_snapshot_bypasses_maxmemory_eviction_so_a_large_snapshot_loads_whole() {
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p engine engine::tests`
 Expected: FAIL with "no method named `snapshot`/`load_snapshot` found for struct `Engine`"
 
-- [ ] **Step 3: Implement, and wire the module**
+- [x] **Step 3: Implement, and wire the module**
 
 ```rust
 // crates/engine/src/engine.rs — add to impl Engine
@@ -692,17 +692,17 @@ pub use store::Store;
 pub use value::{SortedSet, Value};
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p engine`
 Expected: PASS, every test in the crate (this is the final step of the plan touching `engine`'s public surface, so a full-crate run is the right scope)
 
-- [ ] **Step 5: Verify the workspace-wide checks pass**
+- [x] **Step 5: Verify the workspace-wide checks pass**
 
 Run: `cargo build --workspace && cargo clippy --workspace -- -D warnings && cargo fmt --all -- --check`
 Expected: clean
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/engine/src/engine.rs crates/engine/src/lib.rs

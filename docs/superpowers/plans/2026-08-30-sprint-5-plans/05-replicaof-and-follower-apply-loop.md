@@ -27,7 +27,7 @@
 - Consumes: `Engine::load_snapshot` (`01-snapshot-serialization.md`), `dispatcher::dispatch` (existing), the leader-side `PSYNC` handling this connects to (`04-replica-registry-and-leader-fanout.md`).
 - Produces: `ReplicationHandle::start_replicating(&self, host_port: String)` and `ReplicationHandle::stop_replicating(&self)`, both `pub`, consumed by Task 2 below.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
 // crates/server/src/replication.rs — add to the existing tests module
@@ -107,12 +107,12 @@ async fn start_replicating_twice_cancels_the_first_task_before_starting_the_seco
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p rocket-mem replication::tests::sync_once replication::tests::start_replicating`
 Expected: FAIL — `sync_once`, `start_replicating`, `stop_replicating` don't exist yet
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 ```rust
 // crates/server/src/replication.rs — add near the bottom, above the tests module
@@ -208,12 +208,12 @@ async fn sync_once(host_port: &str, engine: &Engine) -> std::io::Result<()> {
 
 Add `use std::sync::Arc;` to `replication.rs`'s existing imports if not already present from earlier plans in this sprint.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p rocket-mem replication::tests`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/server/src/replication.rs
@@ -231,7 +231,7 @@ git commit -m "feat(server): add replication_client_loop and start/stop_replicat
 - Consumes: `ReplicationHandle::start_replicating`/`stop_replicating` (Task 1).
 - Produces: `REPLICAOF`/`REPLICAOF NO ONE` as working commands, reachable over RESP.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 // crates/server/src/dispatcher.rs — add to the existing tests module
@@ -295,12 +295,12 @@ fn replicaof_with_the_wrong_number_of_arguments_is_a_resp_error() {
 
 Note the first two tests are `#[tokio::test]`, not plain `#[test]` — `start_replicating` calls `tokio::spawn`, which panics outside a running runtime.
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p rocket-mem dispatcher::tests::replicaof`
 Expected: FAIL — `REPLICAOF` currently falls through to `dispatch`'s unknown-command path
 
-- [ ] **Step 3: Implement the interception**
+- [x] **Step 3: Implement the interception**
 
 Add to `dispatch_and_log`'s body, right after the existing `SAVE` interception from `03-replication-handle-and-save.md`:
 
@@ -349,12 +349,12 @@ fn handle_replicaof(frame: &Frame, replication: &crate::replication::Replication
 }
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p rocket-mem dispatcher::tests::replicaof`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/server/src/dispatcher.rs
@@ -372,7 +372,7 @@ git commit -m "feat(server): add REPLICAOF and REPLICAOF NO ONE"
 - Consumes: `ReplicationHandle::is_replica` (`03`), `extract_write_command_name` (existing), `crate::aof::WRITE_COMMANDS` (existing).
 - Produces: a write command from a normal client is rejected on a replica node; nothing new consumed by later plans.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 // crates/server/src/dispatcher.rs — add to the existing tests module
@@ -426,12 +426,12 @@ fn a_write_command_when_not_a_replica_is_unaffected() {
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p rocket-mem dispatcher::tests::a_write_command_on_a_replica dispatcher::tests::a_read_command_on_a_replica dispatcher::tests::save_is_not_gated`
 Expected: FAIL — `a_write_command_on_a_replica_is_rejected_with_readonly` fails because the write currently succeeds; the other two pass already (nothing gates them yet), which is expected and fine — they exist as regression guards for Step 3
 
-- [ ] **Step 3: Implement the gate**
+- [x] **Step 3: Implement the gate**
 
 Add at the very top of `dispatch_and_log`'s body, before the `SAVE`/`REPLICAOF` interceptions from `03`/this plan's Task 2:
 
@@ -468,17 +468,17 @@ pub fn dispatch_and_log(
 
 `Ordering::Relaxed` is deliberate: the flag guards nothing but itself, and a client whose write races the exact instant of a role change may legitimately land on either side of it — there's no stronger ordering requirement to uphold here.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p rocket-mem dispatcher::tests`
 Expected: PASS, every test in the module
 
-- [ ] **Step 5: Run the full workspace verification**
+- [x] **Step 5: Run the full workspace verification**
 
 Run: `cargo build --workspace && cargo clippy --workspace -- -D warnings && cargo fmt --all -- --check && cargo test --workspace`
 Expected: all clean/green
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/server/src/dispatcher.rs

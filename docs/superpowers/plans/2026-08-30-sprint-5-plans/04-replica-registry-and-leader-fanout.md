@@ -29,14 +29,14 @@
 - Consumes: nothing new.
 - Produces: `ReplicaRegistry::register(&self, sender: mpsc::UnboundedSender<Bytes>)` and `ReplicaRegistry::broadcast(&self, bytes: Bytes)`, both `pub`, consumed by Task 3 (fan-out hook) and Task 4 (`serve_replica`).
 
-- [ ] **Step 1: Enable tokio's `sync` feature**
+- [x] **Step 1: Enable tokio's `sync` feature**
 
 ```toml
 # Cargo.toml (workspace root) — add "sync" to tokio's existing feature list
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
 ```
 
-- [ ] **Step 2: Write the failing tests**
+- [x] **Step 2: Write the failing tests**
 
 ```rust
 // crates/server/src/replication.rs — add to the existing tests module
@@ -78,12 +78,12 @@ fn broadcast_with_no_registered_replicas_does_nothing() {
 }
 ```
 
-- [ ] **Step 3: Run the tests to verify they fail**
+- [x] **Step 3: Run the tests to verify they fail**
 
 Run: `cargo test -p rocket-mem replication::tests::broadcast`
 Expected: FAIL with "no field `senders`"/"no method named `register`/`broadcast`" — `ReplicaRegistry` is still the empty skeleton from `03-replication-handle-and-save.md`
 
-- [ ] **Step 4: Implement `register`/`broadcast`**
+- [x] **Step 4: Implement `register`/`broadcast`**
 
 ```rust
 // crates/server/src/replication.rs — replaces the `#[derive(Default)] pub struct ReplicaRegistry {}` skeleton
@@ -121,12 +121,12 @@ impl ReplicaRegistry {
 
 Both methods recover from a poisoned lock rather than propagate the panic — this mutex can be reached from arbitrary dispatch work (`dispatch_and_log`'s fan-out hook), so a panicking holder elsewhere in the process must not turn into a permanent, server-wide replication outage, matching `AofWriter::order`'s established convention (Sprint 4).
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [x] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo test -p rocket-mem replication::tests`
 Expected: PASS
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add Cargo.toml crates/server/src/replication.rs
@@ -144,7 +144,7 @@ git commit -m "feat(server): add ReplicaRegistry::register and broadcast"
 - Consumes: nothing new.
 - Produces: `pub fn encode_frame(frame: &Frame) -> std::io::Result<Vec<u8>>` (free function) and `AofWriter::append_encoded(&self, bytes: Vec<u8>) -> std::io::Result<()>`, both `pub`, consumed by Task 3.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 // crates/server/src/aof.rs — add to the existing tests module
@@ -175,12 +175,12 @@ fn append_still_produces_the_same_output_as_before_the_split() {
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p rocket-mem aof::tests::encode_frame aof::tests::append_encoded`
 Expected: FAIL with "cannot find function `encode_frame`"/"no method named `append_encoded`" — `append_still_produces_the_same_output_as_before_the_split` already passes against the current `append`, since it's not new behavior, only a regression guard for the refactor
 
-- [ ] **Step 3: Split `append`**
+- [x] **Step 3: Split `append`**
 
 Replace the existing `append` method with three pieces:
 
@@ -224,12 +224,12 @@ impl AofWriter {
 
 Fold this into the existing `impl AofWriter` block (don't create a second one) — the snippet above shows `append_encoded` and the new `append` body inside their own `impl` fence only for clarity in this plan; in the actual file, edit the existing single `impl AofWriter { ... }` block in place, and add the free `encode_frame` function outside it, near the top of the file below `WRITE_COMMANDS` (or any existing free-function location in the file — check `aof.rs`'s current layout before choosing a spot).
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p rocket-mem aof::tests`
 Expected: PASS, all of `aof.rs`'s tests including the 3 new ones and every pre-existing `append`-based test
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/server/src/aof.rs
@@ -247,7 +247,7 @@ git commit -m "refactor(server): split AofWriter::append into encode_frame + app
 - Consumes: `crate::aof::encode_frame`/`AofWriter::append_encoded` (Task 2), `ReplicaRegistry::broadcast` (Task 1, via `ReplicationHandle::registry`, already threaded through `dispatch_and_log` by `03-replication-handle-and-save.md`).
 - Produces: every write command a leader executes is fanned out to registered replicas; nothing new consumed by later tasks in this plan.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 // crates/server/src/dispatcher.rs — add to the existing tests module
@@ -305,12 +305,12 @@ fn dispatch_and_log_broadcasts_even_when_the_read_only_command_is_not_a_write() 
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p rocket-mem dispatcher::tests::dispatch_and_log_fans_out dispatcher::tests::dispatch_and_log_broadcasts`
 Expected: FAIL — `rx.try_recv()` finds nothing, since `dispatch_and_log` doesn't broadcast anything yet
 
-- [ ] **Step 3: Implement the fan-out hook**
+- [x] **Step 3: Implement the fan-out hook**
 
 Replace the existing `for frame_to_log in to_log { ... }` loop body (the one that currently only calls `aof.append(frame_to_log)`) with:
 
@@ -343,12 +343,12 @@ for frame_to_log in to_log {
 
 This whole loop still runs inside the existing `_order_guard` (from `extract_write_command_name`'s `lock_for_ordering()` acquisition earlier in the function, unchanged from Sprint 4) — nothing about the locking scope changes, only what happens inside it.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p rocket-mem dispatcher::tests`
 Expected: PASS, every test in the module including the 4 new ones
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/server/src/dispatcher.rs
@@ -366,7 +366,7 @@ git commit -m "feat(server): fan out write commands to registered replicas"
 - Consumes: `AofWriter::lock_for_ordering` (existing), `ReplicationHandle::engine`/`registry` (`03`), `Engine::snapshot` (`01`), `ReplicaRegistry::register` (Task 1).
 - Produces: `PSYNC` as a working leader-side handshake; consumed end-to-end by `05-replicaof-and-follower-apply-loop.md`'s follower and `06-replication-integration-tests.md`'s integration tests (neither of which this task's own unit tests can exercise alone, since a full round trip needs a real follower client — Task 4's own tests below cover the leader side in isolation).
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 // crates/server/src/connection.rs — add to the existing tests module
@@ -464,12 +464,12 @@ async fn a_registered_replica_is_pruned_after_its_connection_drops() {
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p rocket-mem connection::tests::psync connection::tests::a_registered_replica`
 Expected: FAIL — `PSYNC` currently falls through to `dispatch_and_log`'s unknown-command path, so no snapshot blob is ever sent and the test hangs on `read_exact` until it times out; if this happens, that confirms the pre-implementation failure mode rather than indicating a broken test
 
-- [ ] **Step 3: Implement `PSYNC` interception and `serve_replica`**
+- [x] **Step 3: Implement `PSYNC` interception and `serve_replica`**
 
 In `handle_connection`'s loop, intercept before dispatching:
 
@@ -551,17 +551,17 @@ async fn serve_replica(
 
 `Framed<tokio::net::TcpStream, RespCodec>` needs `tokio::net::TcpStream` in scope — `connection.rs` already imports it (`use tokio::net::TcpListener;` is present; add `use tokio::net::TcpStream;` alongside it if not already implicitly available via the existing `tokio::net::TcpStream` fully-qualified uses elsewhere in the file — check before assuming).
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p rocket-mem connection::tests`
 Expected: PASS, every test in the module including the 2 new ones
 
-- [ ] **Step 5: Run the full workspace verification**
+- [x] **Step 5: Run the full workspace verification**
 
 Run: `cargo build --workspace && cargo clippy --workspace -- -D warnings && cargo fmt --all -- --check && cargo test --workspace`
 Expected: all clean/green
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/server/src/connection.rs

@@ -26,7 +26,7 @@
 - Consumes: `AofWriter::fsync` (existing).
 - Produces: `AofWriter::current_offset(&self) -> std::io::Result<u64>`, `pub`, used by `03-replication-handle-and-save.md`'s `SAVE` interception.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
 // crates/server/src/aof.rs — add to the existing tests module
@@ -42,12 +42,12 @@ fn current_offset_matches_the_file_length_after_appends_land() {
 }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test -p rocket-mem aof::tests::current_offset`
 Expected: FAIL with "no method named `current_offset` found for struct `AofWriter`"
 
-- [ ] **Step 3: Add the stored `path` field and `current_offset`**
+- [x] **Step 3: Add the stored `path` field and `current_offset`**
 
 Add `use std::path::PathBuf;` to `aof.rs`'s imports (replacing/joining the existing `use std::path::Path;`), then add a `path` field to `AofWriter` and populate it in `open`:
 
@@ -82,12 +82,12 @@ pub fn current_offset(&self) -> std::io::Result<u64> {
 }
 ```
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
 Run: `cargo test -p rocket-mem aof::tests::current_offset`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/server/src/aof.rs
@@ -105,7 +105,7 @@ git commit -m "feat(server): add AofWriter::current_offset"
 - Consumes: nothing new.
 - Produces: `replay(path: &Path, engine: &engine::Engine, start_at: u64) -> std::io::Result<()>` (signature change — every existing call site updated in this task), used by Task 3 below.
 
-- [ ] **Step 1: Update the existing tests' call sites and write the new failing test**
+- [x] **Step 1: Update the existing tests' call sites and write the new failing test**
 
 `replay`'s 5 existing tests in `crates/server/src/aof.rs` (`replay_on_a_missing_file_is_a_no_op_not_an_error`, `replay_reconstructs_state_from_a_well_formed_aof`, `replay_recovers_every_valid_command_before_a_corrupt_tail_without_panicking`, `replay_truncates_the_corrupt_tail_off_the_file_on_disk`, `replay_on_a_fully_well_formed_file_does_not_truncate_anything`) each call `replay(&path, &engine)` — change every one of those five call sites to `replay(&path, &engine, 0)`. In `replay_truncates_the_corrupt_tail_off_the_file_on_disk`, there's a second `replay` call (`replay(&path, &engine2)`) after appending a new frame — update that one too, to `replay(&path, &engine2, 0)`.
 
@@ -159,12 +159,12 @@ fn replay_with_a_nonzero_start_at_still_truncates_a_corrupt_tail_from_the_true_e
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify the new ones fail**
+- [x] **Step 2: Run the tests to verify the new ones fail**
 
 Run: `cargo test -p rocket-mem aof::tests::replay`
 Expected: the three new tests FAIL (wrong number of arguments to `replay`); the five pre-existing ones also FAIL to compile until their call sites are updated per Step 1 above — make sure Step 1's edits are applied to all five before running this
 
-- [ ] **Step 3: Implement `start_at`**
+- [x] **Step 3: Implement `start_at`**
 
 ```rust
 // crates/server/src/aof.rs
@@ -211,12 +211,12 @@ pub fn replay(path: &Path, engine: &engine::Engine, start_at: u64) -> std::io::R
 
 The only change from the existing body: `start_at`'s clamped value seeds both the slice `buf` is built from and `valid_len`'s initial value (was `0`, now `start`) — the truncation math downstream is otherwise untouched, so it still measures corruption relative to the whole file, not relative to `start_at`.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p rocket-mem aof::tests`
 Expected: PASS, all of `aof.rs`'s tests including the 5 pre-existing `replay_*` ones and the 3 new ones
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/server/src/aof.rs
@@ -235,7 +235,7 @@ git commit -m "feat(server): add start_at to aof::replay for hybrid recovery"
 - Consumes: `Engine::snapshot`/`load_snapshot` (`01-snapshot-serialization.md`), `AofWriter::current_offset` (Task 1), `replay` with `start_at` (Task 2).
 - Produces: `recover(aof_path: &Path, snapshot_path: &Path) -> std::io::Result<engine::Engine>`, `pub`, called only from `main.rs`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 // crates/server/src/aof.rs — add to the existing tests module
@@ -313,12 +313,12 @@ fn recover_with_a_snapshot_whose_offset_overshoots_the_aof_discards_it_and_repla
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p rocket-mem aof::tests::recover`
 Expected: FAIL with "cannot find function `recover` in this scope"
 
-- [ ] **Step 3: Implement `recover`**
+- [x] **Step 3: Implement `recover`**
 
 ```rust
 // crates/server/src/aof.rs
@@ -365,12 +365,12 @@ pub fn recover(aof_path: &Path, snapshot_path: &Path) -> std::io::Result<engine:
 }
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p rocket-mem aof::tests`
 Expected: PASS, all of `aof.rs`'s tests
 
-- [ ] **Step 5: Rewrite `main.rs` to call `recover`**
+- [x] **Step 5: Rewrite `main.rs` to call `recover`**
 
 ```rust
 // crates/server/src/main.rs
@@ -407,12 +407,12 @@ async fn main() -> std::io::Result<()> {
 
 This drops the old two-line `replay(...)` + `println!("Replayed AOF from ...")` pair entirely — `recover` now owns both the loading and the log line's information (its own `eprintln!`s cover the fallback cases; this one `println!` covers the success path). `03-replication-handle-and-save.md` touches `main.rs` again to additionally construct a `ReplicationHandle` from this same `engine`/`snapshot_path`.
 
-- [ ] **Step 6: Run the full workspace verification**
+- [x] **Step 6: Run the full workspace verification**
 
 Run: `cargo build --workspace && cargo clippy --workspace -- -D warnings && cargo fmt --all -- --check && cargo test --workspace`
 Expected: all clean/green
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add crates/server/src/aof.rs crates/server/src/main.rs

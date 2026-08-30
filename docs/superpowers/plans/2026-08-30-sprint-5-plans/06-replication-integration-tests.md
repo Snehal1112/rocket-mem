@@ -27,7 +27,7 @@
 - Consumes: `rocket_mem::serve` (`03-replication-handle-and-save.md`'s signature), `rocket_mem::replication::ReplicationHandle` (`03`), `rocket_mem::aof::recover` (`02-hybrid-recovery-and-aof-offset.md`), `Engine::snapshot`/`load_snapshot` (`01-snapshot-serialization.md`), `AofWriter::current_offset` (`02`).
 - Produces: nothing consumed by other plans — this is a leaf, CI-facing test file, like Sprint 4's `08-kill-and-recover-tests.md`.
 
-- [ ] **Step 1: Write the tests**
+- [x] **Step 1: Write the tests**
 
 This plan adds no new production code — like Sprint 4's `08-kill-and-recover-tests.md`, it's a pure integration proof of what plans `01` through `05` already built, so there's no red-then-green cycle here, only a single confirming run once all three tests are written.
 
@@ -185,17 +185,17 @@ async fn a_follower_reconnects_and_resyncs_after_its_connection_drops() {
 }
 ```
 
-- [ ] **Step 2: Run the tests**
+- [x] **Step 2: Run the tests**
 
 Run: `cargo test -p rocket-mem --test replication`
 Expected: PASS, all 3 tests (the benchmark test's own `println!` output is only visible with `cargo test -p rocket-mem --test replication -- --nocapture`; that's expected, not a failure). If any test fails, one of `01`–`05` isn't fully wired into the real binary/library — stop and check those plans before continuing, per `superpowers:executing-plans`'s "stop when blocked" rule, rather than patching around it here.
 
-- [ ] **Step 3: Verify the workspace-wide checks pass**
+- [x] **Step 3: Verify the workspace-wide checks pass**
 
 Run: `cargo build --workspace && cargo clippy --workspace -- -D warnings && cargo fmt --all -- --check && cargo test --workspace`
 Expected: clean
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add crates/server/tests/replication.rs

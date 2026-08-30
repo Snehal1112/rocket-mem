@@ -28,7 +28,7 @@
 - Consumes: `engine::Engine` (existing).
 - Produces: `ReplicaRegistry` (skeleton — no `register`/`broadcast` yet, added in `04-replica-registry-and-leader-fanout.md`), `ReplicationHandle` with `pub registry: ReplicaRegistry`, `pub is_replica: AtomicBool`, `ReplicationHandle::new(engine: Arc<Engine>, snapshot_path: PathBuf) -> Self`, `ReplicationHandle::engine(&self) -> &Arc<Engine>`, `ReplicationHandle::snapshot_path(&self) -> &Path`, and `impl Default for ReplicationHandle`. All consumed by Task 2 below and by `04`/`05`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 // crates/server/src/replication.rs — new file, tests module at the bottom
@@ -64,12 +64,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p rocket-mem replication::tests`
 Expected: FAIL with "module `replication` doesn't exist" — the next step creates the file, and `lib.rs` gets updated after, matching Task 5's ordering pattern from `01-snapshot-serialization.md`. Temporarily add `pub mod replication;` to `crates/server/src/lib.rs` so this file compiles in isolation for this step; Step 3 below makes that permanent.
 
-- [ ] **Step 3: Implement `replication.rs`**
+- [x] **Step 3: Implement `replication.rs`**
 
 ```rust
 // crates/server/src/replication.rs
@@ -158,12 +158,12 @@ pub mod replication;
 pub use connection::serve;
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p rocket-mem replication::tests`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/server/src/replication.rs crates/server/src/lib.rs
@@ -184,7 +184,7 @@ git commit -m "feat(server): add ReplicationHandle and a ReplicaRegistry skeleto
 - Consumes: `ReplicationHandle` (Task 1).
 - Produces: `dispatch_and_log(engine: &Engine, aof: &AofWriter, replication: &ReplicationHandle, frame: Frame, protocol: &mut Protocol, client_id: u64) -> Frame`, `serve(listener: TcpListener, engine: Arc<Engine>, aof: Arc<AofWriter>, replication: Arc<ReplicationHandle>)` — both signature changes, consumed by every later plan in this sprint and by Task 3 below.
 
-- [ ] **Step 1: Update `dispatch_and_log`'s signature and every call site**
+- [x] **Step 1: Update `dispatch_and_log`'s signature and every call site**
 
 In `crates/server/src/dispatcher.rs`, add the new parameter (the function body is otherwise untouched by this step — Task 3 adds the `SAVE` check):
 
@@ -225,7 +225,7 @@ let reply = dispatch_and_log(
 
 Add `use crate::replication::ReplicationHandle;` to `dispatcher.rs`'s `#[cfg(test)] mod tests` imports (alongside its existing `use super::*;` and other test-only imports) so the unqualified name resolves.
 
-- [ ] **Step 2: Update `serve`/`handle_connection` and their call sites**
+- [x] **Step 2: Update `serve`/`handle_connection` and their call sites**
 
 In `crates/server/src/connection.rs`:
 
@@ -308,7 +308,7 @@ tokio::spawn(serve(listener, engine, aof));
 tokio::spawn(serve(listener, engine, aof, Arc::new(crate::replication::ReplicationHandle::default())));
 ```
 
-- [ ] **Step 3: Update `main.rs` and `tests/integration.rs`'s one `serve` call site**
+- [x] **Step 3: Update `main.rs` and `tests/integration.rs`'s one `serve` call site**
 
 ```rust
 // crates/server/src/main.rs — insert before the existing `let listener = ...` line
@@ -337,12 +337,12 @@ tokio::spawn(rocket_mem::serve(
 ));
 ```
 
-- [ ] **Step 4: Run the full test suite to verify every call site compiles and passes**
+- [x] **Step 4: Run the full test suite to verify every call site compiles and passes**
 
 Run: `cargo build --workspace && cargo test --workspace`
 Expected: PASS — this is a pure signature-threading change, so no test's assertions should need to change, only its call site
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/server/src/dispatcher.rs crates/server/src/connection.rs crates/server/src/main.rs crates/server/tests/integration.rs
@@ -360,7 +360,7 @@ git commit -m "refactor(server): thread ReplicationHandle through dispatch_and_l
 - Consumes: `AofWriter::lock_for_ordering`/`current_offset` (existing/`02`), `ReplicationHandle::engine`/`snapshot_path` (Task 1), `Engine::snapshot` (`01`).
 - Produces: `SAVE` as a working command, reachable over RESP; nothing new consumed by later tasks in this plan (Task 3 is this plan's last).
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 // crates/server/src/dispatcher.rs — add to the existing tests module
@@ -410,12 +410,12 @@ fn save_is_not_appended_to_the_aof() {
 
 Note `dispatch_and_log`'s first parameter is declared `engine: &Engine`; passing `&engine` where `engine: Arc<Engine>` works via deref coercion (`&Arc<Engine>` coerces to `&Engine` at a call site expecting the latter), so no `.as_ref()`/`&*engine` is needed.
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p rocket-mem dispatcher::tests::save`
 Expected: FAIL — `SAVE` currently falls through to `dispatch`'s unknown-command error path, so the reply won't be `Frame::Simple("OK")` and no snapshot file gets written
 
-- [ ] **Step 3: Implement the interception**
+- [x] **Step 3: Implement the interception**
 
 Add near the top of `dispatch_and_log`'s body, before the existing `let original_frame = frame.clone();` line:
 
@@ -503,17 +503,17 @@ fn write_snapshot_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::R
 
 Add `use crate::replication::ReplicationHandle;` to the non-test imports at the top of `dispatcher.rs` if `ReplicationHandle` isn't already reachable there as a fully-qualified path (Task 2 used `crate::replication::ReplicationHandle` inline in the signature, so this is optional — keep whichever style Task 2 already settled on for consistency within the file).
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p rocket-mem dispatcher::tests::save`
 Expected: PASS
 
-- [ ] **Step 5: Run the full workspace verification**
+- [x] **Step 5: Run the full workspace verification**
 
 Run: `cargo build --workspace && cargo clippy --workspace -- -D warnings && cargo fmt --all -- --check && cargo test --workspace`
 Expected: all clean/green
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/server/src/dispatcher.rs
