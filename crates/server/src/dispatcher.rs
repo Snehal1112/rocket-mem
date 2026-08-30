@@ -936,14 +936,72 @@ fn extract_write_command_name(frame: &Frame) -> Option<String> {
         .then_some(name)
 }
 
+fn is_save_command(frame: &Frame) -> bool {
+    let Frame::Array(items) = frame else {
+        return false;
+    };
+    let Some(Frame::Bulk(name)) = items.first() else {
+        return false;
+    };
+    name.eq_ignore_ascii_case(b"SAVE")
+}
+
+/// Snapshots `replication.engine()` — in production this is always the same `Arc<Engine>` as
+/// `dispatch_and_log`'s own `engine` parameter (`main.rs` constructs one `Engine`, shares it
+/// into both `serve`'s `engine` argument and `ReplicationHandle::new`), so using the handle's
+/// copy here matches the pattern `04-replica-registry-and-leader-fanout.md`'s `PSYNC` handling
+/// already uses (`replication.engine().snapshot(0)`) instead of introducing a second,
+/// redundant `&Engine` parameter that would always alias it anyway — and writes the result to
+/// `replication.snapshot_path()`.
+///
+/// Holds `aof.lock_for_ordering()` across the offset read and the snapshot walk/encode (never
+/// across the disk write) — see the sprint-5 spec's SAVE atomicity decision for why: without
+/// this, a write landing between `current_offset()` and the snapshot walk would be captured in
+/// both the snapshot and the AOF tail after the recorded offset, double-applying on a future
+/// hybrid recovery for any non-idempotent command like `RPUSH`.
+fn handle_save(
+    aof: &crate::aof::AofWriter,
+    replication: &crate::replication::ReplicationHandle,
+) -> Frame {
+    let bytes = {
+        let _order_guard = aof.lock_for_ordering();
+        let offset = match aof.current_offset() {
+            Ok(o) => o,
+            Err(e) => return Frame::Error(format!("ERR failed to read AOF offset: {e}")),
+        };
+        replication.engine().snapshot(offset)
+    };
+
+    match write_snapshot_atomically(replication.snapshot_path(), &bytes) {
+        Ok(()) => Frame::Simple("OK".into()),
+        Err(e) => Frame::Error(format!("ERR failed to write snapshot: {e}")),
+    }
+}
+
+/// Writes `bytes` to `<path>.tmp`, `sync_data`s it, then atomically renames it over `path`.
+/// Without this, a crash partway through a direct write to `path` leaves a truncated file at
+/// exactly the location startup will try to load next boot — `aof::recover` treats an
+/// unreadable snapshot as a safe fallback to full AOF replay, so this never corrupts recovery,
+/// but silently losing every snapshot on a crash defeats the feature's point.
+fn write_snapshot_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut tmp_os = path.as_os_str().to_owned();
+    tmp_os.push(".tmp");
+    let tmp_path = std::path::PathBuf::from(tmp_os);
+    {
+        let file = std::fs::File::create(&tmp_path)?;
+        let mut writer = std::io::BufWriter::new(file);
+        writer.write_all(bytes)?;
+        writer.flush()?;
+        writer.get_ref().sync_data()?;
+    }
+    std::fs::rename(&tmp_path, path)?;
+    Ok(())
+}
+
 /// Wraps `dispatch`, additionally appending successful write commands to `aof`. `dispatch`
 /// itself is never modified — see ../../docs/superpowers/specs/2026-08-30-sprint-4-spec.md
 /// for why AOF logging lives here instead of inside dispatch's own match arms.
-///
-/// `#[allow(unused_variables)]`: `replication` is threaded through by this plan's Task 2 but
-/// not read until Task 3 wires up `SAVE` interception — same reasoning as the engine crate's
-/// `pub mod commands` staying public ahead of Sprint 2's dispatcher.
-#[allow(unused_variables)]
 pub fn dispatch_and_log(
     engine: &Engine,
     aof: &crate::aof::AofWriter,
@@ -952,6 +1010,10 @@ pub fn dispatch_and_log(
     protocol: &mut Protocol,
     client_id: u64,
 ) -> Frame {
+    if is_save_command(&frame) {
+        return handle_save(aof, replication);
+    }
+
     let original_frame = frame.clone();
     let write_name = extract_write_command_name(&original_frame);
 
@@ -3818,5 +3880,139 @@ mod tests {
             ),
             Frame::Error("ERR unknown OBJECT subcommand 'NOPE'".into())
         );
+    }
+
+    #[test]
+    fn save_writes_a_snapshot_that_load_snapshot_can_read_back() {
+        let engine = std::sync::Arc::new(Engine::new());
+        dispatch(
+            &engine,
+            cmd(&[b"SET", b"k", b"v"]),
+            &mut Protocol::default(),
+            1,
+        );
+        let (dir, aof) = test_aof();
+        let snapshot_path = dir.path().join("test.snapshot");
+        let replication =
+            ReplicationHandle::new(std::sync::Arc::clone(&engine), snapshot_path.clone());
+
+        let reply = dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"SAVE"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(reply, Frame::Simple("OK".into()));
+
+        let bytes = std::fs::read(&snapshot_path).unwrap();
+        let loaded = Engine::new();
+        loaded.load_snapshot(&bytes).unwrap();
+        assert_eq!(
+            loaded.get(b"k"),
+            Some(Value::String(Bytes::from_static(b"v")))
+        );
+    }
+
+    #[test]
+    fn save_does_not_leave_a_tmp_file_behind_on_success() {
+        let engine = std::sync::Arc::new(Engine::new());
+        let (dir, aof) = test_aof();
+        let snapshot_path = dir.path().join("test.snapshot");
+        let replication =
+            ReplicationHandle::new(std::sync::Arc::clone(&engine), snapshot_path.clone());
+
+        dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"SAVE"]),
+            &mut Protocol::default(),
+            1,
+        );
+
+        let mut tmp = snapshot_path.clone().into_os_string();
+        tmp.push(".tmp");
+        assert!(!std::path::Path::new(&tmp).exists());
+    }
+
+    #[test]
+    fn save_is_not_appended_to_the_aof() {
+        let engine = std::sync::Arc::new(Engine::new());
+        let (dir, aof) = test_aof();
+        let snapshot_path = dir.path().join("test.snapshot");
+        let replication = ReplicationHandle::new(std::sync::Arc::clone(&engine), snapshot_path);
+
+        dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"SAVE"]),
+            &mut Protocol::default(),
+            1,
+        );
+        aof.fsync().unwrap();
+        assert_eq!(read_aof(&dir), ""); // SAVE has nothing to replay -- it must not appear in the AOF
+    }
+
+    #[test]
+    fn save_holds_the_ordering_lock_across_the_offset_read_and_the_snapshot_walk() {
+        // Proves the lock is load-bearing, not just present. Without it, a concurrent RPUSH
+        // can land between SAVE's offset read and its snapshot walk, so that push is captured
+        // in BOTH the snapshot AND the AOF tail after the recorded offset -- a hybrid recovery
+        // then replays it a second time, corrupting the list with a duplicate element. RPUSH
+        // is used (not e.g. SET) because replaying it twice is observably wrong, unlike an
+        // idempotent command.
+        const PUSHES: usize = 2000;
+
+        let engine = std::sync::Arc::new(Engine::new());
+        let dir = tempfile::tempdir().unwrap();
+        let aof_path = dir.path().join("test.aof");
+        let aof = std::sync::Arc::new(AofWriter::open(&aof_path, FsyncPolicy::Never).unwrap());
+        let snapshot_path = dir.path().join("test.snapshot");
+        let replication = std::sync::Arc::new(ReplicationHandle::new(
+            std::sync::Arc::clone(&engine),
+            snapshot_path.clone(),
+        ));
+
+        let pusher = {
+            let engine = std::sync::Arc::clone(&engine);
+            let aof = std::sync::Arc::clone(&aof);
+            let replication = std::sync::Arc::clone(&replication);
+            std::thread::spawn(move || {
+                for _ in 0..PUSHES {
+                    dispatch_and_log(
+                        &engine,
+                        &aof,
+                        &replication,
+                        cmd(&[b"RPUSH", b"list", b"x"]),
+                        &mut Protocol::default(),
+                        1,
+                    );
+                }
+            })
+        };
+
+        // Issued concurrently with the pusher thread above, not after joining it.
+        let reply = dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"SAVE"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(reply, Frame::Simple("OK".into()));
+
+        pusher.join().unwrap();
+        aof.fsync().unwrap();
+
+        let recovered = crate::aof::recover(&aof_path, &snapshot_path).unwrap();
+        let len = match recovered.get(b"list") {
+            Some(Value::List(l)) => l.len(),
+            other => panic!("expected a List with {PUSHES} elements, got {other:?}"),
+        };
+        assert_eq!(len, PUSHES); // a lost guard shows up here as a duplicated element
     }
 }
