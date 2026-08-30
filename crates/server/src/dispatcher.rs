@@ -514,6 +514,27 @@ pub fn dispatch(engine: &Engine, frame: Frame, protocol: &mut Protocol, client_i
                 Err(e) => engine_error_to_frame(e),
             }
         }
+        "SSCAN" => {
+            require_args!(rest, 2, "sscan");
+            // No MATCH/COUNT support yet, matching HSCAN's current scope. A set already lives
+            // fully in memory (SMEMBERS reads it all in one shot), so like HSCAN there's no
+            // chunking to design here -- one call always returns everything and reports cursor
+            // "0" (done), which is a legitimate SCAN-family reply.
+            if std::str::from_utf8(&rest[1])
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .is_none()
+            {
+                return Frame::Error("ERR invalid cursor".into());
+            }
+            match commands::set::smembers(engine, &rest[0]) {
+                Ok(members) => Frame::Array(vec![
+                    Frame::Bulk(Bytes::from_static(b"0")),
+                    Frame::Array(members.into_iter().map(Frame::Bulk).collect()),
+                ]),
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
         "SISMEMBER" => {
             require_args!(rest, 2, "sismember");
             match commands::set::sismember(engine, &rest[0], &rest[1]) {
@@ -2470,6 +2491,86 @@ mod tests {
             dispatch(
                 &engine,
                 cmd(&[b"HSCAN", b"k", b"0"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Error(
+                "WRONGTYPE Operation against a key holding the wrong kind of value".into()
+            )
+        );
+    }
+
+    #[test]
+    fn sscan_returns_all_members_in_one_call_with_a_done_cursor() {
+        let engine = Engine::new();
+        dispatch(
+            &engine,
+            cmd(&[b"SADD", b"myset", b"a", b"b"]),
+            &mut Protocol::default(),
+            1,
+        );
+        let reply = dispatch(
+            &engine,
+            cmd(&[b"SSCAN", b"myset", b"0"]),
+            &mut Protocol::default(),
+            1,
+        );
+        let Frame::Array(parts) = reply else {
+            panic!("expected Array")
+        };
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0], Frame::Bulk(Bytes::from_static(b"0")));
+        let Frame::Array(members) = &parts[1] else {
+            panic!("expected Array of members")
+        };
+        assert_eq!(members.len(), 2);
+    }
+
+    #[test]
+    fn sscan_on_missing_key_returns_an_empty_array_not_an_error() {
+        let engine = Engine::new();
+        let reply = dispatch(
+            &engine,
+            cmd(&[b"SSCAN", b"missing", b"0"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(
+            reply,
+            Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"0")),
+                Frame::Array(vec![])
+            ])
+        );
+    }
+
+    #[test]
+    fn sscan_with_a_non_numeric_cursor_is_a_resp_error() {
+        let engine = Engine::new();
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"SSCAN", b"myset", b"notacursor"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Error("ERR invalid cursor".into())
+        );
+    }
+
+    #[test]
+    fn sscan_on_a_string_key_returns_wrongtype() {
+        let engine = Engine::new();
+        dispatch(
+            &engine,
+            cmd(&[b"SET", b"k", b"v"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"SSCAN", b"k", b"0"]),
                 &mut Protocol::default(),
                 1
             ),
