@@ -107,6 +107,29 @@ impl Shard {
             .collect()
     }
 
+    /// A full, point-in-time (per this one shard) projection of every unexpired entry — the
+    /// building block `Store::snapshot_entries` flat-maps across all 16 shards. `Entry` itself
+    /// never escapes this module; only this `(key, value, expiry)` tuple does.
+    #[allow(dead_code)]
+    pub fn entries(&self) -> Vec<(Bytes, Value, Option<Instant>)> {
+        self.map
+            .read()
+            .iter()
+            .filter(|(_, entry)| !entry.is_expired())
+            .map(|(k, entry)| (k.clone(), entry.value.clone(), entry.expires_at))
+            .collect()
+    }
+
+    /// Empties this shard entirely and resets its byte accounting to zero — used by
+    /// `Store::load_snapshot_entries` to fully replace a shard's contents rather than merge
+    /// into them. `bytes_used` must be reset here, not left for the caller to reconcile,
+    /// or `MAXMEMORY` accounting would silently overcount every key this call removed.
+    #[allow(dead_code)]
+    pub fn clear(&self) {
+        self.map.write().clear();
+        self.bytes_used.store(0, Ordering::Relaxed);
+    }
+
     pub fn expire_at(&self, key: &[u8], at: Instant) -> bool {
         let mut guard = self.map.write();
         match guard.get_mut(key) {
@@ -600,5 +623,65 @@ mod tests {
             &clock,
         );
         assert!(shard.bytes_used() > before);
+    }
+
+    #[test]
+    fn entries_returns_every_unexpired_key_value_and_expiry() {
+        let shard = Shard::new();
+        let clock = AtomicU64::new(0);
+        shard.set(
+            Bytes::from_static(b"a"),
+            Value::String(Bytes::from_static(b"1")),
+            &clock,
+        );
+        shard.set(
+            Bytes::from_static(b"b"),
+            Value::String(Bytes::from_static(b"2")),
+            &clock,
+        );
+        let at = Instant::now() + std::time::Duration::from_secs(60);
+        shard.expire_at(b"b", at);
+
+        let mut got = shard.entries();
+        got.sort_by(|x, y| x.0.cmp(&y.0));
+        assert_eq!(
+            got[0],
+            (
+                Bytes::from_static(b"a"),
+                Value::String(Bytes::from_static(b"1")),
+                None
+            )
+        );
+        assert_eq!(got[1].0, Bytes::from_static(b"b"));
+        assert_eq!(got[1].1, Value::String(Bytes::from_static(b"2")));
+        assert_eq!(got[1].2, Some(at));
+    }
+
+    #[test]
+    fn entries_excludes_expired_keys() {
+        let shard = Shard::new();
+        let clock = AtomicU64::new(0);
+        shard.set(
+            Bytes::from_static(b"a"),
+            Value::String(Bytes::from_static(b"1")),
+            &clock,
+        );
+        shard.expire_at(b"a", Instant::now() - std::time::Duration::from_secs(1));
+        assert!(shard.entries().is_empty());
+    }
+
+    #[test]
+    fn clear_empties_the_map_and_resets_bytes_used() {
+        let shard = Shard::new();
+        let clock = AtomicU64::new(0);
+        shard.set(
+            Bytes::from_static(b"a"),
+            Value::String(Bytes::from_static(b"1")),
+            &clock,
+        );
+        assert!(shard.bytes_used() > 0);
+        shard.clear();
+        assert_eq!(shard.bytes_used(), 0);
+        assert!(shard.entries().is_empty());
     }
 }
