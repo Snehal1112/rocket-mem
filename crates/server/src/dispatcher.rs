@@ -946,6 +946,43 @@ fn is_save_command(frame: &Frame) -> bool {
     name.eq_ignore_ascii_case(b"SAVE")
 }
 
+/// Returns `Some(reply)` if `frame` was `REPLICAOF` (in either form) — handled entirely here,
+/// never reaching `dispatch` — or `None` if `frame` was some other command, in which case the
+/// caller falls through to its normal handling.
+fn handle_replicaof(
+    frame: &Frame,
+    replication: &crate::replication::ReplicationHandle,
+) -> Option<Frame> {
+    let Frame::Array(items) = frame else {
+        return None;
+    };
+    let Some(Frame::Bulk(name)) = items.first() else {
+        return None;
+    };
+    if !name.eq_ignore_ascii_case(b"REPLICAOF") {
+        return None;
+    }
+    if items.len() != 3 {
+        return Some(Frame::Error(
+            "ERR wrong number of arguments for 'replicaof' command".into(),
+        ));
+    }
+    let (Frame::Bulk(a), Frame::Bulk(b)) = (&items[1], &items[2]) else {
+        return Some(Frame::Error(
+            "ERR wrong number of arguments for 'replicaof' command".into(),
+        ));
+    };
+
+    if a.eq_ignore_ascii_case(b"NO") && b.eq_ignore_ascii_case(b"ONE") {
+        replication.stop_replicating();
+    } else {
+        let host = String::from_utf8_lossy(a);
+        let port = String::from_utf8_lossy(b);
+        replication.start_replicating(format!("{host}:{port}"));
+    }
+    Some(Frame::Simple("OK".into()))
+}
+
 /// Snapshots `replication.engine()` — in production this is always the same `Arc<Engine>` as
 /// `dispatch_and_log`'s own `engine` parameter (`main.rs` constructs one `Engine`, shares it
 /// into both `serve`'s `engine` argument and `ReplicationHandle::new`), so using the handle's
@@ -1012,6 +1049,9 @@ pub fn dispatch_and_log(
 ) -> Frame {
     if is_save_command(&frame) {
         return handle_save(aof, replication);
+    }
+    if let Some(reply) = handle_replicaof(&frame, replication) {
+        return reply;
     }
 
     let original_frame = frame.clone();
@@ -4175,5 +4215,75 @@ mod tests {
             other => panic!("expected a List with {PUSHES} elements, got {other:?}"),
         };
         assert_eq!(len, PUSHES); // a lost guard shows up here as a duplicated element
+    }
+
+    #[tokio::test]
+    async fn replicaof_with_host_and_port_returns_ok_and_marks_the_node_a_replica() {
+        let engine = std::sync::Arc::new(Engine::new());
+        let (_dir, aof) = test_aof();
+        let replication = ReplicationHandle::new(
+            std::sync::Arc::clone(&engine),
+            "/tmp/unused.snapshot".into(),
+        );
+
+        let reply = dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"REPLICAOF", b"127.0.0.1", b"1"]), // port 1: nothing listens there, connection attempt fails harmlessly in the background
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(reply, Frame::Simple("OK".into()));
+        assert!(replication
+            .is_replica
+            .load(std::sync::atomic::Ordering::Relaxed));
+        replication.stop_replicating(); // clean up the background task this test started
+    }
+
+    #[tokio::test]
+    async fn replicaof_no_one_returns_ok_and_clears_replica_status() {
+        let engine = std::sync::Arc::new(Engine::new());
+        let (_dir, aof) = test_aof();
+        let replication = ReplicationHandle::new(
+            std::sync::Arc::clone(&engine),
+            "/tmp/unused.snapshot".into(),
+        );
+        replication.start_replicating("127.0.0.1:1".to_string());
+
+        let reply = dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"REPLICAOF", b"NO", b"ONE"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(reply, Frame::Simple("OK".into()));
+        assert!(!replication
+            .is_replica
+            .load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn replicaof_with_the_wrong_number_of_arguments_is_a_resp_error() {
+        let engine = std::sync::Arc::new(Engine::new());
+        let (_dir, aof) = test_aof();
+        let replication = ReplicationHandle::new(
+            std::sync::Arc::clone(&engine),
+            "/tmp/unused.snapshot".into(),
+        );
+        let reply = dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"REPLICAOF", b"onlyhost"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(
+            reply,
+            Frame::Error("ERR wrong number of arguments for 'replicaof' command".into())
+        );
     }
 }
