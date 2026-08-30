@@ -30,10 +30,10 @@ fn missing_key_reads_return_empty_or_none_not_errors() {
 fn deleting_a_missing_key_reports_false_not_an_error() {
     let engine = Engine::new();
     assert!(!engine.del(b"missing"));
-    assert_eq!(hash::hdel(&engine, b"missing", b"f").unwrap(), false);
+    assert!(!hash::hdel(&engine, b"missing", b"f").unwrap());
     assert_eq!(
         set::srem(&engine, b"missing", &[Bytes::from_static(b"m")]).unwrap(),
         0
     );
-    assert_eq!(sorted_set::zrem(&engine, b"missing", b"m").unwrap(), false);
+    assert!(!sorted_set::zrem(&engine, b"missing", b"m").unwrap());
 }
