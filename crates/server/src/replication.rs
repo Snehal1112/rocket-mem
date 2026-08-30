@@ -3,19 +3,44 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
-/// A skeleton for now — holds nothing yet. `04-replica-registry-and-leader-fanout.md` adds the
-/// actual `Mutex<Vec<mpsc::UnboundedSender<Bytes>>>` field plus `register`/`broadcast`. It
-/// exists this early only so `ReplicationHandle` below has something concrete to name.
+/// Holds one outbound channel per connected replica. `senders` is a plain `std::sync::Mutex`,
+/// not `tokio::sync::Mutex`: every access is a quick, synchronous push/retain, never held
+/// across an `.await`, so the lighter std lock is the right tool — matching `AofWriter::order`'s
+/// existing choice for the same reason.
 #[derive(Default)]
-pub struct ReplicaRegistry {}
+pub struct ReplicaRegistry {
+    senders: std::sync::Mutex<Vec<tokio::sync::mpsc::UnboundedSender<bytes::Bytes>>>,
+}
+
+impl ReplicaRegistry {
+    /// Registers a newly-synced replica's outbound channel. Called only from `serve_replica`
+    /// (Task 4), while it still holds `AofWriter::lock_for_ordering()` — see this plan's
+    /// Global Constraints for why registration must happen inside that same critical section
+    /// as the snapshot walk, not after it.
+    pub fn register(&self, sender: tokio::sync::mpsc::UnboundedSender<bytes::Bytes>) {
+        self.senders
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(sender);
+    }
+
+    /// Fans `bytes` out to every registered replica, pruning any whose receiver has been
+    /// dropped (the replica connection died). Never itself returns an error: a delivery
+    /// failure to one dead replica must not affect delivery to the others, and must never
+    /// roll back the write that already committed on the leader.
+    pub fn broadcast(&self, bytes: bytes::Bytes) {
+        let mut senders = self.senders.lock().unwrap_or_else(|e| e.into_inner());
+        senders.retain(|tx| tx.send(bytes.clone()).is_ok());
+    }
+}
 
 /// Threads leader/follower replication state through `dispatch_and_log` without adding a
 /// parameter to plain `dispatch` — see the sprint-5 spec's `ReplicationHandle` decision for
 /// why `dispatch`'s ~250 call sites must stay untouched.
 pub struct ReplicationHandle {
-    /// Leader side: connected replicas to fan writes out to. Empty until
-    /// `04-replica-registry-and-leader-fanout.md` gives `ReplicaRegistry` a `register` method
-    /// for `PSYNC` handling to call.
+    /// Leader side: connected replicas to fan writes out to. Empty until `serve_replica`
+    /// (`04-replica-registry-and-leader-fanout.md`, Task 4) calls `ReplicaRegistry::register`
+    /// during `PSYNC` handling.
     pub registry: ReplicaRegistry,
     /// Follower side: gates client-originated writes once this node is replicating from a
     /// leader. Read by `dispatch_and_log`'s `-READONLY` check, added in
@@ -109,5 +134,42 @@ mod tests {
     fn default_is_idle_with_no_replicas_and_is_not_a_replica() {
         let h = ReplicationHandle::default();
         assert!(!h.is_replica.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn broadcast_delivers_to_every_registered_sender() {
+        let registry = ReplicaRegistry::default();
+        let (tx1, mut rx1) = tokio::sync::mpsc::unbounded_channel();
+        let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+        registry.register(tx1);
+        registry.register(tx2);
+
+        registry.broadcast(bytes::Bytes::from_static(b"hello"));
+
+        assert_eq!(rx1.try_recv().unwrap().as_ref(), b"hello");
+        assert_eq!(rx2.try_recv().unwrap().as_ref(), b"hello");
+    }
+
+    #[test]
+    fn broadcast_prunes_a_sender_whose_receiver_was_dropped() {
+        let registry = ReplicaRegistry::default();
+        let (tx1, rx1) = tokio::sync::mpsc::unbounded_channel();
+        drop(rx1); // simulate a dead replica connection
+        let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+        registry.register(tx1);
+        registry.register(tx2);
+
+        registry.broadcast(bytes::Bytes::from_static(b"a"));
+        registry.broadcast(bytes::Bytes::from_static(b"b")); // the dead sender must be pruned by now
+
+        // rx2 saw both broadcasts; nothing panicked or errored over rx1's drop
+        assert_eq!(rx2.try_recv().unwrap().as_ref(), b"a");
+        assert_eq!(rx2.try_recv().unwrap().as_ref(), b"b");
+    }
+
+    #[test]
+    fn broadcast_with_no_registered_replicas_does_nothing() {
+        let registry = ReplicaRegistry::default();
+        registry.broadcast(bytes::Bytes::from_static(b"hello")); // must not panic
     }
 }
