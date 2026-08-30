@@ -2,6 +2,8 @@ use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
+    let metrics_handle = rocket_mem::metrics::recorder_handle();
+
     let addr = std::env::var("ROCKET_MEM_ADDR").unwrap_or_else(|_| "127.0.0.1:6379".to_string());
     let aof_path =
         std::env::var("ROCKET_MEM_AOF_PATH").unwrap_or_else(|_| "./appendonly.aof".to_string());
@@ -70,6 +72,20 @@ async fn main() -> std::io::Result<()> {
         handle = handle.with_cluster(cluster);
     }
     let replication = Arc::new(handle);
+
+    let metrics_addr =
+        std::env::var("ROCKET_MEM_METRICS_ADDR").unwrap_or_else(|_| "127.0.0.1:9121".to_string());
+    let metrics_listener = tokio::net::TcpListener::bind(&metrics_addr).await?;
+    println!(
+        "Metrics on http://{}/metrics",
+        metrics_listener.local_addr()?
+    );
+    tokio::spawn(rocket_mem::metrics::serve_metrics(
+        metrics_listener,
+        metrics_handle,
+        Arc::clone(&engine),
+        Arc::clone(&replication),
+    ));
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     println!("Listening on {}", listener.local_addr()?);
