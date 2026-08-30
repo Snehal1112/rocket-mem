@@ -223,7 +223,7 @@ pub fn dispatch(engine: &Engine, frame: Frame, protocol: &mut Protocol, client_i
                 return Frame::Error("ERR wrong number of arguments for 'hset' command".into());
             }
             let mut added = 0i64;
-            for pair in pairs.chunks_exact(2) {
+            for pair in pairs.as_chunks::<2>().0 {
                 match commands::hash::hset(
                     engine,
                     rest[0].clone(),
