@@ -1646,6 +1646,21 @@ fn command_name_upper(frame: &Frame) -> String {
     String::from_utf8_lossy(name).to_ascii_uppercase()
 }
 
+/// The command's first argument (cloned -- one `Bytes` refcount bump, no data copy) and how many
+/// arguments followed the name. Read before `frame` is moved into `dispatch_and_log_inner`,
+/// because `dispatch` consumes the frame; see this plan's Global Constraints for why the slow log
+/// carries this instead of the whole argument list.
+fn command_key_and_arity(frame: &Frame) -> (Option<Bytes>, usize) {
+    let Frame::Array(items) = frame else {
+        return (None, 0);
+    };
+    let key = match items.get(1) {
+        Some(Frame::Bulk(b)) => Some(b.clone()),
+        _ => None,
+    };
+    (key, items.len().saturating_sub(1))
+}
+
 /// The `cmd` label value for a command name: its lowercase form if we know the command, the
 /// literal `other` otherwise. The `other` fallback is what bounds Prometheus label cardinality --
 /// without it, a client sending random command names could create unbounded series.
@@ -1676,6 +1691,7 @@ pub fn dispatch_and_log(
     client_id: u64,
 ) -> Frame {
     let name = command_name_upper(&frame); // read before `frame` is moved into the inner call
+    let (first_key, arg_count) = command_key_and_arity(&frame);
     let label = metric_label(&name);
     let started = std::time::Instant::now();
 
@@ -1689,6 +1705,9 @@ pub fn dispatch_and_log(
     if matches!(reply, Frame::Error(_)) {
         ::metrics::counter!("rocket_mem_command_errors_total", "cmd" => label).increment(1);
     }
+    replication
+        .slowlog
+        .maybe_record(&name, first_key, arg_count, elapsed);
     reply
 }
 
@@ -2000,6 +2019,62 @@ mod tests {
         assert_eq!(command_name_upper(&cmd(&[b"SeT", b"k", b"v"])), "SET");
         assert_eq!(command_name_upper(&Frame::Simple("nope".into())), "");
         assert_eq!(command_name_upper(&Frame::Array(vec![])), "");
+    }
+
+    /// A handle whose slow-log threshold is 1ns, so every command qualifies. Nothing else about
+    /// it differs from `ReplicationHandle::default()`.
+    fn slowlog_handle() -> ReplicationHandle {
+        ReplicationHandle::default().with_slowlog_threshold(std::time::Duration::from_nanos(1))
+    }
+
+    #[test]
+    fn command_key_and_arity_reads_the_first_argument_and_the_count() {
+        assert_eq!(
+            command_key_and_arity(&cmd(&[b"SET", b"k", b"v"])),
+            (Some(Bytes::from_static(b"k")), 2)
+        );
+        assert_eq!(command_key_and_arity(&cmd(&[b"PING"])), (None, 0));
+        assert_eq!(
+            command_key_and_arity(&cmd(&[b"LRANGE", b"mylist", b"0", b"-1"])),
+            (Some(Bytes::from_static(b"mylist")), 3)
+        );
+        assert_eq!(command_key_and_arity(&Frame::Simple("x".into())), (None, 0));
+    }
+
+    #[test]
+    fn a_slow_command_is_recorded_with_its_name_key_and_arity() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let replication = slowlog_handle();
+        dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"SET", b"k", b"v"]),
+            &mut Protocol::default(),
+            1,
+        );
+        let entries = replication.slowlog.get(10);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].command, "SET");
+        assert_eq!(entries[0].key, Some(Bytes::from_static(b"k")));
+        assert_eq!(entries[0].arg_count, 2);
+    }
+
+    #[test]
+    fn a_fast_command_is_not_recorded_at_the_default_threshold() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let replication = ReplicationHandle::default(); // 10ms threshold
+        dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"PING"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert!(replication.slowlog.is_empty());
     }
 
     #[test]

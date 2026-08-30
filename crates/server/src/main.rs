@@ -12,6 +12,14 @@ async fn main() -> std::io::Result<()> {
         std::env::var("ROCKET_MEM_SNAPSHOT_PATH").unwrap_or_else(|_| "./dump.snapshot".to_string());
     let snapshot_path = std::path::Path::new(&snapshot_path);
 
+    // Microseconds, not milliseconds: 10ms is already a very long time for an in-memory store,
+    // so the useful tuning range is below it. 0 disables the slow log.
+    let slowlog_threshold = std::env::var("ROCKET_MEM_SLOWLOG_THRESHOLD_MICROS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .map(std::time::Duration::from_micros)
+        .unwrap_or_else(|| std::time::Duration::from_millis(10));
+
     // Cluster mode is opt-in and all-or-nothing: the topology file names every node's slot
     // range, and ROCKET_MEM_CLUSTER_NODE_ID says which line is this process. Both must be set
     // together -- one without the other is an operator mistake that would otherwise start a
@@ -67,7 +75,8 @@ async fn main() -> std::io::Result<()> {
         Arc::clone(&engine),
         snapshot_path.to_path_buf(),
     )
-    .with_aof(Arc::clone(&aof));
+    .with_aof(Arc::clone(&aof))
+    .with_slowlog_threshold(slowlog_threshold);
     if let Some(cluster) = cluster {
         handle = handle.with_cluster(cluster);
     }

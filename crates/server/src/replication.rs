@@ -153,6 +153,11 @@ pub struct ReplicationHandle {
     /// `master_link_status`: it tracks the connection, not a byte offset, because this project
     /// has no replication offsets at all.
     link_up: Arc<AtomicBool>,
+    /// Recently-slow commands, recorded by the `dispatch_and_log` wrapper. A plain field, not an
+    /// `Option`: it is always present and always cheap when nothing is slow, so there is nothing
+    /// to configure away. `main.rs` sets its threshold from the environment via
+    /// `with_slowlog_threshold`; `new`/`Default` use the 10ms default.
+    pub slowlog: crate::slowlog::SlowLog,
 }
 
 impl ReplicationHandle {
@@ -175,6 +180,7 @@ impl ReplicationHandle {
             last_save_unix: AtomicI64::new(0),
             master_addr: Mutex::new(None),
             link_up: Arc::new(AtomicBool::new(false)),
+            slowlog: crate::slowlog::SlowLog::default(),
         }
     }
 
@@ -195,6 +201,14 @@ impl ReplicationHandle {
     /// `crates/server/tests/cluster.rs` call this; everything else leaves cluster mode off.
     pub fn with_cluster(mut self, cluster: Arc<crate::cluster::ClusterConfig>) -> Self {
         self.cluster = Some(cluster);
+        self
+    }
+
+    /// Overrides the slow-log threshold. `Duration::ZERO` disables recording entirely -- see
+    /// ../../docs/superpowers/specs/2026-08-30-sprint-6-spec.md for why that differs from real
+    /// Redis's meaning for 0.
+    pub fn with_slowlog_threshold(mut self, threshold: std::time::Duration) -> Self {
+        self.slowlog = crate::slowlog::SlowLog::with_threshold(threshold);
         self
     }
 
