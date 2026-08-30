@@ -33,28 +33,63 @@ Concurrency model: one Tokio task per client connection, keyspace split into 16 
 
 **Sprint 3 (full command set: keys, collections & sorted sets) — done.** `KEYS` now supports glob patterns (`*`, `?`, `[abc]`); `SCAN` walks the keyspace one shard per call without blocking it the way `KEYS` can, proven safe under concurrent writes by a stress test. A new `SortedSet` type backs `ZADD`/`ZSCORE`/`ZREM`/`ZCARD`/`ZINCRBY`/`ZRANGE`/`ZRANK`. String/key commands gained `GETSET`/`MSET`/`MGET`/`MSETNX`/`RENAME`/`RENAMENX`/`TYPE`/`RANDOMKEY` — the `EXPIRE` family (`EXPIRE`/`PEXPIRE`/`EXPIREAT`/`PEXPIREAT`/`TTL`/`PTTL`/`PERSIST`) is an explicit stub returning a clear error, deferred to Sprint 4 alongside the expiry reaper it actually needs (see `docs/superpowers/specs/2026-08-29-sprint-3-spec.md`). Lists, Hashes, and Sets each gained their remaining command coverage (table below).
 
-Remaining sprints (persistence, replication, clustering, a custom protocol, ACLs/TLS) are scoped in the [sprint plan](docs/rocket-mem-sprint-plan.md) but not started.
+**Sprint 4 (expiry, eviction & AOF persistence) — done.** Keys can now carry a TTL: the
+`EXPIRE` family (`EXPIRE`/`PEXPIRE`/`EXPIREAT`/`PEXPIREAT`/`TTL`/`PTTL`/`PERSIST`) and `SET`'s
+`EX`/`PX` flags — both stubs since Sprint 3 — are fully implemented, backed by passive
+expiry (a read finds an expired key gone) and an active background sweep (one shard swept
+every 100ms, so memory doesn't quietly fill with dead entries nobody happens to read). Every
+write command is appended to an on-disk append-only file (`AofWriter`, configurable
+`fsync` policy — `Always`/`EverySecond`/`Never`) and replayed on startup, with a corrupted
+tail truncated rather than merely skipped in memory — data now survives a `kill -9` and
+restart, this sprint's headline goal, proven by a real-subprocess-and-SIGKILL integration
+test. `Engine::with_maxmemory` bounds memory usage via approximated LRU eviction (a
+`Store`-wide recency clock plus per-shard sampling, matching real Redis's own
+"approximated LRU" rather than a maintained-list-based exact one). `MEMORY USAGE` and
+`OBJECT ENCODING` respond usefully for tooling that probes them, rather than "unknown
+command." See `docs/superpowers/specs/2026-08-30-sprint-4-spec.md` for the full set of
+design decisions (why `Entry` wraps `Value` instead of a new `Value` variant, why AOF
+rewrites `SPOP`→`SREM` and the `EXPIRE` family→absolute `PEXPIREAT`, why eviction samples
+instead of maintaining an exact LRU list).
+
+Remaining sprints (replication, clustering, a custom protocol, ACLs/TLS) are scoped in the
+[sprint plan](docs/rocket-mem-sprint-plan.md) but not started.
 
 ### Command coverage
 
 | Type | Implemented |
 |---|---|
-| String/Key | `GET`, `SET` (`NX`/`XX`), `GETSET`, `APPEND`, `STRLEN`, `INCR`/`DECR`/`INCRBY`, `MSET`, `MGET`, `MSETNX`, `RENAME`, `RENAMENX`, `TYPE`, `RANDOMKEY`, `KEYS` (glob: `*`, `?`, `[abc]` only), `SCAN` |
-| Hash | `HSET`, `HGET`, `HDEL`, `HEXISTS`, `HGETALL`, `HLEN`, `HINCRBY`, `HKEYS`, `HVALS`, `HMGET`, `HSETNX` |
-| List | `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LRANGE`, `LLEN`, `LINDEX`, `LSET`, `LTRIM`, `LREM`, `LINSERT` |
+| String/Key | `GET`, `SET` (`NX`/`XX`/`EX`/`PX`), `GETSET`, `GETRANGE`, `SETRANGE`, `APPEND`, `STRLEN`, `INCR`/`DECR`/`INCRBY`, `MSET`, `MGET`, `MSETNX`, `RENAME`, `RENAMENX`, `TYPE`, `RANDOMKEY`, `KEYS` (glob: `*`, `?`, `[abc]` only), `SCAN`, `DEL`/`EXISTS` (variadic), `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`, `TTL`, `PTTL`, `PERSIST`, `MEMORY USAGE`, `OBJECT ENCODING` |
+| Hash | `HSET`, `HGET`, `HDEL`, `HEXISTS`, `HGETALL`, `HLEN`, `HINCRBY`, `HKEYS`, `HVALS`, `HMGET`, `HSETNX`, `HSCAN` |
+| List | `LPUSH`, `RPUSH` (both variadic), `LPOP`, `RPOP`, `LRANGE`, `LLEN`, `LINDEX`, `LSET`, `LTRIM`, `LREM`, `LINSERT` |
 | Set | `SADD`, `SREM`, `SMEMBERS`, `SISMEMBER`, `SCARD`, `SINTER`, `SUNION`, `SDIFF`, `SINTERSTORE`, `SUNIONSTORE`, `SDIFFSTORE`, `SPOP`, `SRANDMEMBER` |
 | Sorted Set | `ZADD`, `ZSCORE`, `ZREM`, `ZCARD`, `ZINCRBY`, `ZRANGE`, `ZRANK` |
 
-`SET`'s `EX`/`PX` flags and the entire `EXPIRE` command family (`EXPIRE`/`PEXPIRE`/`EXPIREAT`/`PEXPIREAT`/`TTL`/`PTTL`/`PERSIST`) are intentionally deferred — there's no expiry reaper until Sprint 4, so time-based semantics would be silently broken (a TTL nothing ever checks) rather than dead code. `KEYS`'s glob support is intentionally partial: no character ranges (`[a-z]`), negation (`[^abc]`), or escaping. `RPUSH`/`LPUSH` still accept exactly one value per call (documented debt from `docs/phase-1-retro.md`, not yet picked up). All of the above are exercised directly by engine tests and reachable over RESP through the dispatcher.
+`KEYS`'s glob support is intentionally partial: no character ranges (`[a-z]`), negation
+(`[^abc]`), or escaping. Active expiry sweeps one whole shard per 100ms tick rather than
+sampling individual keys within a shard the way real Redis does — an accepted
+simplification, not a bug (see the Sprint 4 spec). `OBJECT ENCODING` reports this engine's
+own type name (`string`/`list`/`hash`/`set`/`zset` — exactly what `TYPE` returns, since both
+come from `Value::type_name()`), not real Redis's actual internal
+encodings (`embstr`/`listpack`/etc.), which this engine doesn't implement. All of the above
+are exercised directly by engine tests and reachable over RESP through the dispatcher.
+
+### Running with persistence
+
+The server binary reads two environment variables at startup:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `ROCKET_MEM_ADDR` | `127.0.0.1:6379` | TCP address to bind |
+| `ROCKET_MEM_AOF_PATH` | `./appendonly.aof` | Append-only file path — replayed on startup if it already exists, then opened for appending with an `EverySecond` fsync policy |
 
 ## Workspace layout
 
 Four crates under `crates/`:
 
-- **`common`** — shared `EngineError` enum (`WrongType`, `NotAnInteger`). No dependencies on the other crates.
+- **`common`** — shared `EngineError` enum (`WrongType`, `NotAnInteger`, `NoSuchKey`). No dependencies on the other crates.
 - **`engine`** — the storage engine: `Value` enum, 16-shard `Store`, and one free function per command under `commands/`. Everything in "Status" above lives here.
 - **`protocol`** — RESP wire format: the `Frame` type (RESP2 plus RESP3's `Map`) and `RespCodec`, encoding/decoding both including split-read reassembly.
-- **`server`** — placeholder binary (package name `rocket-mem`); becomes the TCP listener once networking lands.
+- **`server`** — the binary (package name `rocket-mem`): Tokio TCP accept loop, per-connection task, command dispatcher, AOF writer/replayer, and the active-expiry and fsync background loops.
 
 ## Building & testing
 
