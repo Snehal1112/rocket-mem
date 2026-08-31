@@ -84,13 +84,15 @@ impl Drop for ClientGuard {
     }
 }
 
-async fn handle_connection(
-    socket: tokio::net::TcpStream,
+async fn handle_connection<S>(
+    socket: S,
     engine: Arc<Engine>,
     aof: Arc<AofWriter>,
     replication: Arc<ReplicationHandle>,
     client_id: u64,
-) {
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     replication.connection_opened();
     let _client_guard = ClientGuard(Arc::clone(&replication));
     let mut framed = Framed::new(socket, RespCodec::default());
@@ -165,11 +167,13 @@ fn is_psync_command(frame: &protocol::Frame) -> bool {
 /// Takes ownership of `framed`'s underlying socket and never returns until the replica
 /// connection dies. `PSYNC` has no reply frame of its own — the length-prefixed snapshot blob
 /// (not a RESP value) stands in for one.
-async fn serve_replica(
-    framed: Framed<tokio::net::TcpStream, RespCodec>,
+async fn serve_replica<S>(
+    framed: Framed<S, RespCodec>,
     aof: &AofWriter,
     replication: &crate::replication::ReplicationHandle,
-) {
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     use tokio::io::AsyncWriteExt;
 
     // ONE critical section: snapshot + register, so no write can slip between them. Taken
