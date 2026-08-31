@@ -105,8 +105,11 @@ OK
 "app"
 ```
 
-`AUTH <password>` (the single-argument form, against a user named `default`) works too, as does
-a RESP3 client sending its credentials inline as `HELLO 3 AUTH app changeme`.
+`AUTH <password>` (the single-argument form) works too, but only if you have configured a user
+literally named `default` — it authenticates against that user, so against the config above,
+which defines `app` and no `default`, it returns
+`WRONGPASS invalid username-password pair or user is disabled.` A RESP3 client can also send its
+credentials inline as `HELLO 3 AUTH app changeme`.
 
 Users defined in `rocket-mem.toml` are bootstrapped at startup; `ACL SETUSER` adds or edits them
 at runtime. Runtime changes live in memory only and are lost on restart unless they are also
@@ -155,8 +158,11 @@ tls_key_path = "key.pem"
 
 The server then prints `TLS listening on 127.0.0.1:6390` and
 `RMP TLS listening on 127.0.0.1:6391` alongside its plaintext listeners. Connect with
-`redis-cli --tls --cacert cert.pem -p 6390`. A plaintext client that connects to a TLS port gets
-no reply at all — the handshake never completes.
+`redis-cli --tls --cacert cert.pem -p 6390`. A plaintext client that connects to a TLS port
+never gets a usable reply: the TCP connection is accepted, but the handshake fails and the
+connection is dropped. `redis-cli -p 6390 PING` reports
+`Protocol error, got "\x15" as reply type byte` — that `\x15` is a TLS alert record, not a RESP
+reply.
 
 See [`config-reference.md`](config-reference.md) for every `tls_*` field's env var and CLI flag
 equivalents.
