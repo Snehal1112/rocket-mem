@@ -5,9 +5,10 @@ use std::sync::Arc;
 /// Builds a server-auth-only `rustls::ServerConfig` (no client-certificate verification -- TLS
 /// for encrypting/authenticating the server to clients, not mutual TLS) from a PEM certificate
 /// chain and private key. Installs rustls's process-wide default crypto provider defensively --
-/// rustls 0.23 requires one to exist before any `ServerConfig` is built, and ignoring the
-/// "already installed" error is what lets this be called once per TLS listener (plan 10) without
-/// every caller after the first needing to know it was already done.
+/// `ServerConfig::builder()` auto-installs a default from crate features when exactly one crypto
+/// backend is enabled, but panics if more than one backend is ever enabled at once, and ignoring
+/// the "already installed" error here is what lets this be called once per TLS listener (plan 10)
+/// without every caller after the first needing to know it was already done.
 pub fn load_server_config(
     cert_path: &Path,
     key_path: &Path,
@@ -53,7 +54,7 @@ mod tests {
     fn load_server_config_succeeds_with_the_test_fixture() {
         let config =
             load_server_config(&fixture("test-cert.pem"), &fixture("test-key.pem")).unwrap();
-        assert_eq!(config.cert_resolver.only_raw_public_keys(), false); // sanity: a real cert-based config, not raw-key mode
+        assert!(!config.cert_resolver.only_raw_public_keys()); // sanity: a real cert-based config, not raw-key mode
     }
 
     #[test]
@@ -64,7 +65,7 @@ mod tests {
     }
 
     #[test]
-    fn load_server_config_fails_cleanly_on_a_malformed_key_file() {
+    fn load_server_config_fails_cleanly_on_a_key_file_containing_no_private_key() {
         assert!(load_server_config(&fixture("test-cert.pem"), &fixture("test-cert.pem")).is_err());
         // cert file has no private key in it
     }
