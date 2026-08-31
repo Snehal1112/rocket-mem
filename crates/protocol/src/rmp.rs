@@ -1,6 +1,7 @@
 use crate::Frame;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::io;
+use tokio_util::codec::{Decoder, Encoder};
 
 /// Bounds the envelope's `payload_len` and every length/count field decoded from inside the
 /// payload, checked before any allocation sized by that value. The only defense a length-prefixed
@@ -171,6 +172,99 @@ pub(crate) fn decode_frame(src: &mut BytesMut) -> io::Result<Frame> {
     decode_frame_inner(src, 0)
 }
 
+const MAGIC: [u8; 2] = [0x52, 0x4D];
+const VERSION: u8 = 0x01;
+const HEADER_LEN: usize = 16;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MsgType {
+    Request,
+    Response,
+}
+
+impl MsgType {
+    fn to_byte(self) -> u8 {
+        match self {
+            MsgType::Request => 0x00,
+            MsgType::Response => 0x01,
+        }
+    }
+
+    fn from_byte(b: u8) -> io::Result<Self> {
+        match b {
+            0x00 => Ok(MsgType::Request),
+            0x01 => Ok(MsgType::Response),
+            _ => Err(invalid_data("unknown rmp msg_type byte")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RmpMessage {
+    pub request_id: u64,
+    pub msg_type: MsgType,
+    pub frame: Frame,
+}
+
+#[derive(Debug, Default)]
+pub struct RmpCodec;
+
+impl Encoder<RmpMessage> for RmpCodec {
+    type Error = io::Error;
+
+    fn encode(&mut self, item: RmpMessage, dst: &mut BytesMut) -> io::Result<()> {
+        let mut payload = BytesMut::new();
+        encode_frame(&item.frame, &mut payload)?;
+        if payload.len() as u64 > MAX_RMP_FRAME_LEN as u64 {
+            return Err(invalid_data("rmp payload exceeds MAX_RMP_FRAME_LEN"));
+        }
+        dst.reserve(HEADER_LEN + payload.len());
+        dst.put_slice(&MAGIC);
+        dst.put_u8(VERSION);
+        dst.put_u8(item.msg_type.to_byte());
+        dst.put_u64(item.request_id);
+        dst.put_u32(payload.len() as u32);
+        dst.put_slice(&payload);
+        Ok(())
+    }
+}
+
+impl Decoder for RmpCodec {
+    type Item = RmpMessage;
+    type Error = io::Error;
+
+    fn decode(&mut self, src: &mut BytesMut) -> io::Result<Option<RmpMessage>> {
+        if src.len() < HEADER_LEN {
+            return Ok(None);
+        }
+        if src[0..2] != MAGIC {
+            return Err(invalid_data("bad rmp magic"));
+        }
+        if src[2] != VERSION {
+            return Err(invalid_data("unsupported rmp version"));
+        }
+        let msg_type = MsgType::from_byte(src[3])?;
+        let request_id = u64::from_be_bytes(src[4..12].try_into().unwrap());
+        let payload_len = u32::from_be_bytes(src[12..16].try_into().unwrap());
+        if payload_len > MAX_RMP_FRAME_LEN {
+            return Err(invalid_data("rmp payload_len exceeds MAX_RMP_FRAME_LEN"));
+        }
+        let total_len = HEADER_LEN + payload_len as usize;
+        if src.len() < total_len {
+            src.reserve(total_len - src.len());
+            return Ok(None);
+        }
+        src.advance(HEADER_LEN);
+        let mut payload = src.split_to(payload_len as usize);
+        let frame = decode_frame(&mut payload)?;
+        Ok(Some(RmpMessage {
+            request_id,
+            msg_type,
+            frame,
+        }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,5 +429,175 @@ mod tests {
 
         // Round-trip should succeed because we're at the limit, not exceeding it.
         assert_eq!(round_trip(frame.clone()), frame);
+    }
+
+    // Envelope tests (Task 2)
+    use tokio_util::codec::{Decoder, Encoder};
+
+    fn encode_message(msg: RmpMessage) -> BytesMut {
+        let mut buf = BytesMut::new();
+        RmpCodec.encode(msg, &mut buf).unwrap();
+        buf
+    }
+
+    #[test]
+    fn a_request_round_trips_through_encode_decode() {
+        let msg = RmpMessage {
+            request_id: 1,
+            msg_type: MsgType::Request,
+            frame: Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"GET")),
+                Frame::Bulk(Bytes::from_static(b"foo")),
+            ]),
+        };
+        let mut buf = encode_message(msg.clone());
+        let decoded = RmpCodec.decode(&mut buf).unwrap().unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn a_response_round_trips_through_encode_decode() {
+        let msg = RmpMessage {
+            request_id: 1,
+            msg_type: MsgType::Response,
+            frame: Frame::Bulk(Bytes::from_static(b"bar")),
+        };
+        let mut buf = encode_message(msg.clone());
+        let decoded = RmpCodec.decode(&mut buf).unwrap().unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn the_get_foo_request_envelope_matches_the_spec_worked_example_byte_for_byte() {
+        let msg = RmpMessage {
+            request_id: 1,
+            msg_type: MsgType::Request,
+            frame: Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"GET")),
+                Frame::Bulk(Bytes::from_static(b"foo")),
+            ]),
+        };
+        let buf = encode_message(msg);
+        assert_eq!(
+            &buf[..],
+            &[
+                0x52, 0x4D, // magic "RM"
+                0x01, // version
+                0x00, // msg_type = Request
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, // request_id = 1
+                0x00, 0x00, 0x00, 0x15, // payload_len = 21
+                0x05, 0x00, 0x00, 0x00, 0x02, // Array, count 2
+                0x04, 0x00, 0x00, 0x00, 0x03, b'G', b'E', b'T', 0x04, 0x00, 0x00, 0x00, 0x03, b'f',
+                b'o', b'o',
+            ][..]
+        );
+    }
+
+    #[test]
+    fn the_bar_response_envelope_matches_the_spec_worked_example_byte_for_byte() {
+        let msg = RmpMessage {
+            request_id: 1,
+            msg_type: MsgType::Response,
+            frame: Frame::Bulk(Bytes::from_static(b"bar")),
+        };
+        let buf = encode_message(msg);
+        assert_eq!(
+            &buf[..],
+            &[
+                0x52, 0x4D, 0x01, 0x01, // magic, version, msg_type = Response
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, // request_id = 1
+                0x00, 0x00, 0x00, 0x08, // payload_len = 8
+                0x04, 0x00, 0x00, 0x00, 0x03, b'b', b'a', b'r',
+            ][..]
+        );
+    }
+
+    #[test]
+    fn decode_returns_none_when_only_part_of_the_header_has_arrived() {
+        let mut buf = BytesMut::from(&[0x52, 0x4D, 0x01, 0x00, 0x00][..]); // 5 of 16 header bytes
+        assert_eq!(RmpCodec.decode(&mut buf).unwrap(), None);
+        // nothing consumed -- the next call with more bytes must still see all 5
+        assert_eq!(buf.len(), 5);
+    }
+
+    #[test]
+    fn decode_reassembles_a_header_split_across_two_reads() {
+        let full = encode_message(RmpMessage {
+            request_id: 9,
+            msg_type: MsgType::Request,
+            frame: Frame::Bulk(Bytes::from_static(b"x")),
+        });
+        let mut buf = BytesMut::from(&full[..10]); // splits inside the header
+        assert_eq!(RmpCodec.decode(&mut buf).unwrap(), None);
+        buf.extend_from_slice(&full[10..]);
+        let decoded = RmpCodec.decode(&mut buf).unwrap().unwrap();
+        assert_eq!(decoded.request_id, 9);
+    }
+
+    #[test]
+    fn decode_reassembles_a_payload_split_across_two_reads() {
+        let full = encode_message(RmpMessage {
+            request_id: 2,
+            msg_type: MsgType::Response,
+            frame: Frame::Bulk(Bytes::from_static(b"hello world")),
+        });
+        let mut buf = BytesMut::from(&full[..20]); // full header (16) plus a few payload bytes
+        assert_eq!(RmpCodec.decode(&mut buf).unwrap(), None);
+        buf.extend_from_slice(&full[20..]);
+        let decoded = RmpCodec.decode(&mut buf).unwrap().unwrap();
+        assert_eq!(
+            decoded.frame,
+            Frame::Bulk(Bytes::from_static(b"hello world"))
+        );
+    }
+
+    #[test]
+    fn decode_only_consumes_one_message_when_two_arrive_pipelined_in_one_read() {
+        let mut buf = encode_message(RmpMessage {
+            request_id: 1,
+            msg_type: MsgType::Request,
+            frame: Frame::Integer(1),
+        });
+        buf.extend_from_slice(&encode_message(RmpMessage {
+            request_id: 2,
+            msg_type: MsgType::Request,
+            frame: Frame::Integer(2),
+        }));
+        let first = RmpCodec.decode(&mut buf).unwrap().unwrap();
+        assert_eq!(first.request_id, 1);
+        let second = RmpCodec.decode(&mut buf).unwrap().unwrap();
+        assert_eq!(second.request_id, 2);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn a_bad_magic_is_a_decode_error() {
+        let mut buf =
+            BytesMut::from(&[0xAA, 0xBB, 0x01, 0x00, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0][..]);
+        assert!(RmpCodec.decode(&mut buf).is_err());
+    }
+
+    #[test]
+    fn an_unsupported_version_is_a_decode_error() {
+        let mut buf =
+            BytesMut::from(&[0x52, 0x4D, 0x02, 0x00, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0][..]);
+        assert!(RmpCodec.decode(&mut buf).is_err());
+    }
+
+    #[test]
+    fn a_bad_msg_type_byte_is_a_decode_error() {
+        let mut buf =
+            BytesMut::from(&[0x52, 0x4D, 0x01, 0x02, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0][..]);
+        assert!(RmpCodec.decode(&mut buf).is_err());
+    }
+
+    #[test]
+    fn a_payload_len_over_the_max_is_a_decode_error_without_waiting_for_the_bytes() {
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(&[0x52, 0x4D, 0x01, 0x00]); // magic, version, Request
+        buf.extend_from_slice(&1u64.to_be_bytes()); // request_id
+        buf.extend_from_slice(&(MAX_RMP_FRAME_LEN + 1).to_be_bytes()); // payload_len
+                                                                       // No payload bytes follow at all -- this must still error, not return Ok(None).
+        assert!(RmpCodec.decode(&mut buf).is_err());
     }
 }
