@@ -461,6 +461,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn auth_on_one_rmp_request_is_visible_to_a_later_request_on_the_same_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let engine = Arc::new(Engine::new());
+        let (_dir, aof) = test_aof();
+        let replication = Arc::new(ReplicationHandle::default());
+        replication
+            .acl
+            .set_user(
+                "app",
+                &[
+                    Bytes::from_static(b"on"),
+                    Bytes::from_static(b">pw"),
+                    Bytes::from_static(b"allcommands"),
+                    Bytes::from_static(b"allkeys"),
+                ],
+            )
+            .unwrap();
+        tokio::spawn(serve(listener, engine, aof, Arc::clone(&replication)));
+
+        let mut con = connect(addr).await;
+
+        // Denied before AUTH -- proves the gate is live on this connection at all.
+        con.send(RmpMessage {
+            request_id: 1,
+            msg_type: MsgType::Request,
+            frame: command(&[b"GET", b"k"]),
+        })
+        .await
+        .unwrap();
+        let reply = con.next().await.unwrap().unwrap();
+        assert_eq!(
+            reply.frame,
+            Frame::Error("NOAUTH Authentication required.".into())
+        );
+
+        // AUTH is its own independently-spawned request (a fresh tokio::spawn inside
+        // handle_connection, same as every other request) -- awaited here before sending the next
+        // one, per the documented rule that a client needing B to observe A's effect must await A
+        // first (Sprint 7 spec's multiplexing caveat). This is exactly the scenario where the old
+        // per-request `Session::new()` would have silently discarded the authentication.
+        con.send(RmpMessage {
+            request_id: 2,
+            msg_type: MsgType::Request,
+            frame: command(&[b"AUTH", b"app", b"pw"]),
+        })
+        .await
+        .unwrap();
+        let reply = con.next().await.unwrap().unwrap();
+        assert_eq!(reply.frame, Frame::Simple("OK".into()));
+
+        // A third, independently-spawned request on the SAME connection -- must see request 2's
+        // authentication.
+        con.send(RmpMessage {
+            request_id: 3,
+            msg_type: MsgType::Request,
+            frame: command(&[b"GET", b"k"]),
+        })
+        .await
+        .unwrap();
+        let reply = con.next().await.unwrap().unwrap();
+        assert_eq!(
+            reply.frame,
+            Frame::Null,
+            "authenticated GET of a missing key, not NOAUTH"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_rmp_connection_does_not_share_the_first_connections_authentication() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let engine = Arc::new(Engine::new());
+        let (_dir, aof) = test_aof();
+        let replication = Arc::new(ReplicationHandle::default());
+        replication
+            .acl
+            .set_user(
+                "app",
+                &[
+                    Bytes::from_static(b"on"),
+                    Bytes::from_static(b">pw"),
+                    Bytes::from_static(b"allcommands"),
+                    Bytes::from_static(b"allkeys"),
+                ],
+            )
+            .unwrap();
+        tokio::spawn(serve(listener, engine, aof, Arc::clone(&replication)));
+
+        let mut a = connect(addr).await;
+        a.send(RmpMessage {
+            request_id: 1,
+            msg_type: MsgType::Request,
+            frame: command(&[b"AUTH", b"app", b"pw"]),
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            a.next().await.unwrap().unwrap().frame,
+            Frame::Simple("OK".into())
+        );
+
+        let mut b = connect(addr).await; // a second, independent connection
+        b.send(RmpMessage {
+            request_id: 1,
+            msg_type: MsgType::Request,
+            frame: command(&[b"GET", b"k"]),
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            b.next().await.unwrap().unwrap().frame,
+            Frame::Error("NOAUTH Authentication required.".into()),
+            "each connection must have its own Session, not a globally shared one"
+        );
+    }
+
+    #[tokio::test]
     async fn the_server_survives_a_client_disconnecting_immediately() {
         let (_dir, addr, _engine) = spawn_test_server().await;
         let stream = TcpStream::connect(addr).await.unwrap();
