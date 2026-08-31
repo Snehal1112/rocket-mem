@@ -66,12 +66,12 @@ impl AclStore {
 | `AUTH <password>` | Checks against the reserved `"default"` user. |
 | `AUTH <username> <password>` | Checks against the named user. |
 | `ACL SETUSER <name> <rule>...` | Parses tokens into `AclRule`s (unknown token ⇒ `ERR syntax error`), creates or replaces the user. |
-| `ACL DELUSER <name>` | Removes a user; deleting the currently-authenticated user does not retroactively deauthenticate that connection (matches real Redis). |
+| `ACL DELUSER <name>` | Removes a user; deleting the currently-authenticated user's account takes effect immediately -- live re-resolution means that connection's *next* command gets `NOAUTH`, without waiting for reconnection. |
 | `ACL LIST` | One line per user, real-Redis-shaped (`user default on nopass ~* +@all`-style rendering — reconstructed from `rules`, not stored pre-rendered). |
 | `ACL WHOAMI` | The current connection's authenticated username, or `"default"` if unauthenticated (matches real Redis's behavior when no auth is required). |
 | `ACL GETUSER <name>` | Structured reply (`Frame::Map`) of the named user's flags/rules, or `Null` if absent. |
 
-`AUTH`/`ACL *` are always permitted regardless of auth state — the alternative (needing to already be authenticated to authenticate) is nonsensical.
+`AUTH`/`HELLO` are always permitted regardless of auth state — the alternative (needing to already be authenticated to authenticate) is nonsensical. `ACL` is deliberately NOT exempted, matching real Redis's own `CMD_NO_AUTH` set (only `AUTH`, `HELLO`, `RESET`): exempting it would let an unauthenticated client run `ACL SETUSER attacker on >x allcommands allkeys` and then authenticate as their own newly-created user, a full privilege-escalation bypass. `ACL` is gated like any other command — subject to the same `NOAUTH`/`NOPERM` checks.
 
 **Auth error shapes**, matching real Redis's own text so existing client libraries' error-detection logic (which often pattern-matches on these prefixes) works unmodified:
 - No `AUTH` sent, ACL non-empty, command requires auth: `Frame::Error("NOAUTH Authentication required.")`
@@ -243,7 +243,7 @@ README gains short pointers to each, not inline copies.
 ## Testing strategy
 
 - **ACL unit tests** (`crates/server/src/acl.rs`): rule parsing (valid and malformed `ACL SETUSER` token streams), `is_allowed`'s left-to-right last-rule-wins semantics (including the production plan's own `+get -set` example), password hash/verify round-trip, `nopass` accepting any password, an `AllKeys` rule short-circuiting per-key pattern checks.
-- **Session/auth-gate tests** (`crates/server/src/dispatcher.rs`): empty `AclStore` ⇒ every command passes through untouched (the critical backward-compatibility guarantee — a dedicated test, not an incidental one); `NOAUTH` on an unauthenticated connection once a user exists; `NOPERM` for a command/key outside the authenticated user's rules; `AUTH`/`ACL *` always reachable regardless of auth state.
+- **Session/auth-gate tests** (`crates/server/src/dispatcher.rs`): empty `AclStore` ⇒ every command passes through untouched (the critical backward-compatibility guarantee — a dedicated test, not an incidental one); `NOAUTH` on an unauthenticated connection once a user exists; `NOPERM` for a command/key outside the authenticated user's rules; `AUTH`/`HELLO` always reachable regardless of auth state, `ACL` gated like any other command.
 - **RMP session-sharing integration test** (`crates/server/tests/rmp.rs`): `AUTH` on one request, followed by a second, concurrently-dispatched request on the *same* RMP connection, proving the second sees the first's authentication — the test that would have caught the pre-Session per-request-`Protocol::default()` gap.
 - **TLS integration test** (`crates/server/tests/tls.rs`, new): a real `tokio-rustls` client connects and completes a `GET`/`SET` round trip against the TLS listener; a plain `TcpStream` pointed at the TLS-only port connects but never gets a valid reply (the production plan's own named test).
 - **Config layering test** (`crates/server/src/config.rs`): the production plan's own named example — CLI flag overrides env var overrides file value overrides default, asserted for at least one field of each kind (a string and a numeric).
