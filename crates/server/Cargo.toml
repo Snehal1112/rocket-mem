@@ -25,6 +25,9 @@ tokio-util.workspace = true
 futures-util.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+tokio-rustls.workspace = true
 
 [dev-dependencies]
 redis = { version = "0.27", features = ["tokio-comp"] }

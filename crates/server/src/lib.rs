@@ -8,4 +8,5 @@ pub mod metrics;
 pub mod replication;
 pub mod rmp_connection;
 pub mod slowlog;
+pub mod tls;
 pub use connection::serve;

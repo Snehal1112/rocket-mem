@@ -18,8 +18,11 @@ tracing = "0.1"
 parking_lot = "0.12"
 rand = "0.8"
 ordered-float = "4"
+rustls = "0.23"
+rustls-pemfile = "2"
 tokio-util = { version = "0.7", features = ["codec"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
+tokio-rustls = "0.26"
 futures-util = { version = "0.3", features = ["sink"] }
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
