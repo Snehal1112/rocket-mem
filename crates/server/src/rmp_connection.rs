@@ -4,7 +4,6 @@ use crate::dispatcher;
 use crate::replication::ReplicationHandle;
 use engine::Engine;
 use futures_util::{SinkExt, StreamExt};
-use protocol::codec::Protocol;
 use protocol::rmp::{MsgType, RmpCodec, RmpMessage};
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -98,13 +97,13 @@ async fn handle_connection(
         // requests on one connection possible at all.
         tokio::spawn(async move {
             let _permit = permit; // released (dropped) when this task ends, freeing a slot
-            let mut protocol = Protocol::default(); // RMP has no negotiation state to persist
+            let session = dispatcher::Session::new(); // still one-per-request here; plan 07 shares one per connection
             let reply = dispatcher::dispatch_and_log(
                 &engine,
                 &aof,
                 &replication,
                 request.frame,
-                &mut protocol,
+                &session,
                 client_id,
             );
             let _ = tx

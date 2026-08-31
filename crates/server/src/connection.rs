@@ -3,7 +3,7 @@ use crate::dispatcher;
 use crate::replication::ReplicationHandle;
 use engine::Engine;
 use futures_util::{FutureExt, SinkExt, StreamExt};
-use protocol::codec::{Protocol, RespCodec};
+use protocol::codec::RespCodec;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio_util::codec::Framed;
@@ -94,7 +94,7 @@ async fn handle_connection(
     replication.connection_opened();
     let _client_guard = ClientGuard(Arc::clone(&replication));
     let mut framed = Framed::new(socket, RespCodec::default());
-    let mut protocol = Protocol::default();
+    let session = dispatcher::Session::new();
     // Carries a frame pulled ahead by the pipelining peek below, so it isn't re-read.
     let mut pending: Option<Option<std::io::Result<protocol::Frame>>> = None;
     loop {
@@ -110,19 +110,13 @@ async fn handle_connection(
             serve_replica(framed, &aof, &replication).await;
             return; // serve_replica never returns until the replica connection dies
         }
-        let response = dispatcher::dispatch_and_log(
-            &engine,
-            &aof,
-            &replication,
-            frame,
-            &mut protocol,
-            client_id,
-        );
-        framed.codec_mut().protocol = protocol; // sync BEFORE sending this reply
-                                                // Buffer without flushing -- a flush is a write syscall, and flushing after
-                                                // every single response is what turned client-side pipelining into a
-                                                // regression instead of a speedup (each pipelined request paid for its own
-                                                // syscall despite arriving in the same TCP read as its neighbors).
+        let response =
+            dispatcher::dispatch_and_log(&engine, &aof, &replication, frame, &session, client_id);
+        framed.codec_mut().protocol = session.protocol(); // sync BEFORE sending this reply
+                                                          // Buffer without flushing -- a flush is a write syscall, and flushing after
+                                                          // every single response is what turned client-side pipelining into a
+                                                          // regression instead of a speedup (each pipelined request paid for its own
+                                                          // syscall despite arriving in the same TCP read as its neighbors).
         if framed.feed(response).await.is_err() {
             return; // client went away mid-response
         }

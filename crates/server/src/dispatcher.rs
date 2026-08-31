@@ -1685,7 +1685,7 @@ fn handle_info(
 /// see a `HELLO`.
 fn handle_hello(
     frame: &Frame,
-    protocol: &mut Protocol,
+    session: &Session,
     client_id: u64,
     replication: &crate::replication::ReplicationHandle,
 ) -> Option<Frame> {
@@ -1714,21 +1714,21 @@ fn handle_hello(
     };
     let args = &items[1..];
     Some(match args.first() {
-        None => hello_reply(*protocol, client_id, role, mode),
+        None => hello_reply(session.protocol(), client_id, role, mode),
         Some(Frame::Bulk(arg)) => match arg.as_ref() {
             b"2" => {
                 if args.len() > 1 {
                     return Some(Frame::Error("ERR syntax error".into()));
                 }
-                *protocol = Protocol::Resp2;
-                hello_reply(*protocol, client_id, role, mode)
+                session.set_protocol(Protocol::Resp2);
+                hello_reply(session.protocol(), client_id, role, mode)
             }
             b"3" => {
                 if args.len() > 1 {
                     return Some(Frame::Error("ERR syntax error".into()));
                 }
-                *protocol = Protocol::Resp3;
-                hello_reply(*protocol, client_id, role, mode)
+                session.set_protocol(Protocol::Resp3);
+                hello_reply(session.protocol(), client_id, role, mode)
             }
             _ => Frame::Error("NOPROTO unsupported protocol version".into()),
         },
@@ -1939,7 +1939,7 @@ pub fn dispatch_and_log(
     aof: &crate::aof::AofWriter,
     replication: &crate::replication::ReplicationHandle,
     frame: Frame,
-    protocol: &mut Protocol,
+    session: &Session,
     client_id: u64,
 ) -> Frame {
     let name = command_name_upper(&frame); // read before `frame` is moved into the inner call
@@ -1948,7 +1948,7 @@ pub fn dispatch_and_log(
     let label = metric_label(name);
     let started = std::time::Instant::now();
 
-    let reply = dispatch_and_log_inner(engine, aof, replication, frame, protocol, client_id);
+    let reply = dispatch_and_log_inner(engine, aof, replication, frame, session, client_id);
 
     let elapsed = started.elapsed();
     replication.command_executed();
@@ -1972,7 +1972,7 @@ fn dispatch_and_log_inner(
     aof: &crate::aof::AofWriter,
     replication: &crate::replication::ReplicationHandle,
     frame: Frame,
-    protocol: &mut Protocol,
+    session: &Session,
     client_id: u64,
 ) -> Frame {
     // Checked before everything else, including the -READONLY gate below: a redirect says which
@@ -2007,7 +2007,7 @@ fn dispatch_and_log_inner(
     if let Some(reply) = handle_info(&frame, engine, aof, replication) {
         return reply;
     }
-    if let Some(reply) = handle_hello(&frame, protocol, client_id, replication) {
+    if let Some(reply) = handle_hello(&frame, session, client_id, replication) {
         return reply;
     }
     if let Some(reply) = handle_slowlog(&frame, replication) {
@@ -2023,7 +2023,11 @@ fn dispatch_and_log_inner(
     // ../../docs/superpowers/specs/2026-08-30-tech-debt-cleanup-spec.md Item 2.
     let _order_guard = write_name.as_ref().map(|_| aof.lock_for_ordering());
 
-    let reply = dispatch(engine, frame, protocol, client_id);
+    // `dispatch` itself is untouched by this migration -- it still takes `_protocol: &mut
+    // Protocol`, unused inside its body (see its own doc comment). A throwaway `Protocol` is
+    // handed in here rather than threading `session`'s state through it, matching the "only
+    // `dispatch_and_log` changes" scope of this plan's Task 2.
+    let reply = dispatch(engine, frame, &mut Protocol::default(), client_id);
     if let Frame::Error(_) = reply {
         return reply;
     }
@@ -2394,7 +2398,7 @@ mod tests {
             &aof,
             &replication,
             cmd(&[b"SET", b"k", b"v"]),
-            &mut Protocol::default(),
+            &Session::new(),
             1,
         );
         let entries = replication.slowlog.get(10);
@@ -2414,7 +2418,7 @@ mod tests {
             &aof,
             &replication,
             cmd(&[b"PING"]),
-            &mut Protocol::default(),
+            &Session::new(),
             1,
         );
         assert!(replication.slowlog.is_empty());
@@ -2430,7 +2434,7 @@ mod tests {
             &aof,
             &replication,
             cmd(&[b"SET", b"k", b"v"]),
-            &mut Protocol::default(),
+            &Session::new(),
             1,
         );
         // the SLOWLOG LEN command is itself recorded only *after* its reply is built, so it
@@ -2441,7 +2445,7 @@ mod tests {
                 &aof,
                 &replication,
                 cmd(&[b"SLOWLOG", b"LEN"]),
-                &mut Protocol::default(),
+                &Session::new(),
                 1
             ),
             Frame::Integer(1)
@@ -2458,7 +2462,7 @@ mod tests {
             &aof,
             &replication,
             cmd(&[b"LRANGE", b"mylist", b"0", b"-1"]),
-            &mut Protocol::default(),
+            &Session::new(),
             1,
         );
 
@@ -2467,7 +2471,7 @@ mod tests {
             &aof,
             &replication,
             cmd(&[b"SLOWLOG", b"GET"]),
-            &mut Protocol::default(),
+            &Session::new(),
             1,
         ) else {
             panic!("expected Array")
@@ -2505,7 +2509,7 @@ mod tests {
                 &aof,
                 &replication,
                 cmd(&[b"PING"]),
-                &mut Protocol::default(),
+                &Session::new(),
                 1,
             );
         }
@@ -2514,7 +2518,7 @@ mod tests {
             &aof,
             &replication,
             cmd(&[b"SLOWLOG", b"GET", b"2"]),
-            &mut Protocol::default(),
+            &Session::new(),
             1,
         ) else {
             panic!("expected Array")
@@ -2532,7 +2536,7 @@ mod tests {
             &aof,
             &replication,
             cmd(&[b"PING"]),
-            &mut Protocol::default(),
+            &Session::new(),
             1,
         );
         assert_eq!(replication.slowlog.len(), 1);
@@ -2542,7 +2546,7 @@ mod tests {
                 &aof,
                 &replication,
                 cmd(&[b"SLOWLOG", b"RESET"]),
-                &mut Protocol::default(),
+                &Session::new(),
                 1
             ),
             Frame::Simple("OK".into())
@@ -2563,7 +2567,7 @@ mod tests {
                 &aof,
                 &ReplicationHandle::default(),
                 cmd(&[b"SLOWLOG", b"HELP"]),
-                &mut Protocol::default(),
+                &Session::new(),
                 1
             ),
             Frame::Error("ERR unknown SLOWLOG subcommand 'HELP'".into())
@@ -2574,7 +2578,7 @@ mod tests {
                 &aof,
                 &ReplicationHandle::default(),
                 cmd(&[b"SLOWLOG"]),
-                &mut Protocol::default(),
+                &Session::new(),
                 1
             ),
             Frame::Error("ERR wrong number of arguments for 'slowlog' command".into())
@@ -2591,14 +2595,7 @@ mod tests {
             cmd(&[b"GET", b"k"]),
             cmd(&[b"PING"]),
         ] {
-            dispatch_and_log(
-                &engine,
-                &aof,
-                &replication,
-                command,
-                &mut Protocol::default(),
-                1,
-            );
+            dispatch_and_log(&engine, &aof, &replication, command, &Session::new(), 1);
         }
         assert_eq!(replication.total_commands(), 3);
     }
@@ -2614,7 +2611,7 @@ mod tests {
                 &aof,
                 &replication,
                 cmd(&[b"SET", b"k", b"v"]),
-                &mut Protocol::default(),
+                &Session::new(),
                 1
             ),
             Frame::Simple("OK".into())
@@ -2625,7 +2622,7 @@ mod tests {
                 &aof,
                 &replication,
                 cmd(&[b"GET", b"k"]),
-                &mut Protocol::default(),
+                &Session::new(),
                 1
             ),
             Frame::Bulk(Bytes::from_static(b"v"))
@@ -2636,7 +2633,7 @@ mod tests {
                 &aof,
                 &replication,
                 cmd(&[b"NOPE"]),
-                &mut Protocol::default(),
+                &Session::new(),
                 1
             ),
             Frame::Error("ERR unknown command 'NOPE'".into())
@@ -2946,7 +2943,7 @@ mod tests {
             &aof,
             &ReplicationHandle::default(),
             cmd(&[b"INFO"]),
-            &mut Protocol::default(),
+            &Session::new(),
             1,
         ) else {
             panic!("expected Bulk")
@@ -2958,14 +2955,9 @@ mod tests {
         let (_dir, aof) = test_aof();
         let mut command = vec![&b"INFO"[..]];
         command.extend_from_slice(args);
-        let Frame::Bulk(text) = dispatch_and_log(
-            engine,
-            &aof,
-            replication,
-            cmd(&command),
-            &mut Protocol::default(),
-            1,
-        ) else {
+        let Frame::Bulk(text) =
+            dispatch_and_log(engine, &aof, replication, cmd(&command), &Session::new(), 1)
+        else {
             panic!("INFO should reply with a Bulk string")
         };
         String::from_utf8(text.to_vec()).unwrap()
@@ -3085,7 +3077,7 @@ mod tests {
                 &aof,
                 &replication,
                 cmd(&[b"PING"]),
-                &mut Protocol::default(),
+                &Session::new(),
                 1,
             );
         }
@@ -3591,16 +3583,16 @@ mod tests {
     fn hello_with_no_args_reports_current_protocol_without_switching() {
         let engine = Engine::new();
         let (_dir, aof) = test_aof();
-        let mut protocol = Protocol::Resp2;
+        let session = Session::new();
         let reply = dispatch_and_log(
             &engine,
             &aof,
             &ReplicationHandle::default(),
             cmd(&[b"HELLO"]),
-            &mut protocol,
+            &session,
             7,
         );
-        assert_eq!(protocol, Protocol::Resp2); // unchanged
+        assert_eq!(session.protocol(), Protocol::Resp2); // unchanged
         assert_eq!(
             reply,
             Frame::Map(vec![
@@ -3634,16 +3626,17 @@ mod tests {
     fn hello_2_switches_protocol_to_resp2() {
         let engine = Engine::new();
         let (_dir, aof) = test_aof();
-        let mut protocol = Protocol::Resp3;
+        let session = Session::new();
+        session.set_protocol(Protocol::Resp3);
         let reply = dispatch_and_log(
             &engine,
             &aof,
             &ReplicationHandle::default(),
             cmd(&[b"HELLO", b"2"]),
-            &mut protocol,
+            &session,
             1,
         );
-        assert_eq!(protocol, Protocol::Resp2);
+        assert_eq!(session.protocol(), Protocol::Resp2);
         let Frame::Map(pairs) = reply else {
             panic!("expected Map")
         };
@@ -3654,16 +3647,16 @@ mod tests {
     fn hello_3_switches_protocol_to_resp3() {
         let engine = Engine::new();
         let (_dir, aof) = test_aof();
-        let mut protocol = Protocol::Resp2;
+        let session = Session::new();
         let reply = dispatch_and_log(
             &engine,
             &aof,
             &ReplicationHandle::default(),
             cmd(&[b"HELLO", b"3"]),
-            &mut protocol,
+            &session,
             42,
         );
-        assert_eq!(protocol, Protocol::Resp3);
+        assert_eq!(session.protocol(), Protocol::Resp3);
         assert_eq!(
             reply,
             Frame::Map(vec![
@@ -3697,16 +3690,16 @@ mod tests {
     fn hello_with_unsupported_protover_returns_noproto_and_leaves_protocol_unchanged() {
         let engine = Engine::new();
         let (_dir, aof) = test_aof();
-        let mut protocol = Protocol::Resp2;
+        let session = Session::new();
         let reply = dispatch_and_log(
             &engine,
             &aof,
             &ReplicationHandle::default(),
             cmd(&[b"HELLO", b"4"]),
-            &mut protocol,
+            &session,
             1,
         );
-        assert_eq!(protocol, Protocol::Resp2); // unchanged
+        assert_eq!(session.protocol(), Protocol::Resp2); // unchanged
         assert_eq!(
             reply,
             Frame::Error("NOPROTO unsupported protocol version".into())
@@ -3719,14 +3712,9 @@ mod tests {
         let (_dir, aof) = test_aof();
 
         let master = ReplicationHandle::default();
-        let Frame::Map(fields) = dispatch_and_log(
-            &engine,
-            &aof,
-            &master,
-            cmd(&[b"HELLO"]),
-            &mut Protocol::default(),
-            7,
-        ) else {
+        let Frame::Map(fields) =
+            dispatch_and_log(&engine, &aof, &master, cmd(&[b"HELLO"]), &Session::new(), 7)
+        else {
             panic!("expected Map")
         };
         assert!(fields.contains(&(
@@ -3743,7 +3731,7 @@ mod tests {
             &aof,
             &replica,
             cmd(&[b"HELLO"]),
-            &mut Protocol::default(),
+            &Session::new(),
             7,
         ) else {
             panic!("expected Map")
@@ -5091,16 +5079,16 @@ mod tests {
     fn hello_with_extra_args_after_protover_is_a_syntax_error() {
         let engine = Engine::new();
         let (_dir, aof) = test_aof();
-        let mut protocol = Protocol::Resp2;
+        let session = Session::new();
         let reply = dispatch_and_log(
             &engine,
             &aof,
             &ReplicationHandle::default(),
             cmd(&[b"HELLO", b"3", b"AUTH", b"user", b"pass"]),
-            &mut protocol,
+            &session,
             1,
         );
-        assert_eq!(protocol, Protocol::Resp2); // unchanged — the switch never happened
+        assert_eq!(session.protocol(), Protocol::Resp2); // unchanged — the switch never happened
         assert_eq!(reply, Frame::Error("ERR syntax error".into()));
     }
 
@@ -5126,7 +5114,7 @@ mod tests {
             &aof,
             &ReplicationHandle::default(),
             cmd(&[b"SET", b"k", b"v"]),
-            &mut Protocol::default(),
+            &Session::new(),
             1,
         );
         assert_eq!(reply, Frame::Simple("OK".into()));
@@ -5150,7 +5138,7 @@ mod tests {
             &aof,
             &replication,
             cmd(&[b"SET", b"k", b"v"]),
-            &mut Protocol::default(),
+            &Session::new(),
             1,
         );
 
@@ -5183,7 +5171,7 @@ mod tests {
             &aof,
             &replication,
             cmd(&[b"SPOP", b"s"]),
-            &mut Protocol::default(),
+            &Session::new(),
             1,
         );
 
@@ -5207,7 +5195,7 @@ mod tests {
             &aof,
             &replication,
             cmd(&[b"SET", b"k", b"v"]),
-            &mut Protocol::default(),
+            &Session::new(),
             1,
         );
         assert_eq!(reply, Frame::Simple("OK".into()));
@@ -5231,7 +5219,7 @@ mod tests {
             &aof,
             &replication,
             cmd(&[b"GET", b"k"]),
-            &mut Protocol::default(),
+            &Session::new(),
             1,
         );
 
@@ -5247,7 +5235,7 @@ mod tests {
             &aof,
             &ReplicationHandle::default(),
             cmd(&[b"SET", b"k", b"v"]),
-            &mut Protocol::default(),
+            &Session::new(),
             1,
         );
         dispatch_and_log(
@@ -5255,7 +5243,7 @@ mod tests {
             &aof,
             &ReplicationHandle::default(),
             cmd(&[b"GET", b"k"]),
-            &mut Protocol::default(),
+            &Session::new(),
             1,
         );
         aof.fsync().unwrap();
@@ -5273,7 +5261,7 @@ mod tests {
             &aof,
             &ReplicationHandle::default(),
             cmd(&[b"SET", b"onlykey"]),
-            &mut Protocol::default(),
+            &Session::new(),
             1,
         );
         aof.fsync().unwrap();
@@ -5289,7 +5277,7 @@ mod tests {
             &aof,
             &ReplicationHandle::default(),
             cmd(&[b"SADD", b"s", b"x"]),
-            &mut Protocol::default(),
+            &Session::new(),
             1,
         );
         let reply = dispatch_and_log(
@@ -5297,7 +5285,7 @@ mod tests {
             &aof,
             &ReplicationHandle::default(),
             cmd(&[b"SPOP", b"s"]),
-            &mut Protocol::default(),
+            &Session::new(),
             1,
         );
         assert_eq!(reply, Frame::Bulk(Bytes::from_static(b"x"))); // the popped member
@@ -5316,7 +5304,7 @@ mod tests {
             &aof,
             &ReplicationHandle::default(),
             cmd(&[b"SPOP", b"missing"]),
-            &mut Protocol::default(),
+            &Session::new(),
             1,
         );
         aof.fsync().unwrap();
@@ -5336,7 +5324,7 @@ mod tests {
             &aof,
             &ReplicationHandle::default(),
             cmd(&[b"SET", b"k", b"v"]),
-            &mut Protocol::default(),
+            &Session::new(),
             1,
         );
         assert_eq!(
@@ -5373,7 +5361,7 @@ mod tests {
             &aof,
             &replication,
             cmd(&[b"SET", b"k", b"v"]),
-            &mut Protocol::default(),
+            &Session::new(),
             1,
         );
 
@@ -5405,7 +5393,7 @@ mod tests {
             &aof,
             &ReplicationHandle::default(),
             cmd(&[b"SET", b"k", b"v"]),
-            &mut Protocol::default(),
+            &Session::new(),
             1,
         );
         assert_eq!(reply, Frame::Simple("OK".into()));
@@ -5450,7 +5438,7 @@ mod tests {
             &aof,
             &ReplicationHandle::default(),
             cmd(&[b"SET", b"k", b"v"]),
-            &mut Protocol::default(),
+            &Session::new(),
             1,
         );
         let now_before = SystemTime::now()
@@ -5462,7 +5450,7 @@ mod tests {
             &aof,
             &ReplicationHandle::default(),
             cmd(&[b"EXPIRE", b"k", b"100"]),
-            &mut Protocol::default(),
+            &Session::new(),
             1,
         );
         aof.fsync().unwrap();
@@ -5491,7 +5479,7 @@ mod tests {
             &aof,
             &ReplicationHandle::default(),
             cmd(&[b"SET", b"k", b"v"]),
-            &mut Protocol::default(),
+            &Session::new(),
             1,
         );
         dispatch_and_log(
@@ -5499,7 +5487,7 @@ mod tests {
             &aof,
             &ReplicationHandle::default(),
             cmd(&[b"EXPIREAT", b"k", b"2000000000"]),
-            &mut Protocol::default(),
+            &Session::new(),
             1,
         );
         aof.fsync().unwrap();
@@ -5518,7 +5506,7 @@ mod tests {
             &aof,
             &ReplicationHandle::default(),
             cmd(&[b"EXPIRE", b"missing", b"100"]),
-            &mut Protocol::default(),
+            &Session::new(),
             1,
         );
         aof.fsync().unwrap();
@@ -5534,7 +5522,7 @@ mod tests {
             &aof,
             &ReplicationHandle::default(),
             cmd(&[b"SET", b"k", b"v", b"EX", b"100"]),
-            &mut Protocol::default(),
+            &Session::new(),
             1,
         );
         aof.fsync().unwrap();
@@ -5561,7 +5549,7 @@ mod tests {
             &aof,
             &ReplicationHandle::default(),
             cmd(&[b"SET", b"k", b"v", b"EX", b"100", b"PX", b"5000"]),
-            &mut Protocol::default(),
+            &Session::new(),
             1,
         );
         aof.fsync().unwrap();
@@ -5632,7 +5620,7 @@ mod tests {
             &aof,
             &ReplicationHandle::default(),
             cmd(&[b"SET", b"k", b"v"]),
-            &mut Protocol::default(),
+            &Session::new(),
             1,
         );
         let reply = dispatch_and_log(
@@ -5640,7 +5628,7 @@ mod tests {
             &aof,
             &ReplicationHandle::default(),
             cmd(&[b"EXPIRE", b"k", b"10000000000000000"]),
-            &mut Protocol::default(),
+            &Session::new(),
             1,
         );
         assert_eq!(reply, Frame::Integer(1)); // key existed, so the TTL was applied
@@ -5847,7 +5835,7 @@ mod tests {
             &aof,
             &replication,
             cmd(&[b"SAVE"]),
-            &mut Protocol::default(),
+            &Session::new(),
             1,
         );
         assert_eq!(reply, Frame::Simple("OK".into()));
@@ -5874,7 +5862,7 @@ mod tests {
             &aof,
             &replication,
             cmd(&[b"SAVE"]),
-            &mut Protocol::default(),
+            &Session::new(),
             1,
         );
 
@@ -5895,7 +5883,7 @@ mod tests {
             &aof,
             &replication,
             cmd(&[b"SAVE"]),
-            &mut Protocol::default(),
+            &Session::new(),
             1,
         );
         aof.fsync().unwrap();
@@ -5933,7 +5921,7 @@ mod tests {
                         &aof,
                         &replication,
                         cmd(&[b"RPUSH", b"list", b"x"]),
-                        &mut Protocol::default(),
+                        &Session::new(),
                         1,
                     );
                 }
@@ -5946,7 +5934,7 @@ mod tests {
             &aof,
             &replication,
             cmd(&[b"SAVE"]),
-            &mut Protocol::default(),
+            &Session::new(),
             1,
         );
         assert_eq!(reply, Frame::Simple("OK".into()));
@@ -5976,7 +5964,7 @@ mod tests {
             &aof,
             &replication,
             cmd(&[b"REPLICAOF", b"127.0.0.1", b"1"]), // port 1: nothing listens there, connection attempt fails harmlessly in the background
-            &mut Protocol::default(),
+            &Session::new(),
             1,
         );
         assert_eq!(reply, Frame::Simple("OK".into()));
@@ -6001,7 +5989,7 @@ mod tests {
             &aof,
             &replication,
             cmd(&[b"REPLICAOF", b"NO", b"ONE"]),
-            &mut Protocol::default(),
+            &Session::new(),
             1,
         );
         assert_eq!(reply, Frame::Simple("OK".into()));
@@ -6023,7 +6011,7 @@ mod tests {
             &aof,
             &replication,
             cmd(&[b"REPLICAOF", b"onlyhost"]),
-            &mut Protocol::default(),
+            &Session::new(),
             1,
         );
         assert_eq!(
@@ -6049,7 +6037,7 @@ mod tests {
             &aof,
             &replication,
             cmd(&[b"SET", b"k", b"v"]),
-            &mut Protocol::default(),
+            &Session::new(),
             1,
         );
         assert_eq!(
@@ -6082,7 +6070,7 @@ mod tests {
             &aof,
             &replication,
             cmd(&[b"GET", b"k"]),
-            &mut Protocol::default(),
+            &Session::new(),
             1,
         );
         assert_eq!(reply, Frame::Bulk(Bytes::from_static(b"v")));
@@ -6103,7 +6091,7 @@ mod tests {
             &aof,
             &replication,
             cmd(&[b"SAVE"]),
-            &mut Protocol::default(),
+            &Session::new(),
             1,
         );
         assert_eq!(reply, Frame::Simple("OK".into()));
@@ -6123,7 +6111,7 @@ mod tests {
             &aof,
             &replication,
             cmd(&[b"SET", b"k", b"v"]),
-            &mut Protocol::default(),
+            &Session::new(),
             1,
         );
         assert_eq!(reply, Frame::Simple("OK".into()));
@@ -6261,7 +6249,7 @@ mod tests {
             &aof,
             &ReplicationHandle::default(),
             cmd(&[b"CLUSTER", b"KEYSLOT", b"foo"]),
-            &mut Protocol::default(),
+            &Session::new(),
             1,
         );
         assert_eq!(reply, Frame::Integer(12182));
@@ -6276,7 +6264,7 @@ mod tests {
             &aof,
             &cluster_handle("shard-a"),
             cmd(&[b"CLUSTER", b"KEYSLOT", b"{user1000}.following"]),
-            &mut Protocol::default(),
+            &Session::new(),
             1,
         );
         assert_eq!(reply, Frame::Integer(3443));
@@ -6291,7 +6279,7 @@ mod tests {
             &aof,
             &cluster_handle("shard-a"),
             cmd(&[b"CLUSTER", b"KEYSLOT"]),
-            &mut Protocol::default(),
+            &Session::new(),
             1,
         );
         assert_eq!(
@@ -6310,7 +6298,7 @@ mod tests {
                 &aof,
                 &cluster_handle("shard-b"),
                 cmd(&[b"CLUSTER", b"MYID"]),
-                &mut Protocol::default(),
+                &Session::new(),
                 1
             ),
             Frame::Bulk(Bytes::from_static(b"shard-b"))
@@ -6321,7 +6309,7 @@ mod tests {
                 &aof,
                 &ReplicationHandle::default(),
                 cmd(&[b"CLUSTER", b"MYID"]),
-                &mut Protocol::default(),
+                &Session::new(),
                 1
             ),
             Frame::Bulk(Bytes::from("0".repeat(40)))
@@ -6337,7 +6325,7 @@ mod tests {
             &aof,
             &cluster_handle("shard-a"),
             cmd(&[b"CLUSTER", b"INFO"]),
-            &mut Protocol::default(),
+            &Session::new(),
             1,
         ) else {
             panic!("expected Bulk")
@@ -6359,7 +6347,7 @@ mod tests {
             &aof,
             &ReplicationHandle::default(),
             cmd(&[b"CLUSTER", b"INFO"]),
-            &mut Protocol::default(),
+            &Session::new(),
             1,
         ) else {
             panic!("expected Bulk")
@@ -6378,7 +6366,7 @@ mod tests {
             &aof,
             &cluster_handle("shard-b"),
             cmd(&[b"CLUSTER", b"NODES"]),
-            &mut Protocol::default(),
+            &Session::new(),
             1,
         ) else {
             panic!("expected Bulk")
@@ -6410,7 +6398,7 @@ mod tests {
                 &aof,
                 &ReplicationHandle::default(),
                 cmd(&[b"CLUSTER", b"NODES"]),
-                &mut Protocol::default(),
+                &Session::new(),
                 1
             ),
             Frame::Bulk(Bytes::from_static(b""))
@@ -6426,7 +6414,7 @@ mod tests {
             &aof,
             &cluster_handle("shard-a"),
             cmd(&[b"CLUSTER", b"SHARDS"]),
-            &mut Protocol::default(),
+            &Session::new(),
             1,
         ) else {
             panic!("expected Array")
@@ -6477,7 +6465,7 @@ mod tests {
                 &aof,
                 &ReplicationHandle::default(),
                 cmd(&[b"CLUSTER", b"SHARDS"]),
-                &mut Protocol::default(),
+                &Session::new(),
                 1
             ),
             Frame::Array(vec![])
@@ -6494,7 +6482,7 @@ mod tests {
                 &aof,
                 &cluster_handle("shard-a"),
                 cmd(&[b"CLUSTER", b"RESHARD"]),
-                &mut Protocol::default(),
+                &Session::new(),
                 1
             ),
             Frame::Error("ERR unknown CLUSTER subcommand 'RESHARD'".into())
@@ -6511,7 +6499,7 @@ mod tests {
                 &aof,
                 &cluster_handle("shard-a"),
                 cmd(&[b"CLUSTER"]),
-                &mut Protocol::default(),
+                &Session::new(),
                 1
             ),
             Frame::Error("ERR wrong number of arguments for 'cluster' command".into())
@@ -6528,7 +6516,7 @@ mod tests {
             &aof,
             &cluster_handle("shard-a"),
             cmd(&[b"SET", b"hello", b"world"]),
-            &mut Protocol::default(),
+            &Session::new(),
             1,
         );
         assert_eq!(reply, Frame::Simple("OK".into()));
@@ -6544,7 +6532,7 @@ mod tests {
             &aof,
             &cluster_handle("shard-a"),
             cmd(&[b"GET", b"foo"]),
-            &mut Protocol::default(),
+            &Session::new(),
             1,
         );
         assert_eq!(reply, Frame::Error("MOVED 12182 127.0.0.1:7003".into()));
@@ -6559,7 +6547,7 @@ mod tests {
             &aof,
             &cluster_handle("shard-a"),
             cmd(&[b"SET", b"foo", b"bar"]),
-            &mut Protocol::default(),
+            &Session::new(),
             1,
         );
         assert_eq!(reply, Frame::Error("MOVED 12182 127.0.0.1:7003".into()));
@@ -6576,7 +6564,7 @@ mod tests {
             &aof,
             &cluster_handle("shard-a"),
             cmd(&[b"MSET", b"hello", b"1", b"foo", b"2"]),
-            &mut Protocol::default(),
+            &Session::new(),
             1,
         );
         assert_eq!(
@@ -6602,7 +6590,7 @@ mod tests {
                 b"{user1000}.city",
                 b"london",
             ]),
-            &mut Protocol::default(),
+            &Session::new(),
             1,
         );
         assert_eq!(reply, Frame::Simple("OK".into()));
@@ -6626,7 +6614,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                dispatch_and_log(&engine, &aof, &handle, command, &mut Protocol::default(), 1),
+                dispatch_and_log(&engine, &aof, &handle, command, &Session::new(), 1),
                 expected
             );
         }
@@ -6641,7 +6629,7 @@ mod tests {
             &aof,
             &ReplicationHandle::default(),
             cmd(&[b"MSET", b"hello", b"1", b"foo", b"2"]),
-            &mut Protocol::default(),
+            &Session::new(),
             1,
         );
         assert_eq!(reply, Frame::Simple("OK".into()));
@@ -6665,7 +6653,7 @@ mod tests {
                 &aof,
                 &handle,
                 cmd(&[b"SET", b"foo", b"bar"]),
-                &mut Protocol::default(),
+                &Session::new(),
                 1
             ),
             Frame::Error("MOVED 12182 127.0.0.1:7003".into())
@@ -6677,7 +6665,7 @@ mod tests {
                 &aof,
                 &handle,
                 cmd(&[b"SET", b"hello", b"world"]),
-                &mut Protocol::default(),
+                &Session::new(),
                 1
             ),
             Frame::Error("READONLY You can't write against a read only replica.".into())

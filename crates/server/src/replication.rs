@@ -836,7 +836,7 @@ mod tests {
                         protocol::Frame::Array(vec![protocol::Frame::Bulk(
                             bytes::Bytes::from_static(b"SAVE"),
                         )]),
-                        &mut protocol::codec::Protocol::default(),
+                        &crate::dispatcher::Session::new(),
                         1,
                     );
                     assert_eq!(reply, protocol::Frame::Simple("OK".into()));
