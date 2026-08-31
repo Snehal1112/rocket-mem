@@ -7,6 +7,12 @@ use std::io;
 /// format has against a forged multi-gigabyte length claim.
 pub const MAX_RMP_FRAME_LEN: u32 = 64 * 1024 * 1024;
 
+/// Bounds the nesting depth of Arrays and Maps to prevent stack overflow attacks via deeply
+/// nested structures. A hostile stream can encode deep nesting cheaply (5 bytes per level),
+/// well under MAX_RMP_FRAME_LEN, but stack usage is linear with depth. 32 levels is well
+/// beyond any legitimate protocol shape while keeping stack overhead trivial.
+const MAX_RMP_NESTING_DEPTH: usize = 32;
+
 #[allow(dead_code)]
 const TAG_NULL: u8 = 0x00;
 #[allow(dead_code)]
@@ -114,8 +120,11 @@ pub(crate) fn encode_frame(frame: &Frame, dst: &mut BytesMut) -> io::Result<()> 
     Ok(())
 }
 
-#[allow(dead_code)]
-pub(crate) fn decode_frame(src: &mut BytesMut) -> io::Result<Frame> {
+fn decode_frame_inner(src: &mut BytesMut, depth: usize) -> io::Result<Frame> {
+    if depth > MAX_RMP_NESTING_DEPTH {
+        return Err(invalid_data("rmp value nesting exceeds the maximum depth"));
+    }
+
     let tag = take_u8(src)?;
     match tag {
         TAG_NULL => Ok(Frame::Null),
@@ -139,7 +148,7 @@ pub(crate) fn decode_frame(src: &mut BytesMut) -> io::Result<Frame> {
             // fast on the first truncated read once real buffered bytes run out.
             let mut items = Vec::with_capacity(count.min(1024));
             for _ in 0..count {
-                items.push(decode_frame(src)?);
+                items.push(decode_frame_inner(src, depth + 1)?);
             }
             Ok(Frame::Array(items))
         }
@@ -147,14 +156,19 @@ pub(crate) fn decode_frame(src: &mut BytesMut) -> io::Result<Frame> {
             let count = take_len(src)?;
             let mut pairs = Vec::with_capacity(count.min(1024));
             for _ in 0..count {
-                let k = decode_frame(src)?;
-                let v = decode_frame(src)?;
+                let k = decode_frame_inner(src, depth + 1)?;
+                let v = decode_frame_inner(src, depth + 1)?;
                 pairs.push((k, v));
             }
             Ok(Frame::Map(pairs))
         }
         _ => Err(invalid_data("unknown rmp value tag")),
     }
+}
+
+#[allow(dead_code)]
+pub(crate) fn decode_frame(src: &mut BytesMut) -> io::Result<Frame> {
+    decode_frame_inner(src, 0)
 }
 
 #[cfg(test)]
@@ -291,5 +305,35 @@ mod tests {
     fn a_truncated_value_is_a_decode_error_not_a_panic() {
         let mut buf = BytesMut::from(&[TAG_INTEGER, 0x00, 0x00][..]); // needs 8 bytes, has 2
         assert!(decode_frame(&mut buf).is_err());
+    }
+
+    #[test]
+    fn deeply_nested_array_exceeding_max_depth_is_rejected_without_stack_overflow() {
+        // Build a payload encoding an Array nested deeper than MAX_RMP_NESTING_DEPTH.
+        // Each level is: [TAG_ARRAY, count=1 as u32], creating "array of array of array..."
+        // We build MAX_RMP_NESTING_DEPTH + 2 levels to guarantee exceeding the limit.
+        let mut buf = BytesMut::new();
+        for _ in 0..=(MAX_RMP_NESTING_DEPTH + 1) {
+            buf.put_u8(TAG_ARRAY);
+            buf.put_u32(1); // Each array contains exactly one element (the next array)
+        }
+        // The innermost "array" never bottoms out with a leaf value, so decode will
+        // recurse until it hits the depth limit and return InvalidData, not panic.
+        let err = decode_frame(&mut buf).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("nesting exceeds"));
+    }
+
+    #[test]
+    fn deeply_nested_array_at_the_limit_round_trips_successfully() {
+        // Build an array nested exactly at MAX_RMP_NESTING_DEPTH levels deep.
+        // The innermost element is a Null, so the structure bottoms out.
+        let mut frame = Frame::Null;
+        for _ in 0..MAX_RMP_NESTING_DEPTH {
+            frame = Frame::Array(vec![frame]);
+        }
+
+        // Round-trip should succeed because we're at the limit, not exceeding it.
+        assert_eq!(round_trip(frame.clone()), frame);
     }
 }
