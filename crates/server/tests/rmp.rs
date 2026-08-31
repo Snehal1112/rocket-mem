@@ -58,3 +58,16 @@ async fn rmp_write_is_visible_to_a_read_over_resp() {
     let value: String = resp_con.get("k").await.unwrap();
     assert_eq!(value, "v");
 }
+
+#[tokio::test]
+async fn rmp_correctly_multiplexes_concurrent_requests_on_one_connection() {
+    let (_dir, _resp_url, rmp_addr) = spawn_dual_protocol_server().await;
+    let client = rmp_client::RmpClient::connect(rmp_addr).await.unwrap();
+    client.set("a", "1").await.unwrap();
+
+    // Fired concurrently on the same connection, without either awaiting the other first.
+    let (get_result, set_result) = tokio::join!(client.get("a"), client.set("b", "2"));
+    assert_eq!(get_result.unwrap(), Some(Bytes::from_static(b"1")));
+    set_result.unwrap();
+    assert_eq!(client.get("b").await.unwrap(), Some(Bytes::from_static(b"2")));
+}
