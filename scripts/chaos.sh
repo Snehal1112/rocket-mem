@@ -18,6 +18,21 @@ FOLLOWER_PORT=17002
 LOAD_LOG="$WORKDIR/load.log"
 CHAOS_LOG="$WORKDIR/chaos-events.log"
 
+# LEADER_PORT/FOLLOWER_PORT are fixed, so two chaos.sh runs started at once would silently
+# fight over the same ports: each run's kill/restart loop can hand the other run's load
+# generator a write that lands in *this* run's AOF (or vice versa), producing spurious
+# MISMATCH reports at verification time that look like a replication bug but are really just
+# two harnesses stepping on each other. Take a flock on a fixed file before touching any
+# ports, so a second concurrent invocation fails fast instead of corrupting both runs. The
+# lock is tied to fd 9 and releases automatically when this process exits or is killed, so it
+# can't go stale like a manual pidfile.
+LOCK_FILE="/tmp/rocket-mem-chaos.lock"
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+  echo "chaos.sh: another chaos.sh run already holds $LOCK_FILE (ports $LEADER_PORT/$FOLLOWER_PORT are fixed, so only one run at a time). Aborting." >&2
+  exit 1
+fi
+
 echo "chaos.sh: workdir=$WORKDIR iterations=$ITERATIONS duration=${DURATION_SECS}s"
 
 cargo build --release --bin rocket-mem -p rocket-mem --manifest-path "$ROOT/Cargo.toml"
