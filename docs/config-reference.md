@@ -126,8 +126,8 @@ rules = ["~app:*", "+get"]
 
 The second user above has no `password` field, so it authenticates with `nopass`; it can
 only run `GET` and only against keys matching `app:*` — every other command and key is
-denied. See `docs/command-compatibility.md` for `ACL SETUSER`'s full token vocabulary and
-the runtime `ACL` command family.
+denied. See [`docs/command-compatibility.md`](command-compatibility.md) for `ACL SETUSER`'s
+full token vocabulary and the runtime `ACL` command family.
 
 Note that bootstrap ACL users configured here live only in memory at runtime: a user added
 later via `ACL SETUSER` is not persisted, and is lost on restart unless it's also added to
