@@ -46,7 +46,7 @@ impl Default for Config {
 
 /// ACL bootstrap users, read from the TOML config's `[[acl.users]]` array. Converted into real
 /// `acl::AclUser`s by `ReplicationHandle::with_acl_bootstrap` — see
-/// ../../docs/superpowers/plans/2026-08-31-sprint-8-plans/04-acl-store-and-bootstrap-wiring.md.
+/// docs/superpowers/plans/2026-08-31-sprint-8-plans/04-acl-store-and-bootstrap-wiring.md.
 #[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
 pub struct AclBootstrapConfig {
     pub users: Vec<AclUserConfig>,
@@ -61,6 +61,7 @@ pub struct AclUserConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
     /// Raw rule tokens, parsed the same way `ACL SETUSER`'s tokens are (plan 03).
+    #[serde(default)]
     pub rules: Vec<String>,
 }
 
@@ -81,6 +82,10 @@ pub fn load_layered(toml_path: Option<&std::path::Path>) -> Result<Config, figme
 
     let mut figment = Figment::from(Serialized::defaults(Config::default()));
     if let Some(path) = toml_path {
+        // Guard the merge on the resolved path actually existing, rather than letting
+        // figment's own `Toml::file()` upward search silently pick up a same-named file
+        // from a parent directory -- a missing `--config` path should fall back to
+        // defaults, not load an unrelated file found higher up the tree.
         if path.exists() {
             figment = figment.merge(Toml::file(path));
         }
@@ -90,6 +95,7 @@ pub fn load_layered(toml_path: Option<&std::path::Path>) -> Result<Config, figme
 }
 
 #[cfg(test)]
+#[allow(clippy::result_large_err)]
 mod tests {
     use super::*;
 
@@ -137,12 +143,17 @@ mod tests {
         figment::Jail::expect_with(|jail| {
             jail.create_file(
                 "rocket-mem.toml",
-                "addr = \"127.0.0.1:1111\"\nrmp_addr = \"127.0.0.1:2222\"\n",
+                "addr = \"127.0.0.1:1111\"\nrmp_addr = \"127.0.0.1:2222\"\nslowlog_threshold_micros = 7000\n",
             )?;
             jail.set_env("ROCKET_MEM_ADDR", "127.0.0.1:3333"); // env must win over the file
+            jail.set_env("ROCKET_MEM_SLOWLOG_THRESHOLD_MICROS", "9000"); // same, for a numeric field
             let cfg = load_layered(Some(std::path::Path::new("rocket-mem.toml"))).unwrap();
             assert_eq!(cfg.addr, "127.0.0.1:3333", "env overrides file");
             assert_eq!(cfg.rmp_addr, "127.0.0.1:2222", "file overrides default");
+            assert_eq!(
+                cfg.slowlog_threshold_micros, 9000,
+                "numeric field: env overrides file"
+            );
             Ok(())
         });
     }
@@ -152,6 +163,43 @@ mod tests {
         figment::Jail::expect_with(|_jail| {
             let cfg = load_layered(Some(std::path::Path::new("does-not-exist.toml"))).unwrap();
             assert_eq!(cfg.addr, "127.0.0.1:6379"); // fell back to defaults, no error
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn load_layered_parses_acl_users_and_defaults_missing_rules_to_empty() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "rocket-mem.toml",
+                r#"
+                [[acl.users]]
+                username = "admin"
+                password = "hunter2"
+                enabled = true
+                rules = ["allcommands", "allkeys"]
+
+                [[acl.users]]
+                username = "readonly"
+                "#,
+            )?;
+            let cfg = load_layered(Some(std::path::Path::new("rocket-mem.toml"))).unwrap();
+            assert_eq!(cfg.acl.users.len(), 2);
+
+            let admin = &cfg.acl.users[0];
+            assert_eq!(admin.username, "admin");
+            assert_eq!(admin.password.as_deref(), Some("hunter2"));
+            assert!(admin.enabled);
+            assert_eq!(admin.rules, vec!["allcommands", "allkeys"]);
+
+            let readonly = &cfg.acl.users[1];
+            assert_eq!(readonly.username, "readonly");
+            assert_eq!(readonly.password, None, "no password means nopass");
+            assert!(readonly.enabled, "enabled defaults to true when omitted");
+            assert!(
+                readonly.rules.is_empty(),
+                "a rules-less user must load with an empty Vec, not fail"
+            );
             Ok(())
         });
     }
