@@ -17,6 +17,7 @@ protocol = { path = "../protocol" }
 common = { path = "../common" }
 bytes.workspace = true
 figment.workspace = true
+serde.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 futures-util.workspace = true

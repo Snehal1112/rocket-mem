@@ -990,6 +990,7 @@ dependencies = [
  "protocol",
  "redis",
  "rmp-client",
+ "serde",
  "tempfile",
  "tokio",
  "tokio-util",
