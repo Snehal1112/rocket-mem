@@ -56,8 +56,8 @@ Request bytes (name `GET`, one arg `foo`, wrapped as `Array[Bulk("GET"), Bulk("f
 ```
 52 4D 01 00                          magic "RM", version 1, msg_type=Request
 00 00 00 00 00 00 00 01              request_id = 1
-00 00 00 14                          payload_len = 20
--- payload (20 bytes) --
+00 00 00 15                          payload_len = 21
+-- payload (21 bytes) --
 05                                   tag Array
 00 00 00 02                          count = 2
 04 00 00 00 03 47 45 54              tag Bulk, len 3, "GET"
