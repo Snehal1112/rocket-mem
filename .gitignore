@@ -33,3 +33,6 @@ tools/*/node_modules/
 tools/*/dist/
 tools/*/.env
 tools/*/.yarn/install-state.gz
+
+*.aof
+tools
