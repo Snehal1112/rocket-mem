@@ -136,16 +136,24 @@ pub struct Cli {
 /// `BTreeMap` by hand and only inserting `Some(_)` fields is what avoids that: an unset flag is
 /// simply absent from the merged provider, so figment's merge leaves the lower layer's value
 /// untouched.
+///
+/// The map's value type is `figment::value::Value`, not `String`. Figment only coerces a bare
+/// string into a number for providers that do their own string parsing (like `Env`); a plain
+/// serialized `String` value would deserialize as `Value::String` and fail extraction into a
+/// `u64` field with `invalid type: found string, expected u64`. Using `Value::from(v)` for
+/// `slowlog_threshold_micros` preserves its real numeric type through serialization instead.
 fn cli_overrides(
     cli: &Cli,
-) -> figment::providers::Serialized<std::collections::BTreeMap<&'static str, String>> {
+) -> figment::providers::Serialized<std::collections::BTreeMap<&'static str, figment::value::Value>>
+{
     use figment::providers::Serialized;
+    use figment::value::Value;
 
     let mut map = std::collections::BTreeMap::new();
     macro_rules! set {
         ($field:ident) => {
             if let Some(v) = &cli.$field {
-                map.insert(stringify!($field), v.to_string());
+                map.insert(stringify!($field), Value::from(v.as_str()));
             }
         };
     }
@@ -161,7 +169,7 @@ fn cli_overrides(
     set!(tls_cert_path);
     set!(tls_key_path);
     if let Some(v) = cli.slowlog_threshold_micros {
-        map.insert("slowlog_threshold_micros", v.to_string());
+        map.insert("slowlog_threshold_micros", Value::from(v));
     }
     Serialized::defaults(map)
 }
@@ -321,6 +329,28 @@ mod tests {
             assert_eq!(
                 cfg.slowlog_threshold_micros, 3000,
                 "env beats file when CLI doesn't set it"
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn cli_flag_sets_the_numeric_slowlog_threshold_field() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("rocket-mem.toml", "slowlog_threshold_micros = 2000\n")?;
+            jail.set_env("ROCKET_MEM_SLOWLOG_THRESHOLD_MICROS", "3000"); // beats the file
+
+            let cli = Cli::parse_from([
+                "rocket-mem",
+                "--config",
+                "rocket-mem.toml",
+                "--slowlog-threshold-micros",
+                "4000", // beats the env var
+            ]);
+            let cfg = load_with_cli(cli).unwrap();
+            assert_eq!(
+                cfg.slowlog_threshold_micros, 4000,
+                "CLI must be able to set a numeric field, not just string fields"
             );
             Ok(())
         });
