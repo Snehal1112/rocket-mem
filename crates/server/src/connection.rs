@@ -73,6 +73,45 @@ async fn periodic_fsync_loop(aof: Arc<AofWriter>) {
     }
 }
 
+/// A second accept loop for the RESP-over-TLS listener, alongside `serve`'s plaintext one.
+/// Wraps each accepted socket in a TLS handshake before handing it to the same
+/// `handle_connection` `serve` already uses -- see plan 09's genericization of that function.
+/// Deliberately does not spawn `active_expire_loop`/`periodic_fsync_loop`: `serve` already does,
+/// unconditionally, and this project's TLS listener is additive to the plaintext one, not a
+/// replacement for it -- see this plan's Global Constraints.
+pub async fn serve_tls(
+    listener: TcpListener,
+    tls_config: Arc<rustls::ServerConfig>,
+    engine: Arc<Engine>,
+    aof: Arc<AofWriter>,
+    replication: Arc<ReplicationHandle>,
+) {
+    let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
+    let mut next_client_id: u64 = 1;
+    loop {
+        let (socket, _addr) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(_) => continue,
+        };
+        let acceptor = acceptor.clone();
+        let client_id = next_client_id;
+        next_client_id += 1;
+        let engine = Arc::clone(&engine);
+        let aof = Arc::clone(&aof);
+        let replication = Arc::clone(&replication);
+        tokio::spawn(async move {
+            let tls_socket = match acceptor.accept(socket).await {
+                Ok(s) => s,
+                // A failed handshake -- including a plaintext client whose raw bytes don't parse
+                // as a TLS ClientHello -- simply ends this connection, exactly like any other
+                // malformed-input path elsewhere in this codebase.
+                Err(_) => return,
+            };
+            handle_connection(tls_socket, engine, aof, replication, client_id).await;
+        });
+    }
+}
+
 /// Decrements the live-connection count on drop, so every one of `handle_connection`'s early
 /// returns -- and the `serve_replica` path, which never returns normally -- is covered without
 /// each of them having to remember.

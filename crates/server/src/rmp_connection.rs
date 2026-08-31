@@ -44,6 +44,36 @@ pub async fn serve(
     }
 }
 
+pub async fn serve_tls(
+    listener: TcpListener,
+    tls_config: Arc<rustls::ServerConfig>,
+    engine: Arc<Engine>,
+    aof: Arc<AofWriter>,
+    replication: Arc<ReplicationHandle>,
+) {
+    let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
+    let mut next_client_id: u64 = 1;
+    loop {
+        let (socket, _addr) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(_) => continue,
+        };
+        let acceptor = acceptor.clone();
+        let client_id = next_client_id;
+        next_client_id += 1;
+        let engine = Arc::clone(&engine);
+        let aof = Arc::clone(&aof);
+        let replication = Arc::clone(&replication);
+        tokio::spawn(async move {
+            let tls_socket = match acceptor.accept(socket).await {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            handle_connection(tls_socket, engine, aof, replication, client_id).await;
+        });
+    }
+}
+
 async fn handle_connection<S>(
     socket: S,
     engine: Arc<Engine>,

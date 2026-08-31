@@ -9,4 +9,4 @@ pub mod replication;
 pub mod rmp_connection;
 pub mod slowlog;
 pub mod tls;
-pub use connection::serve;
+pub use connection::{serve, serve_tls};

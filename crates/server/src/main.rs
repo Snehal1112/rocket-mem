@@ -130,6 +130,46 @@ async fn main() -> std::io::Result<()> {
         Arc::clone(&replication),
     ));
 
+    if let (Some(tls_addr), Some(cert), Some(key)) = (
+        &config.tls_resp_addr,
+        &config.tls_cert_path,
+        &config.tls_key_path,
+    ) {
+        let tls_config = rocket_mem::tls::load_server_config(
+            std::path::Path::new(cert),
+            std::path::Path::new(key),
+        )?;
+        let tls_listener = tokio::net::TcpListener::bind(tls_addr).await?;
+        println!("TLS listening on {}", tls_listener.local_addr()?);
+        tokio::spawn(rocket_mem::serve_tls(
+            tls_listener,
+            tls_config,
+            Arc::clone(&engine),
+            Arc::clone(&aof),
+            Arc::clone(&replication),
+        ));
+    }
+
+    if let (Some(tls_rmp_addr), Some(cert), Some(key)) = (
+        &config.tls_rmp_addr,
+        &config.tls_cert_path,
+        &config.tls_key_path,
+    ) {
+        let tls_config = rocket_mem::tls::load_server_config(
+            std::path::Path::new(cert),
+            std::path::Path::new(key),
+        )?;
+        let tls_rmp_listener = tokio::net::TcpListener::bind(tls_rmp_addr).await?;
+        println!("RMP TLS listening on {}", tls_rmp_listener.local_addr()?);
+        tokio::spawn(rocket_mem::rmp_connection::serve_tls(
+            tls_rmp_listener,
+            tls_config,
+            Arc::clone(&engine),
+            Arc::clone(&aof),
+            Arc::clone(&replication),
+        ));
+    }
+
     let listener = tokio::net::TcpListener::bind(&config.addr).await?;
     println!("Listening on {}", listener.local_addr()?);
     rocket_mem::serve(listener, engine, aof, replication).await;
