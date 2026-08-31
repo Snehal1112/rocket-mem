@@ -2123,7 +2123,21 @@ fn auth_gate(
     if name == "AUTH" || name == "HELLO" {
         return None; // always reachable regardless of auth state
     }
-    let Some(user) = session.authenticated_user() else {
+    let Some(cached_user) = session.authenticated_user() else {
+        return Some(Frame::Error("NOAUTH Authentication required.".into()));
+    };
+    // Re-resolve the LIVE current version of this user by username rather than trusting the
+    // cached snapshot `Session::authenticated_user()` returns: that snapshot is taken once at
+    // AUTH time and never updated, so without this an admin's `ACL SETUSER`/`DELUSER` on an
+    // already-authenticated connection's username would have zero effect on that connection
+    // until it happened to reconnect and re-AUTH -- defeating the point of shipping admin
+    // revocation commands. A user the live lookup can't find (deleted via DELUSER) or that is
+    // now disabled (SETUSER ... off) is treated exactly like "never authenticated".
+    let Some(user) = replication
+        .acl
+        .get_user(&cached_user.username)
+        .filter(|u| u.enabled)
+    else {
         return Some(Frame::Error("NOAUTH Authentication required.".into()));
     };
     let keys = command_keys(frame);
@@ -2713,11 +2727,19 @@ mod tests {
     #[test]
     fn auth_gate_denies_a_command_the_authenticated_user_lacks_a_grant_for() {
         let replication = ReplicationHandle::default();
-        // Needed so `replication.acl.is_empty()` is false and auth_gate actually enforces
-        // `is_allowed` instead of short-circuiting on the empty-ACL fast path.
+        // `auth_gate` re-resolves the LIVE user by username (Addition C), so the fabricated
+        // `acl_user(...)` below must have a matching real registration here or it would be
+        // treated as deleted and get NOAUTH instead of the NOPERM this test asserts.
         replication
             .acl
-            .set_user("app", &[Bytes::from_static(b"on")])
+            .set_user(
+                "app",
+                &[
+                    Bytes::from_static(b"on"),
+                    Bytes::from_static(b"+get"),
+                    Bytes::from_static(b"~*"),
+                ],
+            )
             .unwrap();
         let session = Session::new();
         session.set_authenticated_user(Some(acl_user(vec![
@@ -2739,11 +2761,19 @@ mod tests {
     #[test]
     fn auth_gate_denies_a_key_outside_the_authenticated_users_pattern() {
         let replication = ReplicationHandle::default();
-        // Needed so `replication.acl.is_empty()` is false and auth_gate actually enforces
-        // `is_allowed` instead of short-circuiting on the empty-ACL fast path.
+        // `auth_gate` re-resolves the LIVE user by username (Addition C), so the fabricated
+        // `acl_user(...)` below must have a matching real registration here or it would be
+        // treated as deleted and get NOAUTH instead of the NOPERM this test asserts.
         replication
             .acl
-            .set_user("app", &[Bytes::from_static(b"on")])
+            .set_user(
+                "app",
+                &[
+                    Bytes::from_static(b"on"),
+                    Bytes::from_static(b"allcommands"),
+                    Bytes::from_static(b"~app:*"),
+                ],
+            )
             .unwrap();
         let session = Session::new();
         session.set_authenticated_user(Some(acl_user(vec![
@@ -2764,11 +2794,19 @@ mod tests {
     #[test]
     fn auth_gate_permits_a_command_the_authenticated_user_is_granted() {
         let replication = ReplicationHandle::default();
-        // Needed so this actually exercises `user.is_allowed` rather than passing vacuously via
-        // the empty-ACL fast path.
+        // `auth_gate` re-resolves the LIVE user by username (Addition C), so the fabricated
+        // `acl_user(...)` below must have a matching real registration here or it would be
+        // treated as deleted and get NOAUTH instead of passing through as this test asserts.
         replication
             .acl
-            .set_user("app", &[Bytes::from_static(b"on")])
+            .set_user(
+                "app",
+                &[
+                    Bytes::from_static(b"on"),
+                    Bytes::from_static(b"allcommands"),
+                    Bytes::from_static(b"~*"),
+                ],
+            )
             .unwrap();
         let session = Session::new();
         session.set_authenticated_user(Some(acl_user(vec![
@@ -2951,6 +2989,88 @@ mod tests {
             Frame::Bulk(Bytes::from_static(b"k")),
         ]);
         assert!(handle_acl(&frame, &session, &replication).is_none());
+    }
+
+    /// Addition C: `auth_gate` must re-resolve the LIVE `AclUser` by username on every call,
+    /// not trust `Session::authenticated_user()`'s cached snapshot -- otherwise an admin's `ACL
+    /// SETUSER` narrowing a live connection's rules would have zero effect until that
+    /// connection happened to reconnect and re-`AUTH`.
+    #[test]
+    fn auth_gate_reflects_a_live_acl_setuser_change_not_the_cached_snapshot() {
+        let replication = ReplicationHandle::default();
+        replication
+            .acl
+            .set_user(
+                "app",
+                &[
+                    Bytes::from_static(b"on"),
+                    Bytes::from_static(b"+get"),
+                    Bytes::from_static(b"+set"),
+                    Bytes::from_static(b"~*"),
+                ],
+            )
+            .unwrap();
+        let session = Session::new();
+        session.set_authenticated_user(replication.acl.get_user("app"));
+        let set_frame = Frame::Array(vec![
+            Frame::Bulk(Bytes::from_static(b"SET")),
+            Frame::Bulk(Bytes::from_static(b"k")),
+            Frame::Bulk(Bytes::from_static(b"v")),
+        ]);
+        // Still allowed under the original rules.
+        assert!(auth_gate(&replication, &session, &set_frame).is_none());
+
+        // An admin revokes SET on the same username -- the session was never re-AUTH'd.
+        replication
+            .acl
+            .set_user("app", &[Bytes::from_static(b"-set")])
+            .unwrap();
+
+        let reply = auth_gate(&replication, &session, &set_frame).unwrap();
+        assert_eq!(
+            reply,
+            Frame::Error("NOPERM this user has no permissions to run this command".into())
+        );
+        // GET remains allowed, proving the cached snapshot's other stale grants don't leak in
+        // either -- this reflects the live user's current rule set, nothing else.
+        let get_frame = Frame::Array(vec![
+            Frame::Bulk(Bytes::from_static(b"GET")),
+            Frame::Bulk(Bytes::from_static(b"k")),
+        ]);
+        assert!(auth_gate(&replication, &session, &get_frame).is_none());
+    }
+
+    /// Addition C: `ACL DELUSER` on an already-authenticated connection's username must revoke
+    /// that connection's access on its very next command, not just future ones.
+    #[test]
+    fn auth_gate_returns_noauth_after_the_authenticated_users_account_is_deleted() {
+        let replication = ReplicationHandle::default();
+        replication
+            .acl
+            .set_user(
+                "app",
+                &[
+                    Bytes::from_static(b"on"),
+                    Bytes::from_static(b"allcommands"),
+                    Bytes::from_static(b"allkeys"),
+                ],
+            )
+            .unwrap();
+        let session = Session::new();
+        session.set_authenticated_user(replication.acl.get_user("app"));
+        let frame = Frame::Array(vec![
+            Frame::Bulk(Bytes::from_static(b"GET")),
+            Frame::Bulk(Bytes::from_static(b"k")),
+        ]);
+        assert!(auth_gate(&replication, &session, &frame).is_none());
+
+        assert!(replication.acl.del_user("app"));
+
+        let reply = auth_gate(&replication, &session, &frame).unwrap();
+        assert_eq!(
+            reply,
+            Frame::Error("NOAUTH Authentication required.".into())
+        );
     }
 
     /// Addition D: `ACL DELUSER` draining the store back to zero users must not silently turn
