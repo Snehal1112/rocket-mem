@@ -1804,7 +1804,8 @@ fn handle_hello(
             // stands: real Redis returns NOAUTH for a bare HELLO under requirepass/ACL, allowing
             // only the inline-AUTH-bearing form (handled below) through unauthenticated. A
             // session already authenticated from a prior AUTH call still negotiates normally.
-            if !replication.acl.is_empty() && session.authenticated_user().is_none() {
+            if replication.acl.has_ever_been_configured() && session.authenticated_user().is_none()
+            {
                 return Some(Frame::Error("NOAUTH Authentication required.".into()));
             }
             hello_reply(session.protocol(), client_id, role, mode)
@@ -1819,7 +1820,9 @@ fn handle_hello(
                 // just set the session's authenticated user) is credited before this looks --
                 // "would this HELLO complete without having just authenticated or already being
                 // authenticated," not "was AUTH attempted."
-                if !replication.acl.is_empty() && session.authenticated_user().is_none() {
+                if replication.acl.has_ever_been_configured()
+                    && session.authenticated_user().is_none()
+                {
                     return Some(Frame::Error("NOAUTH Authentication required.".into()));
                 }
                 session.set_protocol(Protocol::Resp2);
@@ -1830,7 +1833,9 @@ fn handle_hello(
                 {
                     return Some(err_or_syntax);
                 }
-                if !replication.acl.is_empty() && session.authenticated_user().is_none() {
+                if replication.acl.has_ever_been_configured()
+                    && session.authenticated_user().is_none()
+                {
                     return Some(Frame::Error("NOAUTH Authentication required.".into()));
                 }
                 session.set_protocol(Protocol::Resp3);
@@ -2221,10 +2226,9 @@ fn auth_gate(
     // shape; every other command run through a still-unauthenticated session remains gated below.
     //
     // ACL is deliberately NOT exempted, matching real Redis's `CMD_NO_AUTH` set (only AUTH,
-    // HELLO, RESET). No `ACL` command exists yet (that's plan 08), so this has no effect today --
-    // but exempting it here would become a full authentication bypass the moment `ACL SETUSER`
-    // lands: an unauthenticated client could run `ACL SETUSER attacker on >x allcommands allkeys`
-    // then `AUTH attacker x`.
+    // HELLO, RESET). `ACL` (this plan, 08) is gated like any other command below -- exempting it
+    // here would be a full authentication bypass: an unauthenticated client could run
+    // `ACL SETUSER attacker on >x allcommands allkeys` then `AUTH attacker x`.
     if name == "AUTH" || name == "HELLO" {
         return None; // always reachable regardless of auth state
     }
@@ -2806,10 +2810,9 @@ mod tests {
         assert!(auth_gate(&replication, &session, &auth_frame).is_none());
     }
 
-    /// No `ACL` command exists yet (that's plan 08), so this documents the gate's behavior for
-    /// when it lands: unlike `AUTH`/`HELLO`, `ACL` is not exempted -- matching real Redis's own
-    /// `CMD_NO_AUTH` set -- so an unauthenticated `ACL WHOAMI` gets NOAUTH here, same as any other
-    /// gated command, rather than reaching `dispatch`'s ordinary unknown-command error.
+    /// `ACL` (this plan, 08) is not exempted from the auth gate, unlike `AUTH`/`HELLO` -- matching
+    /// real Redis's own `CMD_NO_AUTH` set -- so an unauthenticated `ACL WHOAMI` gets NOAUTH here,
+    /// same as any other gated command, rather than reaching `handle_acl`.
     #[test]
     fn auth_gate_denies_an_unauthenticated_acl_command() {
         let replication = ReplicationHandle::default();
@@ -2923,6 +2926,83 @@ mod tests {
             Frame::Bulk(Bytes::from_static(b"k")),
         ]);
         assert!(auth_gate(&replication, &session, &frame).is_none());
+    }
+
+    /// Privilege-escalation regression test: a user granted only a narrow, unrelated command
+    /// (`+get`, no `allcommands`/`+@all`, no `+ACL`) must get `NOPERM` when attempting `ACL
+    /// SETUSER` -- the property that stops a low-privilege authenticated client from creating (or
+    /// promoting) an account for itself via the ACL admin surface. `ACL`'s own permission check
+    /// is against the top-level `ACL` command name (auth_gate never inspects the `SETUSER`
+    /// subcommand token), so any grant short of `+ACL`/`allcommands` must deny every `ACL *`
+    /// subcommand, not just this one.
+    #[test]
+    fn auth_gate_denies_acl_setuser_to_a_user_with_only_a_narrow_unrelated_grant() {
+        let replication = ReplicationHandle::default();
+        replication
+            .acl
+            .set_user(
+                "app",
+                &[
+                    Bytes::from_static(b"on"),
+                    Bytes::from_static(b"+get"),
+                    Bytes::from_static(b"~*"),
+                ],
+            )
+            .unwrap();
+        let session = Session::new();
+        session.set_authenticated_user(Some(acl_user(vec![
+            crate::acl::AclRule::AllowCommand("GET".to_string()),
+            crate::acl::AclRule::AllKeys,
+        ])));
+        let frame = Frame::Array(vec![
+            Frame::Bulk(Bytes::from_static(b"ACL")),
+            Frame::Bulk(Bytes::from_static(b"SETUSER")),
+            Frame::Bulk(Bytes::from_static(b"attacker")),
+            Frame::Bulk(Bytes::from_static(b"on")),
+            Frame::Bulk(Bytes::from_static(b">x")),
+            Frame::Bulk(Bytes::from_static(b"allcommands")),
+            Frame::Bulk(Bytes::from_static(b"allkeys")),
+        ]);
+        let reply = auth_gate(&replication, &session, &frame).unwrap();
+        assert_eq!(
+            reply,
+            Frame::Error("NOPERM this user has no permissions to run this command".into())
+        );
+        // The escalation attempt must never have actually created the account.
+        assert!(replication.acl.get_user("attacker").is_none());
+    }
+
+    /// Wiring test: proves an `ACL` frame genuinely reaches `handle_acl` when routed through the
+    /// real `dispatch_and_log` entry point, not just by calling `handle_acl` directly (which is
+    /// what every other `handle_acl` test in this module does) -- confirms the interception is
+    /// actually wired into `dispatch_and_log_inner`'s chain, not just present as a standalone,
+    /// never-called function.
+    #[test]
+    fn acl_setuser_reaches_handle_acl_through_the_real_dispatch_and_log_entry_point() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let replication = ReplicationHandle::default();
+        let session = Session::new();
+        let reply = dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[
+                b"ACL",
+                b"SETUSER",
+                b"app",
+                b"on",
+                b">pw",
+                b"allcommands",
+                b"allkeys",
+            ]),
+            &session,
+            1,
+        );
+        assert_eq!(reply, Frame::Simple("OK".into()));
+        // Only `handle_acl` actually creates ACL users -- a stray unknown-command fallback or a
+        // `dispatch` pass-through to the engine would never populate the store.
+        assert!(replication.acl.get_user("app").unwrap().enabled);
     }
 
     fn auth_frame(args: &[&[u8]]) -> Frame {
@@ -6276,6 +6356,31 @@ mod tests {
                 &[Bytes::from_static(b"on"), Bytes::from_static(b">pw")],
             )
             .unwrap();
+        let session = Session::new();
+        let reply = dispatch_and_log(&engine, &aof, &replication, cmd(&[b"HELLO"]), &session, 1);
+        assert_eq!(
+            reply,
+            Frame::Error("NOAUTH Authentication required.".into())
+        );
+    }
+
+    /// `ACL DELUSER` draining a once-configured store back to zero users must not reopen bare
+    /// `HELLO` as an unauthenticated-protocol-negotiation bypass -- same bug class as the PSYNC
+    /// fix, same fix: `handle_hello`'s three inline auth checks must key off
+    /// `has_ever_been_configured` (sticky), not `is_empty` (which flips back to `true` once every
+    /// user is deleted).
+    #[test]
+    fn hello_stays_gated_after_deluser_empties_a_once_configured_store() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let replication = ReplicationHandle::default();
+        replication
+            .acl
+            .set_user("app", &[Bytes::from_static(b"on")])
+            .unwrap();
+        assert!(replication.acl.del_user("app"));
+        assert!(replication.acl.is_empty());
+
         let session = Session::new();
         let reply = dispatch_and_log(&engine, &aof, &replication, cmd(&[b"HELLO"]), &session, 1);
         assert_eq!(
