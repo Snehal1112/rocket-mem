@@ -115,3 +115,53 @@ async fn a_real_tls_client_completes_a_set_get_round_trip() {
         protocol::Frame::Bulk(Bytes::from_static(b"bar"))
     );
 }
+
+#[tokio::test]
+async fn a_plaintext_client_connects_at_tcp_but_never_gets_a_valid_reply() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let engine = Arc::new(engine::Engine::new());
+    let dir = tempfile::tempdir().unwrap();
+    let aof = Arc::new(
+        rocket_mem::aof::AofWriter::open(
+            &dir.path().join("test.aof"),
+            rocket_mem::aof::FsyncPolicy::Never,
+        )
+        .unwrap(),
+    );
+    let replication = Arc::new(rocket_mem::replication::ReplicationHandle::default());
+    let tls_config =
+        rocket_mem::tls::load_server_config(&fixture("test-cert.pem"), &fixture("test-key.pem"))
+            .unwrap();
+    tokio::spawn(rocket_mem::serve_tls(
+        listener,
+        tls_config,
+        engine,
+        aof,
+        replication,
+    ));
+
+    // The TCP layer connects fine -- the port is open and accepting.
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+    // Send raw RESP bytes, as a real (non-TLS) redis-cli would, straight at the TLS port.
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    stream.write_all(b"*1\r\n$4\r\nPING\r\n").await.unwrap();
+
+    // The server's TLS handshake fails to parse these bytes as a ClientHello and drops the
+    // connection -- read_to_end must observe EOF (a closed connection), never a real RESP reply.
+    let mut buf = Vec::new();
+    let read_result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        stream.read_to_end(&mut buf),
+    )
+    .await;
+    assert!(
+        read_result.is_ok(),
+        "the connection must be closed, not hang forever"
+    );
+    assert!(
+        buf.is_empty() || !buf.starts_with(b"+PONG"),
+        "a plaintext client must never receive a valid RESP reply from a TLS-only port, got: {buf:?}"
+    );
+}
