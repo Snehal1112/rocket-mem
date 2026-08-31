@@ -935,7 +935,27 @@ pub fn dispatch(engine: &Engine, frame: Frame, _protocol: &mut Protocol, _client
                         Some(s) => s,
                         None => return Frame::Error("ERR value is not a valid float".into()),
                     };
-                    std::thread::sleep(std::time::Duration::from_secs_f64(secs.max(0.0)));
+                    if !secs.is_finite() {
+                        return Frame::Error("ERR timeout is not finite".into());
+                    }
+                    const MAX_DEBUG_SLEEP_SECS: f64 = 10.0;
+                    if secs > MAX_DEBUG_SLEEP_SECS {
+                        return Frame::Error(format!(
+                            "ERR DEBUG SLEEP duration exceeds the {MAX_DEBUG_SLEEP_SECS}s maximum allowed on this server"
+                        ));
+                    }
+                    // secs.max(0.0) is finite and within [0, MAX_DEBUG_SLEEP_SECS] by this point, so
+                    // try_from_secs_f64 cannot fail -- using the fallible constructor anyway rather than
+                    // the panicking Duration::from_secs_f64 is defense in depth against this invariant
+                    // ever being violated by a future edit above.
+                    //
+                    // This still blocks a real Tokio runtime worker thread (std::thread::sleep inside a
+                    // plain tokio::spawn, not spawn_blocking) -- the 10s ceiling bounds the blast radius
+                    // of that until Sprint 8's ACLs gate DEBUG behind admin auth; it does not eliminate
+                    // the underlying property, which real Redis's own DEBUG SLEEP shares.
+                    let dur = std::time::Duration::try_from_secs_f64(secs.max(0.0))
+                        .unwrap_or(std::time::Duration::ZERO);
+                    std::thread::sleep(dur);
                     Frame::Simple("OK".into())
                 }
                 _ => Frame::Error(format!("ERR unknown DEBUG subcommand '{subcommand}'")),
@@ -5669,6 +5689,40 @@ mod tests {
                 Frame::Bulk(Bytes::from_static(b"DEBUG")),
                 Frame::Bulk(Bytes::from_static(b"SLEEP")),
                 Frame::Bulk(Bytes::from_static(b"not-a-number")),
+            ]),
+            &mut protocol,
+            1,
+        );
+        assert!(matches!(reply, Frame::Error(_)));
+    }
+
+    #[test]
+    fn debug_sleep_rejects_infinite_duration() {
+        let engine = Engine::new();
+        let mut protocol = Protocol::default();
+        let reply = dispatch(
+            &engine,
+            Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"DEBUG")),
+                Frame::Bulk(Bytes::from_static(b"SLEEP")),
+                Frame::Bulk(Bytes::from_static(b"inf")),
+            ]),
+            &mut protocol,
+            1,
+        );
+        assert!(matches!(reply, Frame::Error(_)));
+    }
+
+    #[test]
+    fn debug_sleep_rejects_a_duration_over_the_ceiling() {
+        let engine = Engine::new();
+        let mut protocol = Protocol::default();
+        let reply = dispatch(
+            &engine,
+            Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"DEBUG")),
+                Frame::Bulk(Bytes::from_static(b"SLEEP")),
+                Frame::Bulk(Bytes::from_static(b"3600")),
             ]),
             &mut protocol,
             1,
