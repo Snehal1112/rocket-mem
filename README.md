@@ -2,7 +2,7 @@
 
 ![CI](https://github.com/Snehal1112/rocket-mem/actions/workflows/ci.yml/badge.svg)
 
-A from-scratch, RESP-compatible (Redis wire protocol) in-memory data store written in Rust. The goal is a server real Redis clients (`redis-cli`, `redis-py`, `ioredis`, `go-redis`, ...) can talk to unmodified, built on a storage engine that stays protocol-agnostic so a custom binary protocol can be layered on top later without a rewrite.
+A from-scratch, RESP-compatible (Redis wire protocol) in-memory data store written in Rust. The goal is a server real Redis clients (`redis-cli`, `redis-py`, `ioredis`, `go-redis`, ...) can talk to unmodified, built on a storage engine that stays protocol-agnostic — proven out in Sprint 7, which layered **RMP**, a second binary protocol of rocket-mem's own, on top without touching the engine at all.
 
 This is a 16-week solo build, tracked in 2-week sprints. Full rationale and week-by-week detail live in [`docs/rocket-mem-production-plan.md`](docs/rocket-mem-production-plan.md); sprint capacity/priorities/DoD live in [`docs/rocket-mem-sprint-plan.md`](docs/rocket-mem-sprint-plan.md).
 
@@ -12,8 +12,7 @@ Three layers, fixed in Sprint 1 and respected throughout:
 
 ```
 ┌─────────────────────────────────────────┐
-│  Protocol Layer (RESP2/RESP3, later:     │
-│  a custom binary protocol)               │
+│  Protocol Layer (RESP2/RESP3, RMP)       │
 ├─────────────────────────────────────────┤
 │  Command Dispatcher (maps commands →     │
 │  engine calls, arg validation)           │
@@ -97,6 +96,26 @@ See `docs/superpowers/specs/2026-08-30-sprint-6-spec.md` for the full set of des
 (why `-MOVED` takes precedence over `-READONLY`, why `CROSSSLOT` is enforced rather than skipped,
 why `INFO`/`HELLO` moved out of `dispatch`).
 
+**Sprint 7 (custom protocol) — done.** rocket-mem now speaks a second wire protocol of its own,
+**RMP**, alongside RESP — both read and write the same shared keyspace, and a client can prove it
+by writing over one and reading over the other. RMP's headline capability is the one thing RESP
+structurally cannot do: request multiplexing. A client sends many requests on one connection
+without waiting for each reply, tagging each with its own `request_id`; the server may answer them
+in any order, and the client correlates each reply back to its request by that id rather than by
+arrival order. RMP is a hand-rolled binary framing (magic bytes, version, a 16-byte envelope,
+length-prefixed values) rather than Protobuf/Cap'n Proto, reachable on its own port
+(`ROCKET_MEM_RMP_ADDR`, default `127.0.0.1:6380`) — see "Running the custom protocol (RMP)" below.
+Crucially, RMP reaches rocket-mem's *entire* command set, including `INFO`, `CLUSTER`, `SAVE`,
+`REPLICAOF`, and `SLOWLOG`, for free: its connection handler builds the same `Array`-of-`Bulk`
+command shape RESP already builds and calls the identical, unmodified `dispatch_and_log` function
+every RESP command goes through, so AOF logging, replica fan-out, cluster redirection, and the
+read-only-replica gate all apply to an RMP write exactly as they do to a RESP one. A new
+`rmp-client` crate is a minimal async Rust client (`connect`/`call`/`get`/`set`/`del`) proving the
+whole design end-to-end, including a test that deliberately has the server answer two concurrent
+requests out of order and confirms the client still resolves each to the right caller. See
+`docs/superpowers/specs/2026-08-31-sprint-7-spec.md` for the full wire format (byte-exact worked
+examples for a request, a response, and a multiplexed pair) and the connection concurrency model.
+
 Known limits, called out explicitly rather than left to be discovered: **there is no cluster bus
 and no gossip** — nodes never talk to each other, so `CLUSTER NODES` reports every configured node
 as `connected` and `cluster_state` is always `ok`, because a static config cannot honestly say
@@ -117,11 +136,16 @@ command name and its first argument rather than the full argument list, with rea
 yet; there is no true replication-*offset* lag metric, because Sprint 5's full-resync-only design
 means no offsets exist — `rocket_mem_replication_last_apply_timestamp_seconds` is the honest
 substitute; the `/metrics` endpoint is unauthenticated (hence its loopback default); and
-`ReplicationHandle` is now misnamed — it carries the snapshot path, AOF handle, cluster config,
-slow log, and server counters — with the rename to `ServerState` deferred to Sprint 7, whose
-dual-protocol work already has to touch those signatures.
+`ReplicationHandle` is still misnamed — it carries the snapshot path, AOF handle, cluster config,
+slow log, and server counters. Sprint 7 turned out not to force this rename after all: its RMP
+connection handler takes the exact same `Arc<ReplicationHandle>` every RESP connection already
+does, unchanged. The rename remains deferred, with no forcing sprint currently scoped.
+RMP connections are not yet counted in `rocket_mem_connected_clients`/`rocket_mem_connections_total`
+— those counters are only wired into RESP's connection lifecycle (`connection.rs`'s `ClientGuard`);
+extending them to RMP is a small, contained follow-up (an equivalent guard in
+`rmp_connection.rs`), not attempted this sprint to keep it scoped to the protocol itself.
 
-Remaining sprints (clustering, a custom protocol, ACLs/TLS) are scoped in the
+The remaining sprint (auth, ACLs, TLS & release) is scoped in the
 [sprint plan](docs/rocket-mem-sprint-plan.md) but not started.
 
 ### Command coverage
@@ -151,6 +175,7 @@ The server binary reads these environment variables at startup:
 | Variable | Default | Purpose |
 |---|---|---|
 | `ROCKET_MEM_ADDR` | `127.0.0.1:6379` | TCP address to bind |
+| `ROCKET_MEM_RMP_ADDR` | `127.0.0.1:6380` | TCP address the RMP (custom protocol) listener binds — always on, no opt-out |
 | `ROCKET_MEM_AOF_PATH` | `./appendonly.aof` | Append-only file path — replayed on startup if it already exists, then opened for appending with an `EverySecond` fsync policy |
 | `ROCKET_MEM_SNAPSHOT_PATH` | `./dump.snapshot` | Snapshot file path — loaded on startup if present (together with only the AOF bytes written after the offset embedded in it), written by the `SAVE` command |
 | `ROCKET_MEM_CLUSTER_CONFIG` | unset | Path to the cluster topology file. Unset means cluster mode is off (no `-MOVED`, no `-CROSSSLOT`). Must be set together with `ROCKET_MEM_CLUSTER_NODE_ID` |
@@ -197,6 +222,28 @@ Multi-key commands must have all their keys in one slot, or they are rejected wi
 `{user1000}.city`) to force related keys onto one node. This server never forwards a command to
 another node: following a `-MOVED` is the client's job.
 
+### Running the custom protocol (RMP)
+
+Every node also listens for **RMP** on its own port, unconditionally. A client can send several
+requests without waiting for each reply — each carries a `request_id` the matching response
+echoes back, so replies may arrive in any order:
+
+```bash
+ROCKET_MEM_RMP_ADDR=127.0.0.1:6380 cargo run --release --bin rocket-mem
+```
+
+The `rmp-client` crate is a minimal async client proving the design end-to-end:
+
+```rust
+let client = rmp_client::RmpClient::connect("127.0.0.1:6380").await?;
+client.set("foo", "bar").await?;
+assert_eq!(client.get("foo").await?, Some(bytes::Bytes::from_static(b"bar")));
+```
+
+RMP reaches the same command set RESP does — see
+[`docs/superpowers/specs/2026-08-31-sprint-7-spec.md`](docs/superpowers/specs/2026-08-31-sprint-7-spec.md)
+for the wire format's exact byte layout and the multiplexing design.
+
 ### Observability
 
 `GET http://$ROCKET_MEM_METRICS_ADDR/metrics` serves a Prometheus text-format registry:
@@ -227,12 +274,13 @@ its leader are not counted: only client-originated commands reach the instrument
 
 ## Workspace layout
 
-Four crates under `crates/`:
+Five crates under `crates/`:
 
 - **`common`** — shared `EngineError` enum (`WrongType`, `NotAnInteger`, `NoSuchKey`). No dependencies on the other crates.
 - **`engine`** — the storage engine: `Value` enum, 16-shard `Store`, and one free function per command under `commands/`. Everything in "Status" above lives here.
-- **`protocol`** — RESP wire format: the `Frame` type (RESP2 plus RESP3's `Map`) and `RespCodec`, encoding/decoding both including split-read reassembly.
-- **`server`** — the binary (package name `rocket-mem`): Tokio TCP accept loop, per-connection task, command dispatcher, AOF writer/replayer, snapshotting, leader/follower replication, the active-expiry and fsync background loops, cluster hash-slot routing and `-MOVED` redirection, the Prometheus metrics endpoint, and the slow log.
+- **`protocol`** — wire formats: RESP's `Frame` type (RESP2 plus RESP3's `Map`) and `RespCodec`, and RMP's envelope/value codec (`rmp` module) reusing the same `Frame` as its value model. Both codecs handle split-read reassembly.
+- **`server`** — the binary (package name `rocket-mem`): Tokio TCP accept loops for both RESP and RMP, per-connection tasks, the shared command dispatcher every protocol calls, AOF writer/replayer, snapshotting, leader/follower replication, the active-expiry and fsync background loops, cluster hash-slot routing and `-MOVED` redirection, the Prometheus metrics endpoint, and the slow log.
+- **`rmp-client`** — a minimal async Rust client for RMP (`connect`/`call`/`get`/`set`/`del`), proving the protocol end-to-end.
 
 ## Building & testing
 
