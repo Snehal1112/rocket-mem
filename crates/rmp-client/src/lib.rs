@@ -63,6 +63,7 @@ struct Shared {
 pub struct RmpClient {
     write_tx: mpsc::UnboundedSender<RmpMessage>,
     shared: Arc<Shared>,
+    reader_handle: tokio::task::JoinHandle<()>,
 }
 
 impl RmpClient {
@@ -87,7 +88,7 @@ impl RmpClient {
         });
 
         let reader_shared = Arc::clone(&shared);
-        tokio::spawn(async move {
+        let reader_handle = tokio::spawn(async move {
             while let Some(next) = stream.next().await {
                 let Ok(msg) = next else { break };
                 if msg.msg_type != MsgType::Response {
@@ -110,7 +111,11 @@ impl RmpClient {
             *guard = PendingReplies::Closed;
         });
 
-        Ok(RmpClient { write_tx, shared })
+        Ok(RmpClient {
+            write_tx,
+            shared,
+            reader_handle,
+        })
     }
 
     /// Sends `args` as a Request (encoded as an Array of Bulk strings) and awaits the
@@ -177,6 +182,16 @@ impl RmpClient {
             Frame::Error(e) => Err(RmpError::ServerError(e)),
             other => Err(RmpError::UnexpectedReply(other)),
         }
+    }
+}
+
+impl Drop for RmpClient {
+    fn drop(&mut self) {
+        // Aborting (not gracefully joining) is correct here: nothing can still be
+        // awaiting a reply through `self` once `self` is being dropped -- `call`
+        // borrows `&self`, so any in-flight call future must have already
+        // completed or is being dropped concurrently as part of this same drop.
+        self.reader_handle.abort();
     }
 }
 
@@ -392,6 +407,30 @@ mod tests {
 
         let client = RmpClient::connect(addr).await.unwrap();
         assert!(client.del("k").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn dropping_the_client_closes_its_connection_promptly() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (peer_saw_eof_tx, peer_saw_eof_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut framed = Framed::new(socket, RmpCodec);
+            // The peer's read loop ends (None) once the client-side socket fully closes --
+            // which requires both the writer half (dropped via write_tx) AND the reader
+            // half (currently leaked forever without the Drop fix) to actually go away.
+            while framed.next().await.is_some() {}
+            let _ = peer_saw_eof_tx.send(());
+        });
+
+        let client = RmpClient::connect(addr).await.unwrap();
+        drop(client);
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), peer_saw_eof_rx)
+            .await
+            .expect("peer never saw EOF -- the client's socket leaked past its own drop")
+            .unwrap();
     }
 
     #[tokio::test]
