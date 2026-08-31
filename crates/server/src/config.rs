@@ -68,6 +68,27 @@ fn default_true() -> bool {
     true
 }
 
+/// Merges, in order (later wins): built-in defaults, an optional TOML file, then
+/// `ROCKET_MEM_*` env vars. CLI-flag overrides are a further layer plan 02's `load()` applies
+/// on top of this function's result -- kept separate so this layer stays testable without
+/// needing to construct a `clap::Parser` in every test above.
+// `figment::Error` is the standard error type for this ecosystem and is what plan 02's
+// `load()` expects to propagate; boxing it here would just move the problem there.
+#[allow(clippy::result_large_err)]
+pub fn load_layered(toml_path: Option<&std::path::Path>) -> Result<Config, figment::Error> {
+    use figment::providers::{Env, Format, Serialized, Toml};
+    use figment::Figment;
+
+    let mut figment = Figment::from(Serialized::defaults(Config::default()));
+    if let Some(path) = toml_path {
+        if path.exists() {
+            figment = figment.merge(Toml::file(path));
+        }
+    }
+    figment = figment.merge(Env::prefixed("ROCKET_MEM_"));
+    figment.extract()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -88,5 +109,50 @@ mod tests {
         assert_eq!(cfg.tls_cert_path, None);
         assert_eq!(cfg.tls_key_path, None);
         assert!(cfg.acl.users.is_empty());
+    }
+
+    #[test]
+    fn load_layered_with_no_file_and_no_env_returns_defaults() {
+        figment::Jail::expect_with(|_jail| {
+            let cfg = load_layered(None).unwrap();
+            assert_eq!(cfg.addr, "127.0.0.1:6379");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn load_layered_reads_the_existing_rocket_mem_env_var_names() {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("ROCKET_MEM_ADDR", "0.0.0.0:9999");
+            jail.set_env("ROCKET_MEM_SLOWLOG_THRESHOLD_MICROS", "5000");
+            let cfg = load_layered(None).unwrap();
+            assert_eq!(cfg.addr, "0.0.0.0:9999");
+            assert_eq!(cfg.slowlog_threshold_micros, 5000);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn load_layered_applies_a_toml_file_under_the_env_layer() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "rocket-mem.toml",
+                "addr = \"127.0.0.1:1111\"\nrmp_addr = \"127.0.0.1:2222\"\n",
+            )?;
+            jail.set_env("ROCKET_MEM_ADDR", "127.0.0.1:3333"); // env must win over the file
+            let cfg = load_layered(Some(std::path::Path::new("rocket-mem.toml"))).unwrap();
+            assert_eq!(cfg.addr, "127.0.0.1:3333", "env overrides file");
+            assert_eq!(cfg.rmp_addr, "127.0.0.1:2222", "file overrides default");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn load_layered_with_a_missing_toml_path_is_not_an_error() {
+        figment::Jail::expect_with(|_jail| {
+            let cfg = load_layered(Some(std::path::Path::new("does-not-exist.toml"))).unwrap();
+            assert_eq!(cfg.addr, "127.0.0.1:6379"); // fell back to defaults, no error
+            Ok(())
+        });
     }
 }
