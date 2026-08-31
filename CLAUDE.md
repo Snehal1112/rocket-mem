@@ -18,10 +18,10 @@ cargo test -p engine commands::string::tests                # one test module
 cargo test -p engine commands::string::tests::incr_by_adds_to_existing_value  # one test
 cargo fmt --all -- --check                                 # CI's format check
 cargo fmt --all                                             # apply formatting
-cargo clippy --workspace -- -D warnings                     # CI's lint gate — must be clean
+cargo clippy --workspace --all-targets -- -D warnings        # CI's lint gate — must be clean
 ```
 
-CI (`.github/workflows/ci.yml`) runs exactly those fmt/clippy/test commands on every push and PR. All three must pass locally before committing — `cargo clippy --workspace -- -D warnings` is strict (no warnings at all, including dead-code).
+CI (`.github/workflows/ci.yml`) runs exactly those fmt/clippy/test commands on every push and PR. All three must pass locally before committing — `cargo clippy --workspace --all-targets -- -D warnings` is strict (no warnings at all, including dead-code) and lints test code too, not just lib targets.
 
 ## Workspace layout
 
