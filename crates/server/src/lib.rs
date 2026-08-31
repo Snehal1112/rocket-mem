@@ -4,5 +4,6 @@ pub mod connection;
 pub mod dispatcher;
 pub mod metrics;
 pub mod replication;
+pub mod rmp_connection;
 pub mod slowlog;
 pub use connection::serve;
