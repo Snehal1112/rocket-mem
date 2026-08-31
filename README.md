@@ -105,11 +105,17 @@ in any order, and the client correlates each reply back to its request by that i
 arrival order. RMP is a hand-rolled binary framing (magic bytes, version, a 16-byte envelope,
 length-prefixed values) rather than Protobuf/Cap'n Proto, reachable on its own port
 (`ROCKET_MEM_RMP_ADDR`, default `127.0.0.1:6380`) — see "Running the custom protocol (RMP)" below.
-Crucially, RMP reaches rocket-mem's *entire* command set, including `INFO`, `CLUSTER`, `SAVE`,
+Crucially, RMP reaches almost rocket-mem's entire command set, including `INFO`, `CLUSTER`, `SAVE`,
 `REPLICAOF`, and `SLOWLOG`, for free: its connection handler builds the same `Array`-of-`Bulk`
 command shape RESP already builds and calls the identical, unmodified `dispatch_and_log` function
 every RESP command goes through, so AOF logging, replica fan-out, cluster redirection, and the
-read-only-replica gate all apply to an RMP write exactly as they do to a RESP one. A new
+read-only-replica gate all apply to an RMP write exactly as they do to a RESP one. The one genuine
+exception is `PSYNC`: it's intercepted above `dispatch_and_log`, in RESP's `connection.rs`, before
+that function is even called, and RMP's connection handler has no equivalent interception, so
+`PSYNC` over RMP falls through to the ordinary "unknown command" error. (`HELLO` is not an
+exception — it's intercepted *inside* `dispatch_and_log` itself, so RMP gets a normal success
+reply from it, just always as if freshly negotiated, since RMP has no per-connection protocol
+state for it to persist.) A new
 `rmp-client` crate is a minimal async Rust client (`connect`/`call`/`get`/`set`/`del`) proving the
 whole design end-to-end, including a test that deliberately has the server answer two concurrent
 requests out of order and confirms the client still resolves each to the right caller. See
@@ -207,6 +213,10 @@ ROCKET_MEM_CLUSTER_NODE_ID=shard-a \
   cargo run --release --bin rocket-mem
 ```
 
+Not shown above: running more than one node on one host also needs a distinct `ROCKET_MEM_RMP_ADDR`
+and `ROCKET_MEM_METRICS_ADDR` per node, since each defaults to the same fixed port on every node —
+without that, the second and third node fail to bind.
+
 A key's slot is `CRC16(hash_tag(key)) % 16384`, identical to real Redis Cluster, so any
 cluster-aware client computes the same answer:
 
@@ -226,7 +236,10 @@ another node: following a `-MOVED` is the client's job.
 
 Every node also listens for **RMP** on its own port, unconditionally. A client can send several
 requests without waiting for each reply — each carries a `request_id` the matching response
-echoes back, so replies may arrive in any order:
+echoes back, so replies may arrive in any order. Because each request is handled on its own spawned
+task, commands sent back-to-back on one RMP connection may also *execute* out of order relative to
+each other, not just reply out of order — unlike RESP's strict send-order execution, a client that
+needs command B to see command A's effect must await A's reply before sending B:
 
 ```bash
 ROCKET_MEM_RMP_ADDR=127.0.0.1:6380 cargo run --release --bin rocket-mem
@@ -240,7 +253,8 @@ client.set("foo", "bar").await?;
 assert_eq!(client.get("foo").await?, Some(bytes::Bytes::from_static(b"bar")));
 ```
 
-RMP reaches the same command set RESP does — see
+RMP reaches almost the same command set RESP does — `PSYNC` (raw-socket takeover) is the one
+command genuinely unreachable over RMP; `HELLO` works too, just as a no-op negotiation — see
 [`docs/superpowers/specs/2026-08-31-sprint-7-spec.md`](docs/superpowers/specs/2026-08-31-sprint-7-spec.md)
 for the wire format's exact byte layout and the multiplexing design.
 
