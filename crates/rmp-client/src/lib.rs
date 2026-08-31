@@ -326,7 +326,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             let (socket, _) = listener.accept().await.unwrap();
-            let mut framed = Framed::new(socket, RmpCodec::default());
+            let mut framed = Framed::new(socket, RmpCodec);
             let request = framed.next().await.unwrap().unwrap();
             framed
                 .send(RmpMessage {
@@ -348,7 +348,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             let (socket, _) = listener.accept().await.unwrap();
-            let mut framed = Framed::new(socket, RmpCodec::default());
+            let mut framed = Framed::new(socket, RmpCodec);
             let request = framed.next().await.unwrap().unwrap();
             assert_eq!(
                 request.frame,
@@ -378,7 +378,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             let (socket, _) = listener.accept().await.unwrap();
-            let mut framed = Framed::new(socket, RmpCodec::default());
+            let mut framed = Framed::new(socket, RmpCodec);
             let request = framed.next().await.unwrap().unwrap();
             framed
                 .send(RmpMessage {
@@ -400,7 +400,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             let (socket, _) = listener.accept().await.unwrap();
-            let mut framed = Framed::new(socket, RmpCodec::default());
+            let mut framed = Framed::new(socket, RmpCodec);
             let request = framed.next().await.unwrap().unwrap();
             framed
                 .send(RmpMessage {

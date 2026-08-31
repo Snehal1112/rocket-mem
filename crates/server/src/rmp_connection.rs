@@ -62,7 +62,11 @@ async fn handle_connection(
     while let Some(next) = stream.next().await {
         let request = match next {
             Ok(msg) if msg.msg_type == MsgType::Request => msg,
-            _ => break, // decode error, dropped connection, or a stray Response from the client
+            Ok(_) => break, // a stray Response from a misbehaving client
+            Err(e) => {
+                eprintln!("rmp decode error: {e}");
+                break;
+            }
         };
         let engine = Arc::clone(&engine);
         let aof = Arc::clone(&aof);

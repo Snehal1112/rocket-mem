@@ -129,7 +129,7 @@ async fn the_server_survives_an_rmp_client_disconnecting_before_reading_its_repl
 
     {
         let socket = tokio::net::TcpStream::connect(rmp_addr).await.unwrap();
-        let mut framed = Framed::new(socket, RmpCodec::default());
+        let mut framed = Framed::new(socket, RmpCodec);
         framed
             .send(RmpMessage {
                 request_id: 1,

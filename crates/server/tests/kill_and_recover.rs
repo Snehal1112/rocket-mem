@@ -10,6 +10,7 @@ fn spawn_server(aof_path: &std::path::Path) -> (Child, String) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_rocket-mem"))
         .env("ROCKET_MEM_ADDR", "127.0.0.1:0")
         .env("ROCKET_MEM_METRICS_ADDR", "127.0.0.1:0")
+        .env("ROCKET_MEM_RMP_ADDR", "127.0.0.1:0")
         .env("ROCKET_MEM_AOF_PATH", aof_path)
         .stdout(Stdio::piped())
         .spawn()
