@@ -166,7 +166,7 @@ async fn the_server_survives_an_rmp_client_disconnecting_before_reading_its_repl
 // connection handler -- a tautology. Requiring `flavor = "multi_thread"` here lets PING
 // actually get dispatched on a different worker thread while SLEEP's thread blocks, so
 // this test's timing bound is measuring genuine concurrent dispatch.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rmp_genuinely_delivers_a_fast_reply_before_a_slower_concurrent_request_on_one_connection()
 {
     let (_dir, _resp_url, rmp_addr) = spawn_dual_protocol_server().await;
