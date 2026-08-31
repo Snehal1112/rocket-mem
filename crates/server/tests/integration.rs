@@ -108,7 +108,7 @@ fn resp_frame_len(buf: &[u8]) -> Option<usize> {
     }
     match buf[0] {
         b'+' | b'-' | b':' => find_crlf(&buf[1..]).map(|crlf| 1 + crlf + 2),
-        b'_' => (buf.len() >= 3).then_some(3),
+        b'_' => (buf.len() >= 3 && &buf[1..3] == b"\r\n").then_some(3),
         b'$' => {
             let crlf = find_crlf(&buf[1..])?;
             let len: i64 = std::str::from_utf8(&buf[1..1 + crlf]).ok()?.parse().ok()?;
