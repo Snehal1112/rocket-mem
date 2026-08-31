@@ -1,0 +1,11 @@
+[package]
+name = "rmp-client"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+protocol = { path = "../protocol" }
+bytes.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures-util.workspace = true
