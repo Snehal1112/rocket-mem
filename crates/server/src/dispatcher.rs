@@ -922,6 +922,25 @@ pub fn dispatch(engine: &Engine, frame: Frame, _protocol: &mut Protocol, _client
                 _ => Frame::Error(format!("ERR unknown OBJECT subcommand '{subcommand}'")),
             }
         }
+        "DEBUG" => {
+            require_args!(rest, 1, "debug");
+            let subcommand = String::from_utf8_lossy(&rest[0]).to_ascii_uppercase();
+            match subcommand.as_str() {
+                "SLEEP" => {
+                    require_args!(rest, 2, "debug sleep");
+                    let secs: f64 = match std::str::from_utf8(&rest[1])
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                    {
+                        Some(s) => s,
+                        None => return Frame::Error("ERR value is not a valid float".into()),
+                    };
+                    std::thread::sleep(std::time::Duration::from_secs_f64(secs.max(0.0)));
+                    Frame::Simple("OK".into())
+                }
+                _ => Frame::Error(format!("ERR unknown DEBUG subcommand '{subcommand}'")),
+            }
+        }
         _ => Frame::Error(format!("ERR unknown command '{}'", name.as_str())),
     }
 }
@@ -1001,6 +1020,7 @@ pub(crate) const KNOWN_COMMANDS: &[&str] = &[
     "APPEND",
     "CLUSTER",
     "COMMAND",
+    "DEBUG",
     "DECR",
     "DEL",
     "ECHO",
@@ -1104,7 +1124,9 @@ enum KeySpec {
 fn key_spec(name: &str) -> KeySpec {
     match name {
         "PING" | "ECHO" | "SELECT" | "COMMAND" | "INFO" | "HELLO" | "KEYS" | "SCAN"
-        | "RANDOMKEY" | "CLUSTER" | "SAVE" | "REPLICAOF" | "PSYNC" | "SLOWLOG" => KeySpec::None,
+        | "RANDOMKEY" | "CLUSTER" | "SAVE" | "REPLICAOF" | "PSYNC" | "SLOWLOG" | "DEBUG" => {
+            KeySpec::None
+        }
         "MEMORY" | "OBJECT" => KeySpec::Second,
         "DEL" | "EXISTS" | "MGET" | "RENAME" | "RENAMENX" | "SINTER" | "SUNION" | "SDIFF"
         | "SINTERSTORE" | "SUNIONSTORE" | "SDIFFSTORE" => KeySpec::All,
@@ -5616,6 +5638,42 @@ mod tests {
             ),
             Frame::Error("ERR unknown OBJECT subcommand 'NOPE'".into())
         );
+    }
+
+    #[test]
+    fn debug_sleep_blocks_for_approximately_the_requested_duration() {
+        let engine = Engine::new();
+        let mut protocol = Protocol::default();
+        let started = std::time::Instant::now();
+        let reply = dispatch(
+            &engine,
+            Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"DEBUG")),
+                Frame::Bulk(Bytes::from_static(b"SLEEP")),
+                Frame::Bulk(Bytes::from_static(b"0.05")),
+            ]),
+            &mut protocol,
+            1,
+        );
+        assert_eq!(reply, Frame::Simple("OK".into()));
+        assert!(started.elapsed() >= std::time::Duration::from_millis(45)); // small slack under 50ms
+    }
+
+    #[test]
+    fn debug_sleep_rejects_a_non_numeric_argument() {
+        let engine = Engine::new();
+        let mut protocol = Protocol::default();
+        let reply = dispatch(
+            &engine,
+            Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"DEBUG")),
+                Frame::Bulk(Bytes::from_static(b"SLEEP")),
+                Frame::Bulk(Bytes::from_static(b"not-a-number")),
+            ]),
+            &mut protocol,
+            1,
+        );
+        assert!(matches!(reply, Frame::Error(_)));
     }
 
     #[test]

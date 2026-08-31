@@ -153,3 +153,59 @@ async fn the_server_survives_an_rmp_client_disconnecting_before_reading_its_repl
         Frame::Simple("PONG".into())
     );
 }
+
+// Runs on a multi-threaded runtime deliberately: on the default single-threaded
+// `#[tokio::test]` runtime, `DEBUG SLEEP`'s blocking `std::thread::sleep` blocks the
+// *entire* executor -- including the read loop that would otherwise pick up PING while
+// SLEEP is still in flight -- so PING only ever gets dispatched after SLEEP completes.
+// The two replies then land on the wire within microseconds of each other, and simply
+// recording *which reply's continuation runs first* is not a reliable signal at that
+// point: Tokio's LIFO-slot scheduling optimization can (and, verified empirically while
+// writing this test, reliably does) run the second-woken continuation before the first
+// one queued, making a push-order assertion pass even against a fully sequential
+// connection handler -- a tautology. Requiring `flavor = "multi_thread"` here lets PING
+// actually get dispatched on a different worker thread while SLEEP's thread blocks, so
+// this test's timing bound is measuring genuine concurrent dispatch.
+#[tokio::test(flavor = "multi_thread")]
+async fn rmp_genuinely_delivers_a_fast_reply_before_a_slower_concurrent_request_on_one_connection()
+{
+    let (_dir, _resp_url, rmp_addr) = spawn_dual_protocol_server().await;
+    let client = rmp_client::RmpClient::connect(rmp_addr).await.unwrap();
+    let started = std::time::Instant::now();
+
+    let slow = async {
+        let reply = client
+            .call(vec![
+                Bytes::from_static(b"DEBUG"),
+                Bytes::from_static(b"SLEEP"),
+                Bytes::from_static(b"0.3"),
+            ])
+            .await;
+        (reply, started.elapsed())
+    };
+
+    let fast = async {
+        let reply = client.call(vec![Bytes::from_static(b"PING")]).await;
+        (reply, started.elapsed())
+    };
+
+    let ((slow_result, slow_elapsed), (fast_result, fast_elapsed)) = tokio::join!(slow, fast);
+    assert_eq!(slow_result.unwrap(), Frame::Simple("OK".into()));
+    assert_eq!(fast_result.unwrap(), Frame::Simple("PONG".into()));
+
+    // The real proof: PING's own round trip completed in a small fraction of the 300ms
+    // DEBUG SLEEP is blocked for, even though slow's request was fired first in program
+    // order -- i.e. the server genuinely dispatched PING *while* SLEEP was still running,
+    // not merely "queued PING's reply ahead of SLEEP's by coincidence of scheduling." A
+    // sequential connection handler would make fast_elapsed converge on slow_elapsed
+    // (~300ms) instead of staying near zero.
+    assert!(
+        fast_elapsed < std::time::Duration::from_millis(150),
+        "PING took {fast_elapsed:?} to complete alongside a 300ms DEBUG SLEEP -- \
+         expected well under 150ms, which would mean it was NOT served concurrently"
+    );
+    assert!(
+        slow_elapsed >= std::time::Duration::from_millis(295),
+        "DEBUG SLEEP 0.3 returned after only {slow_elapsed:?}"
+    );
+}
