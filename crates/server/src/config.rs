@@ -216,6 +216,28 @@ pub fn load() -> Result<Config, figment::Error> {
     load_with_cli(Cli::parse())
 }
 
+/// Enforces the spec's "Required if either `tls_*_addr` is set" rule for `tls_cert_path` and
+/// `tls_key_path` (see `docs/superpowers/specs/2026-08-31-sprint-8-spec.md`): an operator who
+/// sets `tls_resp_addr`/`tls_rmp_addr` but forgets one or both of the cert/key paths must fail
+/// startup loudly, not silently start with that TLS listener simply never bound. `main.rs` calls
+/// this before wiring up either TLS listener.
+pub fn validate_tls(config: &Config) -> Result<(), std::io::Error> {
+    let have_cert_and_key = config.tls_cert_path.is_some() && config.tls_key_path.is_some();
+    if config.tls_resp_addr.is_some() && !have_cert_and_key {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "tls_resp_addr is set but tls_cert_path/tls_key_path is not -- TLS requires both",
+        ));
+    }
+    if config.tls_rmp_addr.is_some() && !have_cert_and_key {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "tls_rmp_addr is set but tls_cert_path/tls_key_path is not -- TLS requires both",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(clippy::result_large_err)]
 mod tests {
@@ -406,5 +428,47 @@ mod tests {
             );
             Ok(())
         });
+    }
+
+    #[test]
+    fn validate_tls_rejects_tls_resp_addr_without_cert_and_key() {
+        let mut cfg = Config {
+            tls_resp_addr: Some("127.0.0.1:6443".to_string()),
+            ..Config::default()
+        };
+        assert!(validate_tls(&cfg).is_err(), "cert and key both missing");
+
+        cfg.tls_cert_path = Some("/certs/cert.pem".to_string());
+        assert!(validate_tls(&cfg).is_err(), "key still missing");
+    }
+
+    #[test]
+    fn validate_tls_rejects_tls_rmp_addr_without_cert_and_key() {
+        let mut cfg = Config {
+            tls_rmp_addr: Some("127.0.0.1:6444".to_string()),
+            ..Config::default()
+        };
+        assert!(validate_tls(&cfg).is_err(), "cert and key both missing");
+
+        cfg.tls_key_path = Some("/certs/key.pem".to_string());
+        assert!(validate_tls(&cfg).is_err(), "cert still missing");
+    }
+
+    #[test]
+    fn validate_tls_accepts_fully_configured_tls() {
+        let cfg = Config {
+            tls_resp_addr: Some("127.0.0.1:6443".to_string()),
+            tls_rmp_addr: Some("127.0.0.1:6444".to_string()),
+            tls_cert_path: Some("/certs/cert.pem".to_string()),
+            tls_key_path: Some("/certs/key.pem".to_string()),
+            ..Config::default()
+        };
+        assert!(validate_tls(&cfg).is_ok());
+    }
+
+    #[test]
+    fn validate_tls_accepts_fully_unconfigured_tls() {
+        let cfg = Config::default();
+        assert!(validate_tls(&cfg).is_ok());
     }
 }

@@ -130,6 +130,8 @@ async fn main() -> std::io::Result<()> {
         Arc::clone(&replication),
     ));
 
+    rocket_mem::config::validate_tls(&config)?;
+
     if let (Some(tls_addr), Some(cert), Some(key)) = (
         &config.tls_resp_addr,
         &config.tls_cert_path,
