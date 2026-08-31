@@ -1,8 +1,11 @@
 use bytes::Bytes;
+use futures_util::SinkExt;
+use protocol::rmp::{MsgType, RmpCodec, RmpMessage};
 use protocol::Frame;
 use redis::AsyncCommands;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio_util::codec::Framed;
 
 async fn spawn_dual_protocol_server() -> (tempfile::TempDir, String, std::net::SocketAddr) {
     let engine = Arc::new(engine::Engine::new());
@@ -35,6 +38,14 @@ async fn spawn_dual_protocol_server() -> (tempfile::TempDir, String, std::net::S
     ));
 
     (dir, format!("redis://{resp_addr}"), rmp_addr)
+}
+
+fn command(args: &[&[u8]]) -> Frame {
+    Frame::Array(
+        args.iter()
+            .map(|a| Frame::Bulk(Bytes::copy_from_slice(a)))
+            .collect(),
+    )
 }
 
 #[tokio::test]
@@ -110,4 +121,35 @@ async fn rmp_reaches_info_and_cluster_commands() {
         .await
         .unwrap();
     assert_eq!(slot, Frame::Integer(12182));
+}
+
+#[tokio::test]
+async fn the_server_survives_an_rmp_client_disconnecting_before_reading_its_reply() {
+    let (_dir, _resp_url, rmp_addr) = spawn_dual_protocol_server().await;
+
+    {
+        let socket = tokio::net::TcpStream::connect(rmp_addr).await.unwrap();
+        let mut framed = Framed::new(socket, RmpCodec::default());
+        framed
+            .send(RmpMessage {
+                request_id: 1,
+                msg_type: MsgType::Request,
+                frame: command(&[b"PING"]),
+            })
+            .await
+            .unwrap();
+        // `framed` (and its socket) drops here, before the reply is ever read.
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // A second, independent connection must still work -- proves the dropped connection's
+    // spawned tasks and writer loop didn't take the whole listener down.
+    let client = rmp_client::RmpClient::connect(rmp_addr).await.unwrap();
+    assert_eq!(
+        client
+            .call(vec![Bytes::from_static(b"PING")])
+            .await
+            .unwrap(),
+        Frame::Simple("PONG".into())
+    );
 }
