@@ -112,7 +112,8 @@ async fn handle_connection(
             // loop even calls it), so without this check an unauthenticated client could send
             // PSYNC first and receive a full snapshot of the entire keyspace plus a live stream
             // of every subsequent write, bypassing the auth gate entirely.
-            if !replication.acl.is_empty() && session.authenticated_user().is_none() {
+            if replication.acl.has_ever_been_configured() && session.authenticated_user().is_none()
+            {
                 if framed
                     .send(protocol::Frame::Error(
                         "NOAUTH Authentication required.".into(),

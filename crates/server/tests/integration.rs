@@ -341,3 +341,67 @@ async fn psync_is_denied_before_auth_on_an_unauthenticated_connection() {
         protocol::Frame::Error("NOAUTH Authentication required.".into())
     );
 }
+
+/// Real-socket proof that draining a once-configured ACL store back to zero users via `ACL
+/// DELUSER` does not reopen the PSYNC auth-gate bypass: `handle_connection`'s PSYNC interception
+/// must key off `AclStore::has_ever_been_configured` (sticky, never cleared by `del_user`), not
+/// `AclStore::is_empty` (which goes back to `true` once every user is removed) -- otherwise an
+/// admin deleting every ACL user would silently let an unauthenticated client stream the entire
+/// keyspace via PSYNC again.
+#[tokio::test]
+async fn psync_is_denied_after_deluser_empties_a_once_configured_store() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let engine = std::sync::Arc::new(engine::Engine::new());
+    let dir = tempfile::tempdir().unwrap();
+    let aof = std::sync::Arc::new(
+        rocket_mem::aof::AofWriter::open(
+            &dir.path().join("test.aof"),
+            rocket_mem::aof::FsyncPolicy::Never,
+        )
+        .unwrap(),
+    );
+    let replication = std::sync::Arc::new(rocket_mem::replication::ReplicationHandle::default());
+    replication
+        .acl
+        .set_user(
+            "app",
+            &[
+                bytes::Bytes::from_static(b"on"),
+                bytes::Bytes::from_static(b">pw"),
+                bytes::Bytes::from_static(b"allcommands"),
+                bytes::Bytes::from_static(b"allkeys"),
+            ],
+        )
+        .unwrap();
+    // Drain the store back to zero users -- `is_empty()` is now `true` again, but
+    // `has_ever_been_configured()` must stay `true` forever.
+    assert!(replication.acl.del_user("app"));
+    assert!(replication.acl.is_empty());
+
+    tokio::spawn(rocket_mem::serve(
+        listener,
+        engine,
+        aof,
+        std::sync::Arc::clone(&replication),
+    ));
+
+    use futures_util::{SinkExt, StreamExt};
+    let mut framed = tokio_util::codec::Framed::new(
+        tokio::net::TcpStream::connect(addr).await.unwrap(),
+        protocol::codec::RespCodec::default(),
+    );
+
+    framed
+        .send(protocol::Frame::Array(vec![
+            protocol::Frame::Bulk(bytes::Bytes::from_static(b"PSYNC")),
+            protocol::Frame::Bulk(bytes::Bytes::from_static(b"?")),
+            protocol::Frame::Bulk(bytes::Bytes::from_static(b"-1")),
+        ]))
+        .await
+        .unwrap();
+    assert_eq!(
+        framed.next().await.unwrap().unwrap(),
+        protocol::Frame::Error("NOAUTH Authentication required.".into())
+    );
+}
