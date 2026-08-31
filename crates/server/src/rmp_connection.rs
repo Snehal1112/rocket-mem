@@ -44,6 +44,7 @@ pub async fn serve(
     }
 }
 
+/// The RMP-over-TLS accept loop, mirroring `connection::serve_tls`'s shape and rationale.
 pub async fn serve_tls(
     listener: TcpListener,
     tls_config: Arc<rustls::ServerConfig>,
@@ -65,9 +66,19 @@ pub async fn serve_tls(
         let aof = Arc::clone(&aof);
         let replication = Arc::clone(&replication);
         tokio::spawn(async move {
-            let tls_socket = match acceptor.accept(socket).await {
-                Ok(s) => s,
-                Err(_) => return,
+            // Bounded so a client that completes the TCP handshake and then sends nothing --
+            // or an incomplete ClientHello -- can't hold this task alive forever. 10 seconds is
+            // generous: a normal handshake is sub-millisecond locally and well under a second
+            // over a real network.
+            let tls_socket = match tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                acceptor.accept(socket),
+            )
+            .await
+            {
+                Ok(Ok(s)) => s,
+                // A failed handshake, or a timed-out one, ends this connection the same way.
+                Ok(Err(_)) | Err(_) => return,
             };
             handle_connection(tls_socket, engine, aof, replication, client_id).await;
         });

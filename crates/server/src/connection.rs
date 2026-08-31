@@ -100,12 +100,22 @@ pub async fn serve_tls(
         let aof = Arc::clone(&aof);
         let replication = Arc::clone(&replication);
         tokio::spawn(async move {
-            let tls_socket = match acceptor.accept(socket).await {
-                Ok(s) => s,
+            // Bounded so a client that completes the TCP handshake and then sends nothing --
+            // or an incomplete ClientHello -- can't hold this task alive forever. 10 seconds is
+            // generous: a normal handshake is sub-millisecond locally and well under a second
+            // over a real network.
+            let tls_socket = match tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                acceptor.accept(socket),
+            )
+            .await
+            {
+                Ok(Ok(s)) => s,
                 // A failed handshake -- including a plaintext client whose raw bytes don't parse
                 // as a TLS ClientHello -- simply ends this connection, exactly like any other
-                // malformed-input path elsewhere in this codebase.
-                Err(_) => return,
+                // malformed-input path elsewhere in this codebase. A timed-out handshake ends
+                // the connection the same way.
+                Ok(Err(_)) | Err(_) => return,
             };
             handle_connection(tls_socket, engine, aof, replication, client_id).await;
         });
