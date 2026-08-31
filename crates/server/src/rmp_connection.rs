@@ -44,13 +44,15 @@ pub async fn serve(
     }
 }
 
-async fn handle_connection(
-    socket: tokio::net::TcpStream,
+async fn handle_connection<S>(
+    socket: S,
     engine: Arc<Engine>,
     aof: Arc<AofWriter>,
     replication: Arc<ReplicationHandle>,
     client_id: u64,
-) {
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     replication.connection_opened();
     let _client_guard = ClientGuard(Arc::clone(&replication));
     let framed = Framed::new(socket, RmpCodec);
