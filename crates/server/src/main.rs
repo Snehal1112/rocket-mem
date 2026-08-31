@@ -4,56 +4,54 @@ use std::sync::Arc;
 async fn main() -> std::io::Result<()> {
     let metrics_handle = rocket_mem::metrics::recorder_handle();
 
-    let addr = std::env::var("ROCKET_MEM_ADDR").unwrap_or_else(|_| "127.0.0.1:6379".to_string());
-    let aof_path =
-        std::env::var("ROCKET_MEM_AOF_PATH").unwrap_or_else(|_| "./appendonly.aof".to_string());
-    let aof_path = std::path::Path::new(&aof_path);
-    let snapshot_path =
-        std::env::var("ROCKET_MEM_SNAPSHOT_PATH").unwrap_or_else(|_| "./dump.snapshot".to_string());
-    let snapshot_path = std::path::Path::new(&snapshot_path);
+    let config = rocket_mem::config::load().map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("config error: {e}"),
+        )
+    })?;
+
+    let addr = config.addr.clone();
+    let aof_path = std::path::PathBuf::from(&config.aof_path);
+    let aof_path = aof_path.as_path();
+    let snapshot_path = std::path::PathBuf::from(&config.snapshot_path);
+    let snapshot_path = snapshot_path.as_path();
 
     // Microseconds, not milliseconds: 10ms is already a very long time for an in-memory store,
     // so the useful tuning range is below it. 0 disables the slow log.
-    let slowlog_threshold = std::env::var("ROCKET_MEM_SLOWLOG_THRESHOLD_MICROS")
-        .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
-        .map(std::time::Duration::from_micros)
-        .unwrap_or_else(|| std::time::Duration::from_millis(10));
+    let slowlog_threshold = std::time::Duration::from_micros(config.slowlog_threshold_micros);
 
     // Cluster mode is opt-in and all-or-nothing: the topology file names every node's slot
-    // range, and ROCKET_MEM_CLUSTER_NODE_ID says which line is this process. Both must be set
+    // range, and cluster_node_id says which line is this process. Both must be set
     // together -- one without the other is an operator mistake that would otherwise start a
     // node in standalone mode while its neighbours redirect keys to it.
-    let cluster = match (
-        std::env::var("ROCKET_MEM_CLUSTER_CONFIG"),
-        std::env::var("ROCKET_MEM_CLUSTER_NODE_ID"),
-    ) {
-        (Ok(path), Ok(node_id)) => {
-            let config =
-                rocket_mem::cluster::ClusterConfig::load(std::path::Path::new(&path), &node_id)?;
+    let cluster = match (&config.cluster_config, &config.cluster_node_id) {
+        (Some(path), Some(node_id)) => {
+            let cluster_config =
+                rocket_mem::cluster::ClusterConfig::load(std::path::Path::new(path), node_id)?;
             println!(
                 "Cluster mode enabled: node '{}' at {} owns slots {}-{} of {} nodes",
-                config.myself().id,
-                config.myself().addr,
-                config.myself().first_slot,
-                config.myself().last_slot,
-                config.nodes().len()
+                cluster_config.myself().id,
+                cluster_config.myself().addr,
+                cluster_config.myself().first_slot,
+                cluster_config.myself().last_slot,
+                cluster_config.nodes().len()
             );
-            Some(Arc::new(config))
+            Some(Arc::new(cluster_config))
         }
-        (Ok(_), Err(_)) => {
+        (Some(_), None) => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "ROCKET_MEM_CLUSTER_CONFIG is set but ROCKET_MEM_CLUSTER_NODE_ID is not",
+                "cluster_config is set but cluster_node_id is not",
             ))
         }
-        (Err(_), Ok(_)) => {
+        (None, Some(_)) => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "ROCKET_MEM_CLUSTER_NODE_ID is set but ROCKET_MEM_CLUSTER_CONFIG is not",
+                "cluster_node_id is set but cluster_config is not",
             ))
         }
-        (Err(_), Err(_)) => None,
+        (None, None) => None,
     };
 
     let engine = Arc::new(rocket_mem::aof::recover(aof_path, snapshot_path)?);
@@ -82,8 +80,7 @@ async fn main() -> std::io::Result<()> {
     }
     let replication = Arc::new(handle);
 
-    let metrics_addr =
-        std::env::var("ROCKET_MEM_METRICS_ADDR").unwrap_or_else(|_| "127.0.0.1:9121".to_string());
+    let metrics_addr = config.metrics_addr.clone();
     let metrics_listener = tokio::net::TcpListener::bind(&metrics_addr).await?;
     println!(
         "Metrics on http://{}/metrics",
@@ -96,8 +93,7 @@ async fn main() -> std::io::Result<()> {
         Arc::clone(&replication),
     ));
 
-    let rmp_addr =
-        std::env::var("ROCKET_MEM_RMP_ADDR").unwrap_or_else(|_| "127.0.0.1:6380".to_string());
+    let rmp_addr = config.rmp_addr.clone();
     let rmp_listener = tokio::net::TcpListener::bind(&rmp_addr).await?;
     println!("RMP listening on {}", rmp_listener.local_addr()?);
     tokio::spawn(rocket_mem::rmp_connection::serve(
