@@ -67,8 +67,10 @@ mechanism, why a follower keeps no AOF of its own, the `SAVE`/`PSYNC` atomicity 
 
 Known limits, called out explicitly rather than left to be discovered: no partial resync (a
 dropped follower connection always triggers a full resnapshot, per above); no authentication
-on `PSYNC` (any client that sends it is treated as a legitimate replica — Sprint 8 is the
-first point auth exists anywhere in this project); a stalled replica's fan-out queue is
+on `PSYNC` (any client that sends it is treated as a legitimate replica — Sprint 8 closed this:
+`PSYNC` is now gated by the same auth check every other command goes through, though only once
+ACL users are configured, since a deployment with none still authenticates nobody); a stalled
+replica's fan-out queue is
 unbounded and grows the leader's memory invisibly to `MAXMEMORY` accounting rather than
 stalling every writer
 (`HELLO` and `INFO` now report the real role — that Sprint 5 limitation was fixed in Sprint 6).
@@ -149,8 +151,43 @@ does, unchanged. The rename remains deferred, with no forcing sprint currently s
 RMP connections are now counted in `rocket_mem_connected_clients`/`rocket_mem_connections_total`
 alongside RESP's — both protocols share the same `ClientGuard` (`connection.rs`).
 
-The remaining sprint (auth, ACLs, TLS & release) is scoped in the
-[sprint plan](docs/rocket-mem-sprint-plan.md) but not started.
+**Sprint 8 (auth, ACLs, TLS & release) — done.** rocket-mem now authenticates. `AUTH` accepts
+both the single-argument (`default`-user) and `<user> <pass>` forms, and a RESP3 client's inline
+`HELLO 3 AUTH <user> <pass>` works too. Users carry rules — `allcommands`/`nocommands`,
+`allkeys`, `+CMD`/`-CMD`, and `~pattern` key globs — folded left to right, so a user can be
+restricted to one command against one key prefix. Users come from either a `[[acl.users]]` array
+in the config file, bootstrapped at startup, or `ACL SETUSER` at runtime
+(`ACL DELUSER`/`WHOAMI`/`LIST`/`GETUSER` round out the family); passwords are hashed with Argon2
+and the plaintext never reaches the AOF, the snapshot, the slow log, or an error message. The
+gate sits in `dispatch_and_log` ahead of cluster redirection and the `-READONLY` check, matching
+real Redis's own ordering, and re-resolves the live user on every command so an admin's
+`SETUSER`/`DELUSER` takes effect on already-open connections instead of waiting for a reconnect.
+Only `AUTH` and `HELLO` are reachable before authenticating — `ACL` deliberately is not.
+Both listeners can now run over TLS on their own addresses alongside the plaintext ones
+(`tls_resp_addr`/`tls_rmp_addr` plus a shared cert and key), with the handshake bounded by a
+10-second timeout and a TLS address without a cert/key rejected at startup rather than silently
+never bound. Configuration moved onto layered `figment`/`clap` loading — built-in defaults, then
+a TOML file, then `ROCKET_MEM_*` environment variables, then CLI flags — with every pre-Sprint-8
+environment variable still working identically; layering is purely additive. Durability was
+re-proven under a real `kill -9` chaos loop against a live leader+follower pair, verified against
+the load generator's own independent write log
+([`docs/chaos/2026-09-01-chaos-log.md`](docs/chaos/2026-09-01-chaos-log.md)). Four user-facing
+docs land with this sprint — getting-started, config reference, command compatibility, and
+architecture — listed under "Documentation" below. See
+`docs/superpowers/specs/2026-08-31-sprint-8-spec.md` for the full set of design decisions (why
+`Session` replaced a bare `Protocol` parameter, why ACL state is in-memory and leader-local, why
+the chaos test is a committed script plus a committed log rather than a CI job).
+
+Known limits, called out explicitly rather than left to be discovered: ACL users live in memory
+only — a runtime `ACL SETUSER` is lost on restart unless the same user is also in the bootstrap
+array — and ACL changes are neither logged to the AOF nor fanned out to replicas, so a
+follower's ACL state can diverge from its leader's unless both start from the same config; there
+are no `@category` grants (`+@read`, `+@write`), only explicit `+CMD`/`-CMD` plus
+`allcommands`/`nocommands`; `ACL LIST` renders a password as its stored `#<hash>`, which
+`ACL SETUSER` will not accept back as input; and the `/metrics` endpoint remains unauthenticated
+(hence its loopback default). See
+[`docs/command-compatibility.md`](docs/command-compatibility.md) for these and every other known
+divergence from real Redis, collected in one place.
 
 ### Command coverage
 
@@ -162,6 +199,7 @@ The remaining sprint (auth, ACLs, TLS & release) is scoped in the
 | Set | `SADD`, `SREM`, `SMEMBERS`, `SISMEMBER`, `SCARD`, `SINTER`, `SUNION`, `SDIFF`, `SINTERSTORE`, `SUNIONSTORE`, `SDIFFSTORE`, `SPOP`, `SRANDMEMBER` |
 | Sorted Set | `ZADD`, `ZSCORE`, `ZREM`, `ZCARD`, `ZINCRBY`, `ZRANGE`, `ZRANK` |
 | Server/Cluster | `PING`, `ECHO`, `DEBUG SLEEP`[^debug-sleep-cap], `SELECT`, `COMMAND`, `HELLO`, `INFO [section]`, `SAVE`, `REPLICAOF`, `PSYNC`, `CLUSTER KEYSLOT`/`SHARDS`/`NODES`/`INFO`/`MYID`, `SLOWLOG GET`/`LEN`/`RESET` |
+| Auth/ACL | `AUTH` (both single-arg and `<user> <pass>` forms), `ACL SETUSER`/`DELUSER`/`WHOAMI`/`LIST`/`GETUSER` |
 
 [^debug-sleep-cap]: `DEBUG SLEEP` is capped at a 10-second maximum duration; a longer request is rejected with an error rather than accepted and blocking a server thread indefinitely.
 
@@ -188,6 +226,14 @@ The server binary reads these environment variables at startup:
 | `ROCKET_MEM_CLUSTER_NODE_ID` | unset | Which line of that file describes this process. Startup fails if it is missing or names an unknown id |
 | `ROCKET_MEM_METRICS_ADDR` | `127.0.0.1:9121` | Where the Prometheus `/metrics` endpoint listens. Loopback by default because it is unauthenticated |
 | `ROCKET_MEM_SLOWLOG_THRESHOLD_MICROS` | `10000` (10ms) | Commands at or over this duration are recorded in the slow log. `0` disables it |
+| `ROCKET_MEM_TLS_RESP_ADDR` | unset | TCP address for a TLS-wrapped RESP listener, run alongside the plaintext one. Unset means no TLS RESP listener |
+| `ROCKET_MEM_TLS_RMP_ADDR` | unset | TCP address for a TLS-wrapped RMP listener, run alongside the plaintext one. Unset means no TLS RMP listener |
+| `ROCKET_MEM_TLS_CERT_PATH` | unset | PEM certificate chain, shared by both TLS listeners. Required if either TLS address is set — startup fails otherwise |
+| `ROCKET_MEM_TLS_KEY_PATH` | unset | PEM private key, shared by both TLS listeners. Required if either TLS address is set — startup fails otherwise |
+
+See [`docs/config-reference.md`](docs/config-reference.md) for the full list including TOML/CLI
+equivalents and ACL bootstrap — this table covers only the env-var layer, matching this
+section's existing scope.
 
 Turn a running node into a follower with `REPLICAOF <host> <port>` (sent over its own RESP
 connection, e.g. via `redis-cli -p <port> replicaof <host> <port>`); `REPLICAOF NO ONE`
@@ -313,6 +359,10 @@ CI (`.github/workflows/ci.yml`) runs exactly those fmt/clippy/test commands on e
 
 - [`docs/rocket-mem-production-plan.md`](docs/rocket-mem-production-plan.md) — 16-week phase plan and the architecture decision record (why sharded locks, task-per-connection).
 - [`docs/rocket-mem-sprint-plan.md`](docs/rocket-mem-sprint-plan.md) — 2-week sprint breakdown with capacity, priorities, risks, and definition of done.
+- [`docs/getting-started.md`](docs/getting-started.md) — install, first run, first `redis-cli`/`rmp-client` session, enabling TLS.
+- [`docs/config-reference.md`](docs/config-reference.md) — every config field: TOML key, env var, CLI flag, default.
+- [`docs/command-compatibility.md`](docs/command-compatibility.md) — full command table plus known divergences from real Redis, collected in one place.
+- [`docs/architecture.md`](docs/architecture.md) — the three-layer design and concurrency model, pulling together the per-sprint specs.
 - [`docs/design/sharding-decision.md`](docs/design/sharding-decision.md) — the Sprint 1 design doc on shard count and locking strategy.
 - [`docs/superpowers/specs/`](docs/superpowers/specs/) and [`docs/superpowers/plans/`](docs/superpowers/plans/) — per-sprint specs and numbered TDD implementation plans.
 - [`docs/benchmarks/`](docs/benchmarks/) — the committed `redis-benchmark` head-to-head report and the flamegraph profiling notes.
