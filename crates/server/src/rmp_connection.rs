@@ -144,6 +144,54 @@ mod tests {
         (dir, addr, engine)
     }
 
+    /// Like `spawn_test_server`, but runs the server on its own dedicated OS thread and Tokio
+    /// runtime rather than on the calling test's own runtime. Needed by
+    /// `an_rmp_connection_saturated_with_slow_requests_eventually_serves_every_reply`: that test
+    /// fills all 256 in-flight permits with `DEBUG SLEEP`s, whose blocking `std::thread::sleep`
+    /// (plain `tokio::spawn`, not `spawn_blocking` -- see Finding 1/2's own rationale for why)
+    /// occupies every one of the server runtime's worker threads at once. If the test's own
+    /// reply-polling logic shared that runtime, it would be starved right alongside the read
+    /// loop for as long as the sleeps run, making any timing assertion meaningless -- confirmed
+    /// empirically while writing this test, replies "arriving" within a supposedly-tight window
+    /// only because the whole runtime, polling logic included, was frozen and resumed as one
+    /// burst. A merely large `worker_threads` count on a shared runtime works around that too,
+    /// but spinning up 256+ real OS threads inside a test binary that runs many tests
+    /// concurrently reliably exhausts the process's thread limit (`EAGAIN` from `pthread_create`
+    /// -- also confirmed empirically). Isolating the server onto its own small thread pool,
+    /// separate from the test's own runtime, sidesteps both problems: the test's polling logic
+    /// keeps running on schedule no matter how starved the server's pool gets, and only a
+    /// handful of extra OS threads are needed.
+    ///
+    /// Leaks its background thread and Tokio runtime: there is no shutdown handle, `JoinHandle`,
+    /// or drop guard here, so the spawned thread (and the `serve` loop running on it) simply
+    /// runs for the rest of the test binary's process lifetime. Harmless for the one test that
+    /// currently calls this (the process exits once the suite finishes), but a future caller
+    /// that invokes this more than a handful of times per test run should add real teardown
+    /// rather than relying on that.
+    fn spawn_isolated_test_server() -> (std::net::SocketAddr, tempfile::TempDir) {
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        std_listener.set_nonblocking(true).unwrap();
+        let addr = std_listener.local_addr().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let aof_path = dir.path().join("test.aof");
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(4)
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let listener = TcpListener::from_std(std_listener).unwrap();
+                let engine = Arc::new(Engine::new());
+                let writer = AofWriter::open(&aof_path, crate::aof::FsyncPolicy::Never).unwrap();
+                let aof = Arc::new(writer);
+                let replication = Arc::new(ReplicationHandle::default());
+                serve(listener, engine, aof, replication).await;
+            });
+        });
+        (addr, dir)
+    }
+
     async fn connect(addr: std::net::SocketAddr) -> Framed<TcpStream, RmpCodec> {
         Framed::new(TcpStream::connect(addr).await.unwrap(), RmpCodec)
     }
@@ -315,6 +363,97 @@ mod tests {
             seen.insert(reply.request_id);
         }
         assert_eq!(seen.len(), total);
+    }
+
+    // Proves the in-flight cap's actual mechanism -- the semaphore genuinely refuses a 257th
+    // permit while 256 are held -- with zero thread-scheduling confound. An earlier version of
+    // this coverage instead drove 256 real `DEBUG SLEEP` requests over a live RMP connection and
+    // asserted a 257th (fast) request's reply didn't arrive within a short window. That looked
+    // like a semaphore proof but wasn't: `DEBUG SLEEP` blocks a real worker thread (Finding 1/2's
+    // own point), and an independent synthetic probe -- 256 `tokio::spawn`ed
+    // `std::thread::sleep(1s)` tasks plus one more "fast" task on a 4-worker runtime, *with no
+    // semaphore at all* -- reproduced the identical "fast task doesn't complete within 300ms"
+    // signature in 7/7 trials, purely from worker-thread starvation. That test would have passed
+    // identically with the semaphore deleted, so it was not evidence the cap does anything. This
+    // synchronous, runtime-free test exercises the semaphore directly instead, which is the
+    // actual mechanism `handle_connection`'s read loop relies on -- see
+    // `an_rmp_connection_saturated_with_slow_requests_eventually_serves_every_reply` below for
+    // what the network-level test was salvaged into proving instead.
+    #[test]
+    fn a_semaphore_sized_to_the_in_flight_cap_refuses_a_257th_permit_while_256_are_held() {
+        let semaphore = Semaphore::new(MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION);
+        let permits: Vec<_> = (0..MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION)
+            .map(|_| {
+                semaphore
+                    .try_acquire()
+                    .expect("should have a permit available")
+            })
+            .collect();
+        assert_eq!(permits.len(), MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION);
+
+        // The 257th must be refused immediately -- no blocking, no timing window, no dependency
+        // on worker-thread scheduling.
+        assert!(semaphore.try_acquire().is_err());
+
+        // Freeing one permit makes exactly one more available, not more.
+        drop(permits.into_iter().next().unwrap());
+        assert!(semaphore.try_acquire().is_ok());
+    }
+
+    // Renamed and reframed after review: this does NOT prove the semaphore specifically gates
+    // the 257th request (see the comment on
+    // `a_semaphore_sized_to_the_in_flight_cap_refuses_a_257th_permit_while_256_are_held` above
+    // for why a network-level timing assertion here is structurally confounded by worker-thread
+    // starvation and can't tell "the cap is gating" apart from "the runtime is merely slow").
+    // What this test still legitimately proves, combined with
+    // `more_than_the_in_flight_cap_concurrent_requests_all_still_succeed`'s all-fast-PINGs
+    // coverage: a connection saturated with genuinely slow, real, worker-thread-blocking
+    // commands still correctly delivers every single reply -- none dropped, none corrupted, none
+    // permanently stuck -- once the backlog drains, rather than hanging or losing a reply under
+    // heavy blocking load.
+    #[tokio::test]
+    async fn an_rmp_connection_saturated_with_slow_requests_eventually_serves_every_reply() {
+        let (addr, _dir) = spawn_isolated_test_server();
+        let mut con = connect(addr).await;
+
+        // Short (10ms) sleeps, not the 1s used while chasing the (retracted) timing proof above
+        // -- long enough to guarantee these are still in flight when the fast request is sent,
+        // short enough that draining all of them through the isolated runtime's 4 worker threads
+        // keeps this test's wall time reasonable.
+        for i in 0..MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION as u64 {
+            con.send(RmpMessage {
+                request_id: i,
+                msg_type: MsgType::Request,
+                frame: command(&[b"DEBUG", b"SLEEP", b"0.01"]),
+            })
+            .await
+            .unwrap();
+        }
+        let fast_request_id = MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION as u64;
+        con.send(RmpMessage {
+            request_id: fast_request_id,
+            msg_type: MsgType::Request,
+            frame: command(&[b"PING"]),
+        })
+        .await
+        .unwrap();
+
+        let total = MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION + 1;
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..total {
+            let reply = tokio::time::timeout(std::time::Duration::from_secs(10), con.next())
+                .await
+                .expect("every reply must eventually arrive, not hang forever")
+                .unwrap()
+                .unwrap();
+            if reply.request_id == fast_request_id {
+                assert_eq!(reply.frame, Frame::Simple("PONG".into()));
+            } else {
+                assert_eq!(reply.frame, Frame::Simple("OK".into()));
+            }
+            seen.insert(reply.request_id);
+        }
+        assert_eq!(seen.len(), total); // every reply arrived exactly once
     }
 
     #[tokio::test]
