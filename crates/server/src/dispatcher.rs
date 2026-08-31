@@ -1036,7 +1036,7 @@ fn try_authenticate(
     username: &str,
     password: &[u8],
 ) -> Result<std::sync::Arc<crate::acl::AclUser>, Frame> {
-    if replication.acl.is_empty() {
+    if !replication.acl.has_ever_been_configured() {
         return Err(Frame::Error(
             "ERR Client sent AUTH, but no password is set.".into(),
         ));
@@ -2102,7 +2102,7 @@ fn auth_gate(
     session: &Session,
     frame: &Frame,
 ) -> Option<Frame> {
-    if replication.acl.is_empty() {
+    if !replication.acl.has_ever_been_configured() {
         return None; // the fast path -- every existing deployment and test, unchanged
     }
     let name = command_name_upper(frame)?;
@@ -2951,6 +2951,41 @@ mod tests {
             Frame::Bulk(Bytes::from_static(b"k")),
         ]);
         assert!(handle_acl(&frame, &session, &replication).is_none());
+    }
+
+    /// Addition D: `ACL DELUSER` draining the store back to zero users must not silently turn
+    /// auth enforcement back off for the whole server. Once any user has ever been configured,
+    /// `auth_gate` must keep enforcing even against a currently-empty store.
+    #[test]
+    fn auth_gate_stays_enforced_after_deluser_empties_a_once_configured_store() {
+        let replication = ReplicationHandle::default();
+        replication
+            .acl
+            .set_user("app", &[Bytes::from_static(b"on")])
+            .unwrap();
+        assert!(replication.acl.del_user("app"));
+        assert!(replication.acl.is_empty());
+
+        let session = Session::new();
+        let frame = Frame::Array(vec![
+            Frame::Bulk(Bytes::from_static(b"GET")),
+            Frame::Bulk(Bytes::from_static(b"k")),
+        ]);
+        let reply = auth_gate(&replication, &session, &frame).unwrap();
+        assert_eq!(
+            reply,
+            Frame::Error("NOAUTH Authentication required.".into())
+        );
+
+        // `AUTH` against a now-empty-but-once-configured store must fall through to
+        // `replication.acl.authenticate`'s unknown-user handling (WRONGPASS), not the
+        // "no password is set" message that only applies before ACL was ever turned on.
+        let auth_reply =
+            handle_auth(&auth_frame(&[b"app", b"whatever"]), &session, &replication).unwrap();
+        assert_eq!(
+            auth_reply,
+            Frame::Error("WRONGPASS invalid username-password pair or user is disabled.".into())
+        );
     }
 
     #[test]

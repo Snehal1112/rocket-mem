@@ -216,6 +216,13 @@ impl AclUser {
 #[derive(Default)]
 pub struct AclStore {
     users: RwLock<HashMap<String, Arc<AclUser>>>,
+    /// Set once, permanently, the first time any user is ever configured (`set_user` or
+    /// `insert_bootstrap`) -- never cleared by `del_user`. This is what lets `auth_gate`
+    /// distinguish "no ACL has ever been configured" (safe to skip enforcement entirely) from
+    /// "ACL was configured, then `DELUSER` emptied the table" (must keep enforcing, or an admin
+    /// deleting every user would silently turn auth off for the whole server). See
+    /// `has_ever_been_configured`.
+    ever_configured: std::sync::atomic::AtomicBool,
 }
 
 impl AclStore {
@@ -231,6 +238,15 @@ impl AclStore {
             .is_empty()
     }
 
+    /// `true` once any user has ever been configured via `set_user`/`insert_bootstrap`, even if
+    /// `del_user` has since removed every one of them. Unlike `is_empty`, this never goes back
+    /// to reporting "unconfigured" -- see the field's own doc comment above for why that
+    /// distinction matters.
+    pub fn has_ever_been_configured(&self) -> bool {
+        self.ever_configured
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Applies `raw_tokens` (parsed via `parse_token`) on top of `username`'s existing user, or a
     /// fresh `enabled: false, password_hash: None, rules: []` default if it doesn't exist yet --
     /// real-Redis-style incremental `ACL SETUSER`. Parses every token before applying any of
@@ -238,6 +254,8 @@ impl AclStore {
     /// than half-applying the earlier tokens.
     pub fn set_user(&self, username: &str, raw_tokens: &[bytes::Bytes]) -> Result<(), AclError> {
         validate_username(username)?;
+        self.ever_configured
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let tokens = raw_tokens
             .iter()
             .map(|t| parse_token(t))
@@ -339,6 +357,8 @@ impl AclStore {
     /// application -- used only by bootstrap loading (Task 3), which builds a complete `AclUser`
     /// from `AclUserConfig` in one step.
     pub fn insert_bootstrap(&self, user: AclUser) {
+        self.ever_configured
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         self.users
             .write()
             .unwrap_or_else(|e| e.into_inner())
