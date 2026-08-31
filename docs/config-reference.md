@@ -105,7 +105,7 @@ rules = ["~app:*", "+get", "-set"]
 | Field | Type | Default | Meaning |
 |---|---|---|---|
 | `username` | string | *(required)* | The user's name, as passed to `AUTH`. |
-| `password` | string, optional | unset (`nopass`) | Plaintext in the TOML file — hashed once at load time before it ever reaches memory. Omitting it means `nopass`: the user authenticates with any password, or none at all. |
+| `password` | string, optional | unset (`nopass`) | Plaintext in the TOML file — hashed once at startup, and only ever kept as that hash: the plaintext is never written to the AOF, the snapshot, the slow log, or any error message. Omitting it means `nopass`: the user authenticates with any password, or none at all. |
 | `enabled` | boolean | `true` | Whether the user can authenticate at all. A `false` entry is loaded but rejected at `AUTH` time. |
 | `rules` | array of strings | `[]` (empty) | Access-control rule tokens, applied left to right, same-vocabulary as `ACL SETUSER`'s tokens (`allcommands`/`nocommands`, `allkeys`, `+CMD`/`-CMD` to allow/deny one command, `~pattern` to allow a key glob). Later rules override earlier ones for anything they overlap — e.g. `["allcommands", "-flushall"]` grants every command except `FLUSHALL`. An empty `rules` list denies every command and key until rules are added (via `ACL SETUSER` at runtime, or a longer list here). |
 
