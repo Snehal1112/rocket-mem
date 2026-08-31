@@ -161,7 +161,7 @@ pub struct ReplicationHandle {
     /// In-memory ACL users. Empty by default -- every existing test and deployment through
     /// Sprint 7 -- populated only via `with_acl_bootstrap` (from the TOML config's
     /// `[[acl.users]]`) and at runtime via `ACL SETUSER` (plan 08). Never persisted; see
-    /// ../../docs/superpowers/plans/2026-08-31-sprint-8-plans/04-acl-store-and-bootstrap-wiring.md.
+    /// ../../../docs/superpowers/plans/2026-08-31-sprint-8-plans/04-acl-store-and-bootstrap-wiring.md.
     pub acl: crate::acl::AclStore,
 }
 
@@ -211,7 +211,7 @@ impl ReplicationHandle {
     }
 
     /// Overrides the slow-log threshold. `Duration::ZERO` disables recording entirely -- see
-    /// ../../docs/superpowers/specs/2026-08-30-sprint-6-spec.md for why that differs from real
+    /// ../../../docs/superpowers/specs/2026-08-30-sprint-6-spec.md for why that differs from real
     /// Redis's meaning for 0.
     pub fn with_slowlog_threshold(mut self, threshold: std::time::Duration) -> Self {
         self.slowlog = crate::slowlog::SlowLog::with_threshold(threshold);

@@ -3,7 +3,9 @@
 //! This module holds the whole access-control-list system: rule parsing, password hashing, and
 //! permission-check logic, all implemented here. Keeping them in one module mirrors how Redis
 //! treats ACL as a single subsystem rather than splitting it across the places that consume it.
-//! Wiring this into a live, store-backed `AclUser`/dispatcher path is a later sprint's job.
+//! This module wires all of that into a live, store-backed `AclUser`/dispatcher path: `AclStore`
+//! below is what `ReplicationHandle::acl` (see `replication.rs`) holds and what `main.rs` seeds
+//! from the TOML config's `[[acl.users]]` bootstrap list.
 
 use argon2::password_hash::{
     rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
@@ -130,141 +132,20 @@ pub fn verify_password(password: &[u8], hash: &str) -> bool {
     Argon2::default().verify_password(password, &parsed).is_ok()
 }
 
-/// In-memory ACL users, keyed by username. A plain `std::sync::RwLock`, matching `SlowLog`'s and
-/// `ReplicaRegistry`'s existing choice in this codebase: every access here is a quick map
-/// read/write, never held across an `.await`. Never persisted to the AOF or snapshot -- see this
-/// plan's Global Constraints.
-#[derive(Default)]
-pub struct AclStore {
-    users: RwLock<HashMap<String, Arc<AclUser>>>,
-}
-
-impl AclStore {
-    pub fn new() -> Self {
-        Self::default()
+/// Rejects a username that would corrupt plan 08's future `ACL LIST` output -- one
+/// space-separated line per user (`user <name> on nopass ~* +@all`), which a username
+/// containing whitespace or CRLF would break -- or that otherwise makes no sense as an identity:
+/// empty. Shared by both ways a username enters the store: `AclStore::set_user` (`ACL SETUSER`)
+/// and `from_bootstrap_config` (the TOML `[[acl.users]]` list).
+fn validate_username(username: &str) -> Result<(), AclError> {
+    if username.is_empty()
+        || username.contains(' ')
+        || username.contains('\r')
+        || username.contains('\n')
+    {
+        return Err(AclError::SyntaxError(username.to_string()));
     }
-
-    /// The fast-path check plan 06's auth gate uses to skip enforcement entirely.
-    pub fn is_empty(&self) -> bool {
-        self.users
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_empty()
-    }
-
-    /// Applies `raw_tokens` (parsed via `parse_token`) on top of `username`'s existing user, or a
-    /// fresh `enabled: false, password_hash: None, rules: []` default if it doesn't exist yet --
-    /// real-Redis-style incremental `ACL SETUSER`. Parses every token before applying any of
-    /// them, so a malformed token in the middle of the list leaves the store unchanged rather
-    /// than half-applying the earlier tokens.
-    pub fn set_user(&self, username: &str, raw_tokens: &[bytes::Bytes]) -> Result<(), AclError> {
-        let tokens = raw_tokens
-            .iter()
-            .map(|t| parse_token(t))
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut users = self.users.write().unwrap_or_else(|e| e.into_inner());
-        let base = users
-            .get(username)
-            .map(|u| (**u).clone())
-            .unwrap_or_else(|| AclUser {
-                username: username.to_string(),
-                password_hash: None,
-                enabled: false,
-                rules: Vec::new(),
-            });
-        let updated = apply_tokens(base, &tokens);
-        users.insert(username.to_string(), Arc::new(updated));
-        Ok(())
-    }
-
-    pub fn del_user(&self, username: &str) -> bool {
-        self.users
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(username)
-            .is_some()
-    }
-
-    pub fn get_user(&self, username: &str) -> Option<Arc<AclUser>> {
-        self.users
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(username)
-            .cloned()
-    }
-
-    pub fn list(&self) -> Vec<Arc<AclUser>> {
-        self.users
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .values()
-            .cloned()
-            .collect()
-    }
-
-    /// `None` for: unknown username, a disabled user, or a wrong password. A `nopass` user
-    /// (`password_hash: None`) authenticates with any password, including an empty one.
-    pub fn authenticate(&self, username: &str, password: &str) -> Option<Arc<AclUser>> {
-        let users = self.users.read().unwrap_or_else(|e| e.into_inner());
-        let user = users.get(username)?;
-        if !user.enabled {
-            return None;
-        }
-        match &user.password_hash {
-            None => Some(Arc::clone(user)),
-            Some(hash) if verify_password(password.as_bytes(), hash) => Some(Arc::clone(user)),
-            Some(_) => None,
-        }
-    }
-
-    /// Inserts an already-fully-formed `AclUser` directly, bypassing token parsing/incremental
-    /// application -- used only by bootstrap loading (Task 3), which builds a complete `AclUser`
-    /// from `AclUserConfig` in one step.
-    pub fn insert_bootstrap(&self, user: AclUser) {
-        self.users
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(user.username.clone(), Arc::new(user));
-    }
-}
-
-fn apply_tokens(mut base: AclUser, tokens: &[AclToken]) -> AclUser {
-    for token in tokens {
-        match token {
-            AclToken::On => base.enabled = true,
-            AclToken::Off => base.enabled = false,
-            AclToken::NoPass => base.password_hash = None,
-            AclToken::Password(pw) => base.password_hash = Some(hash_password(pw.as_bytes())),
-            AclToken::Rule(r) => base.rules.push(r.clone()),
-        }
-    }
-    base
-}
-
-/// Converts one TOML `[[acl.users]]` entry into a fully-formed `AclUser`. `cfg.rules` must
-/// contain only rule tokens (`+CMD`/`-CMD`/`~pattern`/`allcommands`/`nocommands`/`allkeys`) --
-/// `enabled` and `password` are `AclUserConfig`'s own fields precisely so they don't also need
-/// to appear as `on`/`off`/`>pw` tokens inside `rules`, and a `rules` entry that parses as one of
-/// those (or fails to parse at all) is rejected rather than silently ignored.
-pub fn from_bootstrap_config(cfg: &crate::config::AclUserConfig) -> Result<AclUser, AclError> {
-    let mut rules = Vec::with_capacity(cfg.rules.len());
-    for raw in &cfg.rules {
-        match parse_token(raw.as_bytes())? {
-            AclToken::Rule(r) => rules.push(r),
-            AclToken::On | AclToken::Off | AclToken::NoPass | AclToken::Password(_) => {
-                return Err(AclError::SyntaxError(raw.clone()))
-            }
-        }
-    }
-    Ok(AclUser {
-        username: cfg.username.clone(),
-        password_hash: cfg
-            .password
-            .as_deref()
-            .map(|pw| hash_password(pw.as_bytes())),
-        enabled: cfg.enabled,
-        rules,
-    })
+    Ok(())
 }
 
 /// One configured ACL user: its login state, password hash (`None` for `nopass`), and the
@@ -315,6 +196,183 @@ impl AclUser {
         }
         allowed
     }
+}
+
+/// In-memory ACL users, keyed by username. A plain `std::sync::RwLock`, matching `SlowLog`'s and
+/// `ReplicaRegistry`'s existing choice in this codebase: every access here is a quick map
+/// read/write, never held across an `.await`. Never persisted to the AOF or snapshot -- see
+/// this plan's Global Constraints:
+/// ../../../docs/superpowers/plans/2026-08-31-sprint-8-plans/04-acl-store-and-bootstrap-wiring.md
+#[derive(Default)]
+pub struct AclStore {
+    users: RwLock<HashMap<String, Arc<AclUser>>>,
+}
+
+impl AclStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The fast-path check plan 06's auth gate uses to skip enforcement entirely.
+    pub fn is_empty(&self) -> bool {
+        self.users
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+    }
+
+    /// Applies `raw_tokens` (parsed via `parse_token`) on top of `username`'s existing user, or a
+    /// fresh `enabled: false, password_hash: None, rules: []` default if it doesn't exist yet --
+    /// real-Redis-style incremental `ACL SETUSER`. Parses every token before applying any of
+    /// them, so a malformed token in the middle of the list leaves the store unchanged rather
+    /// than half-applying the earlier tokens.
+    pub fn set_user(&self, username: &str, raw_tokens: &[bytes::Bytes]) -> Result<(), AclError> {
+        validate_username(username)?;
+        let tokens = raw_tokens
+            .iter()
+            .map(|t| parse_token(t))
+            .collect::<Result<Vec<_>, _>>()?;
+        // Pre-hash any password token now, still outside the write lock: argon2 hashing costs
+        // ~20ms, and that cost must never run while holding the exclusive lock every reader and
+        // writer of this store contends on. From here down, a `Password` token's payload is
+        // already a hash, not plaintext -- see `apply_tokens`.
+        let tokens: Vec<AclToken> = tokens
+            .into_iter()
+            .map(|t| match t {
+                AclToken::Password(pw) => AclToken::Password(hash_password(pw.as_bytes())),
+                other => other,
+            })
+            .collect();
+        let mut users = self.users.write().unwrap_or_else(|e| e.into_inner());
+        let base = users
+            .get(username)
+            .map(|u| (**u).clone())
+            .unwrap_or_else(|| AclUser {
+                username: username.to_string(),
+                password_hash: None,
+                enabled: false,
+                rules: Vec::new(),
+            });
+        let updated = apply_tokens(base, &tokens);
+        users.insert(username.to_string(), Arc::new(updated));
+        Ok(())
+    }
+
+    pub fn del_user(&self, username: &str) -> bool {
+        self.users
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(username)
+            .is_some()
+    }
+
+    pub fn get_user(&self, username: &str) -> Option<Arc<AclUser>> {
+        self.users
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(username)
+            .cloned()
+    }
+
+    pub fn list(&self) -> Vec<Arc<AclUser>> {
+        self.users
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    /// `None` for: unknown username, a disabled user, or a wrong password. A `nopass` user
+    /// (`password_hash: None`) authenticates with any password, including an empty one.
+    ///
+    /// Clones the `Arc<AclUser>` out of the lock and drops it *before* calling
+    /// `verify_password`: `std::sync::RwLock` on Linux does not starve writers, so a pending
+    /// `ACL SETUSER` writer queues, and subsequent readers queue behind that writer. Holding the
+    /// read guard across argon2 verification (~20ms) would mean one slow `AUTH` plus one
+    /// concurrent `ACL SETUSER` stalls every other command's ACL check for that whole window.
+    /// `password` is `&[u8]`, not `&str`: RESP passwords are binary-safe and arrive off the wire
+    /// as arbitrary bytes, so narrowing to `&str` here would force a lossy UTF-8 conversion at
+    /// the call site (`String::from_utf8_lossy` collapses distinct invalid byte sequences to the
+    /// same string -- a narrow auth-bypass shape).
+    pub fn authenticate(&self, username: &str, password: &[u8]) -> Option<Arc<AclUser>> {
+        let user = {
+            self.users
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(username)
+                .cloned()
+        }?;
+        if !user.enabled {
+            return None;
+        }
+        match &user.password_hash {
+            None => Some(user),
+            Some(hash) if verify_password(password, hash) => Some(user),
+            Some(_) => None,
+        }
+    }
+
+    /// Inserts an already-fully-formed `AclUser` directly, bypassing token parsing/incremental
+    /// application -- used only by bootstrap loading (Task 3), which builds a complete `AclUser`
+    /// from `AclUserConfig` in one step.
+    pub fn insert_bootstrap(&self, user: AclUser) {
+        self.users
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(user.username.clone(), Arc::new(user));
+    }
+}
+
+/// Applies `tokens` on top of `base`. By the time a `Password` token reaches here, its payload
+/// is already an argon2 hash, not plaintext -- `set_user` hashes it before acquiring the write
+/// lock this runs under, so this function itself never pays argon2's cost while holding it.
+fn apply_tokens(mut base: AclUser, tokens: &[AclToken]) -> AclUser {
+    for token in tokens {
+        match token {
+            AclToken::On => base.enabled = true,
+            AclToken::Off => base.enabled = false,
+            AclToken::NoPass => base.password_hash = None,
+            AclToken::Password(hash) => base.password_hash = Some(hash.clone()),
+            AclToken::Rule(r) => base.rules.push(r.clone()),
+        }
+    }
+    base
+}
+
+/// Converts one TOML `[[acl.users]]` entry into a fully-formed `AclUser`. `cfg.rules` must
+/// contain only rule tokens (`+CMD`/`-CMD`/`~pattern`/`allcommands`/`nocommands`/`allkeys`) --
+/// `enabled` and `password` are `AclUserConfig`'s own fields precisely so they don't also need
+/// to appear as `on`/`off`/`>pw` tokens inside `rules`, and a `rules` entry that parses as one of
+/// those (or fails to parse at all) is rejected rather than silently ignored.
+pub fn from_bootstrap_config(cfg: &crate::config::AclUserConfig) -> Result<AclUser, AclError> {
+    validate_username(&cfg.username)?;
+    let mut rules = Vec::with_capacity(cfg.rules.len());
+    for raw in &cfg.rules {
+        match parse_token(raw.as_bytes())? {
+            AclToken::Rule(r) => rules.push(r),
+            AclToken::On | AclToken::Off | AclToken::NoPass => {
+                return Err(AclError::SyntaxError(raw.clone()))
+            }
+            // Don't echo the token's content here: unlike on/off/nopass, this one carries a
+            // secret (the raw text is literally `>plaintext-password`), and `AclError`'s
+            // `Display` impl is what `main.rs` prints to stderr on a bootstrap failure --
+            // journald, container logs, CI output. A fixed placeholder keeps the error useful
+            // without leaking the password.
+            AclToken::Password(_) => {
+                return Err(AclError::SyntaxError("<password token>".to_string()))
+            }
+        }
+    }
+    Ok(AclUser {
+        username: cfg.username.clone(),
+        password_hash: cfg
+            .password
+            .as_deref()
+            .map(|pw| hash_password(pw.as_bytes())),
+        enabled: cfg.enabled,
+        rules,
+    })
 }
 
 #[cfg(test)]
@@ -600,6 +658,16 @@ mod tests {
     }
 
     #[test]
+    fn set_user_hashes_the_password_not_stores_it_in_plaintext() {
+        let store = AclStore::default();
+        store.set_user("app", &tokens(&["on", ">hunter2"])).unwrap();
+        let user = store.get_user("app").unwrap();
+        let hash = user.password_hash.as_deref().unwrap();
+        assert_ne!(hash, "hunter2");
+        assert!(verify_password(b"hunter2", hash));
+    }
+
+    #[test]
     fn set_user_is_incremental_not_replace_whole_user() {
         let store = AclStore::default();
         store.set_user("app", &tokens(&["on", "+get"])).unwrap();
@@ -626,6 +694,17 @@ mod tests {
     }
 
     #[test]
+    fn set_user_rejects_an_empty_or_whitespace_containing_username() {
+        assert!(AclStore::default().set_user("", &tokens(&["on"])).is_err());
+        assert!(AclStore::default()
+            .set_user("bad name", &tokens(&["on"]))
+            .is_err());
+        assert!(AclStore::default()
+            .set_user("bad\r\nname", &tokens(&["on"]))
+            .is_err());
+    }
+
+    #[test]
     fn del_user_removes_an_existing_user_and_returns_false_for_an_unknown_one() {
         let store = AclStore::default();
         store.set_user("app", &tokens(&["on"])).unwrap();
@@ -638,28 +717,47 @@ mod tests {
     fn authenticate_succeeds_with_the_right_password_and_fails_with_the_wrong_one() {
         let store = AclStore::default();
         store.set_user("app", &tokens(&["on", ">hunter2"])).unwrap();
-        assert!(store.authenticate("app", "hunter2").is_some());
-        assert!(store.authenticate("app", "wrong").is_none());
+        assert!(store.authenticate("app", b"hunter2").is_some());
+        assert!(store.authenticate("app", b"wrong").is_none());
     }
 
     #[test]
     fn authenticate_a_nopass_user_accepts_any_password() {
         let store = AclStore::default();
         store.set_user("app", &tokens(&["on", "nopass"])).unwrap();
-        assert!(store.authenticate("app", "literally-anything").is_some());
+        assert!(store.authenticate("app", b"literally-anything").is_some());
     }
 
     #[test]
     fn authenticate_a_disabled_user_always_fails() {
         let store = AclStore::default();
         store.set_user("app", &tokens(&["off", "nopass"])).unwrap();
-        assert!(store.authenticate("app", "anything").is_none());
+        assert!(store.authenticate("app", b"anything").is_none());
     }
 
     #[test]
     fn authenticate_an_unknown_username_fails() {
         let store = AclStore::default();
-        assert!(store.authenticate("nobody", "anything").is_none());
+        assert!(store.authenticate("nobody", b"anything").is_none());
+    }
+
+    #[test]
+    fn authenticate_accepts_a_non_utf8_password() {
+        // Binary-safety regression (plan 03 / fix #5): `authenticate` takes `&[u8]`, not `&str`,
+        // so a password containing invalid UTF-8 must still round-trip through hash/verify
+        // without a lossy conversion collapsing it into some other input. `>token` parsing
+        // itself requires UTF-8 (a separate, pre-existing constraint on `ACL SETUSER`/bootstrap
+        // token text), so this builds the `AclUser` directly rather than through `set_user`.
+        let store = AclStore::default();
+        let raw_password: &[u8] = &[0xFF, 0xFE, b'x'];
+        store.insert_bootstrap(AclUser {
+            username: "app".to_string(),
+            password_hash: Some(hash_password(raw_password)),
+            enabled: true,
+            rules: vec![],
+        });
+        assert!(store.authenticate("app", raw_password).is_some());
+        assert!(store.authenticate("app", b"\xFF\xFEy").is_none());
     }
 
     #[test]
@@ -740,5 +838,62 @@ mod tests {
     #[test]
     fn from_bootstrap_config_rejects_a_malformed_rule_token() {
         assert!(from_bootstrap_config(&cfg("bad", None, true, &["garbage"])).is_err());
+    }
+
+    #[test]
+    fn from_bootstrap_config_rejects_an_empty_or_whitespace_containing_username() {
+        assert!(from_bootstrap_config(&cfg("", None, true, &[])).is_err());
+        assert!(from_bootstrap_config(&cfg("bad name", None, true, &[])).is_err());
+    }
+
+    #[test]
+    fn from_bootstrap_config_does_not_leak_a_misplaced_password_into_the_error_message() {
+        let err = from_bootstrap_config(&cfg("bad", None, true, &[">hunter2"])).unwrap_err();
+        let rendered = err.to_string();
+        assert!(
+            !rendered.contains("hunter2"),
+            "the error must not echo the rejected password's content, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn from_bootstrap_config_rejects_a_category_grant_rule() {
+        // Plan 03's Global Constraint: only explicit +CMD/-CMD/allcommands/nocommands, never a
+        // general +@category grant (+@all/-@all excepted, covered elsewhere).
+        assert!(from_bootstrap_config(&cfg("app", None, true, &["+@read"])).is_err());
+    }
+
+    #[test]
+    fn from_bootstrap_config_normalizes_tilde_star_to_allkeys() {
+        let user = from_bootstrap_config(&cfg("app", None, true, &["~*"])).unwrap();
+        assert_eq!(user.rules, vec![AclRule::AllKeys]);
+    }
+
+    /// End-to-end: TOML-shaped config -> `from_bootstrap_config` -> `AclStore::insert_bootstrap`
+    /// -> `authenticate`, proving the whole chain works together, not just each piece alone.
+    #[test]
+    fn the_full_bootstrap_to_authenticate_chain_works_end_to_end() {
+        let toml = r#"
+            [[acl.users]]
+            username = "app"
+            password = "hunter2"
+            enabled = true
+            rules = ["~app:*", "+get", "-set"]
+        "#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, toml).unwrap();
+        let config = crate::config::load_layered(Some(&path)).unwrap();
+
+        let store = AclStore::default();
+        for cfg in &config.acl.users {
+            let user = from_bootstrap_config(cfg).unwrap();
+            store.insert_bootstrap(user);
+        }
+
+        let authenticated = store.authenticate("app", b"hunter2").unwrap();
+        assert!(authenticated.is_allowed("GET", &[&Bytes::from_static(b"app:1")]));
+        assert!(!authenticated.is_allowed("SET", &[&Bytes::from_static(b"app:1")]));
+        assert!(store.authenticate("app", b"wrong").is_none());
     }
 }

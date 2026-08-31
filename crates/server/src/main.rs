@@ -66,6 +66,22 @@ async fn main() -> std::io::Result<()> {
             )
         })?;
 
+    // A config with two `[[acl.users]]` blocks sharing the same username currently would start
+    // cleanly with only the later one live, silently discarding the first -- a fail-quiet
+    // security bug if the discarded entry was the intended, more-restrictive one. Fail loudly
+    // instead of letting `Vec` -> `HashMap` insertion order decide which definition wins.
+    {
+        let mut seen = std::collections::HashSet::new();
+        for user in &acl_users {
+            if !seen.insert(user.username.as_str()) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("acl bootstrap: duplicate username '{}'", user.username),
+                ));
+            }
+        }
+    }
+
     let engine = Arc::new(rocket_mem::aof::recover(aof_path, snapshot_path)?);
     println!(
         "Recovered state from {} and {}",
