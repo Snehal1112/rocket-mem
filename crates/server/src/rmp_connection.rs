@@ -9,7 +9,17 @@ use protocol::rmp::{MsgType, RmpCodec, RmpMessage};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
+use tokio::sync::Semaphore;
 use tokio_util::codec::Framed;
+
+/// Caps how many requests on one RMP connection can be mid-dispatch at once. Once the
+/// cap is hit, the read loop's next `semaphore.acquire_owned().await` blocks -- it stops
+/// reading more requests off the socket, which applies ordinary TCP backpressure to
+/// whatever sent them, mirroring how RESP's sequential loop already gets backpressure
+/// for free. Without this, a client that pipelines aggressively and never reads its
+/// replies could make the server spawn unbounded tasks and queue unbounded encoded
+/// replies in memory.
+const MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION: usize = 256;
 
 pub async fn serve(
     listener: TcpListener,
@@ -52,7 +62,8 @@ async fn handle_connection(
     // `None` once every clone has dropped -- i.e. once every in-flight task has also finished
     // and sent (or failed to send) its reply -- so a client disconnecting mid-flight still gets
     // every reply that was already in progress written out before the connection fully closes.
-    let (tx, mut rx) = mpsc::unbounded_channel::<RmpMessage>();
+    let (tx, mut rx) = mpsc::channel::<RmpMessage>(MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION);
+    let semaphore = Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION));
 
     let writer = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
@@ -71,6 +82,13 @@ async fn handle_connection(
                 break;
             }
         };
+        // Blocks once MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION tasks are already mid-dispatch --
+        // that's the backpressure: the read loop stops pulling more requests off the socket
+        // until one finishes and its permit is released.
+        let permit = match Arc::clone(&semaphore).acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => break, // semaphore closed -- only happens if it were explicitly closed, which nothing here does
+        };
         let engine = Arc::clone(&engine);
         let aof = Arc::clone(&aof);
         let replication = Arc::clone(&replication);
@@ -79,6 +97,7 @@ async fn handle_connection(
         // request without waiting for this one's reply -- that's what makes multiple in-flight
         // requests on one connection possible at all.
         tokio::spawn(async move {
+            let _permit = permit; // released (dropped) when this task ends, freeing a slot
             let mut protocol = Protocol::default(); // RMP has no negotiation state to persist
             let reply = dispatcher::dispatch_and_log(
                 &engine,
@@ -88,11 +107,13 @@ async fn handle_connection(
                 &mut protocol,
                 client_id,
             );
-            let _ = tx.send(RmpMessage {
-                request_id: request.request_id,
-                msg_type: MsgType::Response,
-                frame: reply,
-            });
+            let _ = tx
+                .send(RmpMessage {
+                    request_id: request.request_id,
+                    msg_type: MsgType::Response,
+                    frame: reply,
+                })
+                .await; // bounded channel: send is now async
         });
     }
     drop(tx);
@@ -264,6 +285,36 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert_eq!(replication.connected_clients(), 0);
         assert_eq!(replication.total_connections(), 1); // the lifetime total never drops
+    }
+
+    #[tokio::test]
+    async fn more_than_the_in_flight_cap_concurrent_requests_all_still_succeed() {
+        let (_dir, addr, _engine) = spawn_test_server().await;
+        let con = std::sync::Arc::new(tokio::sync::Mutex::new(connect(addr).await));
+
+        // 2x the cap, all fired without waiting for any individual reply first -- proves
+        // the semaphore-based cap throttles (pauses reading more requests) rather than
+        // ever dropping, corrupting, or deadlocking a request once the cap is in play.
+        let total = MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION * 2;
+        for i in 0..total as u64 {
+            let mut con = con.lock().await;
+            con.send(RmpMessage {
+                request_id: i,
+                msg_type: MsgType::Request,
+                frame: command(&[b"PING"]),
+            })
+            .await
+            .unwrap();
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..total {
+            let mut con = con.lock().await;
+            let reply = con.next().await.unwrap().unwrap();
+            assert_eq!(reply.frame, Frame::Simple("PONG".into()));
+            seen.insert(reply.request_id);
+        }
+        assert_eq!(seen.len(), total);
     }
 
     #[tokio::test]
