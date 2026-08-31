@@ -1998,6 +1998,7 @@ fn handle_acl(
         "DELUSER" => acl_deluser(items, replication),
         "WHOAMI" => acl_whoami(session),
         "LIST" => acl_list(replication),
+        "GETUSER" => acl_getuser(items, replication),
         _ => Frame::Error(format!("ERR unknown ACL subcommand '{sub}'")),
     })
 }
@@ -2036,6 +2037,62 @@ fn acl_whoami(session: &Session) -> Frame {
         Some(u) => Frame::Bulk(Bytes::from(u.username.clone())),
         None => Frame::Bulk(Bytes::from_static(b"default")),
     }
+}
+
+fn acl_getuser(items: &[Frame], replication: &crate::replication::ReplicationHandle) -> Frame {
+    let Some(Frame::Bulk(username)) = items.get(2) else {
+        return Frame::Error("ERR wrong number of arguments for 'acl|getuser' command".into());
+    };
+    let username = String::from_utf8_lossy(username);
+    let Some(user) = replication.acl.get_user(&username) else {
+        return Frame::Null;
+    };
+    use crate::acl::AclRule;
+    let commands: Vec<String> = user
+        .rules
+        .iter()
+        .filter(|r| {
+            matches!(
+                r,
+                AclRule::AllCommands
+                    | AclRule::NoCommands
+                    | AclRule::AllowCommand(_)
+                    | AclRule::DenyCommand(_)
+            )
+        })
+        .map(rule_token)
+        .collect();
+    let keys: Vec<String> = user
+        .rules
+        .iter()
+        .filter(|r| matches!(r, AclRule::AllKeys | AclRule::KeyPattern(_)))
+        .map(rule_token)
+        .collect();
+    Frame::Map(vec![
+        (
+            Frame::Bulk(Bytes::from_static(b"flags")),
+            Frame::Array(vec![Frame::Bulk(Bytes::from(if user.enabled {
+                "on"
+            } else {
+                "off"
+            }))]),
+        ),
+        (
+            Frame::Bulk(Bytes::from_static(b"passwords")),
+            Frame::Array(match &user.password_hash {
+                Some(h) => vec![Frame::Bulk(Bytes::from(h.clone()))],
+                None => vec![],
+            }),
+        ),
+        (
+            Frame::Bulk(Bytes::from_static(b"commands")),
+            Frame::Bulk(Bytes::from(commands.join(" "))),
+        ),
+        (
+            Frame::Bulk(Bytes::from_static(b"keys")),
+            Frame::Bulk(Bytes::from(keys.join(" "))),
+        ),
+    ])
 }
 
 fn acl_list(replication: &crate::replication::ReplicationHandle) -> Frame {
@@ -3206,6 +3263,63 @@ mod tests {
         assert!(line.starts_with("user app on "), "got: {line}");
         assert!(line.contains("~app:*"));
         assert!(line.contains("+get"));
+    }
+
+    #[test]
+    fn acl_getuser_returns_null_for_an_unknown_user() {
+        let replication = ReplicationHandle::default();
+        let session = Session::new();
+        let reply = handle_acl(&acl_cmd(&[b"GETUSER", b"nobody"]), &session, &replication).unwrap();
+        assert_eq!(reply, Frame::Null);
+    }
+
+    #[test]
+    fn acl_getuser_returns_a_structured_map_for_a_known_user() {
+        let replication = ReplicationHandle::default();
+        replication
+            .acl
+            .set_user(
+                "app",
+                &[
+                    Bytes::from_static(b"on"),
+                    Bytes::from_static(b">pw"),
+                    Bytes::from_static(b"~app:*"),
+                    Bytes::from_static(b"+get"),
+                ],
+            )
+            .unwrap();
+        let session = Session::new();
+        let reply = handle_acl(&acl_cmd(&[b"GETUSER", b"app"]), &session, &replication).unwrap();
+        let Frame::Map(fields) = reply else {
+            panic!("expected a map")
+        };
+        let field = |key: &str| {
+            fields
+                .iter()
+                .find(|(k, _)| matches!(k, Frame::Bulk(b) if b.as_ref() == key.as_bytes()))
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(
+            field("flags"),
+            Some(Frame::Array(vec![Frame::Bulk(Bytes::from_static(b"on"))]))
+        );
+        assert!(matches!(field("passwords"), Some(Frame::Array(v)) if v.len() == 1));
+        assert_eq!(
+            field("commands"),
+            Some(Frame::Bulk(Bytes::from_static(b"+get")))
+        );
+        assert_eq!(
+            field("keys"),
+            Some(Frame::Bulk(Bytes::from_static(b"~app:*")))
+        );
+    }
+
+    #[test]
+    fn acl_getuser_with_wrong_argument_count_is_an_error() {
+        let replication = ReplicationHandle::default();
+        let session = Session::new();
+        let reply = handle_acl(&acl_cmd(&[b"GETUSER"]), &session, &replication).unwrap();
+        assert!(matches!(reply, Frame::Error(_)));
     }
 
     #[test]
