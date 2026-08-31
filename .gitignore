@@ -27,3 +27,9 @@ dist/
 .worktrees/
 
 .claude
+
+# Node-based dev tools under tools/ (e.g. tools/review-agent)
+tools/*/node_modules/
+tools/*/dist/
+tools/*/.env
+tools/*/.yarn/install-state.gz

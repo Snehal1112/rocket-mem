@@ -58,3 +58,7 @@ This project's sprint specs and implementation plans follow the Superpowers Clau
 - `docs/superpowers/plans/<date>-sprint-N-plans/` — one numbered TDD implementation plan per backlog item for that sprint (`01-*.md`, `02-*.md`, ...), each referencing its sprint's spec via `../../specs/<date>-sprint-N-spec.md`.
 
 `.worktrees/` (gitignored) is a separate Superpowers convention, for the `using-git-worktrees` skill's isolated-workspace creation.
+
+## Manual testing
+
+See `.claude/manual-testing.md` for how to run the server by hand (env vars, standalone/replication/cluster-mode examples, `REPLICAOF` explained).

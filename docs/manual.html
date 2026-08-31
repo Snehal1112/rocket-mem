@@ -1,0 +1,1248 @@
+<title>rocket-mem Manual</title>
+<style>
+  /* ---------- tokens ---------- */
+  :root{
+    --paper:#eef1f6;
+    --surface:#ffffff;
+    --surface-2:#e4e9f1;
+    --ink:#161b22;
+    --ink-2:#4a5568;
+    --ink-3:#7b879a;
+    --line:#d7dee8;
+    --line-strong:#b9c3d2;
+    --signal:#2f5fe0;
+    --signal-ink:#ffffff;
+    --signal-soft:#e4ebff;
+    --mint:#187a58;
+    --mint-soft:#e0f3ea;
+    --err:#b7401f;
+    --err-soft:#fbe7e0;
+    --amber:#a3660b;
+    --amber-soft:#f7ecd8;
+    --teal:#0e7c86;
+    --teal-soft:#dcf1f2;
+    --violet:#6b4fbb;
+    --violet-soft:#ece6f9;
+    --rose:#a6366b;
+    --rose-soft:#f7e1ea;
+    --null:#8a97a8;
+    --null-soft:#eceff3;
+    --shadow: 0 1px 2px rgba(22,27,34,.04), 0 8px 24px -12px rgba(22,27,34,.15);
+    --radius:5px;
+    /* System font stacks — each OS's own UI faces, no webfont download. Mono still does double
+       duty as the display face (this product's whole identity is text bytes on a wire); it now
+       resolves to whichever monospace face the reader's own platform ships. */
+    --font-display:ui-monospace, 'SF Mono', 'Cascadia Code', 'Segoe UI Mono', 'Roboto Mono', Menlo, Consolas, 'Liberation Mono', 'Courier New', monospace;
+    --font-body:system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+    --font-mono:ui-monospace, 'SF Mono', 'Cascadia Code', 'Segoe UI Mono', 'Roboto Mono', Menlo, Consolas, 'Liberation Mono', 'Courier New', monospace;
+    /* Deliberately theme-invariant: the terminal/code surfaces always look like a terminal,
+       in either page theme, so this never gets redefined in a dark-mode block. */
+    --term-bg:#12161d;
+    --term-line:#262d38;
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){
+      --paper:#0e1116;
+      --surface:#151a21;
+      --surface-2:#1b212a;
+      --ink:#e7ecf3;
+      --ink-2:#a7b2c2;
+      --ink-3:#778394;
+      --line:#262d38;
+      --line-strong:#333c49;
+      --signal:#6d8fff;
+      --signal-ink:#0b1020;
+      --signal-soft:#1a2440;
+      --mint:#4fd8a4;
+      --mint-soft:#123528;
+      --err:#ff8566;
+      --err-soft:#3a1c14;
+      --amber:#e0ac52;
+      --amber-soft:#3a2c10;
+      --teal:#5fd3dd;
+      --teal-soft:#0f2f32;
+      --violet:#b09bef;
+      --violet-soft:#251c3c;
+      --rose:#ef8fb6;
+      --rose-soft:#3a1826;
+      --null:#8a97a8;
+      --null-soft:#1e2530;
+      --shadow: 0 1px 2px rgba(0,0,0,.3), 0 8px 24px -12px rgba(0,0,0,.6);
+    }
+  }
+  :root[data-theme="dark"]{
+    --paper:#0e1116; --surface:#151a21; --surface-2:#1b212a; --ink:#e7ecf3; --ink-2:#a7b2c2; --ink-3:#778394;
+    --line:#262d38; --line-strong:#333c49; --signal:#6d8fff; --signal-ink:#0b1020; --signal-soft:#1a2440;
+    --mint:#4fd8a4; --mint-soft:#123528; --err:#ff8566; --err-soft:#3a1c14; --amber:#e0ac52; --amber-soft:#3a2c10;
+    --teal:#5fd3dd; --teal-soft:#0f2f32; --violet:#b09bef; --violet-soft:#251c3c; --rose:#ef8fb6; --rose-soft:#3a1826;
+    --null:#8a97a8; --null-soft:#1e2530; --shadow: 0 1px 2px rgba(0,0,0,.3), 0 8px 24px -12px rgba(0,0,0,.6);
+  }
+
+  *{box-sizing:border-box;}
+  body{
+    margin:0; background:var(--paper); color:var(--ink);
+    font-family:var(--font-body); font-size:15px; line-height:1.6;
+    -webkit-font-smoothing:antialiased;
+  }
+  h1,h2,h3,h4{font-family:var(--font-display); text-wrap:balance; margin:0; font-weight:700; letter-spacing:-.01em;}
+  p{margin:0 0 .8em; max-width:64ch;}
+  code, .mono{font-family:var(--font-mono);}
+  a{color:var(--signal);}
+  a:focus-visible, button:focus-visible, input:focus-visible, summary:focus-visible{
+    outline:2px solid var(--signal); outline-offset:2px; border-radius:3px;
+  }
+  ::selection{background:var(--signal-soft); color:var(--ink);}
+  @media (prefers-reduced-motion: reduce){
+    *{animation-duration:.001ms !important; animation-iteration-count:1 !important; transition-duration:.001ms !important;}
+  }
+
+  .eyebrow{
+    font-family:var(--font-mono); font-size:11px; letter-spacing:.12em; text-transform:uppercase;
+    color:var(--ink-3); font-weight:600;
+  }
+
+  /* ---------- topbar ---------- */
+  .topbar{
+    position:sticky; top:0; z-index:40; display:flex; align-items:center; justify-content:space-between;
+    padding:.7rem 1.25rem; background:color-mix(in srgb, var(--surface) 92%, transparent);
+    backdrop-filter:blur(8px); border-bottom:1px solid var(--line);
+  }
+  .brand{display:flex; align-items:center; gap:.55rem; font-family:var(--font-display); font-weight:700; font-size:15px;}
+  .brand .dot{width:9px;height:9px;background:var(--signal);border-radius:1px; transform:rotate(45deg); flex:none;}
+  .top-actions{display:flex; align-items:center; gap:.6rem;}
+  .theme-btn{
+    font-family:var(--font-mono); font-size:11px; border:1px solid var(--line-strong); background:var(--surface);
+    color:var(--ink-2); padding:.4rem .6rem; border-radius:var(--radius); cursor:pointer;
+  }
+  .theme-btn:hover{border-color:var(--signal); color:var(--ink);}
+  .top-link{font-family:var(--font-mono); font-size:12px; color:var(--ink-2); text-decoration:none; border:1px solid transparent; padding:.4rem .6rem;}
+  .top-link:hover{color:var(--signal);}
+
+  /* ---------- hero ---------- */
+  .hero{
+    padding:3.2rem 1.25rem 2.4rem; border-bottom:1px solid var(--line);
+    background:
+      linear-gradient(180deg, color-mix(in srgb, var(--signal) 5%, transparent), transparent 60%),
+      var(--surface);
+  }
+  .hero-inner{max-width:1180px; margin:0 auto; display:grid; grid-template-columns: 1.1fr .9fr; gap:2.5rem; align-items:center;}
+  .hero h1{font-size:clamp(2.1rem, 4.4vw, 3.1rem); line-height:1.02;}
+  .hero h1 .accent{color:var(--signal);}
+  .hero-sub{color:var(--ink-2); font-size:16px; max-width:46ch; margin-top:.9rem;}
+  .hero-facts{display:flex; gap:1.4rem; margin-top:1.4rem; flex-wrap:wrap;}
+  .hero-fact{font-family:var(--font-mono); font-size:12px; color:var(--ink-3);}
+  .hero-fact b{display:block; font-size:19px; color:var(--ink); font-weight:700;}
+  .hero-cta{display:flex; gap:.7rem; margin-top:1.6rem; flex-wrap:wrap;}
+  .btn{
+    font-family:var(--font-mono); font-size:12.5px; font-weight:600; padding:.65rem 1rem; border-radius:var(--radius);
+    border:1px solid var(--line-strong); background:var(--surface); color:var(--ink); cursor:pointer; text-decoration:none;
+    display:inline-flex; align-items:center; gap:.4rem;
+  }
+  .btn.primary{background:var(--signal); border-color:var(--signal); color:var(--signal-ink);}
+  .btn:hover{border-color:var(--signal);}
+  .btn.primary:hover{filter:brightness(1.06);}
+
+  .hero-term{
+    background:var(--term-bg); color:#dbe3ee; border-radius:8px; box-shadow:var(--shadow); overflow:hidden;
+    border:1px solid var(--term-line);
+  }
+  .hero-term-bar{display:flex; align-items:center; gap:.4rem; padding:.55rem .8rem; background:rgba(255,255,255,.06); font-family:var(--font-mono); font-size:11px; color:#9fb0c9;}
+  .hero-term-bar span{width:8px;height:8px;border-radius:50%; background:#4c5768;}
+  .hero-term pre{margin:0; padding:1.1rem 1.2rem 1.3rem; font-family:var(--font-mono); font-size:13.2px; line-height:1.65; min-height:150px; white-space:pre-wrap;}
+  .hero-term .p{color:#6d8fff;}
+  .hero-term .r{color:#7fe0b8;}
+  .hero-term .c{color:#8ea0bd;}
+  .caret{display:inline-block; width:7px; height:1em; background:#6d8fff; vertical-align:text-bottom; animation:blink 1s steps(1) infinite;}
+  @keyframes blink{50%{opacity:0;}}
+
+  /* ---------- shell ---------- */
+  .shell{
+    max-width:1440px; margin:0 auto; padding:0 1.25rem 4rem;
+    display:grid; grid-template-columns: 216px minmax(0,1fr) 400px; gap:2rem;
+    align-items:start;
+  }
+  .toc{position:sticky; top:58px; padding-top:2rem; max-height:calc(100vh - 58px); overflow-y:auto;}
+  .toc-group{margin-bottom:1.1rem;}
+  .toc-group h4{font-size:10.5px; letter-spacing:.1em; text-transform:uppercase; color:var(--ink-3); margin-bottom:.45rem; font-weight:700;}
+  .toc a{
+    display:block; font-family:var(--font-mono); font-size:12.5px; color:var(--ink-2); text-decoration:none;
+    padding:.28rem 0 .28rem .6rem; border-left:2px solid transparent;
+  }
+  .toc a:hover{color:var(--ink); border-left-color:var(--line-strong);}
+  .toc a.active{color:var(--signal); border-left-color:var(--signal); font-weight:600;}
+
+  .content{min-width:0; padding-top:2rem;}
+  section.doc{padding-bottom:2.6rem; margin-bottom:2.6rem; border-bottom:1px solid var(--line); scroll-margin-top:70px;}
+  section.doc:last-child{border-bottom:none;}
+  .sec-head{display:flex; align-items:baseline; gap:.7rem; margin-bottom:.4rem; flex-wrap:wrap;}
+  .sec-head h2{font-size:1.5rem;}
+  .sec-blurb{color:var(--ink-2); margin:.6rem 0 1.6rem;}
+  .status-pill{
+    font-family:var(--font-mono); font-size:10px; letter-spacing:.04em; padding:.15rem .5rem; border-radius:99px;
+    border:1px solid var(--line-strong); color:var(--ink-3); text-transform:uppercase; font-weight:600;
+  }
+
+  .cmd-group{border-top:1px solid var(--line);}
+  .cmd{
+    display:grid; grid-template-columns: 172px 1fr; gap:1.4rem; padding:1.3rem 0; border-bottom:1px solid var(--line);
+    scroll-margin-top:70px;
+  }
+  .cmd-id{display:flex; flex-direction:column; gap:.4rem;}
+  .cmd-name{font-family:var(--font-display); font-weight:700; font-size:15px; letter-spacing:-.01em;}
+  .type-dot{display:inline-flex; align-items:center; gap:.35rem; font-family:var(--font-mono); font-size:10px; color:var(--ink-3);}
+  .type-dot i{width:7px; height:7px; border-radius:50%; background:var(--ink-3); flex:none;}
+  .cmd-sig{font-family:var(--font-mono); font-size:12.5px; color:var(--ink-2); background:var(--surface-2); border-radius:4px; padding:.55rem .6rem; line-height:1.5; word-break:break-word;}
+  .cmd-desc{margin:0 0 .7rem;}
+  .cmd-facts{display:grid; grid-template-columns: max-content 1fr; gap:.25rem .7rem; font-size:13px; margin-bottom:.85rem;}
+  .cmd-facts dt{font-family:var(--font-mono); font-size:10.5px; text-transform:uppercase; letter-spacing:.06em; color:var(--ink-3); padding-top:.15rem;}
+  .cmd-facts dd{margin:0; color:var(--ink-2);}
+  .cmd-example{
+    display:flex; align-items:center; justify-content:space-between; gap:.8rem; background:var(--surface);
+    border:1px solid var(--line); border-radius:var(--radius); padding:.55rem .55rem .55rem .8rem; flex-wrap:wrap;
+  }
+  .cmd-example code{font-size:12.8px;}
+  .cmd-example .eg-cmd{color:var(--ink);}
+  .cmd-example .eg-arrow{color:var(--ink-3); margin:0 .4rem;}
+  .cmd-example .eg-reply{color:var(--mint);}
+  .try-btn{
+    font-family:var(--font-mono); font-size:11px; font-weight:600; color:var(--signal); background:var(--signal-soft);
+    border:1px solid transparent; padding:.4rem .65rem; border-radius:4px; cursor:pointer; white-space:nowrap; flex:none;
+  }
+  .try-btn:hover{border-color:var(--signal);}
+
+  @media (max-width:1240px){
+    .shell{grid-template-columns: 200px minmax(0,1fr) 340px;}
+  }
+  @media (max-width:980px){
+    .hero-inner{grid-template-columns:1fr;}
+    .shell{grid-template-columns:1fr; grid-template-areas:"play" "toc" "content";}
+    .toc{position:static; grid-area:toc; display:flex; overflow-x:auto; gap:1.4rem; padding:1rem 0; max-height:none; border-bottom:1px solid var(--line); border-top:1px solid var(--line); margin-bottom:1rem;}
+    .toc-group{margin-bottom:0; flex:none;}
+    .content{grid-area:content; padding-top:0;}
+    .cmd{grid-template-columns:1fr;}
+    aside.playground{grid-area:play; position:static; max-height:none;}
+  }
+
+  /* ---------- playground ---------- */
+  aside.playground{position:sticky; top:58px; padding-top:2rem; max-height:calc(100vh - 58px); display:flex; flex-direction:column;}
+  .pg-card{
+    background:var(--term-bg); color:#dbe3ee; border-radius:9px; box-shadow:var(--shadow); display:flex; flex-direction:column;
+    overflow:hidden; border:1px solid var(--term-line); flex:1; min-height:0;
+  }
+  .pg-head{display:flex; align-items:center; justify-content:space-between; padding:.7rem .9rem; background:rgba(255,255,255,.05); font-family:var(--font-mono); font-size:11.5px; color:#9fb0c9;}
+  .pg-head .live{display:flex; align-items:center; gap:.4rem;}
+  .pg-head .live i{width:6px;height:6px;border-radius:50%; background:#4fd8a4; box-shadow:0 0 0 2px rgba(79,216,164,.2);}
+  .pg-toggle{display:flex; border:1px solid rgba(255,255,255,.14); border-radius:5px; overflow:hidden;}
+  .pg-toggle button{
+    font-family:var(--font-mono); font-size:10.5px; padding:.28rem .55rem; background:transparent; color:#9fb0c9;
+    border:none; cursor:pointer;
+  }
+  .pg-toggle button.active{background:rgba(109,143,255,.22); color:#dbe3ee;}
+  .pg-log{flex:1; overflow-y:auto; padding:.9rem 1rem; font-family:var(--font-mono); font-size:12.6px; line-height:1.62; min-height:220px;}
+  .pg-entry{margin-bottom:.85rem;}
+  .pg-cmdline{color:#dbe3ee;}
+  .pg-cmdline .car{color:#6d8fff; margin-right:.5rem;}
+  .pg-reply{margin-top:.25rem; white-space:pre-wrap; word-break:break-word;}
+  .pg-note{color:#7683c9; font-style:normal;}
+  .resp-simple{color:#7fe0b8;} .resp-error{color:#ff9b7f;} .resp-integer{color:#8fb2ff;}
+  .resp-bulk{color:#f1f3f6;} .resp-bulk-data{color:#ffe08a;} .resp-null{color:#7683c9;}
+  .resp-array{color:#c6b4ff;} .resp-map{color:#f2a4c6;} .resp-idx{color:#5a6785;} .crlf{color:#42506b;}
+  .pg-form{display:flex; gap:.55rem; padding:.75rem; border-top:1px solid rgba(255,255,255,.1); background:rgba(255,255,255,.03);}
+  .pg-form input{
+    flex:1; background:rgba(255,255,255,.06); border:1px solid rgba(255,255,255,.12); border-radius:5px; color:#f1f3f6;
+    font-family:var(--font-mono); font-size:12.8px; padding:.55rem .7rem;
+  }
+  .pg-form input::placeholder{color:#5a6785;}
+  .pg-form button{font-family:var(--font-mono); font-size:12px; font-weight:600; background:#6d8fff; color:#0b1020; border:none; border-radius:5px; padding:0 .95rem; cursor:pointer;}
+  .pg-legend{display:flex; flex-wrap:wrap; gap:.5rem .85rem; padding:0 1rem .8rem; font-family:var(--font-mono); font-size:10px; color:#7683c9;}
+  .pg-legend span{display:inline-flex; align-items:center; gap:.3rem;}
+  .pg-legend i{width:7px;height:7px;border-radius:2px;}
+  .pg-scope{font-size:11.5px; color:var(--ink-3); margin-top:.7rem; line-height:1.5;}
+  .pg-scope b{color:var(--ink-2);}
+
+  /* ---------- misc content blocks ---------- */
+  .prose h3{font-size:1.05rem; margin:1.4rem 0 .5rem;}
+  .prose h3:first-child{margin-top:0;}
+  .grid-2{display:grid; grid-template-columns:1fr 1fr; gap:1.4rem;}
+  @media (max-width:700px){.grid-2{grid-template-columns:1fr;}}
+  .info-card{background:var(--surface); border:1px solid var(--line); border-radius:var(--radius); padding:1rem 1.1rem;}
+  .info-card h4{font-family:var(--font-mono); font-size:12px; text-transform:uppercase; letter-spacing:.05em; color:var(--ink-3); margin-bottom:.5rem;}
+  .info-card p{margin:0; color:var(--ink-2); font-size:13.5px;}
+  table.spec{width:100%; border-collapse:collapse; font-size:13px; margin:.8rem 0 1.2rem;}
+  table.spec th, table.spec td{text-align:left; padding:.45rem .6rem; border-bottom:1px solid var(--line);}
+  table.spec th{font-family:var(--font-mono); font-size:10.5px; text-transform:uppercase; letter-spacing:.05em; color:var(--ink-3); font-weight:600;}
+  table.spec td.mono{font-family:var(--font-mono); font-size:12.3px;}
+  .wrap-x{overflow-x:auto;}
+  .codeblock{
+    background:var(--term-bg); color:#dbe3ee; border-radius:7px; padding:.9rem 1rem; font-family:var(--font-mono);
+    font-size:12.6px; line-height:1.65; overflow-x:auto; border:1px solid var(--term-line);
+    white-space:pre-wrap; word-break:break-word;
+  }
+  .codeblock .c1{color:#6d8fff;} .codeblock .c2{color:#7fe0b8;} .codeblock .c3{color:#8ea0bd;}
+  .gap-badges{display:flex; flex-wrap:wrap; gap:.4rem; margin:.8rem 0;}
+  .gap-badge{font-family:var(--font-mono); font-size:11px; color:var(--amber); background:var(--amber-soft); border-radius:4px; padding:.28rem .55rem;}
+  .limits{margin:1.1rem 0 1.4rem; padding-top:.9rem; border-top:1px dashed var(--line);}
+  .limits-label{display:block; font-family:var(--font-mono); font-size:10.5px; text-transform:uppercase; letter-spacing:.06em; color:var(--ink-3); font-weight:600; margin-bottom:.15rem;}
+  h3.cmds-heading{font-size:1.05rem; margin:1.8rem 0 0;}
+  .keyslot-tool{display:flex; gap:.6rem; align-items:center; flex-wrap:wrap; margin:.9rem 0;}
+  .keyslot-tool input{
+    font-family:var(--font-mono); font-size:13px; padding:.5rem .65rem; border:1px solid var(--line-strong); border-radius:4px;
+    background:var(--surface); color:var(--ink); width:220px;
+  }
+  .keyslot-out{font-family:var(--font-mono); font-size:13px; color:var(--signal); background:var(--signal-soft); padding:.5rem .7rem; border-radius:4px;}
+
+  footer{max-width:1440px; margin:0 auto; padding:2rem 1.25rem 3rem; color:var(--ink-3); font-size:12.5px; font-family:var(--font-mono); border-top:1px solid var(--line);}
+</style>
+
+<div class="topbar">
+  <div class="brand"><span class="dot"></span>rocket-mem <span style="color:var(--ink-3); font-weight:500;">/ manual</span></div>
+  <div class="top-actions">
+    <a class="top-link" href="#playground">Playground</a>
+    <button class="theme-btn" id="themeBtn" type="button">Theme: System</button>
+  </div>
+</div>
+
+<header class="hero">
+  <div class="hero-inner">
+    <div>
+      <p class="eyebrow">Reference manual — RESP-compatible in-memory store, Rust</p>
+      <h1>Speak the wire<br>protocol, <span class="accent">not&nbsp;around&nbsp;it.</span></h1>
+      <p class="hero-sub">Every command rocket-mem understands, exactly what it returns, and the raw RESP bytes it sends back on the socket. Type a command below and watch both.</p>
+      <div class="hero-facts">
+        <div class="hero-fact"><b>16</b>shard-striped store</div>
+        <div class="hero-fact"><b>2 / 3</b>RESP protocol versions</div>
+        <div class="hero-fact"><b>16384</b>cluster hash slots</div>
+        <div class="hero-fact"><b>~70</b>commands wired up</div>
+      </div>
+      <div class="hero-cta">
+        <a class="btn primary" href="#playground">Open the playground →</a>
+        <a class="btn" href="#connecting">Connect a real client</a>
+      </div>
+    </div>
+    <div class="hero-term">
+      <div class="hero-term-bar"><span></span><span></span><span></span>redis-cli -p 6379</div>
+      <pre id="heroTyping"></pre>
+    </div>
+  </div>
+</header>
+
+<div class="shell">
+  <nav class="toc" id="toc"></nav>
+  <main class="content" id="content"></main>
+
+  <aside class="playground" id="playground">
+    <div class="pg-card">
+      <div class="pg-head">
+        <span class="live"><i></i>in-browser engine</span>
+        <div class="pg-toggle" role="group" aria-label="Reply view">
+          <button id="viewCli" class="active" type="button">cli</button>
+          <button id="viewResp" type="button">resp bytes</button>
+        </div>
+      </div>
+      <div class="pg-log" id="pgLog" aria-live="polite"></div>
+      <div class="pg-legend" id="pgLegend"></div>
+      <form class="pg-form" id="pgForm">
+        <span class="car" aria-hidden="true" style="align-self:center;color:#6d8fff;font-family:var(--font-mono)">&gt;</span>
+        <input id="pgInput" type="text" autocomplete="off" spellcheck="false" placeholder="SET foo bar" aria-label="Command input">
+        <button type="submit">Run</button>
+      </form>
+    </div>
+    <p class="pg-scope"><b>Scope:</b> strings, hashes, lists, sets, sorted sets, keys/TTL and PING/ECHO/HELLO/TYPE run against a real client-side reimplementation of the engine's semantics. SLOWLOG tracks genuine timings of commands run in this playground. SAVE, REPLICAOF and CLUSTER SHARDS/NODES/INFO describe multi-node/on-disk state this single browser session can't actually produce, so they reply with a short note explaining what a real node would do instead. <code>HELLO 3</code> switches this session to RESP3.</p>
+  </aside>
+</div>
+
+<footer>rocket-mem — from-scratch RESP-compatible in-memory data store, Rust. Manual generated from the current source tree, not from memory.</footer>
+
+<script>
+/* ============================================================
+   RESP frame model + encoder
+   ============================================================ */
+const enc = new TextEncoder();
+const byteLen = s => enc.encode(s).length;
+const esc = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+
+function F(t,v){ return {t,v}; }
+const Simple = v => F('simple', v);
+const Err = v => F('error', v);
+const Int = v => F('integer', v);
+const Bulk = v => F('bulk', v);
+const Null = F('null', null);
+const Arr = v => F('array', v);
+const MapF = v => F('map', v);
+
+function encodeResp(frame, resp3){
+  const CR = '<span class="crlf">↵</span>\n';
+  switch(frame.t){
+    case 'simple': return `<span class="resp-simple">+${esc(frame.v)}</span>${CR}`;
+    case 'error': return `<span class="resp-error">-${esc(frame.v)}</span>${CR}`;
+    case 'integer': return `<span class="resp-integer">:${frame.v}</span>${CR}`;
+    case 'bulk': return `<span class="resp-bulk">$${byteLen(frame.v)}</span>${CR}<span class="resp-bulk-data">${esc(frame.v)}</span>${CR}`;
+    case 'null': return resp3 ? `<span class="resp-null">_</span>${CR}` : `<span class="resp-null">$-1</span>${CR}`;
+    case 'array': {
+      let s = `<span class="resp-array">*${frame.v.length}</span>${CR}`;
+      for (const f of frame.v) s += encodeResp(f, resp3);
+      return s;
+    }
+    case 'map': {
+      if (resp3){
+        let s = `<span class="resp-map">%${frame.v.length}</span>${CR}`;
+        for (const [k,v] of frame.v){ s += encodeResp(k,resp3); s += encodeResp(v,resp3); }
+        return s;
+      } else {
+        let s = `<span class="resp-array">*${frame.v.length*2}</span>${CR}`;
+        for (const [k,v] of frame.v){ s += encodeResp(k,resp3); s += encodeResp(v,resp3); }
+        return s;
+      }
+    }
+  }
+}
+
+function prettyResp(frame, depth){
+  depth = depth || 0;
+  const pad = '  '.repeat(depth);
+  switch(frame.t){
+    case 'simple': return `<span class="resp-simple">${esc(frame.v)}</span>`;
+    case 'error': return `<span class="resp-error">(error) ${esc(frame.v)}</span>`;
+    case 'integer': return `<span class="resp-integer">(integer) ${frame.v}</span>`;
+    case 'bulk': return `<span class="resp-bulk-data">"${esc(frame.v)}"</span>`;
+    case 'null': return `<span class="resp-null">(nil)</span>`;
+    case 'array': {
+      if (frame.v.length === 0) return `<span class="resp-null">(empty array)</span>`;
+      return frame.v.map((f,i)=>`${pad}<span class="resp-idx">${i+1})</span> ${prettyResp(f, depth+1)}`).join('\n');
+    }
+    case 'map': {
+      if (frame.v.length === 0) return `<span class="resp-null">(empty map)</span>`;
+      return frame.v.map(([k,v],i)=>`${pad}<span class="resp-idx">${i+1})</span> ${prettyResp(k, depth+1)} <span class="crlf">=&gt;</span> ${prettyResp(v, depth+1)}`).join('\n');
+    }
+  }
+}
+
+/* ============================================================
+   Simulated engine — mirrors crates/engine + dispatcher semantics
+   ============================================================ */
+const store = new Map(); // key -> {type, value, expiresAt|null}
+let clientId = 1;
+let protocol = 'RESP2';
+// Real slow-command tracking, driven by actually-measured execution time of commands run
+// through this playground — not canned data. SLOWLOG GET/LEN/RESET read from this.
+const SLOWLOG_ENTRIES = [];
+let slowlogSeq = 0;
+function recordSlowlog(name, args, micros){
+  slowlogSeq++;
+  SLOWLOG_ENTRIES.unshift({id:slowlogSeq, ts:Math.floor(Date.now()/1000), us:Math.max(micros,1), cmd:name.toUpperCase(), key:args[0]||'', extra:Math.max(args.length-1,0)});
+  if (SLOWLOG_ENTRIES.length > 128) SLOWLOG_ENTRIES.length = 128;
+}
+function noteFor(name, args){
+  const cmd = name.toUpperCase();
+  if (cmd==='REPLICAOF'){
+    return (args[0]||'').toUpperCase()==='NO'
+      ? 'On a real node: cancels the background apply loop and returns to normal read/write. This single-session demo has nothing to disconnect from.'
+      : 'On a real node: connects to the leader, pulls a full snapshot, then applies every write it streams afterward, live. This demo runs one node in your browser, so there is no leader to actually reach.';
+  }
+  if (cmd==='SAVE') return 'On a real node: briefly pauses new writes, serializes the whole keyspace to ROCKET_MEM_SNAPSHOT_PATH, fsyncs it, then resumes. Here it only confirms the request.';
+  if (cmd==='PSYNC') return 'A replica sends this itself, right after REPLICAOF — it is never something a client types. Shown here only so you know the name if you see it in a packet capture.';
+  if (cmd==='CLUSTER'){
+    const sub=(args[0]||'').toUpperCase();
+    if (sub==='SHARDS' || sub==='NODES') return 'Empty here because this demo never configures a real cluster topology. On a node started with ROCKET_MEM_CLUSTER_CONFIG set, this lists every node and the slot range it owns.';
+    if (sub==='INFO') return 'cluster_enabled:0 because this demo has no topology file. A real cluster node reports 1, plus how much of the 16384-slot space is actually assigned.';
+  }
+  return null;
+}
+
+function now(){ return Date.now(); }
+function isLive(k){
+  const e = store.get(k);
+  if (!e) return false;
+  if (e.expiresAt !== null && e.expiresAt <= now()){ store.delete(k); return false; }
+  return true;
+}
+function get(k){ return isLive(k) ? store.get(k) : undefined; }
+function typeName(k){ const e = get(k); return e ? e.type : 'none'; }
+class WrongType extends Error{}
+class NotInt extends Error{}
+function need(k, type){
+  const e = get(k);
+  if (e && e.type !== type) throw new WrongType();
+  return e;
+}
+function toBytes(s){ return String(s); }
+function asInt(s, errMsg){
+  if (!/^-?\d+$/.test(s)) throw new NotInt(errMsg);
+  return parseInt(s, 10);
+}
+function clampRange(len, start, stop){
+  if (start < 0) start = Math.max(len + start, 0);
+  if (stop < 0) stop = len + stop;
+  stop = Math.min(stop, len - 1);
+  if (start > stop || len === 0) return [0,-1];
+  return [start, stop];
+}
+function globMatch(pattern, str){
+  const re = '^' + pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g,'.*').replace(/\?/g,'.') + '$';
+  return new RegExp(re).test(str);
+}
+// CRC16-CCITT/XMODEM over hash-tagged key, for CLUSTER KEYSLOT — matches the real algorithm.
+function crc16(buf){
+  let crc = 0x0000;
+  for (let i=0;i<buf.length;i++){
+    crc ^= (buf.charCodeAt(i) & 0xff) << 8;
+    for (let j=0;j<8;j++){
+      crc = (crc & 0x8000) ? ((crc << 1) ^ 0x1021) : (crc << 1);
+      crc &= 0xffff;
+    }
+  }
+  return crc;
+}
+function hashTag(key){
+  const open = key.indexOf('{');
+  if (open === -1) return key;
+  const close = key.indexOf('}', open+1);
+  if (close === -1 || close === open+1) return key;
+  return key.slice(open+1, close);
+}
+function keySlot(key){ return crc16(hashTag(key)) % 16384; }
+
+const WRONGTYPE_MSG = 'WRONGTYPE Operation against a key holding the wrong kind of value';
+
+function ttlStatus(k){
+  const e = store.get(k);
+  if (!e || (e.expiresAt !== null && e.expiresAt <= now())) return -2;
+  if (e.expiresAt === null) return -1;
+  return e.expiresAt - now();
+}
+
+const WRITE_LOGGED_NOTE = null;
+
+function run(name, args){
+  const cmd = name.toUpperCase();
+  try {
+    switch(cmd){
+      case 'PING': return args.length ? Bulk(args[0]) : Simple('PONG');
+      case 'ECHO': reqArgs(args,1,'echo'); return Bulk(args[0]);
+      case 'SELECT': return Simple('OK');
+      case 'COMMAND': return Arr([]);
+      case 'TYPE': reqArgs(args,1,'type'); return Simple(typeName(args[0]));
+      case 'HELLO': {
+        if (args[0] === '2') protocol = 'RESP2';
+        else if (args[0] === '3') protocol = 'RESP3';
+        else if (args[0]) return Err('NOPROTO unsupported protocol version');
+        return MapF([
+          [Bulk('server'), Bulk('redis')], [Bulk('version'), Bulk('rocket-mem-0.1.0')],
+          [Bulk('proto'), Int(protocol==='RESP3'?3:2)], [Bulk('id'), Int(clientId)],
+          [Bulk('mode'), Bulk('standalone')], [Bulk('role'), Bulk('master')],
+        ]);
+      }
+
+      // ---- strings ----
+      case 'SET': {
+        reqArgs(args,2,'set');
+        const [key,val,...flags] = args;
+        const up = flags.map(f=>f.toUpperCase());
+        let exMs = null;
+        if (up.includes('EX')) exMs = asInt(flags[up.indexOf('EX')+1], 'ERR value is not an integer or out of range') * 1000;
+        else if (up.includes('PX')) exMs = asInt(flags[up.indexOf('PX')+1], 'ERR value is not an integer or out of range');
+        let applied = true;
+        if (up.includes('NX')) applied = !get(key);
+        else if (up.includes('XX')) applied = !!get(key);
+        if (!applied) return Null;
+        store.set(key, {type:'string', value:val, expiresAt: exMs!==null ? now()+exMs : null});
+        return Simple('OK');
+      }
+      case 'GET': { reqArgs(args,1,'get'); const e = need(args[0],'string'); return e ? Bulk(e.value) : Null; }
+      case 'APPEND': {
+        reqArgs(args,2,'append');
+        const e = need(args[0],'string');
+        const nv = (e?e.value:'') + args[1];
+        store.set(args[0], {type:'string', value:nv, expiresAt: e?e.expiresAt:null});
+        return Int(byteLen(nv));
+      }
+      case 'STRLEN': { reqArgs(args,1,'strlen'); const e = need(args[0],'string'); return Int(e?byteLen(e.value):0); }
+      case 'GETRANGE': {
+        reqArgs(args,3,'getrange');
+        const e = need(args[0],'string'); if (!e) return Bulk('');
+        let [s,en] = [asInt(args[1]), asInt(args[2])];
+        const [a,b] = clampRange(e.value.length, s, en);
+        return Bulk(b>=a ? e.value.slice(a,b+1) : '');
+      }
+      case 'SETRANGE': {
+        reqArgs(args,3,'setrange');
+        const off = asInt(args[1]); const e = need(args[0],'string');
+        let base = e ? e.value : '';
+        if (args[2]==='' && !e) return Int(0);
+        if (base.length < off) base = base.padEnd(off, '\0');
+        const nv = base.slice(0,off) + args[2] + base.slice(off+args[2].length);
+        store.set(args[0], {type:'string', value:nv, expiresAt: e?e.expiresAt:null});
+        return Int(byteLen(nv));
+      }
+      case 'INCR': case 'DECR': case 'INCRBY': case 'DECRBY': {
+        reqArgs(args,1,cmd.toLowerCase());
+        const e = need(args[0],'string');
+        const cur = e ? asInt(e.value,'ERR value is not an integer or out of range') : 0;
+        let delta = cmd==='INCR'?1:cmd==='DECR'?-1:asInt(args[1],'ERR value is not an integer or out of range');
+        if (cmd==='DECRBY') delta = -delta;
+        const nv = cur + delta;
+        store.set(args[0], {type:'string', value:String(nv), expiresAt: e?e.expiresAt:null});
+        return Int(nv);
+      }
+      case 'GETSET': {
+        reqArgs(args,2,'getset');
+        const e = need(args[0],'string');
+        store.set(args[0], {type:'string', value:args[1], expiresAt:null});
+        return e ? Bulk(e.value) : Null;
+      }
+      case 'MSET': {
+        reqArgs(args,2,'mset'); if (args.length%2) return Err("ERR wrong number of arguments for 'mset' command");
+        for (let i=0;i<args.length;i+=2) store.set(args[i], {type:'string', value:args[i+1], expiresAt:null});
+        return Simple('OK');
+      }
+      case 'MGET': {
+        reqArgs(args,1,'mget');
+        return Arr(args.map(k=>{ const e = store.get(k); return (e && isLive(k) && e.type==='string') ? Bulk(e.value) : Null; }));
+      }
+      case 'MSETNX': {
+        reqArgs(args,2,'msetnx'); if (args.length%2) return Err("ERR wrong number of arguments for 'msetnx' command");
+        for (let i=0;i<args.length;i+=2) if (get(args[i])) return Int(0);
+        for (let i=0;i<args.length;i+=2) store.set(args[i], {type:'string', value:args[i+1], expiresAt:null});
+        return Int(1);
+      }
+
+      // ---- hashes ----
+      case 'HSET': { reqArgs(args,3,'hset'); const [k,f,v]=args; const e=need(k,'hash')||{type:'hash',value:{},expiresAt:null};
+        const isNew = !(f in e.value); e.value[f]=v; store.set(k,e); return Int(isNew?1:0); }
+      case 'HGET': { reqArgs(args,2,'hget'); const e=need(args[0],'hash'); return (e && args[1] in e.value) ? Bulk(e.value[args[1]]) : Null; }
+      case 'HDEL': { reqArgs(args,2,'hdel'); const e=need(args[0],'hash'); if(!e || !(args[1] in e.value)) return Int(0); delete e.value[args[1]]; return Int(1); }
+      case 'HGETALL': { reqArgs(args,1,'hgetall'); const e=need(args[0],'hash'); if(!e) return Arr([]);
+        return Arr(Object.entries(e.value).flatMap(([f,v])=>[Bulk(f),Bulk(v)])); }
+      case 'HEXISTS': { reqArgs(args,2,'hexists'); const e=need(args[0],'hash'); return Int(e && (args[1] in e.value) ? 1:0); }
+      case 'HLEN': { reqArgs(args,1,'hlen'); const e=need(args[0],'hash'); return Int(e?Object.keys(e.value).length:0); }
+      case 'HINCRBY': { reqArgs(args,3,'hincrby'); const [k,f,d]=args; const e=need(k,'hash')||{type:'hash',value:{},expiresAt:null};
+        const cur = f in e.value ? asInt(e.value[f],'ERR hash value is not an integer') : 0;
+        const nv = cur + asInt(d,'ERR value is not an integer or out of range'); e.value[f]=String(nv); store.set(k,e); return Int(nv); }
+      case 'HKEYS': { reqArgs(args,1,'hkeys'); const e=need(args[0],'hash'); return Arr(e?Object.keys(e.value).map(Bulk):[]); }
+      case 'HVALS': { reqArgs(args,1,'hvals'); const e=need(args[0],'hash'); return Arr(e?Object.values(e.value).map(Bulk):[]); }
+      case 'HMGET': { reqArgs(args,2,'hmget'); const e=need(args[0],'hash'); return Arr(args.slice(1).map(f=> (e && f in e.value)?Bulk(e.value[f]):Null)); }
+      case 'HSETNX': { reqArgs(args,3,'hsetnx'); const [k,f,v]=args; const e=need(k,'hash')||{type:'hash',value:{},expiresAt:null};
+        if (f in e.value) return Int(0); e.value[f]=v; store.set(k,e); return Int(1); }
+      case 'HSCAN': { reqArgs(args,2,'hscan'); asInt(args[1],'ERR invalid cursor'); const e=need(args[0],'hash');
+        return Arr([Bulk('0'), Arr(e?Object.entries(e.value).flatMap(([f,v])=>[Bulk(f),Bulk(v)]):[])]); }
+
+      // ---- lists ----
+      case 'RPUSH': case 'LPUSH': {
+        reqArgs(args,2,cmd.toLowerCase()); const [k,...vals]=args; const e=need(k,'list')||{type:'list',value:[],expiresAt:null};
+        if (cmd==='RPUSH') e.value.push(...vals); else for(const v of vals) e.value.unshift(v);
+        store.set(k,e); return Int(e.value.length);
+      }
+      case 'RPOP': case 'LPOP': { reqArgs(args,1,cmd.toLowerCase()); const e=need(args[0],'list'); if(!e||!e.value.length) return Null;
+        return Bulk(cmd==='RPOP'?e.value.pop():e.value.shift()); }
+      case 'LLEN': { reqArgs(args,1,'llen'); const e=need(args[0],'list'); return Int(e?e.value.length:0); }
+      case 'LRANGE': { reqArgs(args,3,'lrange'); const e=need(args[0],'list'); if(!e) return Arr([]);
+        const [a,b]=clampRange(e.value.length, asInt(args[1]), asInt(args[2])); return Arr(e.value.slice(a,b+1).map(Bulk)); }
+      case 'LINDEX': { reqArgs(args,2,'lindex'); const e=need(args[0],'list'); if(!e) return Null;
+        let i=asInt(args[1]); if(i<0) i+=e.value.length; return (i>=0&&i<e.value.length)?Bulk(e.value[i]):Null; }
+      case 'LSET': { reqArgs(args,3,'lset'); const e=need(args[0],'list'); if(!e) return Err('ERR no such key');
+        let i=asInt(args[1]); if(i<0) i+=e.value.length; if(i<0||i>=e.value.length) return Err('ERR index out of range');
+        e.value[i]=args[2]; return Simple('OK'); }
+      case 'LTRIM': { reqArgs(args,3,'ltrim'); const e=need(args[0],'list'); if(!e) return Simple('OK');
+        const [a,b]=clampRange(e.value.length, asInt(args[1]), asInt(args[2])); e.value = b>=a?e.value.slice(a,b+1):[]; return Simple('OK'); }
+      case 'LREM': { reqArgs(args,3,'lrem'); const e=need(args[0],'list'); if(!e) return Int(0);
+        let count=asInt(args[1]); const val=args[2]; let removed=0;
+        if (count===0){ const nv=e.value.filter(v=>{ if(v===val){removed++; return false;} return true; }); e.value=nv; }
+        else if (count>0){ const nv=[]; for(const v of e.value){ if(v===val && removed<count){removed++; continue;} nv.push(v);} e.value=nv; }
+        else { const nv=[]; for(let i=e.value.length-1;i>=0;i--){ const v=e.value[i]; if(v===val && removed<-count){removed++; continue;} nv.unshift(v);} e.value=nv; }
+        return Int(removed); }
+      case 'LINSERT': { reqArgs(args,4,'linsert'); const [k,pos,piv,val]=args; const e=need(k,'list'); if(!e) return Int(0);
+        const idx = e.value.indexOf(piv); if(idx===-1) return Int(-1);
+        e.value.splice(pos.toUpperCase()==='BEFORE'?idx:idx+1,0,val); return Int(e.value.length); }
+
+      // ---- sets ----
+      case 'SADD': { reqArgs(args,2,'sadd'); const [k,...mem]=args; const e=need(k,'set')||{type:'set',value:new Set(),expiresAt:null};
+        let added=0; for(const m of mem) if(!e.value.has(m)){e.value.add(m); added++;} store.set(k,e); return Int(added); }
+      case 'SREM': { reqArgs(args,2,'srem'); const [k,...mem]=args; const e=need(k,'set'); if(!e) return Int(0);
+        let removed=0; for(const m of mem) if(e.value.delete(m)) removed++; return Int(removed); }
+      case 'SMEMBERS': { reqArgs(args,1,'smembers'); const e=need(args[0],'set'); return Arr(e?[...e.value].map(Bulk):[]); }
+      case 'SISMEMBER': { reqArgs(args,2,'sismember'); const e=need(args[0],'set'); return Int(e&&e.value.has(args[1])?1:0); }
+      case 'SCARD': { reqArgs(args,1,'scard'); const e=need(args[0],'set'); return Int(e?e.value.size:0); }
+      case 'SINTER': case 'SUNION': case 'SDIFF': {
+        reqArgs(args,1,cmd.toLowerCase());
+        const sets = args.map(k=>{ const e=need(k,'set'); return e?e.value:new Set(); });
+        let res;
+        if (cmd==='SINTER') res = sets.length? [...sets[0]].filter(m=>sets.every(s=>s.has(m))) : [];
+        else if (cmd==='SUNION') res = [...new Set(sets.flatMap(s=>[...s]))];
+        else res = sets.length? [...sets[0]].filter(m=>!sets.slice(1).some(s=>s.has(m))) : [];
+        return Arr(res.map(Bulk));
+      }
+      case 'SINTERSTORE': case 'SUNIONSTORE': case 'SDIFFSTORE': {
+        reqArgs(args,2,cmd.toLowerCase()); const [dest,...keys]=args;
+        const inner = run(cmd.replace('STORE',''), keys);
+        const result = new Set(inner.v.map(f=>f.v));
+        store.set(dest, {type:'set', value:result, expiresAt:null});
+        return Int(result.size);
+      }
+      case 'SPOP': { reqArgs(args,1,'spop'); const e=need(args[0],'set'); if(!e||!e.value.size) return Null;
+        const arr=[...e.value]; const pick=arr[Math.floor(Math.random()*arr.length)]; e.value.delete(pick); return Bulk(pick); }
+      case 'SRANDMEMBER': { reqArgs(args,1,'srandmember'); const e=need(args[0],'set'); if(!e||!e.value.size) return Null;
+        const arr=[...e.value]; return Bulk(arr[Math.floor(Math.random()*arr.length)]); }
+      case 'SSCAN': { reqArgs(args,2,'sscan'); asInt(args[1],'ERR invalid cursor'); const e=need(args[0],'set');
+        return Arr([Bulk('0'), Arr(e?[...e.value].map(Bulk):[])]); }
+
+      // ---- sorted sets ----
+      case 'ZADD': { reqArgs(args,3,'zadd'); const [k,sc,m]=args; const score=parseFloat(sc); if(Number.isNaN(score)) return Err('ERR value is not a valid float');
+        const e=need(k,'zset')||{type:'zset',value:new Map(),expiresAt:null}; const isNew=!e.value.has(m); e.value.set(m,score); store.set(k,e); return Int(isNew?1:0); }
+      case 'ZSCORE': { reqArgs(args,2,'zscore'); const e=need(args[0],'zset'); return (e&&e.value.has(args[1]))?Bulk(fmtScore(e.value.get(args[1]))):Null; }
+      case 'ZREM': { reqArgs(args,2,'zrem'); const e=need(args[0],'zset'); if(!e||!e.value.has(args[1])) return Int(0); e.value.delete(args[1]); return Int(1); }
+      case 'ZCARD': { reqArgs(args,1,'zcard'); const e=need(args[0],'zset'); return Int(e?e.value.size:0); }
+      case 'ZINCRBY': { reqArgs(args,3,'zincrby'); const [k,d,m]=args; const delta=parseFloat(d); if(Number.isNaN(delta)) return Err('ERR value is not a valid float');
+        const e=need(k,'zset')||{type:'zset',value:new Map(),expiresAt:null}; const nv=(e.value.get(m)||0)+delta; e.value.set(m,nv); store.set(k,e); return Bulk(fmtScore(nv)); }
+      case 'ZRANGE': { reqArgs(args,3,'zrange'); const e=need(args[0],'zset'); if(!e) return Arr([]);
+        const sorted=[...e.value.entries()].sort((a,b)=> a[1]-b[1] || (a[0]<b[0]?-1:1));
+        const [a,b]=clampRange(sorted.length, asInt(args[1]), asInt(args[2])); return Arr(b>=a?sorted.slice(a,b+1).map(x=>Bulk(x[0])):[]); }
+      case 'ZRANK': { reqArgs(args,2,'zrank'); const e=need(args[0],'zset'); if(!e||!e.value.has(args[1])) return Null;
+        const sorted=[...e.value.entries()].sort((a,b)=> a[1]-b[1] || (a[0]<b[0]?-1:1)); return Int(sorted.findIndex(x=>x[0]===args[1])); }
+
+      // ---- keys / generic ----
+      case 'DEL': { reqArgs(args,1,'del'); let n=0; for(const k of args) if(isLive(k)){store.delete(k); n++;} return Int(n); }
+      case 'EXISTS': { reqArgs(args,1,'exists'); let n=0; for(const k of args) if(isLive(k)) n++; return Int(n); }
+      case 'KEYS': { reqArgs(args,1,'keys'); const pat=args[0]; const res=[]; for(const k of store.keys()) if(isLive(k)&&globMatch(pat,k)) res.push(k); return Arr(res.map(Bulk)); }
+      case 'SCAN': { reqArgs(args,1,'scan'); asInt(args[0],'ERR invalid cursor'); const res=[]; for(const k of store.keys()) if(isLive(k)) res.push(k); return Arr([Bulk('0'), Arr(res.map(Bulk))]); }
+      case 'RANDOMKEY': { const ks=[...store.keys()].filter(isLive); return ks.length? Bulk(ks[Math.floor(Math.random()*ks.length)]) : Null; }
+      case 'RENAME': { reqArgs(args,2,'rename'); if(!isLive(args[0])) return Err('ERR no such key'); const e=store.get(args[0]); store.delete(args[0]); store.set(args[1],e); return Simple('OK'); }
+      case 'RENAMENX': { reqArgs(args,2,'renamenx'); if(!isLive(args[0])) return Err('ERR no such key'); if(isLive(args[1])) return Int(0);
+        const e=store.get(args[0]); store.delete(args[0]); store.set(args[1],e); return Int(1); }
+      case 'EXPIRE': case 'PEXPIRE': case 'EXPIREAT': case 'PEXPIREAT': {
+        reqArgs(args,2,cmd.toLowerCase()); const n=asInt(args[1],'ERR value is not an integer or out of range'); if(!isLive(args[0])) return Int(0);
+        const e=store.get(args[0]);
+        if (cmd==='EXPIRE') e.expiresAt = now()+n*1000;
+        else if (cmd==='PEXPIRE') e.expiresAt = now()+n;
+        else if (cmd==='EXPIREAT') e.expiresAt = n*1000;
+        else e.expiresAt = n;
+        return Int(1);
+      }
+      case 'TTL': { reqArgs(args,1,'ttl'); const s=ttlStatus(args[0]); return Int(s<0?s:Math.round(s/1000)); }
+      case 'PTTL': { reqArgs(args,1,'pttl'); const s=ttlStatus(args[0]); return Int(s<0?s:s); }
+      case 'PERSIST': { reqArgs(args,1,'persist'); if(!isLive(args[0])) return Int(0); const e=store.get(args[0]); if(e.expiresAt===null) return Int(0); e.expiresAt=null; return Int(1); }
+      case 'MEMORY': { if(args[0]&&args[0].toUpperCase()==='USAGE'){ const e=get(args[1]); return e?Int(JSON.stringify(e.value).length+32):Null; } return Err("ERR unknown MEMORY subcommand"); }
+      case 'OBJECT': { if(args[0]&&args[0].toUpperCase()==='ENCODING'){ if(!isLive(args[1])) return Err('ERR no such key'); return Bulk(typeName(args[1])); } return Err("ERR unknown OBJECT subcommand"); }
+
+      // ---- operational ----
+      case 'SAVE': return Simple('OK');
+      case 'REPLICAOF': reqArgs(args,2,'replicaof'); return Simple('OK');
+      case 'PSYNC': return Err('ERR PSYNC is sent by a replica internally, not by a client — see the note below');
+      case 'CLUSTER': {
+        const sub = (args[0]||'').toUpperCase();
+        if (sub==='KEYSLOT'){ reqArgs(args,2,'cluster'); return Int(keySlot(args[1])); }
+        if (sub==='MYID') return Bulk('7f0a2c9e1b3d4f56');
+        if (sub==='INFO') return Bulk('cluster_enabled:0\ncluster_state:ok\ncluster_slots_assigned:0\ncluster_known_nodes:1');
+        if (sub==='SHARDS' || sub==='NODES') return Arr([]);
+        return Err(`ERR unknown CLUSTER subcommand '${args[0]||''}'`);
+      }
+      case 'SLOWLOG': {
+        const sub=(args[0]||'').toUpperCase();
+        if (sub==='LEN') return Int(SLOWLOG_ENTRIES.length);
+        if (sub==='RESET'){ SLOWLOG_ENTRIES.length = 0; return Simple('OK'); }
+        if (sub==='GET'){
+          const count = args[1]!==undefined ? asInt(args[1],'ERR value is not an integer or out of range') : 10;
+          const n = count<0 ? SLOWLOG_ENTRIES.length : Math.min(count, SLOWLOG_ENTRIES.length);
+          return Arr(SLOWLOG_ENTRIES.slice(0,n).map(e=>Arr([
+            Int(e.id), Int(e.ts), Int(e.us),
+            Arr([Bulk(e.cmd), ...(e.key?[Bulk(e.key)]:[]), ...(e.extra>0?[Bulk(`... (${e.extra} more arguments)`)]:[])])
+          ])));
+        }
+        return Err("ERR unknown SLOWLOG subcommand");
+      }
+      case 'INFO': {
+        const nKeys=[...store.keys()].filter(isLive).length;
+        return Bulk(`# Server\r\nredis_version:rocket-mem-0.1.0\r\ntcp_port:6379\r\n\r\n# Clients\r\nconnected_clients:1\r\n\r\n# Memory\r\nmaxmemory:0\r\n\r\n# Keyspace\r\ndb0:keys=${nKeys},expires=${[...store.values()].filter(v=>v.expiresAt!==null).length}\r\n`);
+      }
+
+      default: return Err(`ERR unknown command '${name}'`);
+    }
+  } catch (e){
+    if (e instanceof WrongType) return Err(WRONGTYPE_MSG);
+    if (e instanceof NotInt) return Err(e.message || 'ERR value is not an integer or out of range');
+    return Err(String(e.message||e));
+  }
+}
+function reqArgs(args, n, cmdName){ if (args.length < n) throw {message:`ERR wrong number of arguments for '${cmdName}' command`}; }
+function fmtScore(n){ return Number.isInteger(n) ? String(n) : String(n); }
+
+/* Reply-arity errors thrown as plain objects need catching too */
+const _origRun = run;
+run = function(name,args){
+  try { return _origRun(name,args); }
+  catch(e){ if (e && e.message) return Err(e.message); return Err(String(e)); }
+};
+
+/* tokenize a command line, respecting simple "quoted strings" */
+function tokenize(line){
+  const out = []; let i=0;
+  while (i<line.length){
+    while (i<line.length && /\s/.test(line[i])) i++;
+    if (i>=line.length) break;
+    if (line[i]==='"'){
+      i++; let s='';
+      while (i<line.length && line[i]!=='"'){ s+=line[i]; i++; }
+      i++; out.push(s);
+    } else {
+      let s='';
+      while (i<line.length && !/\s/.test(line[i])){ s+=line[i]; i++; }
+      out.push(s);
+    }
+  }
+  return out;
+}
+
+/* ============================================================
+   Playground UI
+   ============================================================ */
+const pgLog = document.getElementById('pgLog');
+const pgForm = document.getElementById('pgForm');
+const pgInput = document.getElementById('pgInput');
+let viewMode = 'cli';
+
+function renderLegend(){
+  const items = [
+    ['simple','Simple string'], ['error','Error'], ['integer','Integer'],
+    ['bulk-data','Bulk string'], ['null','Null'], ['array','Array'], ['map','Map (RESP3)']
+  ];
+  document.getElementById('pgLegend').innerHTML = items.map(([c,label])=>
+    `<span><i style="background:var(--${c==='bulk-data'?'amber':c})"></i>${label}</span>`
+  ).join('');
+}
+renderLegend();
+
+function addEntry(cmdline, frame, note){
+  const div = document.createElement('div');
+  div.className = 'pg-entry';
+  const body = viewMode==='cli' ? prettyResp(frame) : encodeResp(frame, protocol==='RESP3');
+  const noteHtml = note ? `<div class="pg-reply pg-note">↳ ${esc(note)}</div>` : '';
+  div.innerHTML = `<div class="pg-cmdline"><span class="car">&gt;</span>${esc(cmdline)}</div><div class="pg-reply">${body}</div>${noteHtml}`;
+  div._frame = frame; div._cmdline = cmdline;
+  pgLog.appendChild(div);
+  pgLog.scrollTop = pgLog.scrollHeight;
+}
+
+function rerenderLog(){
+  [...pgLog.children].forEach(div=>{
+    const reply = div.querySelector('.pg-reply');
+    reply.innerHTML = viewMode==='cli' ? prettyResp(div._frame) : encodeResp(div._frame, protocol==='RESP3');
+  });
+}
+
+pgForm.addEventListener('submit', e=>{
+  e.preventDefault();
+  const line = pgInput.value.trim();
+  if (!line) return;
+  const [name, ...args] = tokenize(line);
+  const t0 = performance.now();
+  const frame = run(name, args);
+  const micros = Math.round((performance.now()-t0)*1000);
+  if (name.toUpperCase() !== 'SLOWLOG') recordSlowlog(name, args, micros);
+  addEntry(line, frame, noteFor(name, args));
+  pgInput.value = '';
+});
+
+document.getElementById('viewCli').addEventListener('click', ()=>{ setView('cli'); });
+document.getElementById('viewResp').addEventListener('click', ()=>{ setView('resp'); });
+function setView(mode){
+  viewMode = mode;
+  document.getElementById('viewCli').classList.toggle('active', mode==='cli');
+  document.getElementById('viewResp').classList.toggle('active', mode==='resp');
+  rerenderLog();
+}
+
+function runExample(cmdline){
+  pgInput.value = cmdline;
+  document.getElementById('playground').scrollIntoView({behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto':'smooth', block:'start'});
+  pgForm.requestSubmit();
+}
+window.runExample = runExample;
+
+/* seed a little state + welcome line */
+run('SET', ['session:1','warming-up']);
+run('HSET', ['user:1','name','Ada']);
+addEntry('PING', Simple('PONG'));
+
+/* ============================================================
+   Content data — command groups
+   ============================================================ */
+const GROUPS = [
+{ id:'strings', title:'Strings', crumb:'Data types', blurb:'A key holding one byte string. Every value in rocket-mem is bytes underneath — strings are the base case.', cmds:[
+  {name:'SET', sig:'key value [NX | XX] [EX seconds | PX ms]', desc:'Sets key to value, unconditionally by default. NX only sets if the key is absent; XX only if it already exists — the two are mutually exclusive. EX/PX attach a TTL in the same call.', returns:'+OK, or (nil) if a NX/XX condition wasn’t met', errors:'—', missing:'NX always applies to a missing key; XX never does', ex:{cmd:'SET session:1 warming-up EX 30', reply:'+OK'}},
+  {name:'GET', sig:'key', desc:'Reads a string value back out.', returns:'Bulk string, or nil', errors:'WRONGTYPE on a non-string key', missing:'nil, not an error', ex:{cmd:'GET session:1', reply:'"warming-up"'}},
+  {name:'APPEND', sig:'key value', desc:'Appends value to the existing string, creating the key if it doesn’t exist.', returns:'Integer — length of the string after the append', errors:'WRONGTYPE', missing:'Creates the key with value as its whole content', ex:{cmd:'APPEND session:1 "-active"', reply:'(integer) 19'}},
+  {name:'STRLEN', sig:'key', desc:'Byte length of the string.', returns:'Integer', errors:'WRONGTYPE', missing:'0', ex:{cmd:'STRLEN session:1', reply:'(integer) 11'}},
+  {name:'GETRANGE', sig:'key start end', desc:'A byte substring, inclusive at both ends. Negative indices count from the end of the string.', returns:'Bulk string', errors:'WRONGTYPE', missing:'Empty string', ex:{cmd:'GETRANGE session:1 -6 -1', reply:'"ng-up"'}},
+  {name:'SETRANGE', sig:'key offset value', desc:'Overwrites the string starting at offset. If the string is shorter than offset, the gap is zero-padded first.', returns:'Integer — new length', errors:'WRONGTYPE', missing:'Creates the key, zero-padded up to offset — unless value is empty, which is a documented no-op', ex:{cmd:'SETRANGE session:1 0 "cold"', reply:'(integer) 11'}},
+  {name:'INCR / DECR', sig:'key', desc:'Parses the string as a 64-bit integer and adjusts it by 1.', returns:'Integer — the value after the change', errors:'NotAnInteger if the stored value isn’t a parseable integer; WRONGTYPE', missing:'Treated as 0 before applying the delta', ex:{cmd:'INCR views', reply:'(integer) 1'}},
+  {name:'INCRBY / DECRBY', sig:'key delta', desc:'Same as INCR/DECR with an explicit signed amount.', returns:'Integer', errors:'NotAnInteger, WRONGTYPE', missing:'Treated as 0', ex:{cmd:'INCRBY views 41', reply:'(integer) 42'}},
+  {name:'GETSET', sig:'key value', desc:'Sets a new value and returns whatever was there before, in one call.', returns:'Bulk string (old value), or nil', errors:'WRONGTYPE', missing:'nil, then the key is set', ex:{cmd:'GETSET session:1 idle', reply:'"cold"'}},
+  {name:'MSET', sig:'key value [key value ...]', desc:'Sets many keys in one call. Unconditional — always succeeds, one key at a time (not a single atomic step across the whole batch).', returns:'+OK', errors:'—', missing:'n/a', ex:{cmd:'MSET a 1 b 2 c 3', reply:'+OK'}},
+  {name:'MGET', sig:'key [key ...]', desc:'Reads many keys at once.', returns:'Array, one entry per key', errors:'Never — a missing key AND a wrong-type key both come back nil in their slot', missing:'nil in that position', ex:{cmd:'MGET a b nope', reply:'1) "1"\n2) "2"\n3) (nil)'}},
+  {name:'MSETNX', sig:'key value [key value ...]', desc:'Sets every pair only if none of the keys exist yet — all or nothing.', returns:'Integer 1 (applied) or 0 (at least one key already existed, nothing was written)', errors:'—', missing:'n/a', ex:{cmd:'MSETNX x 1 y 2', reply:'(integer) 1'}},
+]},
+{ id:'hashes', title:'Hashes', crumb:'Data types', blurb:'A key holding a field → value map. Good for representing a record without JSON-encoding it into a string.', cmds:[
+  {name:'HSET', sig:'key field value', desc:'Sets one field. rocket-mem’s HSET takes exactly one field/value pair per call (not the variadic form some Redis versions allow).', returns:'Integer 1 if the field was new, 0 if it overwrote an existing field', errors:'WRONGTYPE', missing:'Creates the hash', ex:{cmd:'HSET user:1 name Ada', reply:'(integer) 1'}},
+  {name:'HGET', sig:'key field', desc:'Reads one field.', returns:'Bulk string, or nil', errors:'WRONGTYPE', missing:'nil for a missing key or a missing field', ex:{cmd:'HGET user:1 name', reply:'"Ada"'}},
+  {name:'HDEL', sig:'key field', desc:'Removes one field.', returns:'Integer 1 or 0', errors:'WRONGTYPE', missing:'0, no error', ex:{cmd:'HDEL user:1 name', reply:'(integer) 1'}},
+  {name:'HGETALL', sig:'key', desc:'Every field and value, flattened into one array.', returns:'Array of [field, value, field, value, …]', errors:'WRONGTYPE', missing:'Empty array', ex:{cmd:'HGETALL user:1', reply:'1) "name"\n2) "Ada"'}},
+  {name:'HEXISTS', sig:'key field', desc:'Whether a field is present.', returns:'Integer 1 or 0', errors:'WRONGTYPE', missing:'0', ex:{cmd:'HEXISTS user:1 name', reply:'(integer) 1'}},
+  {name:'HLEN', sig:'key', desc:'Number of fields.', returns:'Integer', errors:'WRONGTYPE', missing:'0', ex:{cmd:'HLEN user:1', reply:'(integer) 1'}},
+  {name:'HINCRBY', sig:'key field delta', desc:'Parses the field as an integer and adjusts it.', returns:'Integer — value after the change', errors:'NotAnInteger, WRONGTYPE', missing:'Field starts from 0; key is created if needed', ex:{cmd:'HINCRBY user:1 logins 1', reply:'(integer) 1'}},
+  {name:'HKEYS / HVALS', sig:'key', desc:'Just the field names, or just the values.', returns:'Array', errors:'WRONGTYPE', missing:'Empty array', ex:{cmd:'HKEYS user:1', reply:'1) "name"\n2) "logins"'}},
+  {name:'HMGET', sig:'key field [field ...]', desc:'Reads several fields at once.', returns:'Array, one entry per field, same length as the request', errors:'WRONGTYPE', missing:'nil per field for a missing key or missing field', ex:{cmd:'HMGET user:1 name email', reply:'1) "Ada"\n2) (nil)'}},
+  {name:'HSETNX', sig:'key field value', desc:'Sets a field only if it doesn’t already exist.', returns:'Integer 1 (applied) or 0', errors:'WRONGTYPE', missing:'Creates the hash and sets it', ex:{cmd:'HSETNX user:1 name Grace', reply:'(integer) 0'}},
+  {name:'HSCAN', sig:'key cursor', desc:'Cursor-style iteration, kept for client compatibility. A hash lives fully in memory already, so one call always returns every field and a cursor of "0" — there’s no MATCH/COUNT or chunking yet.', returns:'[next-cursor, [field, value, …]]', errors:'WRONGTYPE', missing:'["0", []]', ex:{cmd:'HSCAN user:1 0', reply:'1) "0"\n2) 1) "name"\n   2) "Ada"'}},
+]},
+{ id:'lists', title:'Lists', crumb:'Data types', blurb:'A key holding an ordered, doubly-ended sequence of byte strings — a deque, not a linked list of the Redis-internal-encoding sense.', cmds:[
+  {name:'RPUSH / LPUSH', sig:'key value [value ...]', desc:'Pushes one or more values onto the tail (RPUSH) or head (LPUSH) in one call. Multi-value LPUSH prepends each value in argument order, so the last argument ends up first — matches Redis, not simple iteration.', returns:'Integer — length after the push', errors:'WRONGTYPE', missing:'Creates the list; an empty value list on a missing key is a documented no-op, not an empty list', ex:{cmd:'RPUSH queue a b c', reply:'(integer) 3'}},
+  {name:'RPOP / LPOP', sig:'key', desc:'Removes and returns the tail or head element.', returns:'Bulk string, or nil', errors:'WRONGTYPE', missing:'nil for a missing key or an empty list', ex:{cmd:'LPOP queue', reply:'"a"'}},
+  {name:'LLEN', sig:'key', desc:'Number of elements.', returns:'Integer', errors:'WRONGTYPE', missing:'0', ex:{cmd:'LLEN queue', reply:'(integer) 2'}},
+  {name:'LRANGE', sig:'key start stop', desc:'An inclusive slice. Negative indices count from the tail; out-of-range bounds clamp instead of erroring.', returns:'Array', errors:'WRONGTYPE', missing:'Empty array', ex:{cmd:'LRANGE queue 0 -1', reply:'1) "b"\n2) "c"'}},
+  {name:'LINDEX', sig:'key index', desc:'The element at a position; negative counts from the tail.', returns:'Bulk string, or nil if out of range', errors:'WRONGTYPE', missing:'nil', ex:{cmd:'LINDEX queue -1', reply:'"c"'}},
+  {name:'LSET', sig:'key index value', desc:'Overwrites the element at a position.', returns:'+OK', errors:'WRONGTYPE; an out-of-range index or a missing key is reported as an error here (unlike most reads)', missing:'Error, not a silent no-op', ex:{cmd:'LSET queue 0 B', reply:'+OK'}},
+  {name:'LTRIM', sig:'key start stop', desc:'Keeps only the LRANGE-equivalent slice, discarding everything else.', returns:'+OK', errors:'WRONGTYPE', missing:'No-op', ex:{cmd:'LTRIM queue 0 0', reply:'+OK'}},
+  {name:'LREM', sig:'key count value', desc:'Removes occurrences of value. count &gt; 0 removes that many from the head; count &lt; 0 removes that many from the tail; count = 0 removes every occurrence.', returns:'Integer — number actually removed', errors:'WRONGTYPE', missing:'0', ex:{cmd:'LREM queue 0 B', reply:'(integer) 1'}},
+  {name:'LINSERT', sig:'key BEFORE|AFTER pivot value', desc:'Inserts value next to the first element equal to pivot.', returns:'Integer — new length, or -1 if pivot wasn’t found', errors:'WRONGTYPE', missing:'0', ex:{cmd:'LINSERT queue BEFORE c X', reply:'(integer) 2'}},
+]},
+{ id:'sets', title:'Sets', crumb:'Data types', blurb:'A key holding an unordered collection of unique byte strings.', cmds:[
+  {name:'SADD', sig:'key member [member ...]', desc:'Adds members, ignoring ones already present.', returns:'Integer — count newly added (duplicates in the same call only count once)', errors:'WRONGTYPE', missing:'Creates the set; empty member list on a missing key is a no-op', ex:{cmd:'SADD tags rust redis rust', reply:'(integer) 2'}},
+  {name:'SREM', sig:'key member [member ...]', desc:'Removes members.', returns:'Integer — count actually removed', errors:'WRONGTYPE', missing:'0', ex:{cmd:'SREM tags redis', reply:'(integer) 1'}},
+  {name:'SMEMBERS', sig:'key', desc:'Every member.', returns:'Array', errors:'WRONGTYPE', missing:'Empty array', ex:{cmd:'SMEMBERS tags', reply:'1) "rust"'}},
+  {name:'SISMEMBER', sig:'key member', desc:'Membership test.', returns:'Integer 1 or 0', errors:'WRONGTYPE', missing:'0', ex:{cmd:'SISMEMBER tags rust', reply:'(integer) 1'}},
+  {name:'SCARD', sig:'key', desc:'Number of members.', returns:'Integer', errors:'WRONGTYPE', missing:'0', ex:{cmd:'SCARD tags', reply:'(integer) 1'}},
+  {name:'SINTER / SUNION / SDIFF', sig:'key [key ...]', desc:'Set intersection, union, or difference (first key minus the rest) computed on the fly. A missing key among the operands behaves like an empty set.', returns:'Array', errors:'WRONGTYPE', missing:'Contributes an empty set to the operation', ex:{cmd:'SINTER tags other:tags', reply:'(empty array)'}},
+  {name:'SINTERSTORE / SUNIONSTORE / SDIFFSTORE', sig:'dest key [key ...]', desc:'Same computation, but writes the result into dest, unconditionally overwriting whatever was there.', returns:'Integer — size of the stored result', errors:'WRONGTYPE', missing:'Same empty-set treatment as the non-store form', ex:{cmd:'SUNIONSTORE all tags other:tags', reply:'(integer) 1'}},
+  {name:'SPOP', sig:'key', desc:'Removes and returns one random member.', returns:'Bulk string, or nil', errors:'WRONGTYPE', missing:'nil for a missing key or empty set', ex:{cmd:'SPOP tags', reply:'"rust"'}},
+  {name:'SRANDMEMBER', sig:'key', desc:'Returns one random member without removing it. No count argument yet — always exactly one.', returns:'Bulk string, or nil', errors:'WRONGTYPE', missing:'nil', ex:{cmd:'SRANDMEMBER tags', reply:'(nil)'}},
+  {name:'SSCAN', sig:'key cursor', desc:'Same one-shot cursor contract as HSCAN: a set already lives fully in memory, so this returns every member and cursor "0" in a single call.', returns:'[next-cursor, [member, …]]', errors:'WRONGTYPE', missing:'["0", []]', ex:{cmd:'SSCAN tags 0', reply:'1) "0"\n2) (empty array)'}},
+]},
+{ id:'zsets', title:'Sorted sets', crumb:'Data types', blurb:'A key holding members each paired with a floating-point score, kept in ascending score order (ties broken lexicographically by member).', cmds:[
+  {name:'ZADD', sig:'key score member', desc:'Adds a member with a score, or updates its score if it’s already present. One member per call.', returns:'Integer 1 if newly added, 0 if only the score changed', errors:'WRONGTYPE', missing:'Creates the sorted set', ex:{cmd:'ZADD leaderboard 42 ada', reply:'(integer) 1'}},
+  {name:'ZSCORE', sig:'key member', desc:'The score of a member.', returns:'Bulk string (the score), or nil', errors:'WRONGTYPE', missing:'nil', ex:{cmd:'ZSCORE leaderboard ada', reply:'"42"'}},
+  {name:'ZREM', sig:'key member', desc:'Removes one member.', returns:'Integer 1 or 0', errors:'WRONGTYPE', missing:'0', ex:{cmd:'ZREM leaderboard ada', reply:'(integer) 1'}},
+  {name:'ZCARD', sig:'key', desc:'Number of members.', returns:'Integer', errors:'WRONGTYPE', missing:'0', ex:{cmd:'ZCARD leaderboard', reply:'(integer) 0'}},
+  {name:'ZINCRBY', sig:'key delta member', desc:'Adjusts a member’s score by delta.', returns:'Bulk string — the new score', errors:'WRONGTYPE', missing:'Member starts from score 0; key is created if needed', ex:{cmd:'ZINCRBY leaderboard 5 ada', reply:'"5"'}},
+  {name:'ZRANGE', sig:'key start stop', desc:'A slice by rank, ascending, inclusive. Members only — no WITHSCORES, REV, or by-score/by-lex variants yet.', returns:'Array of members', errors:'WRONGTYPE', missing:'Empty array', ex:{cmd:'ZRANGE leaderboard 0 -1', reply:'1) "ada"'}},
+  {name:'ZRANK', sig:'key member', desc:'Zero-based position in ascending score order.', returns:'Integer, or nil if the member/key is missing', errors:'WRONGTYPE', missing:'nil', ex:{cmd:'ZRANK leaderboard ada', reply:'(integer) 0'}},
+]},
+{ id:'keys', title:'Keys, TTL &amp; generic', crumb:'Keyspace', blurb:'Operations that work across any value type, plus expiry — the mechanism every SET EX and every EXPIRE ultimately goes through.', cmds:[
+  {name:'DEL', sig:'key [key ...]', desc:'Removes keys.', returns:'Integer — count actually removed', errors:'—', missing:'Not counted', ex:{cmd:'DEL session:1', reply:'(integer) 1'}},
+  {name:'EXISTS', sig:'key [key ...]', desc:'Counts how many of the given keys are present (a key repeated in the arguments counts twice).', returns:'Integer', errors:'—', missing:'Not counted', ex:{cmd:'EXISTS user:1 nope', reply:'(integer) 1'}},
+  {name:'TYPE', sig:'key', desc:'The type name of the stored value.', returns:'Simple string: string, list, hash, set, zset, or none', errors:'—', missing:'"none" — a real reply, not an error', ex:{cmd:'TYPE user:1', reply:'+hash'}},
+  {name:'KEYS', sig:'pattern', desc:'Every key matching a glob pattern (* ? and character classes). Scans the whole keyspace — fine here, worth avoiding on a large production dataset.', returns:'Array', errors:'—', missing:'n/a', ex:{cmd:'KEYS user:*', reply:'1) "user:1"'}},
+  {name:'SCAN', sig:'cursor', desc:'Cursor-based keyspace iteration. On the real server the cursor is literally an internal shard index (0–15) — one call sweeps one shard and hands back the next cursor, wrapping to 0 once every shard has been walked.', returns:'[next-cursor, [key, …]]', errors:'—', missing:'n/a', ex:{cmd:'SCAN 0', reply:'1) "0"\n2) 1) "user:1"'}},
+  {name:'RANDOMKEY', sig:'(no args)', desc:'One key, chosen uniformly at random across the whole keyspace.', returns:'Bulk string, or nil if the keyspace is empty', errors:'—', missing:'n/a', ex:{cmd:'RANDOMKEY', reply:'"user:1"'}},
+  {name:'RENAME', sig:'src dst', desc:'Renames a key, overwriting dst unconditionally if it already holds something.', returns:'+OK', errors:'"no such key" if src is missing', missing:'Errors rather than silently no-opping', ex:{cmd:'RENAME user:1 person:1', reply:'+OK'}},
+  {name:'RENAMENX', sig:'src dst', desc:'Renames only if dst doesn’t already exist.', returns:'Integer 1 (applied) or 0', errors:'"no such key" if src is missing', missing:'Errors on missing src; 0 (not an error) if dst exists', ex:{cmd:'RENAMENX person:1 user:1', reply:'(integer) 0'}},
+  {name:'EXPIRE / PEXPIRE', sig:'key seconds | ms', desc:'Attaches a TTL, seconds or milliseconds from now. Unconditionally overwrites any TTL already on the key — there’s no NX/XX/GT/LT modifier at this layer.', returns:'Integer 1 (set) or 0 (key missing)', errors:'—', missing:'0', ex:{cmd:'EXPIRE session:1 60', reply:'(integer) 1'}},
+  {name:'EXPIREAT / PEXPIREAT', sig:'key unix-seconds | unix-ms', desc:'Same as EXPIRE/PEXPIRE but with an absolute deadline. This is also the exact form the AOF log rewrites every relative EXPIRE into, so replay never restarts the countdown from scratch.', returns:'Integer 1 or 0', errors:'—', missing:'0', ex:{cmd:'PEXPIREAT session:1 4102444800000', reply:'(integer) 1'}},
+  {name:'TTL / PTTL', sig:'key', desc:'Remaining time to live, in seconds or milliseconds.', returns:'Integer ≥ 0, or -1 (no TTL set), or -2 (key doesn’t exist)', errors:'—', missing:'-2', ex:{cmd:'TTL session:1', reply:'(integer) 60'}},
+  {name:'PERSIST', sig:'key', desc:'Clears an existing TTL, making the key permanent again.', returns:'Integer 1 (a TTL was cleared) or 0 (none was set, or the key is missing)', errors:'—', missing:'0', ex:{cmd:'PERSIST session:1', reply:'(integer) 1'}},
+]},
+{ id:'meta', title:'Connection &amp; introspection', crumb:'Server', blurb:'Commands the dispatcher answers directly, without touching the storage engine.', cmds:[
+  {name:'PING', sig:'[message]', desc:'Liveness check. Echoes message if given.', returns:'+PONG, or the bulk message', errors:'—', missing:'n/a', ex:{cmd:'PING', reply:'+PONG'}},
+  {name:'ECHO', sig:'message', desc:'Echoes the argument back.', returns:'Bulk string', errors:'—', missing:'n/a', ex:{cmd:'ECHO hi', reply:'"hi"'}},
+  {name:'SELECT', sig:'index', desc:'Always replies OK — there’s only one logical database, so the index is accepted and ignored.', returns:'+OK', errors:'—', missing:'n/a', ex:{cmd:'SELECT 0', reply:'+OK'}},
+  {name:'COMMAND', sig:'(no args)', desc:'Replies with an empty array — enough that clients probing server capabilities on connect don’t choke.', returns:'Array', errors:'—', missing:'n/a', ex:{cmd:'COMMAND', reply:'(empty array)'}},
+  {name:'HELLO', sig:'[2 | 3]', desc:'Negotiates the RESP protocol version for this connection. Bare HELLO reports the current version without switching.', returns:'A map of server/protocol/role info (flattened to an array on RESP2)', errors:'NOPROTO for any version other than 2 or 3', missing:'n/a', ex:{cmd:'HELLO 3', reply:'%6 server => redis ...'}},
+  {name:'MEMORY USAGE', sig:'key', desc:'Approximate in-memory size of a key’s value.', returns:'Integer (bytes), or nil if missing', errors:'—', missing:'nil', ex:{cmd:'MEMORY USAGE user:1', reply:'(integer) 64'}},
+  {name:'OBJECT ENCODING', sig:'key', desc:'Reports the value’s type name as its "encoding" — rocket-mem doesn’t vary internal encodings per type the way Redis does, so this is really TYPE by another name.', returns:'Bulk string', errors:'"no such key" if missing', missing:'Errors, unlike TYPE', ex:{cmd:'OBJECT ENCODING user:1', reply:'"hash"'}},
+]},
+];
+
+/* ============================================================
+   Render nav + reference sections
+   ============================================================ */
+const RESP_TYPE_COLOR = { simple:'mint', integer:'signal', bulk:'amber', array:'violet', null:'null', map:'rose' };
+function cmdReturnType(returns){
+  const r = returns.toLowerCase();
+  if (r.includes('array')) return 'array';
+  if (r.includes('map')) return 'map';
+  if (r.includes('integer')) return 'integer';
+  if (r.includes('+ok') || r.includes('simple')) return 'simple';
+  return 'bulk';
+}
+
+const content = document.getElementById('content');
+const toc = document.getElementById('toc');
+
+function section(id, title, blurb, bodyEl){
+  const s = document.createElement('section');
+  s.className = 'doc'; s.id = id;
+  s.innerHTML = `<div class="sec-head"><h2>${title}</h2></div>${blurb?`<p class="sec-blurb">${blurb}</p>`:''}`;
+  s.appendChild(bodyEl);
+  return s;
+}
+
+function renderCmdGroup(group){
+  const wrap = document.createElement('div'); wrap.className = 'cmd-group';
+  for (const c of group.cmds){
+    const id = 'cmd-' + (group.id+'-'+c.name).toLowerCase().replace(/[^a-z0-9]+/g,'-');
+    const type = cmdReturnType(c.returns);
+    const el = document.createElement('article'); el.className = 'cmd'; el.id = id;
+    el.innerHTML = `
+      <div class="cmd-id">
+        <span class="cmd-name">${c.name}</span>
+        <span class="type-dot"><i style="background:var(--${RESP_TYPE_COLOR[type]})"></i>returns ${type}</span>
+      </div>
+      <div>
+        <code class="cmd-sig">${esc(c.name.split(' ')[0].split('/')[0].trim())} ${esc(c.sig)}</code>
+        <p class="cmd-desc" style="margin-top:.75rem">${c.desc}</p>
+        <dl class="cmd-facts">
+          <dt>Returns</dt><dd>${c.returns}</dd>
+          <dt>Errors</dt><dd>${c.errors}</dd>
+          <dt>Missing key</dt><dd>${c.missing}</dd>
+        </dl>
+        <div class="cmd-example">
+          <code><span class="eg-cmd">${esc(c.ex.cmd)}</span><span class="eg-arrow">→</span><span class="eg-reply">${esc(c.ex.reply)}</span></code>
+          <button class="try-btn" type="button" data-run="${esc(c.ex.cmd)}">Try it →</button>
+        </div>
+      </div>`;
+    wrap.appendChild(el);
+  }
+  return wrap;
+}
+
+const tocGroupsByCrumb = {};
+for (const g of GROUPS){
+  const body = renderCmdGroup(g);
+  content.appendChild(section(g.id, g.title, g.blurb, body));
+  (tocGroupsByCrumb[g.crumb] ||= []).push(g);
+}
+
+/* ============================================================
+   Prose sections: protocol, persistence, replication, cluster, observability, connecting
+   ============================================================ */
+function limitsHtml(items){
+  return `<div class="limits"><span class="limits-label">Limits today</span><div class="gap-badges">${items.map(i=>`<span class="gap-badge">${i}</span>`).join('')}</div></div>`;
+}
+function proseSection(id, title, blurb, html, cmds){
+  const body = document.createElement('div');
+  const prose = document.createElement('div'); prose.className = 'prose'; prose.innerHTML = html;
+  body.appendChild(prose);
+  if (cmds && cmds.length){
+    const h = document.createElement('h3'); h.className='cmds-heading'; h.textContent = 'Commands';
+    body.appendChild(h);
+    body.appendChild(renderCmdGroup({id, cmds}));
+  }
+  content.appendChild(section(id, title, blurb, body));
+}
+
+proseSection('protocol', 'The wire protocol', 'Both RESP2 and RESP3 are supported on the same TCP port, negotiated per connection.', `
+  <h3>Negotiating a version</h3>
+  <p>Every new connection starts on RESP2. A client that wants RESP3 sends <code>HELLO 3</code>; the switch takes effect starting with the reply to that very command. <code>HELLO 2</code> switches back, and bare <code>HELLO</code> reports the current version without changing it. Anything else — <code>HELLO 4</code>, or extra clauses like <code>AUTH</code>/<code>SETNAME</code> — is rejected, since there’s no auth support.</p>
+  <div class="grid-2">
+    <div class="info-card"><h4>Frame types on the wire</h4><p>Simple strings, errors, integers, bulk strings, arrays, and null are shared by both versions (null is <code>$-1\\r\\n</code> under RESP2, <code>_\\r\\n</code> under RESP3). RESP3 adds exactly one more: <b>Map</b>, used only for <code>HELLO</code>’s reply — doubles, booleans, big numbers, verbatim strings and push messages aren’t implemented, since nothing in the command surface needs them yet.</p></div>
+    <div class="info-card"><h4>Requests are always the same shape</h4><p>A client always sends a command as an <b>array of bulk strings</b>, regardless of protocol version — so the decoder needed no changes at all for RESP3. Command names are matched case-insensitively.</p></div>
+  </div>
+  <h3>Pipelining</h3>
+  <p>Multiple commands sent back-to-back in one write are pipelined efficiently: after replying, the connection loop checks — without blocking — whether another full frame is already buffered, and if so keeps queuing replies without an extra flush syscall per command.</p>
+  <p>Client pipelines two commands in one write; the server queues both replies and flushes once:</p>
+  <div class="wrap-x"><div class="codeblock" id="pipelineDemo"></div></div>
+  <h3>Errors on the wire</h3>
+  <p>Every error — wrong arity, an unknown command, a WRONGTYPE mismatch — comes back as a plain RESP error frame, terminated by <code>\\r\\n</code> like everything else: <code>-ERR wrong number of arguments for 'set' command</code>. There is no separate error taxonomy on the wire beyond the message text.</p>
+`);
+
+/* Built from the same Frame/encodeResp helpers the playground uses, so this matches it exactly
+   instead of being a hand-typed, easy-to-get-wrong string of literal \r\n characters. */
+document.getElementById('pipelineDemo').innerHTML =
+  '<span class="c1">&gt;&gt; client sends</span>\n' +
+  encodeResp(Arr([Bulk('SET'), Bulk('foo'), Bulk('bar')]), false) +
+  encodeResp(Arr([Bulk('GET'), Bulk('foo')]), false) +
+  '\n<span class="c2">&lt;&lt; server replies (one flush)</span>\n' +
+  encodeResp(Simple('OK'), false) +
+  encodeResp(Bulk('bar'), false);
+
+proseSection('persistence', 'Persistence — AOF and snapshots', 'Every write is appended to a log; a snapshot exists purely to make startup faster, not as a substitute for the log.', `
+  <div class="grid-2">
+    <div class="info-card"><h4>What gets logged</h4><p>Write commands only, and only once they’ve actually succeeded. A few are rewritten before logging so replay is deterministic: <code>SPOP</code> becomes <code>SREM</code> of the member that was actually popped; the whole <code>EXPIRE</code> family, and <code>SET … EX/PX</code>, are rewritten to an absolute <code>PEXPIREAT</code>, so replaying the log a day later doesn’t restart a relative countdown from scratch.</p></div>
+    <div class="info-card"><h4>Fsync policy</h4><p>The shipped server fsyncs the AOF once a second (<code>EverySecond</code>) — a hard kill can lose at most about a second of writes. This isn’t currently configurable from outside the binary.</p></div>
+  </div>
+  <h3>Recovery</h3>
+  <p>On startup, rocket-mem loads the most recent snapshot if one exists, then replays only the AOF written <em>after</em> that snapshot was taken. Without a snapshot, it replays the whole log from byte zero. A truncated or corrupt final entry (as from a kill mid-write) is detected, the file is trimmed back to the last valid frame, and startup continues normally.</p>
+  <h3>Triggering a snapshot</h3>
+  <p><code>SAVE</code> is synchronous — it briefly pauses new writes while it serializes the whole keyspace to disk, syncs it, and atomically swaps it in. There’s no background <code>BGSAVE</code> and no AOF compaction yet, so the log itself only ever grows; a snapshot speeds up the next restart, it doesn’t reclaim log space.</p>
+  <div class="wrap-x"><div class="codeblock"><span class="c1">$</span> redis-cli SAVE
++OK
+<span class="c3">// restart the process against the same ROCKET_MEM_AOF_PATH / ROCKET_MEM_SNAPSHOT_PATH</span>
+<span class="c3">// and every key — including TTLs, replayed as absolute deadlines — comes back.</span></div></div>
+  <table class="spec"><tr><th>Env var</th><th>Default</th><th>Purpose</th></tr>
+  <tr><td class="mono">ROCKET_MEM_AOF_PATH</td><td class="mono">./appendonly.aof</td><td>Append-only command log</td></tr>
+  <tr><td class="mono">ROCKET_MEM_SNAPSHOT_PATH</td><td class="mono">./dump.snapshot</td><td>Point-in-time keyspace snapshot</td></tr></table>
+  ` + limitsHtml(['No BGSAVE — SAVE blocks new writes while it runs', 'No AOF compaction — the log only ever grows', 'Fsync policy fixed to every second, not configurable yet']), [
+    {name:'SAVE', sig:'(no args)', desc:'Synchronously snapshots the whole keyspace to ROCKET_MEM_SNAPSHOT_PATH — pauses new writes for the duration, fsyncs the result, then atomically swaps it in.', returns:'+OK', errors:'—', missing:'n/a', ex:{cmd:'SAVE', reply:'+OK'}},
+  ]);
+
+proseSection('replication', 'Replication', 'A single leader with any number of followers, connected over the same RESP port they serve clients on.', `
+  <p>Any node can become a follower with <code>REPLICAOF host port</code> — no separate replication port, no extra process. The follower connects to the leader, requests a full snapshot, loads it (replacing whatever it had locally), then applies every subsequent write the leader sends, as they arrive. <code>REPLICAOF NO ONE</code> stops following and returns the node to normal read/write operation.</p>
+  <div class="grid-2">
+    <div class="info-card"><h4>What it guarantees</h4><p>Replication is asynchronous and best-effort — a slow follower doesn’t block the leader, at the cost of unbounded memory growth if it falls badly behind. Every reconnect does a fresh full resync; there’s no partial-resync offset tracking yet.</p></div>
+    <div class="info-card"><h4>What it doesn’t do</h4><p>No automatic failover. Promoting a follower means telling it <code>REPLICAOF NO ONE</code> yourself, and the role isn’t persisted — a restarted follower comes back standalone, on whatever it had on disk. A follower rejects client writes outright.</p></div>
+  </div>
+  <div class="wrap-x"><div class="codeblock"><span class="c1">$</span> redis-cli -p 6380 REPLICAOF 127.0.0.1 6379
++OK
+<span class="c1">$</span> redis-cli -p 6380 SET k v
+<span class="c2">(error)</span> READONLY You can't write against a read only replica.
+<span class="c1">$</span> redis-cli -p 6380 INFO replication
+role:slave
+master_host:127.0.0.1
+master_link_status:up</div></div>
+  ` + limitsHtml(['No auth on the replication link', 'Always a full resync — no partial-resync offset tracking', 'No automatic failover or promotion', 'Replica role is not persisted across a restart']), [
+    {name:'REPLICAOF', sig:'host port | NO ONE', desc:'Starts this node replicating from the leader at host:port — connects, pulls a full snapshot, then applies every write the leader streams afterward, live. REPLICAOF NO ONE cancels that and returns the node to normal read/write operation.', returns:'+OK — replies immediately; the sync itself runs in the background', errors:'—', missing:'n/a', ex:{cmd:'REPLICAOF 127.0.0.1 6400', reply:'+OK'}},
+    {name:'PSYNC', sig:'(internal)', desc:'The handshake a replica sends to its leader right after REPLICAOF — never something a client types by hand. Documented here so the name isn’t a mystery if you see it in a packet capture.', returns:'A length-prefixed snapshot, then a live write stream', errors:'—', missing:'n/a', ex:{cmd:'PSYNC', reply:'(sent by a replica, not by a client)'}},
+  ]);
+
+proseSection('clustering', 'Clustering', 'Redis-Cluster-compatible key routing across independent server processes — a different sharding scheme entirely from the 16-shard lock striping inside one process.', `
+  <p>Every key hashes to one of <b>16384 slots</b> using the same CRC16 algorithm and <code>{hash-tag}</code> convention real Redis Cluster clients already know how to speak. Topology is a small static text file — <code>node-id host:port first-slot last-slot</code>, one line per node, identical on every node — read once at startup. There’s no gossip protocol and no live resharding: growing the cluster means editing the file and restarting.</p>
+  <div class="keyslot-tool">
+    <input id="keyslotInput" type="text" value="user:1000" aria-label="Key to hash">
+    <span>→ slot</span>
+    <span class="keyslot-out" id="keyslotOut">0</span>
+  </div>
+  <p>A node asked for a key it doesn’t own doesn’t proxy the request — it tells the client exactly where to go:</p>
+  <div class="wrap-x"><div class="codeblock"><span class="c1">$</span> redis-cli -p 7001 SET foo bar
+<span class="c2">(error)</span> MOVED 12182 127.0.0.1:7003
+<span class="c1">$</span> redis-cli -p 7003 SET foo bar
++OK</div></div>
+  <p><code>CLUSTER SLOTS</code> is intentionally left out — it’s deprecated upstream in favor of <code>SHARDS</code>. Hash tags route related keys onto the same node: <code>{user1000}.name</code> and <code>{user1000}.city</code> hash to the same slot, so a multi-key command touching both never hits CROSSSLOT.</p>
+  <div class="info-card"><h4>Running more than one node on one machine</h4><p><code class="mono">ROCKET_MEM_METRICS_ADDR</code> defaults to the same <code class="mono">127.0.0.1:9121</code> on every node — the second and third node in a local three-node test crash with <code>AddrInUse</code> even though their RESP ports are free. Give each node its own metrics port explicitly.</p></div>
+  ` + limitsHtml(['Static topology file — no gossip, no live resharding', 'No CLUSTER SETSLOT / MIGRATE / ASK', 'No cross-node forwarding — clients must follow MOVED themselves']), [
+    {name:'CLUSTER KEYSLOT', sig:'key', desc:'Hashes a key to its slot — works even with cluster mode off, which is what powers the calculator above.', returns:'Integer, 0–16383', errors:'—', missing:'n/a', ex:{cmd:'CLUSTER KEYSLOT foo', reply:'(integer) 12182'}},
+    {name:'CLUSTER MYID', sig:'(no args)', desc:'This node’s cluster id.', returns:'Bulk string', errors:'—', missing:'n/a', ex:{cmd:'CLUSTER MYID', reply:'"7f0a2c9e1b3d4f56"'}},
+    {name:'CLUSTER INFO', sig:'(no args)', desc:'Cluster-level status as text: whether cluster mode is on, and how much of the 16384-slot space is currently covered.', returns:'Bulk string', errors:'—', missing:'n/a', ex:{cmd:'CLUSTER INFO', reply:'cluster_enabled:0 …'}},
+    {name:'CLUSTER SHARDS / NODES', sig:'(no args)', desc:'The topology as this node sees it — one entry per node, with the address and slot range it owns. Since there’s no gossip, this only ever reflects the static config file, never live membership changes.', returns:'Array', errors:'—', missing:'n/a', ex:{cmd:'CLUSTER SHARDS', reply:'(one entry per node in the config file)'}},
+  ]);
+
+proseSection('observability', 'Observability', 'A Prometheus endpoint for metrics, plus a slowlog for finding the specific commands that were slow.', `
+  <div class="grid-2">
+    <div class="info-card"><h4>Metrics</h4><p>Plain-text Prometheus exposition on a separate HTTP listener (default <code class="mono">127.0.0.1:9121/metrics</code>) — command counts and error counts per command, a latency histogram, connected clients, key counts, replica counts, and more. Only client-originated commands are counted; AOF replay and follower-apply traffic aren’t.</p></div>
+    <div class="info-card"><h4>Slowlog</h4><p>A 128-entry ring buffer of commands that took longer than a threshold (default 10ms, via <code class="mono">ROCKET_MEM_SLOWLOG_THRESHOLD_MICROS</code> — set it to 0 to disable recording, not to log everything, which is a deliberate difference from Redis).</p></div>
+  </div>
+  <div class="wrap-x"><div class="codeblock"><span class="c1">$</span> curl -s 127.0.0.1:9121/metrics | grep rocket_mem_commands_total
+rocket_mem_commands_total{cmd="GET"} 18422
+rocket_mem_commands_total{cmd="SET"} 5031
+<span class="c1">$</span> redis-cli SLOWLOG GET 1
+1) 1) (integer) 42
+   2) (integer) 1735689000
+   3) (integer) 14210
+   4) 1) "KEYS"
+      2) "*"</div></div>
+  <h3>Memory reporting and eviction</h3>
+  <p>The engine has an approximate-LRU sampling evictor ready to go (<code class="mono">Engine::with_maxmemory</code>), but the shipped binary never turns it on — it always starts unlimited. <code>INFO</code>’s <code class="mono">maxmemory</code> field reports <code>0</code> accordingly, and nothing gets evicted under memory pressure today.</p>
+  ` + limitsHtml(['No auth on the /metrics endpoint', 'maxmemory / LRU eviction exists in the engine but is never enabled by the shipped binary']), [
+    {name:'SLOWLOG GET', sig:'[count]', desc:'The most recent slow entries, newest first (default 10). The playground on this page tracks real, measured timings of the commands you run in it below, so its example reads from genuine data — not a canned sample.', returns:'Array of [id, unix-time, duration-µs, [command, key, …]]', errors:'—', missing:'n/a', ex:{cmd:'SLOWLOG GET 3', reply:'(whatever you\'ve run below)'}},
+    {name:'SLOWLOG LEN', sig:'(no args)', desc:'How many entries are currently recorded.', returns:'Integer', errors:'—', missing:'n/a', ex:{cmd:'SLOWLOG LEN', reply:'(integer) 3'}},
+    {name:'SLOWLOG RESET', sig:'(no args)', desc:'Clears the ring buffer.', returns:'+OK', errors:'—', missing:'n/a', ex:{cmd:'SLOWLOG RESET', reply:'+OK'}},
+    {name:'INFO', sig:'[section]', desc:'Server status as text, grouped into sections — Server, Clients, Memory, Persistence, Stats, Replication, Cluster, Keyspace. Fields rocket-mem can’t compute honestly (like keyspace_hits) are left out rather than faked.', returns:'Bulk string', errors:'—', missing:'n/a', ex:{cmd:'INFO keyspace', reply:'# Keyspace / db0:keys=3,expires=1'}},
+  ]);
+
+proseSection('connecting', 'Connecting a real client', 'Any RESP2/RESP3 client library works unmodified — this manual’s playground is a browser-side stand-in, not the actual protocol implementation.', `
+  <p>rocket-mem listens on <code class="mono">127.0.0.1:6379</code> by default (override with <code class="mono">ROCKET_MEM_ADDR</code>) — the same port <code>redis-cli</code> already defaults to.</p>
+  <div class="wrap-x"><div class="codeblock"><span class="c1">$</span> cargo run --bin rocket-mem
+<span class="c3">// in another shell:</span>
+<span class="c1">$</span> redis-cli SET foo bar
++OK
+<span class="c1">$</span> redis-cli GET foo
+"bar"</div></div>
+  <p>redis-py, ioredis, go-redis, redis-rs — any of them connect exactly as they would to real Redis. The command surface documented on this page is what they’ll actually get back.</p>
+  <div class="gap-badges" aria-label="Known gaps, stated up front">
+    <span class="gap-badge">No AUTH / ACL</span>
+    <span class="gap-badge">No BGSAVE — SAVE blocks</span>
+    <span class="gap-badge">No AOF compaction</span>
+    <span class="gap-badge">No automatic failover</span>
+    <span class="gap-badge">No CLIENT / QUIT / RESET</span>
+  </div>
+`);
+
+document.getElementById('keyslotInput').addEventListener('input', e=>{
+  document.getElementById('keyslotOut').textContent = keySlot(e.target.value || '');
+});
+document.getElementById('keyslotOut').textContent = keySlot('user:1000');
+
+/* click-to-run wiring for every "Try it" button */
+content.addEventListener('click', e=>{
+  const btn = e.target.closest('[data-run]');
+  if (btn) runExample(btn.getAttribute('data-run'));
+});
+
+/* ============================================================
+   TOC build + scrollspy
+   ============================================================ */
+const CRUMB_ORDER = ['Data types','Keyspace','Server'];
+for (const crumb of CRUMB_ORDER){
+  const groups = tocGroupsByCrumb[crumb] || [];
+  const div = document.createElement('div'); div.className='toc-group';
+  div.innerHTML = `<h4>${crumb}</h4>` + groups.map(g=>`<a href="#${g.id}">${g.title}</a>`).join('');
+  toc.appendChild(div);
+}
+const opsDiv = document.createElement('div'); opsDiv.className='toc-group';
+opsDiv.innerHTML = `<h4>Operations</h4>` + ['protocol:Protocol','persistence:Persistence','replication:Replication','clustering:Clustering','observability:Observability','connecting:Connecting'].map(p=>{
+  const [id,label]=p.split(':'); return `<a href="#${id}">${label}</a>`;
+}).join('');
+toc.appendChild(opsDiv);
+
+const allSections = [...document.querySelectorAll('section.doc')];
+const tocLinks = [...toc.querySelectorAll('a')];
+const spy = new IntersectionObserver(entries=>{
+  for (const en of entries){
+    if (en.isIntersecting){
+      const id = en.target.id;
+      tocLinks.forEach(a=>a.classList.toggle('active', a.getAttribute('href')==='#'+id));
+    }
+  }
+}, {rootMargin:'-20% 0px -70% 0px'});
+allSections.forEach(s=>spy.observe(s));
+
+/* ============================================================
+   Theme toggle
+   ============================================================ */
+const themeBtn = document.getElementById('themeBtn');
+function applyTheme(mode){
+  if (mode==='system') document.documentElement.removeAttribute('data-theme');
+  else document.documentElement.setAttribute('data-theme', mode);
+  themeBtn.textContent = 'Theme: ' + mode[0].toUpperCase()+mode.slice(1);
+  try{ localStorage.setItem('rm-theme', mode); }catch(e){}
+}
+let savedTheme = 'system';
+try{ savedTheme = localStorage.getItem('rm-theme') || 'system'; }catch(e){}
+applyTheme(savedTheme);
+themeBtn.addEventListener('click', ()=>{
+  const order = ['system','light','dark'];
+  const next = order[(order.indexOf(savedTheme)+1)%3];
+  savedTheme = next; applyTheme(next);
+});
+
+/* ============================================================
+   Hero typing sequence (decorative; respects reduced motion)
+   ============================================================ */
+(function(){
+  const el = document.getElementById('heroTyping');
+  const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const steps = [
+    {cmd:'SET launch T-10s', reply:'OK'},
+    {cmd:'INCR countdown', reply:'(integer) 1'},
+    {cmd:'GET launch', reply:'"T-10s"'},
+  ];
+  if (reduced){
+    el.innerHTML = steps.map(s=>`<span class="p">&gt; ${esc(s.cmd)}</span>\n<span class="r">${esc(s.reply)}</span>\n\n`).join('');
+    return;
+  }
+  let out = '';
+  let si = 0;
+  function typeStep(){
+    if (si >= steps.length){ out += '<span class="caret"></span>'; el.innerHTML = out; return; }
+    const {cmd, reply} = steps[si];
+    let ci = 0;
+    (function typeChar(){
+      if (ci <= cmd.length){
+        el.innerHTML = out + `<span class="p">&gt; ${esc(cmd.slice(0,ci))}<span class="caret"></span></span>`;
+        ci++; setTimeout(typeChar, 26);
+      } else {
+        out += `<span class="p">&gt; ${esc(cmd)}</span>\n<span class="r">${esc(reply)}</span>\n\n`;
+        si++; setTimeout(typeStep, 420);
+      }
+    })();
+  }
+  typeStep();
+})();
+</script>
