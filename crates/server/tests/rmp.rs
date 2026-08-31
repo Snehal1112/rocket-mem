@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use protocol::Frame;
 use redis::AsyncCommands;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -40,11 +41,17 @@ async fn spawn_dual_protocol_server() -> (tempfile::TempDir, String, std::net::S
 async fn resp_write_is_visible_to_a_read_over_rmp() {
     let (_dir, resp_url, rmp_addr) = spawn_dual_protocol_server().await;
     let redis_client = redis::Client::open(resp_url).unwrap();
-    let mut resp_con = redis_client.get_multiplexed_async_connection().await.unwrap();
+    let mut resp_con = redis_client
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap();
     let _: () = resp_con.set("k", "v").await.unwrap();
 
     let rmp_client = rmp_client::RmpClient::connect(rmp_addr).await.unwrap();
-    assert_eq!(rmp_client.get("k").await.unwrap(), Some(Bytes::from_static(b"v")));
+    assert_eq!(
+        rmp_client.get("k").await.unwrap(),
+        Some(Bytes::from_static(b"v"))
+    );
 }
 
 #[tokio::test]
@@ -54,7 +61,10 @@ async fn rmp_write_is_visible_to_a_read_over_resp() {
     rmp_client.set("k", "v").await.unwrap();
 
     let redis_client = redis::Client::open(resp_url).unwrap();
-    let mut resp_con = redis_client.get_multiplexed_async_connection().await.unwrap();
+    let mut resp_con = redis_client
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap();
     let value: String = resp_con.get("k").await.unwrap();
     assert_eq!(value, "v");
 }
@@ -69,5 +79,35 @@ async fn rmp_correctly_multiplexes_concurrent_requests_on_one_connection() {
     let (get_result, set_result) = tokio::join!(client.get("a"), client.set("b", "2"));
     assert_eq!(get_result.unwrap(), Some(Bytes::from_static(b"1")));
     set_result.unwrap();
-    assert_eq!(client.get("b").await.unwrap(), Some(Bytes::from_static(b"2")));
+    assert_eq!(
+        client.get("b").await.unwrap(),
+        Some(Bytes::from_static(b"2"))
+    );
+}
+
+#[tokio::test]
+async fn rmp_reaches_info_and_cluster_commands() {
+    let (_dir, _resp_url, rmp_addr) = spawn_dual_protocol_server().await;
+    let client = rmp_client::RmpClient::connect(rmp_addr).await.unwrap();
+
+    let info = client
+        .call(vec![Bytes::from_static(b"INFO")])
+        .await
+        .unwrap();
+    match info {
+        Frame::Bulk(b) => assert!(String::from_utf8_lossy(&b).contains("# Server")),
+        other => panic!("expected INFO to reply Bulk, got {other:?}"),
+    }
+
+    // 12182 is the known reference value for key_slot(b"foo") (Sprint 6 spec), independent of
+    // whether cluster mode is configured -- CLUSTER KEYSLOT is a pure function of the key.
+    let slot = client
+        .call(vec![
+            Bytes::from_static(b"CLUSTER"),
+            Bytes::from_static(b"KEYSLOT"),
+            Bytes::from_static(b"foo"),
+        ])
+        .await
+        .unwrap();
+    assert_eq!(slot, Frame::Integer(12182));
 }
