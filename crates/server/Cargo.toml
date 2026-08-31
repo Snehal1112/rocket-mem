@@ -24,4 +24,5 @@ metrics-exporter-prometheus.workspace = true
 
 [dev-dependencies]
 redis = { version = "0.27", features = ["tokio-comp"] }
+rmp-client = { path = "../rmp-client" }
 tempfile = "3"

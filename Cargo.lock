@@ -917,6 +917,7 @@ dependencies = [
  "metrics-exporter-prometheus",
  "protocol",
  "redis",
+ "rmp-client",
  "tempfile",
  "tokio",
  "tokio-util",
