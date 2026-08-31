@@ -36,13 +36,24 @@ impl From<std::io::Error> for RmpError {
     }
 }
 
+/// The reader task's view of the connection: still accepting new pending replies, or
+/// torn down for good. Modeled as an enum (not a bool alongside the map) so that
+/// "the connection just closed" and "a new call registers a pending reply" can never
+/// interleave -- both transitions happen under the same lock, so a `call` either lands
+/// before the close (and gets cleaned up when the map is dropped) or after it (and sees
+/// `Closed` immediately, instead of inserting a reply nothing will ever resolve).
+enum PendingReplies {
+    Open(HashMap<u64, oneshot::Sender<Frame>>),
+    Closed,
+}
+
 /// State shared between `call` (which registers a pending reply) and the reader task
 /// (which resolves or, on disconnect, drops it). The lock is only ever held for the
-/// duration of a single insert/remove/clear -- never across an `.await` -- so it never
+/// duration of a single insert/remove/close -- never across an `.await` -- so it never
 /// blocks either side for longer than a `HashMap` operation.
 struct Shared {
     next_id: AtomicU64,
-    pending: Mutex<HashMap<u64, oneshot::Sender<Frame>>>,
+    pending: Mutex<PendingReplies>,
 }
 
 /// A minimal async client for the RMP wire protocol. Opens one TCP connection and lets
@@ -63,7 +74,7 @@ impl RmpClient {
 
         let shared = Arc::new(Shared {
             next_id: AtomicU64::new(1),
-            pending: Mutex::new(HashMap::new()),
+            pending: Mutex::new(PendingReplies::Open(HashMap::new())),
         });
 
         let (write_tx, mut write_rx) = mpsc::unbounded_channel::<RmpMessage>();
@@ -82,19 +93,21 @@ impl RmpClient {
                 if msg.msg_type != MsgType::Response {
                     continue; // a stray Request from the server would be a protocol violation
                 }
-                if let Some(tx) = reader_shared
-                    .pending
-                    .lock()
-                    .unwrap()
-                    .remove(&msg.request_id)
-                {
-                    let _ = tx.send(msg.frame);
+                let mut guard = reader_shared.pending.lock().unwrap();
+                if let PendingReplies::Open(map) = &mut *guard {
+                    if let Some(tx) = map.remove(&msg.request_id) {
+                        drop(guard);
+                        let _ = tx.send(msg.frame);
+                    }
                 }
             }
-            // The connection ended: fail every reply still waiting instead of hanging forever.
-            // Dropping each Sender fails its matching Receiver with a RecvError, which `call`
-            // below maps to RmpError::ConnectionClosed.
-            reader_shared.pending.lock().unwrap().clear();
+            // The connection ended: fail every reply still waiting instead of hanging
+            // forever, and mark the state Closed under the same lock so any `call` that
+            // registers afterwards sees it immediately rather than inserting a reply
+            // nothing will ever resolve. Dropping each Sender fails its matching Receiver
+            // with a RecvError, which `call` below maps to RmpError::ConnectionClosed.
+            let mut guard = reader_shared.pending.lock().unwrap();
+            *guard = PendingReplies::Closed;
         });
 
         Ok(RmpClient { write_tx, shared })
@@ -106,7 +119,17 @@ impl RmpClient {
     pub async fn call(&self, args: Vec<Bytes>) -> Result<Frame, RmpError> {
         let request_id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        self.shared.pending.lock().unwrap().insert(request_id, tx);
+        {
+            let mut guard = self.shared.pending.lock().unwrap();
+            match &mut *guard {
+                PendingReplies::Open(map) => {
+                    map.insert(request_id, tx);
+                }
+                // The reader task already tore the connection down. Fail fast instead of
+                // registering a reply the reader task will never come back to resolve.
+                PendingReplies::Closed => return Err(RmpError::ConnectionClosed),
+            }
+        }
         let command = Frame::Array(args.into_iter().map(Frame::Bulk).collect());
         self.write_tx
             .send(RmpMessage {
@@ -230,5 +253,32 @@ mod tests {
         let client = RmpClient::connect(addr).await.unwrap();
         let result = client.call(vec![Bytes::from_static(b"PING")]).await;
         assert!(matches!(result, Err(RmpError::ConnectionClosed)));
+    }
+
+    #[tokio::test]
+    async fn a_call_made_after_the_connection_is_already_closed_fails_fast_instead_of_hanging() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            drop(socket); // disconnect immediately, without ever replying
+        });
+
+        let client = RmpClient::connect(addr).await.unwrap();
+        // Drain one call first, so the reader task's disconnect cleanup has definitely
+        // already run by the time the second call is made.
+        let first = client.call(vec![Bytes::from_static(b"PING")]).await;
+        assert!(matches!(first, Err(RmpError::ConnectionClosed)));
+
+        // A call registered strictly after the reader task has torn itself down must not
+        // register a pending reply that nothing will ever resolve -- bounded by a timeout
+        // so a regression hangs this test instead of the whole suite.
+        let second = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.call(vec![Bytes::from_static(b"PING")]),
+        )
+        .await
+        .expect("call must fail immediately, not hang, once the connection is closed");
+        assert!(matches!(second, Err(RmpError::ConnectionClosed)));
     }
 }
