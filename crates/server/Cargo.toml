@@ -15,6 +15,7 @@ path = "src/main.rs"
 engine = { path = "../engine" }
 protocol = { path = "../protocol" }
 common = { path = "../common" }
+argon2.workspace = true
 clap.workspace = true
 bytes.workspace = true
 figment.workspace = true

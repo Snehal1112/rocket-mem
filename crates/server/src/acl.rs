@@ -1,9 +1,14 @@
-//! ACL rule types and `ACL SETUSER`-style token parsing.
+//! ACL rule types, `ACL SETUSER`-style token parsing, and password hashing.
 //!
-//! This module holds the whole access-control-list system: rule parsing (here), password
-//! hashing, and permission-check logic (both added by later tasks in this sprint). Keeping them
-//! in one module mirrors how Redis treats ACL as a single subsystem rather than splitting it
-//! across the places that consume it.
+//! This module holds the whole access-control-list system: rule parsing, password hashing
+//! (here), and permission-check logic (added by a later task in this sprint). Keeping them in
+//! one module mirrors how Redis treats ACL as a single subsystem rather than splitting it across
+//! the places that consume it.
+
+use argon2::password_hash::{
+    rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
+};
+use argon2::Argon2;
 
 /// One permission grant or restriction parsed from an `ACL SETUSER` rule token. `on`/`off` and
 /// password tokens live on `AclToken` instead -- they're user-level state, not permission rules,
@@ -75,6 +80,27 @@ pub fn parse_token(raw: &[u8]) -> Result<AclToken, AclError> {
     }
 }
 
+/// Hashes `password` with a fresh random salt using argon2's own recommended default
+/// parameters -- no manual tuning this sprint, per the spec's own scope note.
+pub fn hash_password(password: &str) -> String {
+    let salt = SaltString::generate(&mut OsRng);
+    Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .expect("argon2 hashing with a freshly generated salt cannot fail")
+        .to_string()
+}
+
+/// `false` for both a genuine mismatch and a malformed `hash` string -- a caller never needs to
+/// distinguish "wrong password" from "corrupt stored hash", and both must fail closed.
+pub fn verify_password(password: &str, hash: &str) -> bool {
+    let Ok(parsed) = PasswordHash::new(hash) else {
+        return false;
+    };
+    Argon2::default()
+        .verify_password(password.as_bytes(), &parsed)
+        .is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,5 +170,31 @@ mod tests {
     fn an_unrecognized_token_is_a_syntax_error() {
         assert!(parse_token(b"@read").is_err()); // @categories are out of scope, see Global Constraints
         assert!(parse_token(b"garbage").is_err());
+    }
+
+    #[test]
+    fn a_password_verifies_against_its_own_hash() {
+        let hash = hash_password("hunter2");
+        assert!(verify_password("hunter2", &hash));
+    }
+
+    #[test]
+    fn the_wrong_password_does_not_verify() {
+        let hash = hash_password("hunter2");
+        assert!(!verify_password("wrong", &hash));
+    }
+
+    #[test]
+    fn two_hashes_of_the_same_password_differ_by_salt() {
+        let a = hash_password("hunter2");
+        let b = hash_password("hunter2");
+        assert_ne!(a, b, "each hash must use a fresh random salt");
+        assert!(verify_password("hunter2", &a));
+        assert!(verify_password("hunter2", &b));
+    }
+
+    #[test]
+    fn verify_against_a_malformed_hash_string_returns_false_not_a_panic() {
+        assert!(!verify_password("anything", "not-a-real-argon2-hash"));
     }
 }
