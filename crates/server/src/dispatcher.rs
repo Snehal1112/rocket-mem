@@ -1025,6 +1025,79 @@ pub fn dispatch(engine: &Engine, frame: Frame, _protocol: &mut Protocol, _client
     }
 }
 
+/// Shared by `handle_auth` and `handle_hello`'s inline `AUTH` support -- both need the exact same
+/// "check the ACL store, verify the password" logic, differing only in what each does with the
+/// result: `handle_auth` replies `OK`, `handle_hello` continues on to its own success reply.
+/// `session` isn't read here -- it's threaded through so both call sites have it at hand without
+/// needing a second helper signature, and so this function's shape stays parallel to the ones it
+/// replaces (`handle_auth`'s pre-Task-2 body, `handle_hello`'s syntax-error-only check) --
+/// setting the authenticated user on success is each caller's own responsibility, not this one's.
+fn try_authenticate(
+    replication: &crate::replication::ReplicationHandle,
+    _session: &Session,
+    username: &str,
+    password: &[u8],
+) -> Result<std::sync::Arc<crate::acl::AclUser>, Frame> {
+    if replication.acl.is_empty() {
+        return Err(Frame::Error(
+            "ERR Client sent AUTH, but no password is set.".into(),
+        ));
+    }
+    match replication.acl.authenticate(username, password) {
+        Some(user) => Ok(user),
+        None => Err(Frame::Error(
+            "WRONGPASS invalid username-password pair or user is disabled.".into(),
+        )),
+    }
+}
+
+/// Returns `Some(reply)` if `frame` was `AUTH` -- handled entirely here, never reaching
+/// `dispatch` -- or `None` for any other command. Same interception shape as `handle_replicaof`/
+/// `handle_cluster` above.
+fn handle_auth(
+    frame: &Frame,
+    session: &Session,
+    replication: &crate::replication::ReplicationHandle,
+) -> Option<Frame> {
+    let Frame::Array(items) = frame else {
+        return None;
+    };
+    let Some(Frame::Bulk(name)) = items.first() else {
+        return None;
+    };
+    if !name.eq_ignore_ascii_case(b"AUTH") {
+        return None;
+    }
+    let (username, password): (String, &Bytes) = match items.len() {
+        2 => {
+            let Frame::Bulk(pw) = &items[1] else {
+                return Some(Frame::Error("ERR syntax error".into()));
+            };
+            ("default".to_string(), pw)
+        }
+        3 => {
+            let (Frame::Bulk(user), Frame::Bulk(pw)) = (&items[1], &items[2]) else {
+                return Some(Frame::Error("ERR syntax error".into()));
+            };
+            (String::from_utf8_lossy(user).into_owned(), pw)
+        }
+        _ => {
+            return Some(Frame::Error(
+                "ERR wrong number of arguments for 'auth' command".into(),
+            ))
+        }
+    };
+    Some(
+        match try_authenticate(replication, session, &username, password) {
+            Ok(user) => {
+                session.set_authenticated_user(Some(user));
+                Frame::Simple("OK".into())
+            }
+            Err(frame) => frame,
+        },
+    )
+}
+
 fn hello_reply(
     protocol: Protocol,
     client_id: u64,
@@ -1724,15 +1797,17 @@ fn handle_hello(
         None => hello_reply(session.protocol(), client_id, role, mode),
         Some(Frame::Bulk(arg)) => match arg.as_ref() {
             b"2" => {
-                if args.len() > 1 {
-                    return Some(Frame::Error("ERR syntax error".into()));
+                if let Err(err_or_syntax) = apply_hello_extra_args(&args[1..], replication, session)
+                {
+                    return Some(err_or_syntax);
                 }
                 session.set_protocol(Protocol::Resp2);
                 hello_reply(session.protocol(), client_id, role, mode)
             }
             b"3" => {
-                if args.len() > 1 {
-                    return Some(Frame::Error("ERR syntax error".into()));
+                if let Err(err_or_syntax) = apply_hello_extra_args(&args[1..], replication, session)
+                {
+                    return Some(err_or_syntax);
                 }
                 session.set_protocol(Protocol::Resp3);
                 hello_reply(session.protocol(), client_id, role, mode)
@@ -1743,6 +1818,38 @@ fn handle_hello(
         // exact error so the move changes no observable behavior.
         Some(_) => Frame::Error("ERR invalid request, expected array of bulk strings".into()),
     })
+}
+
+/// Handles whatever follows `HELLO <ver>`. Empty is always fine (no-op). Real RESP3 client
+/// libraries (redis-py, ioredis, node-redis) send credentials as `HELLO 3 AUTH <user> <pass>`
+/// rather than a separate `AUTH` call, so that exact shape -- `AUTH` followed by exactly two more
+/// bulk-string tokens, `AUTH` matched case-insensitively like every other keyword token in this
+/// codebase (see `acl::parse_token`) -- authenticates the session via `try_authenticate` and
+/// leaves HELLO's own success reply shape untouched. Any other shape of extra arguments (wrong
+/// count, first token isn't `AUTH`, a non-Bulk token) is still `ERR syntax error`, exactly as
+/// before this existed.
+fn apply_hello_extra_args(
+    extra: &[Frame],
+    replication: &crate::replication::ReplicationHandle,
+    session: &Session,
+) -> Result<(), Frame> {
+    if extra.is_empty() {
+        return Ok(());
+    }
+    let [Frame::Bulk(kw), Frame::Bulk(user), Frame::Bulk(pass)] = extra else {
+        return Err(Frame::Error("ERR syntax error".into()));
+    };
+    if !kw.eq_ignore_ascii_case(b"AUTH") {
+        return Err(Frame::Error("ERR syntax error".into()));
+    }
+    let username = String::from_utf8_lossy(user).into_owned();
+    match try_authenticate(replication, session, &username, pass) {
+        Ok(authenticated) => {
+            session.set_authenticated_user(Some(authenticated));
+            Ok(())
+        }
+        Err(frame) => Err(frame),
+    }
 }
 
 /// Renders one slow-log entry's argument array. The entry carries only the command name and its
@@ -1907,7 +2014,14 @@ fn auth_gate(
     }
     let name = command_name_upper(frame)?;
     let name = name.as_str();
-    if name == "AUTH" || name == "ACL" {
+    // HELLO is exempted alongside AUTH/ACL, not just for protocol negotiation but because it is
+    // itself a valid way to authenticate: real RESP3 client libraries send credentials as
+    // `HELLO <ver> AUTH <user> <pass>` in one command (see `apply_hello_extra_args`) rather than
+    // a separate `AUTH` call. Blocking HELLO here would make that inline form unreachable --
+    // every such client would get NOAUTH before `handle_hello` ever saw the frame. `handle_hello`
+    // itself still only authenticates the session when the trailing tokens are exactly that
+    // shape; every other command run through a still-unauthenticated session remains gated below.
+    if name == "AUTH" || name == "ACL" || name == "HELLO" {
         return None; // always reachable regardless of auth state
     }
     let Some(user) = session.authenticated_user() else {
@@ -2044,6 +2158,10 @@ fn dispatch_and_log_inner(
         && extract_write_command_name(&frame).is_some()
     {
         return Frame::Error("READONLY You can't write against a read only replica.".into());
+    }
+
+    if let Some(reply) = handle_auth(&frame, session, replication) {
+        return reply;
     }
 
     if is_save_command(&frame) {
@@ -2528,6 +2646,97 @@ mod tests {
             Frame::Bulk(Bytes::from_static(b"k")),
         ]);
         assert!(auth_gate(&replication, &session, &frame).is_none());
+    }
+
+    fn auth_frame(args: &[&[u8]]) -> Frame {
+        let mut items = vec![Frame::Bulk(Bytes::from_static(b"AUTH"))];
+        items.extend(args.iter().map(|a| Frame::Bulk(Bytes::copy_from_slice(a))));
+        Frame::Array(items)
+    }
+
+    #[test]
+    fn auth_with_no_acl_configured_returns_the_no_password_set_error() {
+        let replication = ReplicationHandle::default();
+        let session = Session::new();
+        let reply = handle_auth(&auth_frame(&[b"anything"]), &session, &replication).unwrap();
+        assert_eq!(
+            reply,
+            Frame::Error("ERR Client sent AUTH, but no password is set.".into())
+        );
+    }
+
+    #[test]
+    fn auth_single_arg_form_checks_against_the_default_user() {
+        let replication = ReplicationHandle::default();
+        replication
+            .acl
+            .set_user(
+                "default",
+                &[Bytes::from_static(b"on"), Bytes::from_static(b">pw")],
+            )
+            .unwrap();
+        let session = Session::new();
+        let reply = handle_auth(&auth_frame(&[b"pw"]), &session, &replication).unwrap();
+        assert_eq!(reply, Frame::Simple("OK".into()));
+        assert!(session.authenticated_user().is_some());
+    }
+
+    #[test]
+    fn auth_two_arg_form_checks_against_the_named_user() {
+        let replication = ReplicationHandle::default();
+        replication
+            .acl
+            .set_user(
+                "app",
+                &[Bytes::from_static(b"on"), Bytes::from_static(b">pw")],
+            )
+            .unwrap();
+        let session = Session::new();
+        let reply = handle_auth(&auth_frame(&[b"app", b"pw"]), &session, &replication).unwrap();
+        assert_eq!(reply, Frame::Simple("OK".into()));
+        assert_eq!(session.authenticated_user().unwrap().username, "app");
+    }
+
+    #[test]
+    fn auth_with_the_wrong_password_returns_wrongpass_and_does_not_authenticate() {
+        let replication = ReplicationHandle::default();
+        replication
+            .acl
+            .set_user(
+                "app",
+                &[Bytes::from_static(b"on"), Bytes::from_static(b">pw")],
+            )
+            .unwrap();
+        let session = Session::new();
+        let reply = handle_auth(&auth_frame(&[b"app", b"wrong"]), &session, &replication).unwrap();
+        assert_eq!(
+            reply,
+            Frame::Error("WRONGPASS invalid username-password pair or user is disabled.".into())
+        );
+        assert!(session.authenticated_user().is_none());
+    }
+
+    #[test]
+    fn auth_with_too_many_arguments_is_a_syntax_error() {
+        let replication = ReplicationHandle::default();
+        replication
+            .acl
+            .set_user("app", &[Bytes::from_static(b"on")])
+            .unwrap();
+        let session = Session::new();
+        let reply = handle_auth(&auth_frame(&[b"a", b"b", b"c"]), &session, &replication).unwrap();
+        assert!(matches!(reply, Frame::Error(_)));
+    }
+
+    #[test]
+    fn a_non_auth_frame_is_not_intercepted() {
+        let replication = ReplicationHandle::default();
+        let session = Session::new();
+        let frame = Frame::Array(vec![
+            Frame::Bulk(Bytes::from_static(b"GET")),
+            Frame::Bulk(Bytes::from_static(b"k")),
+        ]);
+        assert!(handle_auth(&frame, &session, &replication).is_none());
     }
 
     #[test]
@@ -5307,12 +5516,103 @@ mod tests {
             &engine,
             &aof,
             &ReplicationHandle::default(),
-            cmd(&[b"HELLO", b"3", b"AUTH", b"user", b"pass"]),
+            cmd(&[b"HELLO", b"3", b"EXTRA"]),
             &session,
             1,
         );
         assert_eq!(session.protocol(), Protocol::Resp2); // unchanged — the switch never happened
         assert_eq!(reply, Frame::Error("ERR syntax error".into()));
+    }
+
+    #[test]
+    fn hello_3_with_inline_auth_authenticates_and_negotiates_resp3() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let replication = ReplicationHandle::default();
+        replication
+            .acl
+            .set_user(
+                "app",
+                &[Bytes::from_static(b"on"), Bytes::from_static(b">pw")],
+            )
+            .unwrap();
+        let session = Session::new();
+        let reply = dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"HELLO", b"3", b"AUTH", b"app", b"pw"]),
+            &session,
+            1,
+        );
+        assert_eq!(session.protocol(), Protocol::Resp3);
+        assert_eq!(
+            session.authenticated_user().map(|u| u.username.clone()),
+            Some("app".to_string())
+        );
+        let Frame::Map(pairs) = reply else {
+            panic!("expected Map")
+        };
+        assert!(pairs.contains(&(Frame::Bulk(Bytes::from_static(b"proto")), Frame::Integer(3))));
+    }
+
+    #[test]
+    fn hello_3_with_inline_auth_and_wrong_password_returns_wrongpass_without_negotiating() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let replication = ReplicationHandle::default();
+        replication
+            .acl
+            .set_user(
+                "app",
+                &[Bytes::from_static(b"on"), Bytes::from_static(b">pw")],
+            )
+            .unwrap();
+        let session = Session::new();
+        let reply = dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"HELLO", b"3", b"AUTH", b"app", b"wrong"]),
+            &session,
+            1,
+        );
+        assert_eq!(session.protocol(), Protocol::Resp2); // unchanged — the switch never happened
+        assert!(session.authenticated_user().is_none());
+        assert_eq!(
+            reply,
+            Frame::Error("WRONGPASS invalid username-password pair or user is disabled.".into())
+        );
+    }
+
+    #[test]
+    fn hello_3_with_malformed_extra_args_is_still_a_syntax_error() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let session = Session::new();
+
+        // Wrong count (missing the password token).
+        let reply = dispatch_and_log(
+            &engine,
+            &aof,
+            &ReplicationHandle::default(),
+            cmd(&[b"HELLO", b"3", b"AUTH", b"app"]),
+            &session,
+            1,
+        );
+        assert_eq!(reply, Frame::Error("ERR syntax error".into()));
+
+        // First token isn't AUTH.
+        let reply = dispatch_and_log(
+            &engine,
+            &aof,
+            &ReplicationHandle::default(),
+            cmd(&[b"HELLO", b"3", b"NOTAUTH", b"app", b"pw"]),
+            &session,
+            1,
+        );
+        assert_eq!(reply, Frame::Error("ERR syntax error".into()));
+        assert_eq!(session.protocol(), Protocol::Resp2); // unchanged in both cases
     }
 
     use crate::aof::{AofWriter, FsyncPolicy};
