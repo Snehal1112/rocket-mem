@@ -9,6 +9,8 @@ use argon2::password_hash::{
     rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
 };
 use argon2::Argon2;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 /// One permission grant or restriction parsed from an `ACL SETUSER` rule token. `on`/`off` and
 /// password tokens live on `AclToken` instead -- they're user-level state, not permission rules,
@@ -126,6 +128,117 @@ pub fn verify_password(password: &[u8], hash: &str) -> bool {
         return false;
     };
     Argon2::default().verify_password(password, &parsed).is_ok()
+}
+
+/// In-memory ACL users, keyed by username. A plain `std::sync::RwLock`, matching `SlowLog`'s and
+/// `ReplicaRegistry`'s existing choice in this codebase: every access here is a quick map
+/// read/write, never held across an `.await`. Never persisted to the AOF or snapshot -- see this
+/// plan's Global Constraints.
+#[derive(Default)]
+pub struct AclStore {
+    users: RwLock<HashMap<String, Arc<AclUser>>>,
+}
+
+impl AclStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The fast-path check plan 06's auth gate uses to skip enforcement entirely.
+    pub fn is_empty(&self) -> bool {
+        self.users
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+    }
+
+    /// Applies `raw_tokens` (parsed via `parse_token`) on top of `username`'s existing user, or a
+    /// fresh `enabled: false, password_hash: None, rules: []` default if it doesn't exist yet --
+    /// real-Redis-style incremental `ACL SETUSER`. Parses every token before applying any of
+    /// them, so a malformed token in the middle of the list leaves the store unchanged rather
+    /// than half-applying the earlier tokens.
+    pub fn set_user(&self, username: &str, raw_tokens: &[bytes::Bytes]) -> Result<(), AclError> {
+        let tokens = raw_tokens
+            .iter()
+            .map(|t| parse_token(t))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut users = self.users.write().unwrap_or_else(|e| e.into_inner());
+        let base = users
+            .get(username)
+            .map(|u| (**u).clone())
+            .unwrap_or_else(|| AclUser {
+                username: username.to_string(),
+                password_hash: None,
+                enabled: false,
+                rules: Vec::new(),
+            });
+        let updated = apply_tokens(base, &tokens);
+        users.insert(username.to_string(), Arc::new(updated));
+        Ok(())
+    }
+
+    pub fn del_user(&self, username: &str) -> bool {
+        self.users
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(username)
+            .is_some()
+    }
+
+    pub fn get_user(&self, username: &str) -> Option<Arc<AclUser>> {
+        self.users
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(username)
+            .cloned()
+    }
+
+    pub fn list(&self) -> Vec<Arc<AclUser>> {
+        self.users
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    /// `None` for: unknown username, a disabled user, or a wrong password. A `nopass` user
+    /// (`password_hash: None`) authenticates with any password, including an empty one.
+    pub fn authenticate(&self, username: &str, password: &str) -> Option<Arc<AclUser>> {
+        let users = self.users.read().unwrap_or_else(|e| e.into_inner());
+        let user = users.get(username)?;
+        if !user.enabled {
+            return None;
+        }
+        match &user.password_hash {
+            None => Some(Arc::clone(user)),
+            Some(hash) if verify_password(password.as_bytes(), hash) => Some(Arc::clone(user)),
+            Some(_) => None,
+        }
+    }
+
+    /// Inserts an already-fully-formed `AclUser` directly, bypassing token parsing/incremental
+    /// application -- used only by bootstrap loading (Task 3), which builds a complete `AclUser`
+    /// from `AclUserConfig` in one step.
+    pub fn insert_bootstrap(&self, user: AclUser) {
+        self.users
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(user.username.clone(), Arc::new(user));
+    }
+}
+
+fn apply_tokens(mut base: AclUser, tokens: &[AclToken]) -> AclUser {
+    for token in tokens {
+        match token {
+            AclToken::On => base.enabled = true,
+            AclToken::Off => base.enabled = false,
+            AclToken::NoPass => base.password_hash = None,
+            AclToken::Password(pw) => base.password_hash = Some(hash_password(pw.as_bytes())),
+            AclToken::Rule(r) => base.rules.push(r.clone()),
+        }
+    }
+    base
 }
 
 /// One configured ACL user: its login state, password hash (`None` for `nopass`), and the
@@ -436,5 +549,113 @@ mod tests {
     #[test]
     fn verify_against_a_malformed_hash_string_returns_false_not_a_panic() {
         assert!(!verify_password(b"anything", "not-a-real-argon2-hash"));
+    }
+
+    fn tokens(strs: &[&str]) -> Vec<Bytes> {
+        strs.iter().map(|s| Bytes::from(s.to_string())).collect()
+    }
+
+    #[test]
+    fn a_new_store_is_empty() {
+        let store = AclStore::default();
+        assert!(store.is_empty());
+        assert!(store.list().is_empty());
+    }
+
+    #[test]
+    fn set_user_creates_a_user_disabled_and_closed_by_default_then_applies_tokens() {
+        let store = AclStore::default();
+        store
+            .set_user("app", &tokens(&["on", ">pw", "~app:*", "+get", "-set"]))
+            .unwrap();
+        let user = store.get_user("app").unwrap();
+        assert!(user.enabled);
+        assert!(!store.is_empty());
+    }
+
+    #[test]
+    fn set_user_is_incremental_not_replace_whole_user() {
+        let store = AclStore::default();
+        store.set_user("app", &tokens(&["on", "+get"])).unwrap();
+        store.set_user("app", &tokens(&["+set"])).unwrap(); // adds to, doesn't reset, the existing rules
+        let user = store.get_user("app").unwrap();
+        // AllKeys was never granted, so this only proves both command grants survived, not key access.
+        assert!(user
+            .rules
+            .contains(&AclRule::AllowCommand("GET".to_string())));
+        assert!(user
+            .rules
+            .contains(&AclRule::AllowCommand("SET".to_string())));
+    }
+
+    #[test]
+    fn set_user_with_a_malformed_token_returns_a_syntax_error_and_does_not_partially_apply() {
+        let store = AclStore::default();
+        let result = store.set_user("app", &tokens(&["on", "garbage-token"]));
+        assert!(result.is_err());
+        assert!(
+            store.get_user("app").is_none(),
+            "a failed SETUSER must not create a half-applied user"
+        );
+    }
+
+    #[test]
+    fn del_user_removes_an_existing_user_and_returns_false_for_an_unknown_one() {
+        let store = AclStore::default();
+        store.set_user("app", &tokens(&["on"])).unwrap();
+        assert!(store.del_user("app"));
+        assert!(store.get_user("app").is_none());
+        assert!(!store.del_user("app"));
+    }
+
+    #[test]
+    fn authenticate_succeeds_with_the_right_password_and_fails_with_the_wrong_one() {
+        let store = AclStore::default();
+        store.set_user("app", &tokens(&["on", ">hunter2"])).unwrap();
+        assert!(store.authenticate("app", "hunter2").is_some());
+        assert!(store.authenticate("app", "wrong").is_none());
+    }
+
+    #[test]
+    fn authenticate_a_nopass_user_accepts_any_password() {
+        let store = AclStore::default();
+        store.set_user("app", &tokens(&["on", "nopass"])).unwrap();
+        assert!(store.authenticate("app", "literally-anything").is_some());
+    }
+
+    #[test]
+    fn authenticate_a_disabled_user_always_fails() {
+        let store = AclStore::default();
+        store.set_user("app", &tokens(&["off", "nopass"])).unwrap();
+        assert!(store.authenticate("app", "anything").is_none());
+    }
+
+    #[test]
+    fn authenticate_an_unknown_username_fails() {
+        let store = AclStore::default();
+        assert!(store.authenticate("nobody", "anything").is_none());
+    }
+
+    #[test]
+    fn list_returns_every_user() {
+        let store = AclStore::default();
+        store.set_user("a", &tokens(&["on"])).unwrap();
+        store.set_user("b", &tokens(&["on"])).unwrap();
+        let mut names: Vec<String> = store.list().iter().map(|u| u.username.clone()).collect();
+        names.sort();
+        assert_eq!(names, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn insert_bootstrap_adds_an_already_formed_user_directly() {
+        let store = AclStore::default();
+        store.insert_bootstrap(AclUser {
+            username: "seed".to_string(),
+            password_hash: None,
+            enabled: true,
+            rules: vec![AclRule::AllCommands, AclRule::AllKeys],
+        });
+        assert!(!store.is_empty());
+        assert!(store.get_user("seed").unwrap().enabled);
     }
 }
