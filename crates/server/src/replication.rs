@@ -158,6 +158,11 @@ pub struct ReplicationHandle {
     /// to configure away. `main.rs` sets its threshold from the environment via
     /// `with_slowlog_threshold`; `new`/`Default` use the 10ms default.
     pub slowlog: crate::slowlog::SlowLog,
+    /// In-memory ACL users. Empty by default -- every existing test and deployment through
+    /// Sprint 7 -- populated only via `with_acl_bootstrap` (from the TOML config's
+    /// `[[acl.users]]`) and at runtime via `ACL SETUSER` (plan 08). Never persisted; see
+    /// ../../docs/superpowers/plans/2026-08-31-sprint-8-plans/04-acl-store-and-bootstrap-wiring.md.
+    pub acl: crate::acl::AclStore,
 }
 
 impl ReplicationHandle {
@@ -181,6 +186,7 @@ impl ReplicationHandle {
             master_addr: Mutex::new(None),
             link_up: Arc::new(AtomicBool::new(false)),
             slowlog: crate::slowlog::SlowLog::default(),
+            acl: crate::acl::AclStore::default(),
         }
     }
 
@@ -209,6 +215,17 @@ impl ReplicationHandle {
     /// Redis's meaning for 0.
     pub fn with_slowlog_threshold(mut self, threshold: std::time::Duration) -> Self {
         self.slowlog = crate::slowlog::SlowLog::with_threshold(threshold);
+        self
+    }
+
+    /// Seeds the ACL store from the config file's `[[acl.users]]` bootstrap list. A builder
+    /// method, matching `with_aof`/`with_cluster`/`with_slowlog_threshold`'s existing pattern, so
+    /// the ~25 existing `ReplicationHandle::new` call sites (all tests, none configuring ACLs)
+    /// stay untouched.
+    pub fn with_acl_bootstrap(self, users: Vec<crate::acl::AclUser>) -> Self {
+        for user in users {
+            self.acl.insert_bootstrap(user);
+        }
         self
     }
 
@@ -933,6 +950,28 @@ mod tests {
     fn a_handle_is_not_in_cluster_mode_by_default() {
         let h = ReplicationHandle::default();
         assert!(h.cluster().is_none());
+    }
+
+    #[test]
+    fn a_new_handle_has_an_empty_acl_store() {
+        let h = ReplicationHandle::default();
+        assert!(h.acl.is_empty());
+    }
+
+    #[test]
+    fn with_acl_bootstrap_populates_the_store() {
+        let h = ReplicationHandle::new(Arc::new(Engine::new()), "/tmp/does-not-matter".into())
+            .with_acl_bootstrap(vec![crate::acl::AclUser {
+                username: "seed".to_string(),
+                password_hash: None,
+                enabled: true,
+                rules: vec![
+                    crate::acl::AclRule::AllCommands,
+                    crate::acl::AclRule::AllKeys,
+                ],
+            }]);
+        assert!(!h.acl.is_empty());
+        assert!(h.acl.get_user("seed").unwrap().enabled);
     }
 
     #[test]
