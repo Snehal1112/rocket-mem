@@ -5,6 +5,13 @@
 //! successful write -- this log is the independent "what should be there" record chaos.sh
 //! verifies the post-chaos keyspace against. See
 //! ../../docs/superpowers/plans/2026-08-31-sprint-8-plans/11-chaos-test.md.
+//!
+//! Throughput is not the point here -- correctness of the confirmed-write log is. The write
+//! loop is rate-limited to roughly 10 writes/second (a 100ms delay after every attempt, success
+//! or failure) so that scripts/chaos.sh's exhaustive per-key verification step (one `redis-cli
+//! GET` round trip per key per node, ~3ms each, by design not sampled) stays tractable at real
+//! chaos-run durations: a full 3600s run produces on the order of 36,000 keys instead of
+//! millions, keeping verification a matter of minutes rather than hours.
 
 use redis::Commands;
 use std::io::Write;
@@ -46,6 +53,10 @@ fn main() {
                 writeln!(log, "{key} {value}").expect("failed to append to the write log");
                 log.flush().expect("failed to flush the write log");
                 written += 1;
+                // Rate-limit to ~10 writes/sec -- see the module doc comment: this keeps a
+                // full-length chaos run's keyspace small enough for chaos.sh's exhaustive
+                // per-key verification to finish in minutes instead of hours.
+                std::thread::sleep(std::time::Duration::from_millis(100));
             }
             // A connection error (the target was just kill -9'd, or hasn't restarted yet) is
             // expected and swallowed -- the loop just tries again on the next key. A write
