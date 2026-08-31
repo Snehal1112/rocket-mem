@@ -1893,6 +1893,38 @@ fn write_snapshot_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::R
     Ok(())
 }
 
+/// `None` = proceed to `dispatch`. `Some(frame)` = reply with this instead, without touching the
+/// engine, the AOF, the replica fan-out, or any lock -- same shape as `cluster_redirect` above.
+/// Checked first, ahead of `cluster_redirect`, matching real Redis's own auth-before-everything
+/// ordering: an unauthenticated client should not learn cluster topology or reach any other gate.
+fn auth_gate(
+    replication: &crate::replication::ReplicationHandle,
+    session: &Session,
+    frame: &Frame,
+) -> Option<Frame> {
+    if replication.acl.is_empty() {
+        return None; // the fast path -- every existing deployment and test, unchanged
+    }
+    let name = command_name_upper(frame)?;
+    let name = name.as_str();
+    if name == "AUTH" || name == "ACL" {
+        return None; // always reachable regardless of auth state
+    }
+    let Some(user) = session.authenticated_user() else {
+        return Some(Frame::Error("NOAUTH Authentication required.".into()));
+    };
+    let keys = command_keys(frame);
+    if !user.is_allowed(name, &keys) {
+        let msg = if user.is_allowed(name, &[]) {
+            "NOPERM no permissions to access a key"
+        } else {
+            "NOPERM this user has no permissions to run this command"
+        };
+        return Some(Frame::Error(msg.into()));
+    }
+    None
+}
+
 /// The uppercased command name, or `None` for a frame that isn't a command array. Cheap enough to
 /// call once per command -- uppercases into a stack buffer rather than allocating.
 fn command_name_upper(frame: &Frame) -> Option<CommandName> {
@@ -1987,6 +2019,13 @@ fn dispatch_and_log_inner(
     session: &Session,
     client_id: u64,
 ) -> Frame {
+    // Checked before everything else, including the cluster redirect below: an unauthenticated
+    // or unauthorized client must not learn cluster topology or reach any other gate. Matches
+    // real Redis's own auth-before-everything ordering.
+    if let Some(reply) = auth_gate(replication, session, &frame) {
+        return reply;
+    }
+
     // Checked before everything else, including the -READONLY gate below: a redirect says which
     // node should handle this key at all, and it must land before any lock is taken or any
     // interception runs. See ../../docs/superpowers/specs/2026-08-30-sprint-6-spec.md for the
@@ -2358,6 +2397,137 @@ mod tests {
             session.authenticated_user().map(|u| u.username.clone()),
             Some("thread-user".to_string())
         );
+    }
+
+    fn acl_user(rules: Vec<crate::acl::AclRule>) -> std::sync::Arc<crate::acl::AclUser> {
+        std::sync::Arc::new(crate::acl::AclUser {
+            username: "app".to_string(),
+            password_hash: None,
+            enabled: true,
+            rules,
+        })
+    }
+
+    #[test]
+    fn auth_gate_with_no_acl_users_configured_lets_everything_through() {
+        let replication = ReplicationHandle::default();
+        let session = Session::new();
+        let frame = Frame::Array(vec![
+            Frame::Bulk(Bytes::from_static(b"GET")),
+            Frame::Bulk(Bytes::from_static(b"k")),
+        ]);
+        assert!(auth_gate(&replication, &session, &frame).is_none());
+    }
+
+    #[test]
+    fn auth_gate_denies_an_unauthenticated_connection_once_acl_users_exist() {
+        let replication = ReplicationHandle::default();
+        replication
+            .acl
+            .set_user("app", &[Bytes::from_static(b"on")])
+            .unwrap();
+        let session = Session::new();
+        let frame = Frame::Array(vec![
+            Frame::Bulk(Bytes::from_static(b"GET")),
+            Frame::Bulk(Bytes::from_static(b"k")),
+        ]);
+        let reply = auth_gate(&replication, &session, &frame).unwrap();
+        assert_eq!(
+            reply,
+            Frame::Error("NOAUTH Authentication required.".into())
+        );
+    }
+
+    #[test]
+    fn auth_gate_lets_auth_and_acl_commands_through_even_when_unauthenticated() {
+        let replication = ReplicationHandle::default();
+        replication
+            .acl
+            .set_user("app", &[Bytes::from_static(b"on")])
+            .unwrap();
+        let session = Session::new();
+        let auth_frame = Frame::Array(vec![
+            Frame::Bulk(Bytes::from_static(b"AUTH")),
+            Frame::Bulk(Bytes::from_static(b"pw")),
+        ]);
+        let acl_frame = Frame::Array(vec![
+            Frame::Bulk(Bytes::from_static(b"ACL")),
+            Frame::Bulk(Bytes::from_static(b"WHOAMI")),
+        ]);
+        assert!(auth_gate(&replication, &session, &auth_frame).is_none());
+        assert!(auth_gate(&replication, &session, &acl_frame).is_none());
+    }
+
+    #[test]
+    fn auth_gate_denies_a_command_the_authenticated_user_lacks_a_grant_for() {
+        let replication = ReplicationHandle::default();
+        // Needed so `replication.acl.is_empty()` is false and auth_gate actually enforces
+        // `is_allowed` instead of short-circuiting on the empty-ACL fast path.
+        replication
+            .acl
+            .set_user("app", &[Bytes::from_static(b"on")])
+            .unwrap();
+        let session = Session::new();
+        session.set_authenticated_user(Some(acl_user(vec![
+            crate::acl::AclRule::AllowCommand("GET".to_string()),
+            crate::acl::AclRule::AllKeys,
+        ])));
+        let frame = Frame::Array(vec![
+            Frame::Bulk(Bytes::from_static(b"SET")),
+            Frame::Bulk(Bytes::from_static(b"k")),
+            Frame::Bulk(Bytes::from_static(b"v")),
+        ]);
+        let reply = auth_gate(&replication, &session, &frame).unwrap();
+        assert_eq!(
+            reply,
+            Frame::Error("NOPERM this user has no permissions to run this command".into())
+        );
+    }
+
+    #[test]
+    fn auth_gate_denies_a_key_outside_the_authenticated_users_pattern() {
+        let replication = ReplicationHandle::default();
+        // Needed so `replication.acl.is_empty()` is false and auth_gate actually enforces
+        // `is_allowed` instead of short-circuiting on the empty-ACL fast path.
+        replication
+            .acl
+            .set_user("app", &[Bytes::from_static(b"on")])
+            .unwrap();
+        let session = Session::new();
+        session.set_authenticated_user(Some(acl_user(vec![
+            crate::acl::AclRule::AllCommands,
+            crate::acl::AclRule::KeyPattern("app:*".to_string()),
+        ])));
+        let frame = Frame::Array(vec![
+            Frame::Bulk(Bytes::from_static(b"GET")),
+            Frame::Bulk(Bytes::from_static(b"other:1")),
+        ]);
+        let reply = auth_gate(&replication, &session, &frame).unwrap();
+        assert_eq!(
+            reply,
+            Frame::Error("NOPERM no permissions to access a key".into())
+        );
+    }
+
+    #[test]
+    fn auth_gate_permits_a_command_the_authenticated_user_is_granted() {
+        let replication = ReplicationHandle::default();
+        // Needed so this actually exercises `user.is_allowed` rather than passing vacuously via
+        // the empty-ACL fast path.
+        replication
+            .acl
+            .set_user("app", &[Bytes::from_static(b"on")])
+            .unwrap();
+        let session = Session::new();
+        session.set_authenticated_user(Some(acl_user(vec![
+            crate::acl::AclRule::AllCommands,
+            crate::acl::AclRule::AllKeys,
+        ])));
+        let frame = Frame::Array(vec![
+            Frame::Bulk(Bytes::from_static(b"GET")),
+            Frame::Bulk(Bytes::from_static(b"k")),
+        ]);
+        assert!(auth_gate(&replication, &session, &frame).is_none());
     }
 
     #[test]
