@@ -254,8 +254,6 @@ impl AclStore {
     /// than half-applying the earlier tokens.
     pub fn set_user(&self, username: &str, raw_tokens: &[bytes::Bytes]) -> Result<(), AclError> {
         validate_username(username)?;
-        self.ever_configured
-            .store(true, std::sync::atomic::Ordering::Relaxed);
         let tokens = raw_tokens
             .iter()
             .map(|t| parse_token(t))
@@ -283,6 +281,14 @@ impl AclStore {
             });
         let updated = apply_tokens(base, &tokens);
         users.insert(username.to_string(), Arc::new(updated));
+        // Only flip the sticky flag once a user was actually, successfully created/updated --
+        // setting it earlier (before token parsing could fail) would let one malformed `ACL
+        // SETUSER` from an anonymous client, on a server with no ACL configured yet, permanently
+        // lock out every client forever (until restart): the flag would already be `true` with
+        // zero users in the store, so `auth_gate` would NOAUTH everyone and `AUTH` would always
+        // fail (no user to authenticate against).
+        self.ever_configured
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -736,6 +742,25 @@ mod tests {
     }
 
     #[test]
+    fn set_user_with_a_malformed_token_does_not_flip_ever_configured() {
+        // Final-review fix: `ever_configured` must only flip once a user was actually,
+        // successfully created -- otherwise one malformed `ACL SETUSER` from any anonymous
+        // client, on a server with no ACL configured yet, would permanently lock out every
+        // client (NOAUTH forever, with no user in the store to AUTH against).
+        let store = AclStore::default();
+        let result = store.set_user("app", &tokens(&["on", "garbage-token"]));
+        assert!(result.is_err());
+        assert!(
+            !store.has_ever_been_configured(),
+            "a failed SETUSER must not turn on permanent auth enforcement"
+        );
+
+        // Contrast: a *successful* set_user call does flip it, on the same store.
+        store.set_user("app", &tokens(&["on"])).unwrap();
+        assert!(store.has_ever_been_configured());
+    }
+
+    #[test]
     fn set_user_rejects_an_empty_or_whitespace_containing_username() {
         assert!(AclStore::default().set_user("", &tokens(&["on"])).is_err());
         assert!(AclStore::default()
@@ -744,6 +769,31 @@ mod tests {
         assert!(AclStore::default()
             .set_user("bad\r\nname", &tokens(&["on"]))
             .is_err());
+    }
+
+    #[test]
+    fn has_ever_been_configured_is_sticky_across_set_user_insert_bootstrap_and_del_user() {
+        let store = AclStore::default();
+        assert!(!store.has_ever_been_configured());
+
+        store.set_user("app", &tokens(&["on"])).unwrap();
+        assert!(store.has_ever_been_configured());
+
+        // A fresh store proves `insert_bootstrap` also flips it, independently of `set_user`.
+        let bootstrap_store = AclStore::default();
+        assert!(!bootstrap_store.has_ever_been_configured());
+        bootstrap_store.insert_bootstrap(AclUser {
+            username: "seed".to_string(),
+            password_hash: None,
+            enabled: true,
+            rules: vec![],
+        });
+        assert!(bootstrap_store.has_ever_been_configured());
+
+        // `del_user` removing every user must never clear the flag back to `false`.
+        assert!(store.del_user("app"));
+        assert!(store.is_empty());
+        assert!(store.has_ever_been_configured());
     }
 
     #[test]
