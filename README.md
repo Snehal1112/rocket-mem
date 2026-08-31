@@ -146,10 +146,8 @@ substitute; the `/metrics` endpoint is unauthenticated (hence its loopback defau
 slow log, and server counters. Sprint 7 turned out not to force this rename after all: its RMP
 connection handler takes the exact same `Arc<ReplicationHandle>` every RESP connection already
 does, unchanged. The rename remains deferred, with no forcing sprint currently scoped.
-RMP connections are not yet counted in `rocket_mem_connected_clients`/`rocket_mem_connections_total`
-— those counters are only wired into RESP's connection lifecycle (`connection.rs`'s `ClientGuard`);
-extending them to RMP is a small, contained follow-up (an equivalent guard in
-`rmp_connection.rs`), not attempted this sprint to keep it scoped to the protocol itself.
+RMP connections are now counted in `rocket_mem_connected_clients`/`rocket_mem_connections_total`
+alongside RESP's — both protocols share the same `ClientGuard` (`connection.rs`).
 
 The remaining sprint (auth, ACLs, TLS & release) is scoped in the
 [sprint plan](docs/rocket-mem-sprint-plan.md) but not started.

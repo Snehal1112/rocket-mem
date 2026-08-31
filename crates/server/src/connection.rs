@@ -76,7 +76,7 @@ async fn periodic_fsync_loop(aof: Arc<AofWriter>) {
 /// Decrements the live-connection count on drop, so every one of `handle_connection`'s early
 /// returns -- and the `serve_replica` path, which never returns normally -- is covered without
 /// each of them having to remember.
-struct ClientGuard(Arc<ReplicationHandle>);
+pub(crate) struct ClientGuard(pub(crate) Arc<ReplicationHandle>);
 
 impl Drop for ClientGuard {
     fn drop(&mut self) {

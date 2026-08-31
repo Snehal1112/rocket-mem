@@ -1,4 +1,5 @@
 use crate::aof::AofWriter;
+use crate::connection::ClientGuard;
 use crate::dispatcher;
 use crate::replication::ReplicationHandle;
 use engine::Engine;
@@ -41,6 +42,8 @@ async fn handle_connection(
     replication: Arc<ReplicationHandle>,
     client_id: u64,
 ) {
+    replication.connection_opened();
+    let _client_guard = ClientGuard(Arc::clone(&replication));
     let framed = Framed::new(socket, RmpCodec);
     let (mut sink, mut stream) = framed.split();
 
@@ -234,6 +237,33 @@ mod tests {
         .unwrap();
         let reply = con.next().await.unwrap().unwrap();
         assert!(matches!(reply.frame, Frame::Error(_)));
+    }
+
+    #[tokio::test]
+    async fn serve_tracks_connected_rmp_clients_and_drops_the_count_on_disconnect() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let engine = Arc::new(Engine::new());
+        let (_dir, aof) = test_aof();
+        let replication = Arc::new(ReplicationHandle::default());
+        tokio::spawn(serve(listener, engine, aof, Arc::clone(&replication)));
+
+        let mut con = connect(addr).await;
+        con.send(RmpMessage {
+            request_id: 1,
+            msg_type: MsgType::Request,
+            frame: command(&[b"PING"]),
+        })
+        .await
+        .unwrap();
+        con.next().await.unwrap().unwrap();
+        assert_eq!(replication.connected_clients(), 1);
+        assert_eq!(replication.total_connections(), 1);
+
+        drop(con);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(replication.connected_clients(), 0);
+        assert_eq!(replication.total_connections(), 1); // the lifetime total never drops
     }
 
     #[tokio::test]
