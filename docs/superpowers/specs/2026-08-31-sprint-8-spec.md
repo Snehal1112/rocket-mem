@@ -90,7 +90,7 @@ Auth breaks that assumption: once one request on an RMP connection authenticates
 
 ```rust
 pub struct Session {
-    protocol: std::cell::Cell<Protocol>,               // Protocol is Copy; RESP mutates it via HELLO
+    protocol: std::sync::Mutex<Protocol>,               // Protocol is Copy; RESP mutates it via HELLO
     authenticated_user: std::sync::Mutex<Option<Arc<AclUser>>>,
 }
 
@@ -107,7 +107,7 @@ impl Session {
 
 **Ownership, per protocol:**
 - **RESP** (`connection.rs`): `let session = Session::new();` once, outside the request loop — replacing `let mut protocol = Protocol::default();`. Passed as `&session` each iteration. No `Arc` needed; RESP is one task, one connection, sequential.
-- **RMP** (`rmp_connection.rs`): `let session = Arc::new(Session::new());` **once per accepted connection**, before the read loop starts — this is the behavioral fix that matters. Each spawned per-request task clones the `Arc<Session>` alongside its existing `Arc<Engine>`/`Arc<AofWriter>`/`Arc<ReplicationHandle>` clones. `Session`'s interior mutability (`Cell` + `Mutex`) is what makes sharing across concurrently-running tasks sound without redesigning the spawn-per-request model.
+- **RMP** (`rmp_connection.rs`): `let session = Arc::new(Session::new());` **once per accepted connection**, before the read loop starts — this is the behavioral fix that matters. Each spawned per-request task clones the `Arc<Session>` alongside its existing `Arc<Engine>`/`Arc<AofWriter>`/`Arc<ReplicationHandle>` clones. `Session`'s interior mutability (both fields `Mutex`) is what makes sharing across concurrently-running tasks sound without redesigning the spawn-per-request model: `Mutex<T>` is `Sync` (for `T: Send`), which is required for `Arc<Session>: Send` — and `tokio::spawn` requires its future (and therefore everything captured into it, including the cloned `Arc<Session>`) to be `Send`. `Cell<T>` is never `Sync`, no matter what `T` is, so a `Cell` field here would make `Session: !Sync` and `Arc<Session>: !Send`, which would not compile against `tokio::spawn`.
 
 **Auth gate placement:** the very first check inside `dispatch_and_log_inner`, ahead of `cluster_redirect` — matching real Redis's own auth-before-everything-else ordering (an unauthenticated client should not learn cluster topology, get read-only-replica errors, or reach the engine at all):
 

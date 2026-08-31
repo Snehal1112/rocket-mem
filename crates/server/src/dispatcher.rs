@@ -4,11 +4,17 @@ use protocol::codec::Protocol;
 use protocol::Frame;
 
 /// Per-connection state `dispatch_and_log` reads/writes, replacing the bare `protocol: &mut
-/// Protocol` parameter it used through Sprint 7. Interior mutability (`Cell`/`Mutex`) is
-/// deliberate: it lets this be passed as `&Session` (a shared reference) rather than `&mut
-/// Protocol` (exclusive), which is what makes it possible for several concurrently-spawned RMP
-/// request tasks to hold independent `Arc<Session>` clones of the same connection's state
-/// (plan 07) — an exclusive reference could never be handed to more than one task at a time.
+/// Protocol` parameter it used through Sprint 7. Interior mutability (`Mutex`) is deliberate: it
+/// lets this be passed as `&Session` (a shared reference) rather than `&mut Protocol`
+/// (exclusive), which is what makes it possible for several concurrently-spawned RMP request
+/// tasks to hold independent `Arc<Session>` clones of the same connection's state (plan 07) — an
+/// exclusive reference could never be handed to more than one task at a time.
+///
+/// Both fields use `Mutex`, not `Cell`: `Cell<T>` is never `Sync` (it gives only
+/// single-threaded interior mutability), so a `Cell` field would make `Session: !Sync` and
+/// therefore `Arc<Session>: !Send` — which `tokio::spawn` requires for the RMP per-request
+/// tasks in plan 07. `Mutex<T>` is `Sync` (for `T: Send`), which is what keeps `Arc<Session>`
+/// safely shareable across spawned tasks.
 ///
 /// RESP's connection loop owns one `Session` across its lifetime and passes `&session` each
 /// iteration (Task 3 here). RMP's connection handler will own one `Arc<Session>` per accepted
@@ -16,24 +22,24 @@ use protocol::Frame;
 /// plan's Task 2 gives RMP a fresh, throwaway `Session::new()` per request, identical in effect
 /// to today's per-request `Protocol::default()`.
 pub struct Session {
-    protocol: std::cell::Cell<Protocol>,
+    protocol: std::sync::Mutex<Protocol>,
     authenticated_user: std::sync::Mutex<Option<std::sync::Arc<crate::acl::AclUser>>>,
 }
 
 impl Session {
     pub fn new() -> Self {
         Self {
-            protocol: std::cell::Cell::new(Protocol::default()),
+            protocol: std::sync::Mutex::new(Protocol::default()),
             authenticated_user: std::sync::Mutex::new(None),
         }
     }
 
     pub fn protocol(&self) -> Protocol {
-        self.protocol.get()
+        *self.protocol.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     pub fn set_protocol(&self, p: Protocol) {
-        self.protocol.set(p);
+        *self.protocol.lock().unwrap_or_else(|e| e.into_inner()) = p;
     }
 
     pub fn authenticated_user(&self) -> Option<std::sync::Arc<crate::acl::AclUser>> {
@@ -2029,10 +2035,12 @@ fn dispatch_and_log_inner(
     // ../../docs/superpowers/specs/2026-08-30-tech-debt-cleanup-spec.md Item 2.
     let _order_guard = write_name.as_ref().map(|_| aof.lock_for_ordering());
 
-    // `dispatch` itself is untouched by this migration -- it still takes `_protocol: &mut
-    // Protocol`, unused inside its body (see its own doc comment). A throwaway `Protocol` is
-    // handed in here rather than threading `session`'s state through it, matching the "only
-    // `dispatch_and_log` changes" scope of this plan's Task 2.
+    // `dispatch`'s `_protocol` parameter is frozen for this sprint (see Global Constraints in
+    // ../../docs/superpowers/plans/2026-08-31-sprint-8-plans/05-session-type-and-resp-wiring.md)
+    // and unused by its body; this throwaway value is intentional, not a bug -- real
+    // per-connection protocol state lives in `Session`, not here. `dispatch` is called directly
+    // by AOF replay and the follower apply loop, neither of which needs auth/session state, so
+    // its signature does not change.
     let reply = dispatch(engine, frame, &mut Protocol::default(), client_id);
     if let Frame::Error(_) = reply {
         return reply;
@@ -2295,6 +2303,17 @@ mod tests {
         );
     }
 
+    /// Compiles only if `T: Send + Sync`. Calling this with `Session` (below) is a static
+    /// assertion: if `Session` ever regains a `!Sync` field (e.g. a stray `Cell`/`Rc`/`RefCell`),
+    /// this fails to *compile* rather than merely failing a runtime test -- the strongest
+    /// possible regression guard for the `Arc<Session>: !Send` bug this fix wave corrected.
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    #[test]
+    fn session_is_send_and_sync() {
+        assert_send_sync::<Session>();
+    }
+
     #[test]
     fn a_mutation_through_one_arc_clone_is_visible_through_another() {
         // The property plan 07 depends on: several tasks holding independent Arc<Session> clones
@@ -2311,6 +2330,34 @@ mod tests {
         });
         clone_a.set_authenticated_user(Some(user));
         assert!(clone_b.authenticated_user().is_some());
+    }
+
+    #[test]
+    fn a_mutation_through_an_arc_clone_moved_to_another_thread_is_visible_here() {
+        // Unlike the single-threaded test above, this genuinely requires `Session: Send + Sync`
+        // (and therefore `Arc<Session>: Send`) -- it's exactly the property that `Cell<Protocol>`
+        // silently broke without any existing test catching it, since nothing here previously
+        // crossed a real thread boundary.
+        let session = std::sync::Arc::new(Session::new());
+        let clone_for_thread = std::sync::Arc::clone(&session);
+
+        let handle = std::thread::spawn(move || {
+            clone_for_thread.set_protocol(Protocol::Resp3);
+            let user = std::sync::Arc::new(crate::acl::AclUser {
+                username: "thread-user".to_string(),
+                password_hash: None,
+                enabled: true,
+                rules: vec![],
+            });
+            clone_for_thread.set_authenticated_user(Some(user));
+        });
+        handle.join().unwrap();
+
+        assert_eq!(session.protocol(), Protocol::Resp3);
+        assert_eq!(
+            session.authenticated_user().map(|u| u.username.clone()),
+            Some("thread-user".to_string())
+        );
     }
 
     #[test]
