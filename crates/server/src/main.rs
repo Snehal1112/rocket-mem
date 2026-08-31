@@ -2,8 +2,6 @@ use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
-    let metrics_handle = rocket_mem::metrics::recorder_handle();
-
     let config = rocket_mem::config::load().map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -11,7 +9,8 @@ async fn main() -> std::io::Result<()> {
         )
     })?;
 
-    let addr = config.addr.clone();
+    let metrics_handle = rocket_mem::metrics::recorder_handle();
+
     let aof_path = std::path::PathBuf::from(&config.aof_path);
     let aof_path = aof_path.as_path();
     let snapshot_path = std::path::PathBuf::from(&config.snapshot_path);
@@ -80,8 +79,7 @@ async fn main() -> std::io::Result<()> {
     }
     let replication = Arc::new(handle);
 
-    let metrics_addr = config.metrics_addr.clone();
-    let metrics_listener = tokio::net::TcpListener::bind(&metrics_addr).await?;
+    let metrics_listener = tokio::net::TcpListener::bind(&config.metrics_addr).await?;
     println!(
         "Metrics on http://{}/metrics",
         metrics_listener.local_addr()?
@@ -93,8 +91,7 @@ async fn main() -> std::io::Result<()> {
         Arc::clone(&replication),
     ));
 
-    let rmp_addr = config.rmp_addr.clone();
-    let rmp_listener = tokio::net::TcpListener::bind(&rmp_addr).await?;
+    let rmp_listener = tokio::net::TcpListener::bind(&config.rmp_addr).await?;
     println!("RMP listening on {}", rmp_listener.local_addr()?);
     tokio::spawn(rocket_mem::rmp_connection::serve(
         rmp_listener,
@@ -103,7 +100,7 @@ async fn main() -> std::io::Result<()> {
         Arc::clone(&replication),
     ));
 
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    let listener = tokio::net::TcpListener::bind(&config.addr).await?;
     println!("Listening on {}", listener.local_addr()?);
     rocket_mem::serve(listener, engine, aof, replication).await;
     Ok(())

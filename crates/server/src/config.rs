@@ -94,38 +94,54 @@ pub fn load_layered(toml_path: Option<&std::path::Path>) -> Result<Config, figme
     figment.extract()
 }
 
-/// CLI flags, parsed via `clap`. Every field is `Option` -- an unset flag must not override a
-/// lower layer's value (see `cli_overrides`), so a required/defaulted field here would break
-/// that precedence chain.
+// Every field is `Option` -- an unset flag must not override a lower layer's value (see
+// `cli_overrides`), so a required/defaulted field here would break that precedence chain.
+//
+// Adding a new field to `Config` also requires adding it here and to `cli_overrides`'s `set!`
+// calls -- there's no compile-time check that catches a forgotten one.
+/// A RESP-compatible in-memory data store.
 #[derive(clap::Parser, Debug)]
-#[command(name = "rocket-mem")]
+#[command(name = "rocket-mem", version)]
 pub struct Cli {
     /// Path to a TOML config file. Not read via env/CLI layering itself -- it names which file
     /// `load_layered` merges, so it's resolved before any other layer applies.
+    /// [default: "rocket-mem.toml" if present, else skipped]
     #[arg(long)]
     pub config: Option<std::path::PathBuf>,
+    /// TCP address for RESP clients [default: 127.0.0.1:6379]
     #[arg(long)]
     pub addr: Option<String>,
+    /// TCP address for RMP (rocket-mem's custom protocol) clients [default: 127.0.0.1:6380]
     #[arg(long)]
     pub rmp_addr: Option<String>,
+    /// TCP address the Prometheus metrics endpoint listens on [default: 127.0.0.1:9121]
     #[arg(long)]
     pub metrics_addr: Option<String>,
+    /// Path to the append-only file [default: ./appendonly.aof]
     #[arg(long)]
     pub aof_path: Option<String>,
+    /// Path to the point-in-time snapshot file [default: ./dump.snapshot]
     #[arg(long)]
     pub snapshot_path: Option<String>,
+    /// Minimum command duration, in microseconds, logged to the slow log; 0 disables it [default: 10000]
     #[arg(long)]
     pub slowlog_threshold_micros: Option<u64>,
+    /// Path to the cluster topology file; requires --cluster-node-id [default: unset, standalone mode]
     #[arg(long)]
     pub cluster_config: Option<String>,
+    /// This node's id within --cluster-config's topology; requires --cluster-config [default: unset]
     #[arg(long)]
     pub cluster_node_id: Option<String>,
+    /// TCP address for TLS-wrapped RESP clients [default: unset, TLS disabled]
     #[arg(long)]
     pub tls_resp_addr: Option<String>,
+    /// TCP address for TLS-wrapped RMP clients [default: unset, TLS disabled]
     #[arg(long)]
     pub tls_rmp_addr: Option<String>,
+    /// Path to the TLS certificate file [default: unset]
     #[arg(long)]
     pub tls_cert_path: Option<String>,
+    /// Path to the TLS private key file [default: unset]
     #[arg(long)]
     pub tls_key_path: Option<String>,
 }
@@ -182,7 +198,11 @@ pub fn load_with_cli(cli: Cli) -> Result<Config, figment::Error> {
     use figment::providers::Serialized;
     use figment::Figment;
 
-    let base = load_layered(cli.config.as_deref())?;
+    let base = load_layered(Some(
+        cli.config
+            .as_deref()
+            .unwrap_or(std::path::Path::new("rocket-mem.toml")),
+    ))?;
     Figment::from(Serialized::defaults(base))
         .merge(cli_overrides(&cli))
         .extract()
@@ -312,7 +332,7 @@ mod tests {
         figment::Jail::expect_with(|jail| {
             jail.create_file(
                 "rocket-mem.toml",
-                "addr = \"127.0.0.1:1111\"\nslowlog_threshold_micros = 2000\n",
+                "addr = \"127.0.0.1:1111\"\nslowlog_threshold_micros = 2000\nrmp_addr = \"127.0.0.1:1234\"\n",
             )?;
             jail.set_env("ROCKET_MEM_ADDR", "127.0.0.1:2222"); // beats the file
             jail.set_env("ROCKET_MEM_SLOWLOG_THRESHOLD_MICROS", "3000"); // beats the file, not overridden by CLI below
@@ -329,6 +349,24 @@ mod tests {
             assert_eq!(
                 cfg.slowlog_threshold_micros, 3000,
                 "env beats file when CLI doesn't set it"
+            );
+            assert_eq!(
+                cfg.rmp_addr, "127.0.0.1:1234",
+                "file-only value (no CLI flag, no env var) still reaches the final Config"
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn cli_flag_overrides_an_optional_string_field() {
+        figment::Jail::expect_with(|_jail| {
+            let cli = Cli::parse_from(["rocket-mem", "--tls-cert-path", "/x"]);
+            let cfg = load_with_cli(cli).unwrap();
+            assert_eq!(
+                cfg.tls_cert_path.as_deref(),
+                Some("/x"),
+                "CLI flag must be able to override an Option<String> field"
             );
             Ok(())
         });
