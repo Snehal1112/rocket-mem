@@ -101,9 +101,141 @@ pub fn verify_password(password: &str, hash: &str) -> bool {
         .is_ok()
 }
 
+/// One configured ACL user: its login state, password hash (`None` for `nopass`), and the
+/// ordered list of rules `is_allowed` folds to answer permission questions.
+#[derive(Debug, Clone)]
+pub struct AclUser {
+    pub username: String,
+    pub password_hash: Option<String>,
+    pub enabled: bool,
+    pub rules: Vec<AclRule>,
+}
+
+impl AclUser {
+    /// Folds `self.rules` left-to-right: the last rule that matches a given question (command
+    /// allowed? this key allowed?) wins, matching real Redis's own rule-order semantics. A
+    /// command with no keys needs only the command check; a command with keys additionally
+    /// needs every one of them to match at least one key rule.
+    pub fn is_allowed(&self, command: &str, keys: &[&bytes::Bytes]) -> bool {
+        let mut command_allowed = false;
+        for rule in &self.rules {
+            match rule {
+                AclRule::AllCommands => command_allowed = true,
+                AclRule::NoCommands => command_allowed = false,
+                AclRule::AllowCommand(c) if c == command => command_allowed = true,
+                AclRule::DenyCommand(c) if c == command => command_allowed = false,
+                _ => {}
+            }
+        }
+        if !command_allowed {
+            return false;
+        }
+        keys.iter().all(|key| self.key_allowed(key))
+    }
+
+    fn key_allowed(&self, key: &[u8]) -> bool {
+        let mut allowed = false;
+        for rule in &self.rules {
+            match rule {
+                AclRule::AllKeys => allowed = true,
+                AclRule::KeyPattern(p) if engine::glob::glob_match(p.as_bytes(), key) => {
+                    allowed = true
+                }
+                _ => {}
+            }
+        }
+        allowed
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
+
+    fn user(rules: Vec<AclRule>) -> AclUser {
+        AclUser {
+            username: "test".to_string(),
+            password_hash: None,
+            enabled: true,
+            rules,
+        }
+    }
+
+    #[test]
+    fn a_user_with_no_rules_is_allowed_nothing() {
+        let u = user(vec![]);
+        assert!(!u.is_allowed("GET", &[]));
+    }
+
+    #[test]
+    fn allcommands_and_allkeys_permits_any_command_and_key() {
+        let u = user(vec![AclRule::AllCommands, AclRule::AllKeys]);
+        let k = Bytes::from_static(b"anything");
+        assert!(u.is_allowed("GET", &[&k]));
+        assert!(u.is_allowed("FLUSHALL", &[]));
+    }
+
+    #[test]
+    fn the_spec_example_plus_get_minus_set_with_a_key_pattern() {
+        // ["on", ">pw", "~app:*", "+get", "-set"] from the spec's own worked example
+        let u = user(vec![
+            AclRule::KeyPattern("app:*".to_string()),
+            AclRule::AllowCommand("GET".to_string()),
+            AclRule::DenyCommand("SET".to_string()),
+        ]);
+        let allowed_key = Bytes::from_static(b"app:1");
+        let other_key = Bytes::from_static(b"other:1");
+        assert!(u.is_allowed("GET", &[&allowed_key]));
+        assert!(!u.is_allowed("SET", &[&allowed_key]), "explicitly denied");
+        assert!(
+            !u.is_allowed("GET", &[&other_key]),
+            "key outside the pattern"
+        );
+        assert!(!u.is_allowed("DEL", &[&allowed_key]), "never granted");
+    }
+
+    #[test]
+    fn a_later_rule_overrides_an_earlier_one_for_the_same_command() {
+        let u = user(vec![
+            AclRule::AllowCommand("GET".to_string()),
+            AclRule::DenyCommand("GET".to_string()), // revokes it again
+            AclRule::AllKeys,
+        ]);
+        assert!(!u.is_allowed("GET", &[]));
+    }
+
+    #[test]
+    fn allcommands_then_a_later_deny_still_denies_that_one_command() {
+        let u = user(vec![
+            AclRule::AllCommands,
+            AclRule::DenyCommand("FLUSHALL".to_string()),
+            AclRule::AllKeys,
+        ]);
+        assert!(!u.is_allowed("FLUSHALL", &[]));
+        assert!(u.is_allowed("GET", &[]));
+    }
+
+    #[test]
+    fn a_keyless_command_needs_no_key_rule_at_all() {
+        let u = user(vec![AclRule::AllowCommand("PING".to_string())]); // no AllKeys/KeyPattern rule at all
+        assert!(u.is_allowed("PING", &[]));
+    }
+
+    #[test]
+    fn a_command_with_keys_needs_every_key_to_match_some_key_rule() {
+        let u = user(vec![
+            AclRule::AllCommands,
+            AclRule::KeyPattern("app:*".to_string()),
+        ]);
+        let ok = Bytes::from_static(b"app:1");
+        let bad = Bytes::from_static(b"other:1");
+        assert!(u.is_allowed("MGET", &[&ok, &ok]));
+        assert!(
+            !u.is_allowed("MGET", &[&ok, &bad]),
+            "one key outside the pattern denies the whole command"
+        );
+    }
 
     #[test]
     fn parses_on_and_off() {
