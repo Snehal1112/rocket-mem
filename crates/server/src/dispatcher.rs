@@ -1166,6 +1166,7 @@ fn extract_write_command_name(frame: &Frame) -> Option<CommandName> {
 /// slot-routed in cluster mode -- it would be served by whichever node the client happened to
 /// reach, quietly breaking the routing invariant. Step 3a below is the check.
 pub(crate) const KNOWN_COMMANDS: &[&str] = &[
+    "ACL",
     "APPEND",
     "AUTH",
     "CLUSTER",
@@ -1275,11 +1276,13 @@ fn key_spec(name: &str) -> KeySpec {
     match name {
         "PING" | "ECHO" | "SELECT" | "COMMAND" | "INFO" | "HELLO" | "KEYS" | "SCAN"
         | "RANDOMKEY" | "CLUSTER" | "SAVE" | "REPLICAOF" | "PSYNC" | "SLOWLOG" | "DEBUG"
-        | "AUTH" => {
+        | "AUTH" | "ACL" => {
             // AUTH has no keys -- its arguments are a username/password, never a routable key.
-            // Without this exception it would fall through to the `KNOWN_COMMANDS` catch-all
-            // below and get `KeySpec::First`, which in cluster mode would hash the plaintext
-            // password to a slot and potentially -MOVED it before it's ever authenticated.
+            // ACL likewise -- its arguments are a subcommand/username/rule tokens, never a
+            // routable key. Without this exception either would fall through to the
+            // `KNOWN_COMMANDS` catch-all below and get `KeySpec::First`, which in cluster mode
+            // would hash a plaintext password (AUTH) or a rule token (ACL SETUSER) to a slot and
+            // potentially -MOVED it before it's ever authenticated/applied.
             KeySpec::None
         }
         "MEMORY" | "OBJECT" => KeySpec::Second,
@@ -1965,6 +1968,75 @@ fn handle_slowlog(
     })
 }
 
+/// Returns `Some(reply)` if `frame` was `ACL` -- handled entirely here, never reaching
+/// `dispatch` -- or `None` for any other command. Same interception shape as `handle_cluster`/
+/// `handle_slowlog` above.
+///
+/// `session` is unused by this task's `SETUSER`/`DELUSER` subcommands but kept in the signature
+/// (matching `handle_auth`'s shape) for future subcommands like `ACL WHOAMI` that need it.
+fn handle_acl(
+    frame: &Frame,
+    _session: &Session,
+    replication: &crate::replication::ReplicationHandle,
+) -> Option<Frame> {
+    let Frame::Array(items) = frame else {
+        return None;
+    };
+    let Some(Frame::Bulk(name)) = items.first() else {
+        return None;
+    };
+    if !name.eq_ignore_ascii_case(b"ACL") {
+        return None;
+    }
+    let Some(Frame::Bulk(sub_bytes)) = items.get(1) else {
+        return Some(Frame::Error(
+            "ERR wrong number of arguments for 'acl' command".into(),
+        ));
+    };
+    let sub = String::from_utf8_lossy(sub_bytes).to_ascii_uppercase();
+    Some(match sub.as_str() {
+        "SETUSER" => acl_setuser(items, replication),
+        "DELUSER" => acl_deluser(items, replication),
+        _ => Frame::Error(format!("ERR unknown ACL subcommand '{sub}'")),
+    })
+}
+
+fn acl_setuser(items: &[Frame], replication: &crate::replication::ReplicationHandle) -> Frame {
+    let Some(Frame::Bulk(username)) = items.get(2) else {
+        return Frame::Error("ERR wrong number of arguments for 'acl|setuser' command".into());
+    };
+    let raw_tokens: Vec<Bytes> = items[3..]
+        .iter()
+        .filter_map(|f| match f {
+            Frame::Bulk(b) => Some(b.clone()),
+            _ => None,
+        })
+        .collect();
+    if raw_tokens.len() != items[3..].len() {
+        return Frame::Error("ERR syntax error".into());
+    }
+    let username = String::from_utf8_lossy(username).into_owned();
+    match replication.acl.set_user(&username, &raw_tokens) {
+        Ok(()) => Frame::Simple("OK".into()),
+        Err(e) => Frame::Error(e.to_string()),
+    }
+}
+
+fn acl_deluser(items: &[Frame], replication: &crate::replication::ReplicationHandle) -> Frame {
+    if items.len() < 3 {
+        return Frame::Error("ERR wrong number of arguments for 'acl|deluser' command".into());
+    }
+    let deleted = items[2..]
+        .iter()
+        .filter_map(|f| match f {
+            Frame::Bulk(b) => Some(b),
+            _ => None,
+        })
+        .filter(|b| replication.acl.del_user(&String::from_utf8_lossy(b)))
+        .count();
+    Frame::Integer(deleted as i64)
+}
+
 /// Snapshots `replication.engine()` — in production this is always the same `Arc<Engine>` as
 /// `dispatch_and_log`'s own `engine` parameter (`main.rs` constructs one `Engine`, shares it
 /// into both `serve`'s `engine` argument and `ReplicationHandle::new`), so using the handle's
@@ -2202,6 +2274,9 @@ fn dispatch_and_log_inner(
     }
 
     if let Some(reply) = handle_auth(&frame, session, replication) {
+        return reply;
+    }
+    if let Some(reply) = handle_acl(&frame, session, replication) {
         return reply;
     }
 
@@ -2796,6 +2871,86 @@ mod tests {
             Frame::Bulk(Bytes::from_static(b"k")),
         ]);
         assert!(handle_auth(&frame, &session, &replication).is_none());
+    }
+
+    fn acl_cmd(args: &[&[u8]]) -> Frame {
+        let mut items = vec![Frame::Bulk(Bytes::from_static(b"ACL"))];
+        items.extend(args.iter().map(|a| Frame::Bulk(Bytes::copy_from_slice(a))));
+        Frame::Array(items)
+    }
+
+    #[test]
+    fn acl_setuser_creates_a_user_and_returns_ok() {
+        let replication = ReplicationHandle::default();
+        let session = Session::new();
+        let reply = handle_acl(
+            &acl_cmd(&[
+                b"SETUSER",
+                b"app",
+                b"on",
+                b">pw",
+                b"allcommands",
+                b"allkeys",
+            ]),
+            &session,
+            &replication,
+        )
+        .unwrap();
+        assert_eq!(reply, Frame::Simple("OK".into()));
+        assert!(replication.acl.get_user("app").unwrap().enabled);
+    }
+
+    #[test]
+    fn acl_setuser_with_a_malformed_token_returns_the_syntax_error() {
+        let replication = ReplicationHandle::default();
+        let session = Session::new();
+        let reply = handle_acl(
+            &acl_cmd(&[b"SETUSER", b"app", b"garbage"]),
+            &session,
+            &replication,
+        )
+        .unwrap();
+        assert!(matches!(reply, Frame::Error(_)));
+    }
+
+    #[test]
+    fn acl_deluser_removes_users_and_counts_them() {
+        let replication = ReplicationHandle::default();
+        replication
+            .acl
+            .set_user("a", &[Bytes::from_static(b"on")])
+            .unwrap();
+        replication
+            .acl
+            .set_user("b", &[Bytes::from_static(b"on")])
+            .unwrap();
+        let session = Session::new();
+        let reply = handle_acl(
+            &acl_cmd(&[b"DELUSER", b"a", b"b", b"nonexistent"]),
+            &session,
+            &replication,
+        )
+        .unwrap();
+        assert_eq!(reply, Frame::Integer(2));
+    }
+
+    #[test]
+    fn an_unknown_acl_subcommand_is_an_error() {
+        let replication = ReplicationHandle::default();
+        let session = Session::new();
+        let reply = handle_acl(&acl_cmd(&[b"BOGUS"]), &session, &replication).unwrap();
+        assert!(matches!(reply, Frame::Error(_)));
+    }
+
+    #[test]
+    fn a_non_acl_frame_is_not_intercepted() {
+        let replication = ReplicationHandle::default();
+        let session = Session::new();
+        let frame = Frame::Array(vec![
+            Frame::Bulk(Bytes::from_static(b"GET")),
+            Frame::Bulk(Bytes::from_static(b"k")),
+        ]);
+        assert!(handle_acl(&frame, &session, &replication).is_none());
     }
 
     #[test]
