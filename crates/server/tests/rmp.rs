@@ -1,6 +1,4 @@
 use bytes::Bytes;
-use protocol::rmp::{MsgType, RmpCodec, RmpMessage};
-use protocol::Frame;
 use redis::AsyncCommands;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -38,10 +36,25 @@ async fn spawn_dual_protocol_server() -> (tempfile::TempDir, String, std::net::S
     (dir, format!("redis://{resp_addr}"), rmp_addr)
 }
 
-fn command(args: &[&[u8]]) -> Frame {
-    Frame::Array(
-        args.iter()
-            .map(|a| Frame::Bulk(Bytes::copy_from_slice(a)))
-            .collect(),
-    )
+#[tokio::test]
+async fn resp_write_is_visible_to_a_read_over_rmp() {
+    let (_dir, resp_url, rmp_addr) = spawn_dual_protocol_server().await;
+    let redis_client = redis::Client::open(resp_url).unwrap();
+    let mut resp_con = redis_client.get_multiplexed_async_connection().await.unwrap();
+    let _: () = resp_con.set("k", "v").await.unwrap();
+
+    let rmp_client = rmp_client::RmpClient::connect(rmp_addr).await.unwrap();
+    assert_eq!(rmp_client.get("k").await.unwrap(), Some(Bytes::from_static(b"v")));
+}
+
+#[tokio::test]
+async fn rmp_write_is_visible_to_a_read_over_resp() {
+    let (_dir, resp_url, rmp_addr) = spawn_dual_protocol_server().await;
+    let rmp_client = rmp_client::RmpClient::connect(rmp_addr).await.unwrap();
+    rmp_client.set("k", "v").await.unwrap();
+
+    let redis_client = redis::Client::open(resp_url).unwrap();
+    let mut resp_con = redis_client.get_multiplexed_async_connection().await.unwrap();
+    let value: String = resp_con.get("k").await.unwrap();
+    assert_eq!(value, "v");
 }
