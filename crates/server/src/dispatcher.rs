@@ -3,6 +3,60 @@ use engine::{commands, Engine, Value};
 use protocol::codec::Protocol;
 use protocol::Frame;
 
+/// Per-connection state `dispatch_and_log` reads/writes, replacing the bare `protocol: &mut
+/// Protocol` parameter it used through Sprint 7. Interior mutability (`Cell`/`Mutex`) is
+/// deliberate: it lets this be passed as `&Session` (a shared reference) rather than `&mut
+/// Protocol` (exclusive), which is what makes it possible for several concurrently-spawned RMP
+/// request tasks to hold independent `Arc<Session>` clones of the same connection's state
+/// (plan 07) — an exclusive reference could never be handed to more than one task at a time.
+///
+/// RESP's connection loop owns one `Session` across its lifetime and passes `&session` each
+/// iteration (Task 3 here). RMP's connection handler will own one `Arc<Session>` per accepted
+/// connection and clone it into every spawned per-request task (plan 07) — until then, this
+/// plan's Task 2 gives RMP a fresh, throwaway `Session::new()` per request, identical in effect
+/// to today's per-request `Protocol::default()`.
+pub struct Session {
+    protocol: std::cell::Cell<Protocol>,
+    authenticated_user: std::sync::Mutex<Option<std::sync::Arc<crate::acl::AclUser>>>,
+}
+
+impl Session {
+    pub fn new() -> Self {
+        Self {
+            protocol: std::cell::Cell::new(Protocol::default()),
+            authenticated_user: std::sync::Mutex::new(None),
+        }
+    }
+
+    pub fn protocol(&self) -> Protocol {
+        self.protocol.get()
+    }
+
+    pub fn set_protocol(&self, p: Protocol) {
+        self.protocol.set(p);
+    }
+
+    pub fn authenticated_user(&self) -> Option<std::sync::Arc<crate::acl::AclUser>> {
+        self.authenticated_user
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub fn set_authenticated_user(&self, user: Option<std::sync::Arc<crate::acl::AclUser>>) {
+        *self
+            .authenticated_user
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = user;
+    }
+}
+
+impl Default for Session {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Extracts the `Vec<Bytes>` command name+args from an `Array` of `Bulk` frames —
 /// the only shape a real RESP client ever sends a command as.
 fn frame_to_args(frame: Frame) -> Result<Vec<Bytes>, Frame> {
@@ -2203,6 +2257,50 @@ mod tests {
                 .map(|p| Frame::Bulk(Bytes::copy_from_slice(p)))
                 .collect(),
         )
+    }
+
+    #[test]
+    fn a_new_session_is_unauthenticated_with_default_protocol() {
+        let session = Session::new();
+        assert_eq!(session.protocol(), Protocol::default());
+        assert!(session.authenticated_user().is_none());
+    }
+
+    #[test]
+    fn set_protocol_and_set_authenticated_user_are_visible_through_get() {
+        let session = Session::new();
+        session.set_protocol(Protocol::Resp3);
+        assert_eq!(session.protocol(), Protocol::Resp3);
+
+        let user = std::sync::Arc::new(crate::acl::AclUser {
+            username: "app".to_string(),
+            password_hash: None,
+            enabled: true,
+            rules: vec![],
+        });
+        session.set_authenticated_user(Some(std::sync::Arc::clone(&user)));
+        assert_eq!(
+            session.authenticated_user().map(|u| u.username.clone()),
+            Some("app".to_string())
+        );
+    }
+
+    #[test]
+    fn a_mutation_through_one_arc_clone_is_visible_through_another() {
+        // The property plan 07 depends on: several tasks holding independent Arc<Session> clones
+        // (one per spawned RMP request) must all see the same underlying state.
+        let session = std::sync::Arc::new(Session::new());
+        let clone_a = std::sync::Arc::clone(&session);
+        let clone_b = std::sync::Arc::clone(&session);
+
+        let user = std::sync::Arc::new(crate::acl::AclUser {
+            username: "app".to_string(),
+            password_hash: None,
+            enabled: true,
+            rules: vec![],
+        });
+        clone_a.set_authenticated_user(Some(user));
+        assert!(clone_b.authenticated_user().is_some());
     }
 
     #[test]
