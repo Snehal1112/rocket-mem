@@ -17,10 +17,10 @@ use protocol::Frame;
 /// safely shareable across spawned tasks.
 ///
 /// RESP's connection loop owns one `Session` across its lifetime and passes `&session` each
-/// iteration (Task 3 here). RMP's connection handler will own one `Arc<Session>` per accepted
-/// connection and clone it into every spawned per-request task (plan 07) — until then, this
-/// plan's Task 2 gives RMP a fresh, throwaway `Session::new()` per request, identical in effect
-/// to today's per-request `Protocol::default()`.
+/// iteration. RMP's connection handler owns one `Arc<Session>` per accepted connection and
+/// clones it into every spawned per-request task (plan 07's `rmp_connection.rs`) — this is what
+/// lets `AUTH` on one RMP request stay visible to a later, independently-spawned request on the
+/// same connection.
 pub struct Session {
     protocol: std::sync::Mutex<Protocol>,
     authenticated_user: std::sync::Mutex<Option<std::sync::Arc<crate::acl::AclUser>>>,
