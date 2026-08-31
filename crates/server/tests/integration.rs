@@ -188,3 +188,83 @@ async fn session_state_persists_across_sequential_requests_on_one_resp_connectio
          one connection rather than resetting to a fresh Protocol::default()"
     );
 }
+
+/// Real-socket proof that `AUTH`'s effect on a connection is not a one-shot flag: a `GET` sent
+/// before `AUTH` is refused with `NOAUTH`, and a `GET` sent after `AUTH` -- on the very same
+/// connection, no reconnect -- goes through. That persistence across two independent requests
+/// only holds if auth state lives in the connection's `Session` (plan 05's wiring), not in
+/// something scoped to a single request.
+#[tokio::test]
+async fn a_resp_connection_is_denied_before_auth_and_permitted_after_on_the_same_connection() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let engine = std::sync::Arc::new(engine::Engine::new());
+    let dir = tempfile::tempdir().unwrap();
+    let aof = std::sync::Arc::new(
+        rocket_mem::aof::AofWriter::open(
+            &dir.path().join("test.aof"),
+            rocket_mem::aof::FsyncPolicy::Never,
+        )
+        .unwrap(),
+    );
+    let replication = std::sync::Arc::new(rocket_mem::replication::ReplicationHandle::default());
+    replication
+        .acl
+        .set_user(
+            "app",
+            &[
+                bytes::Bytes::from_static(b"on"),
+                bytes::Bytes::from_static(b">pw"),
+                bytes::Bytes::from_static(b"allcommands"),
+                bytes::Bytes::from_static(b"allkeys"),
+            ],
+        )
+        .unwrap();
+    tokio::spawn(rocket_mem::serve(
+        listener,
+        engine,
+        aof,
+        std::sync::Arc::clone(&replication),
+    ));
+
+    use futures_util::{SinkExt, StreamExt};
+    let mut framed = tokio_util::codec::Framed::new(
+        tokio::net::TcpStream::connect(addr).await.unwrap(),
+        protocol::codec::RespCodec::default(),
+    );
+
+    framed
+        .send(protocol::Frame::Array(vec![
+            protocol::Frame::Bulk(bytes::Bytes::from_static(b"GET")),
+            protocol::Frame::Bulk(bytes::Bytes::from_static(b"k")),
+        ]))
+        .await
+        .unwrap();
+    assert_eq!(
+        framed.next().await.unwrap().unwrap(),
+        protocol::Frame::Error("NOAUTH Authentication required.".into())
+    );
+
+    framed
+        .send(protocol::Frame::Array(vec![
+            protocol::Frame::Bulk(bytes::Bytes::from_static(b"AUTH")),
+            protocol::Frame::Bulk(bytes::Bytes::from_static(b"app")),
+            protocol::Frame::Bulk(bytes::Bytes::from_static(b"pw")),
+        ]))
+        .await
+        .unwrap();
+    assert_eq!(
+        framed.next().await.unwrap().unwrap(),
+        protocol::Frame::Simple("OK".into())
+    );
+
+    // Same connection, no reconnect -- proves auth state persisted via Session (plan 05).
+    framed
+        .send(protocol::Frame::Array(vec![
+            protocol::Frame::Bulk(bytes::Bytes::from_static(b"GET")),
+            protocol::Frame::Bulk(bytes::Bytes::from_static(b"k")),
+        ]))
+        .await
+        .unwrap();
+    assert_eq!(framed.next().await.unwrap().unwrap(), protocol::Frame::Null);
+}
