@@ -1677,8 +1677,9 @@ fn handle_info(
 /// Returns `Some(reply)` if `frame` was `HELLO`. Moved out of `dispatch` this sprint for one
 /// reason: the reply's `role` field must reflect whether this node is a follower, and only
 /// `dispatch_and_log` has the `ReplicationHandle` that knows. The protocol-switching behavior is
-/// identical to the arm it replaces, and it still mutates the caller's `&mut Protocol`, so
-/// `connection.rs`'s `framed.codec_mut().protocol = protocol` keeps working unchanged.
+/// identical to the arm it replaces, and it still writes through the caller's `&Session`
+/// (via `session.set_protocol`), so `connection.rs`'s
+/// `framed.codec_mut().protocol = session.protocol()` keeps working unchanged.
 ///
 /// `dispatch` therefore answers `HELLO` with its unknown-command error, which is correct: its
 /// only direct callers are `aof::replay` and the follower apply loop, neither of which can ever
@@ -1933,7 +1934,12 @@ fn metric_label(name: &str) -> String {
 /// follower apply loop call, and counting a 5,000-frame boot-time replay as 5,000 client
 /// commands would make every dashboard lie about traffic.
 ///
-/// The signature is byte-for-byte the one Sprint 5 left, so none of the ~36 call sites change.
+/// `dispatch_and_log`'s own signature changed in Sprint 8 (05-session-type-and-resp-wiring):
+/// its bare `protocol: &mut Protocol` parameter became `session: &Session`, updating every
+/// call site (~84, across `dispatcher.rs`'s and `replication.rs`'s test modules plus the
+/// real RESP/RMP wiring). What stayed byte-for-byte unchanged is `dispatch`'s own
+/// signature, just below -- that's the real invariant worth relying on here, since it's
+/// what lets `aof::replay` and the follower apply loop keep calling it directly.
 pub fn dispatch_and_log(
     engine: &Engine,
     aof: &crate::aof::AofWriter,
