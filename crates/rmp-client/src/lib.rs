@@ -140,6 +140,44 @@ impl RmpClient {
             .map_err(|_| RmpError::ConnectionClosed)?;
         rx.await.map_err(|_| RmpError::ConnectionClosed)
     }
+
+    pub async fn get(&self, key: impl Into<Bytes>) -> Result<Option<Bytes>, RmpError> {
+        match self
+            .call(vec![Bytes::from_static(b"GET"), key.into()])
+            .await?
+        {
+            Frame::Bulk(b) => Ok(Some(b)),
+            Frame::Null => Ok(None),
+            Frame::Error(e) => Err(RmpError::ServerError(e)),
+            other => Err(RmpError::UnexpectedReply(other)),
+        }
+    }
+
+    pub async fn set(
+        &self,
+        key: impl Into<Bytes>,
+        value: impl Into<Bytes>,
+    ) -> Result<(), RmpError> {
+        match self
+            .call(vec![Bytes::from_static(b"SET"), key.into(), value.into()])
+            .await?
+        {
+            Frame::Simple(_) => Ok(()),
+            Frame::Error(e) => Err(RmpError::ServerError(e)),
+            other => Err(RmpError::UnexpectedReply(other)),
+        }
+    }
+
+    pub async fn del(&self, key: impl Into<Bytes>) -> Result<bool, RmpError> {
+        match self
+            .call(vec![Bytes::from_static(b"DEL"), key.into()])
+            .await?
+        {
+            Frame::Integer(n) => Ok(n > 0),
+            Frame::Error(e) => Err(RmpError::ServerError(e)),
+            other => Err(RmpError::UnexpectedReply(other)),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -280,5 +318,102 @@ mod tests {
         .await
         .expect("call must fail immediately, not hang, once the connection is closed");
         assert!(matches!(second, Err(RmpError::ConnectionClosed)));
+    }
+
+    #[tokio::test]
+    async fn get_returns_none_for_a_null_reply() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut framed = Framed::new(socket, RmpCodec::default());
+            let request = framed.next().await.unwrap().unwrap();
+            framed
+                .send(RmpMessage {
+                    request_id: request.request_id,
+                    msg_type: MsgType::Response,
+                    frame: Frame::Null,
+                })
+                .await
+                .unwrap();
+        });
+
+        let client = RmpClient::connect(addr).await.unwrap();
+        assert_eq!(client.get("missing").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn set_succeeds_on_a_simple_ok_reply() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut framed = Framed::new(socket, RmpCodec::default());
+            let request = framed.next().await.unwrap().unwrap();
+            assert_eq!(
+                request.frame,
+                Frame::Array(vec![
+                    Frame::Bulk(Bytes::from_static(b"SET")),
+                    Frame::Bulk(Bytes::from_static(b"k")),
+                    Frame::Bulk(Bytes::from_static(b"v")),
+                ])
+            );
+            framed
+                .send(RmpMessage {
+                    request_id: request.request_id,
+                    msg_type: MsgType::Response,
+                    frame: Frame::Simple("OK".into()),
+                })
+                .await
+                .unwrap();
+        });
+
+        let client = RmpClient::connect(addr).await.unwrap();
+        client.set("k", "v").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn del_returns_true_when_a_key_was_removed() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut framed = Framed::new(socket, RmpCodec::default());
+            let request = framed.next().await.unwrap().unwrap();
+            framed
+                .send(RmpMessage {
+                    request_id: request.request_id,
+                    msg_type: MsgType::Response,
+                    frame: Frame::Integer(1),
+                })
+                .await
+                .unwrap();
+        });
+
+        let client = RmpClient::connect(addr).await.unwrap();
+        assert!(client.del("k").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_server_error_reply_becomes_rmp_error_server_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut framed = Framed::new(socket, RmpCodec::default());
+            let request = framed.next().await.unwrap().unwrap();
+            framed
+                .send(RmpMessage {
+                    request_id: request.request_id,
+                    msg_type: MsgType::Response,
+                    frame: Frame::Error("WRONGTYPE bad".into()),
+                })
+                .await
+                .unwrap();
+        });
+
+        let client = RmpClient::connect(addr).await.unwrap();
+        let err = client.get("k").await.unwrap_err();
+        assert!(matches!(err, RmpError::ServerError(msg) if msg == "WRONGTYPE bad"));
     }
 }
