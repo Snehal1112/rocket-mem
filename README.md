@@ -161,7 +161,9 @@ The remaining sprint (auth, ACLs, TLS & release) is scoped in the
 | List | `LPUSH`, `RPUSH` (both variadic), `LPOP`, `RPOP`, `LRANGE`, `LLEN`, `LINDEX`, `LSET`, `LTRIM`, `LREM`, `LINSERT` |
 | Set | `SADD`, `SREM`, `SMEMBERS`, `SISMEMBER`, `SCARD`, `SINTER`, `SUNION`, `SDIFF`, `SINTERSTORE`, `SUNIONSTORE`, `SDIFFSTORE`, `SPOP`, `SRANDMEMBER` |
 | Sorted Set | `ZADD`, `ZSCORE`, `ZREM`, `ZCARD`, `ZINCRBY`, `ZRANGE`, `ZRANK` |
-| Server/Cluster | `PING`, `ECHO`, `SELECT`, `COMMAND`, `HELLO`, `INFO [section]`, `SAVE`, `REPLICAOF`, `PSYNC`, `CLUSTER KEYSLOT`/`SHARDS`/`NODES`/`INFO`/`MYID`, `SLOWLOG GET`/`LEN`/`RESET` |
+| Server/Cluster | `PING`, `ECHO`, `DEBUG SLEEP`[^debug-sleep-cap], `SELECT`, `COMMAND`, `HELLO`, `INFO [section]`, `SAVE`, `REPLICAOF`, `PSYNC`, `CLUSTER KEYSLOT`/`SHARDS`/`NODES`/`INFO`/`MYID`, `SLOWLOG GET`/`LEN`/`RESET` |
+
+[^debug-sleep-cap]: `DEBUG SLEEP` is capped at a 10-second maximum duration; a longer request is rejected with an error rather than accepted and blocking a server thread indefinitely.
 
 `KEYS`'s glob support is intentionally partial: no character ranges (`[a-z]`), negation
 (`[^abc]`), or escaping. Active expiry sweeps one whole shard per 100ms tick rather than
@@ -237,7 +239,9 @@ requests without waiting for each reply — each carries a `request_id` the matc
 echoes back, so replies may arrive in any order. Because each request is handled on its own spawned
 task, commands sent back-to-back on one RMP connection may also *execute* out of order relative to
 each other, not just reply out of order — unlike RESP's strict send-order execution, a client that
-needs command B to see command A's effect must await A's reply before sending B:
+needs command B to see command A's effect must await A's reply before sending B. Each connection
+caps how many requests can be mid-dispatch at once at 256 — pipelining beyond that applies ordinary
+TCP backpressure (the read loop pauses) rather than spawning unbounded tasks:
 
 ```bash
 ROCKET_MEM_RMP_ADDR=127.0.0.1:6380 cargo run --release --bin rocket-mem
