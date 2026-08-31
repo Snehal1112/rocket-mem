@@ -321,11 +321,11 @@ impl AclStore {
                 .cloned()
         };
         let Some(user) = user else {
-            verify_password(password, dummy_password_hash());
+            std::hint::black_box(verify_password(password, dummy_password_hash()));
             return None;
         };
         if !user.enabled {
-            verify_password(password, dummy_password_hash());
+            std::hint::black_box(verify_password(password, dummy_password_hash()));
             return None;
         }
         match &user.password_hash {

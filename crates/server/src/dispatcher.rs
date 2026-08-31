@@ -1796,12 +1796,28 @@ fn handle_hello(
     };
     let args = &items[1..];
     Some(match args.first() {
-        None => hello_reply(session.protocol(), client_id, role, mode),
+        None => {
+            // A bare HELLO has no inline AUTH to apply, so check the session's auth state as it
+            // stands: real Redis returns NOAUTH for a bare HELLO under requirepass/ACL, allowing
+            // only the inline-AUTH-bearing form (handled below) through unauthenticated. A
+            // session already authenticated from a prior AUTH call still negotiates normally.
+            if !replication.acl.is_empty() && session.authenticated_user().is_none() {
+                return Some(Frame::Error("NOAUTH Authentication required.".into()));
+            }
+            hello_reply(session.protocol(), client_id, role, mode)
+        }
         Some(Frame::Bulk(arg)) => match arg.as_ref() {
             b"2" => {
                 if let Err(err_or_syntax) = apply_hello_extra_args(&args[1..], replication, session)
                 {
                     return Some(err_or_syntax);
+                }
+                // Checked after `apply_hello_extra_args` so a successful inline `AUTH` (which
+                // just set the session's authenticated user) is credited before this looks --
+                // "would this HELLO complete without having just authenticated or already being
+                // authenticated," not "was AUTH attempted."
+                if !replication.acl.is_empty() && session.authenticated_user().is_none() {
+                    return Some(Frame::Error("NOAUTH Authentication required.".into()));
                 }
                 session.set_protocol(Protocol::Resp2);
                 hello_reply(session.protocol(), client_id, role, mode)
@@ -1810,6 +1826,9 @@ fn handle_hello(
                 if let Err(err_or_syntax) = apply_hello_extra_args(&args[1..], replication, session)
                 {
                     return Some(err_or_syntax);
+                }
+                if !replication.acl.is_empty() && session.authenticated_user().is_none() {
+                    return Some(Frame::Error("NOAUTH Authentication required.".into()));
                 }
                 session.set_protocol(Protocol::Resp3);
                 hello_reply(session.protocol(), client_id, role, mode)
@@ -2016,14 +2035,20 @@ fn auth_gate(
     }
     let name = command_name_upper(frame)?;
     let name = name.as_str();
-    // HELLO is exempted alongside AUTH/ACL, not just for protocol negotiation but because it is
+    // HELLO is exempted alongside AUTH, not just for protocol negotiation but because it is
     // itself a valid way to authenticate: real RESP3 client libraries send credentials as
     // `HELLO <ver> AUTH <user> <pass>` in one command (see `apply_hello_extra_args`) rather than
     // a separate `AUTH` call. Blocking HELLO here would make that inline form unreachable --
     // every such client would get NOAUTH before `handle_hello` ever saw the frame. `handle_hello`
     // itself still only authenticates the session when the trailing tokens are exactly that
     // shape; every other command run through a still-unauthenticated session remains gated below.
-    if name == "AUTH" || name == "ACL" || name == "HELLO" {
+    //
+    // ACL is deliberately NOT exempted, matching real Redis's `CMD_NO_AUTH` set (only AUTH,
+    // HELLO, RESET). No `ACL` command exists yet (that's plan 08), so this has no effect today --
+    // but exempting it here would become a full authentication bypass the moment `ACL SETUSER`
+    // lands: an unauthenticated client could run `ACL SETUSER attacker on >x allcommands allkeys`
+    // then `AUTH attacker x`.
+    if name == "AUTH" || name == "HELLO" {
         return None; // always reachable regardless of auth state
     }
     let Some(user) = session.authenticated_user() else {
@@ -2573,7 +2598,7 @@ mod tests {
     }
 
     #[test]
-    fn auth_gate_lets_auth_and_acl_commands_through_even_when_unauthenticated() {
+    fn auth_gate_lets_auth_through_even_when_unauthenticated() {
         let replication = ReplicationHandle::default();
         replication
             .acl
@@ -2584,12 +2609,30 @@ mod tests {
             Frame::Bulk(Bytes::from_static(b"AUTH")),
             Frame::Bulk(Bytes::from_static(b"pw")),
         ]);
+        assert!(auth_gate(&replication, &session, &auth_frame).is_none());
+    }
+
+    /// No `ACL` command exists yet (that's plan 08), so this documents the gate's behavior for
+    /// when it lands: unlike `AUTH`/`HELLO`, `ACL` is not exempted -- matching real Redis's own
+    /// `CMD_NO_AUTH` set -- so an unauthenticated `ACL WHOAMI` gets NOAUTH here, same as any other
+    /// gated command, rather than reaching `dispatch`'s ordinary unknown-command error.
+    #[test]
+    fn auth_gate_denies_an_unauthenticated_acl_command() {
+        let replication = ReplicationHandle::default();
+        replication
+            .acl
+            .set_user("app", &[Bytes::from_static(b"on")])
+            .unwrap();
+        let session = Session::new();
         let acl_frame = Frame::Array(vec![
             Frame::Bulk(Bytes::from_static(b"ACL")),
             Frame::Bulk(Bytes::from_static(b"WHOAMI")),
         ]);
-        assert!(auth_gate(&replication, &session, &auth_frame).is_none());
-        assert!(auth_gate(&replication, &session, &acl_frame).is_none());
+        let reply = auth_gate(&replication, &session, &acl_frame).unwrap();
+        assert_eq!(
+            reply,
+            Frame::Error("NOAUTH Authentication required.".into())
+        );
     }
 
     #[test]
@@ -5648,6 +5691,131 @@ mod tests {
         );
         assert_eq!(reply, Frame::Error("ERR syntax error".into()));
         assert_eq!(session.protocol(), Protocol::Resp2); // unchanged in both cases
+    }
+
+    #[test]
+    fn bare_hello_with_acl_configured_and_no_prior_auth_returns_noauth() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let replication = ReplicationHandle::default();
+        replication
+            .acl
+            .set_user(
+                "app",
+                &[Bytes::from_static(b"on"), Bytes::from_static(b">pw")],
+            )
+            .unwrap();
+        let session = Session::new();
+        let reply = dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"HELLO", b"3"]),
+            &session,
+            1,
+        );
+        assert_eq!(session.protocol(), Protocol::Resp2); // unchanged — the switch never happened
+        assert_eq!(
+            reply,
+            Frame::Error("NOAUTH Authentication required.".into())
+        );
+    }
+
+    #[test]
+    fn hello_with_no_version_arg_and_acl_configured_but_no_prior_auth_returns_noauth() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let replication = ReplicationHandle::default();
+        replication
+            .acl
+            .set_user(
+                "app",
+                &[Bytes::from_static(b"on"), Bytes::from_static(b">pw")],
+            )
+            .unwrap();
+        let session = Session::new();
+        let reply = dispatch_and_log(&engine, &aof, &replication, cmd(&[b"HELLO"]), &session, 1);
+        assert_eq!(
+            reply,
+            Frame::Error("NOAUTH Authentication required.".into())
+        );
+    }
+
+    /// A session that already authenticated via a prior, separate `AUTH` call must still be able
+    /// to negotiate protocol via `HELLO` (bare, `HELLO 2`, or `HELLO 3`) -- the NOAUTH gate added
+    /// to `handle_hello` must not re-demand credentials from an already-authenticated connection.
+    #[test]
+    fn hello_variants_succeed_when_the_session_is_already_authenticated() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let replication = ReplicationHandle::default();
+        replication
+            .acl
+            .set_user(
+                "app",
+                &[
+                    Bytes::from_static(b"on"),
+                    Bytes::from_static(b">pw"),
+                    Bytes::from_static(b"allcommands"),
+                    Bytes::from_static(b"allkeys"),
+                ],
+            )
+            .unwrap();
+
+        let variants: [Vec<&[u8]>; 3] = [
+            vec![&b"HELLO"[..]],
+            vec![&b"HELLO"[..], &b"2"[..]],
+            vec![&b"HELLO"[..], &b"3"[..]],
+        ];
+        for hello_args in variants {
+            let session = Session::new();
+            let auth_reply = dispatch_and_log(
+                &engine,
+                &aof,
+                &replication,
+                cmd(&[b"AUTH", b"app", b"pw"]),
+                &session,
+                1,
+            );
+            assert_eq!(auth_reply, Frame::Simple("OK".into()));
+
+            let hello_reply =
+                dispatch_and_log(&engine, &aof, &replication, cmd(&hello_args), &session, 1);
+            assert!(
+                matches!(hello_reply, Frame::Map(_)),
+                "expected {hello_args:?} to succeed for an already-authenticated session, got \
+                 {hello_reply:?}"
+            );
+        }
+    }
+
+    /// Re-verifies `hello_3_with_inline_auth_authenticates_and_negotiates_resp3` above still
+    /// holds after the NOAUTH gate was added to `handle_hello`: a `HELLO 3 AUTH user pass` that
+    /// successfully authenticates must still negotiate protocol and succeed, not be blocked by
+    /// the new "would this HELLO complete without having just authenticated" check.
+    #[test]
+    fn hello_3_with_correct_inline_auth_still_negotiates_resp3_after_the_noauth_gate() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let replication = ReplicationHandle::default();
+        replication
+            .acl
+            .set_user(
+                "app",
+                &[Bytes::from_static(b"on"), Bytes::from_static(b">pw")],
+            )
+            .unwrap();
+        let session = Session::new();
+        let reply = dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"HELLO", b"3", b"AUTH", b"app", b"pw"]),
+            &session,
+            1,
+        );
+        assert_eq!(session.protocol(), Protocol::Resp3);
+        assert!(matches!(reply, Frame::Map(_)), "got {reply:?}");
     }
 
     use crate::aof::{AofWriter, FsyncPolicy};

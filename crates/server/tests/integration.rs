@@ -268,3 +268,76 @@ async fn a_resp_connection_is_denied_before_auth_and_permitted_after_on_the_same
         .unwrap();
     assert_eq!(framed.next().await.unwrap().unwrap(), protocol::Frame::Null);
 }
+
+/// Real-socket proof that `PSYNC` cannot be used to bypass the auth gate: `handle_connection`
+/// intercepts `PSYNC` before the frame loop ever calls `dispatch_and_log` (where `auth_gate`
+/// normally runs), so without its own explicit check, any unauthenticated client could send
+/// `PSYNC` first and receive a full snapshot of the entire keyspace plus a live stream of every
+/// subsequent write. With an ACL user configured, an unauthenticated `PSYNC ? -1` on a fresh
+/// connection must get `NOAUTH Authentication required.` back as an ordinary RESP error frame --
+/// not the length-prefixed snapshot blob `serve_replica` would otherwise send.
+#[tokio::test]
+async fn psync_is_denied_before_auth_on_an_unauthenticated_connection() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let engine = std::sync::Arc::new(engine::Engine::new());
+    let dir = tempfile::tempdir().unwrap();
+    let aof = std::sync::Arc::new(
+        rocket_mem::aof::AofWriter::open(
+            &dir.path().join("test.aof"),
+            rocket_mem::aof::FsyncPolicy::Never,
+        )
+        .unwrap(),
+    );
+    let replication = std::sync::Arc::new(rocket_mem::replication::ReplicationHandle::default());
+    replication
+        .acl
+        .set_user(
+            "app",
+            &[
+                bytes::Bytes::from_static(b"on"),
+                bytes::Bytes::from_static(b">pw"),
+                bytes::Bytes::from_static(b"allcommands"),
+                bytes::Bytes::from_static(b"allkeys"),
+            ],
+        )
+        .unwrap();
+    tokio::spawn(rocket_mem::serve(
+        listener,
+        engine,
+        aof,
+        std::sync::Arc::clone(&replication),
+    ));
+
+    use futures_util::{SinkExt, StreamExt};
+    let mut framed = tokio_util::codec::Framed::new(
+        tokio::net::TcpStream::connect(addr).await.unwrap(),
+        protocol::codec::RespCodec::default(),
+    );
+
+    framed
+        .send(protocol::Frame::Array(vec![
+            protocol::Frame::Bulk(bytes::Bytes::from_static(b"PSYNC")),
+            protocol::Frame::Bulk(bytes::Bytes::from_static(b"?")),
+            protocol::Frame::Bulk(bytes::Bytes::from_static(b"-1")),
+        ]))
+        .await
+        .unwrap();
+    assert_eq!(
+        framed.next().await.unwrap().unwrap(),
+        protocol::Frame::Error("NOAUTH Authentication required.".into())
+    );
+
+    // The connection must still be alive and usable afterward -- PSYNC being rejected must not
+    // tear down the connection, only decline to serve the replica stream on it.
+    framed
+        .send(protocol::Frame::Array(vec![protocol::Frame::Bulk(
+            bytes::Bytes::from_static(b"PING"),
+        )]))
+        .await
+        .unwrap();
+    assert_eq!(
+        framed.next().await.unwrap().unwrap(),
+        protocol::Frame::Error("NOAUTH Authentication required.".into())
+    );
+}
