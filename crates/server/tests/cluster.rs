@@ -121,7 +121,7 @@ fn moved_target(reply: &Frame) -> String {
 #[tokio::test]
 async fn every_node_reports_the_same_three_shard_topology() {
     let cluster = spawn_3_shard_cluster().await;
-    for i in 0..3 {
+    for (i, node_id) in NODE_IDS.iter().enumerate() {
         let mut c = connect(cluster.addr(i)).await;
         let Frame::Bulk(info) = send(&mut c, &[b"CLUSTER", b"INFO"]).await else {
             panic!("expected Bulk")
@@ -132,7 +132,7 @@ async fn every_node_reports_the_same_three_shard_topology() {
 
         assert_eq!(
             send(&mut c, &[b"CLUSTER", b"MYID"]).await,
-            Frame::Bulk(Bytes::from(NODE_IDS[i]))
+            Frame::Bulk(Bytes::from(*node_id))
         );
 
         let Frame::Array(shards) = send(&mut c, &[b"CLUSTER", b"SHARDS"]).await else {
