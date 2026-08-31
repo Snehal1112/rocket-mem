@@ -55,6 +55,11 @@ async fn handle_connection(
     let _client_guard = ClientGuard(Arc::clone(&replication));
     let framed = Framed::new(socket, RmpCodec);
     let (mut sink, mut stream) = framed.split();
+    // ONE Session for this connection's whole lifetime, shared by every request spawned below --
+    // this is what lets AUTH on one request be observed by a later, independently-spawned
+    // request on the same connection. See
+    // ../../docs/superpowers/plans/2026-08-31-sprint-8-plans/07-rmp-session-sharing.md.
+    let session = Arc::new(dispatcher::Session::new());
 
     // Every spawned request-handling task below gets its own clone of `tx`; this loop's own
     // clone is dropped when the read loop ends. The writer task's `rx.recv()` only returns
@@ -92,12 +97,12 @@ async fn handle_connection(
         let aof = Arc::clone(&aof);
         let replication = Arc::clone(&replication);
         let tx = tx.clone();
+        let session = Arc::clone(&session);
         // Spawned, not awaited inline: the read loop must go straight back to decoding the next
         // request without waiting for this one's reply -- that's what makes multiple in-flight
         // requests on one connection possible at all.
         tokio::spawn(async move {
             let _permit = permit; // released (dropped) when this task ends, freeing a slot
-            let session = dispatcher::Session::new(); // still one-per-request here; plan 07 shares one per connection
             let reply = dispatcher::dispatch_and_log(
                 &engine,
                 &aof,
