@@ -290,6 +290,10 @@ This maps the 16-week phase plan (`rocket-mem-production-plan.md`) onto 2-week s
 ## Sprint 7 — Custom protocol: design & implementation
 **Maps to:** Weeks 13-14 | **Dates:** Day 85–98
 
+**Status:** ✅ Complete — full P0 scope shipped, plus the P1 client library. See
+`docs/superpowers/specs/2026-08-31-sprint-7-spec.md` and
+`docs/superpowers/plans/2026-08-31-sprint-7-plans/`.
+
 **Sprint goal:** Your own protocol is live alongside RESP, both reading and writing the same shared keyspace.
 
 ### Capacity
@@ -315,9 +319,9 @@ This maps the 16-week phase plan (`rocket-mem-production-plan.md`) onto 2-week s
 | Dual-protocol wiring reveals the engine wasn't as protocol-agnostic as assumed | Forces changes back in the engine layer | This is a good signal, not a failure — the Architecture Decision Record exists precisely so this stays a contained fix, not a rewrite |
 
 ### Definition of done
-- [ ] Protocol spec doc committed
-- [ ] Integration test proves a write via RESP is visible via the new protocol (and vice versa)
-- [ ] Minimal client library can perform at least GET/SET-equivalent operations
+- [x] Protocol spec doc committed
+- [x] Integration test proves a write via RESP is visible via the new protocol (and vice versa)
+- [x] Minimal client library can perform at least GET/SET-equivalent operations
 
 ### Key dates
 | Day | Event |
