@@ -1972,11 +1972,10 @@ fn handle_slowlog(
 /// `dispatch` -- or `None` for any other command. Same interception shape as `handle_cluster`/
 /// `handle_slowlog` above.
 ///
-/// `session` is unused by this task's `SETUSER`/`DELUSER` subcommands but kept in the signature
-/// (matching `handle_auth`'s shape) for future subcommands like `ACL WHOAMI` that need it.
+/// `session` is used by `WHOAMI` to report the caller's cached authenticated identity.
 fn handle_acl(
     frame: &Frame,
-    _session: &Session,
+    session: &Session,
     replication: &crate::replication::ReplicationHandle,
 ) -> Option<Frame> {
     let Frame::Array(items) = frame else {
@@ -1997,8 +1996,57 @@ fn handle_acl(
     Some(match sub.as_str() {
         "SETUSER" => acl_setuser(items, replication),
         "DELUSER" => acl_deluser(items, replication),
+        "WHOAMI" => acl_whoami(session),
+        "LIST" => acl_list(replication),
         _ => Frame::Error(format!("ERR unknown ACL subcommand '{sub}'")),
     })
+}
+
+/// Renders one `AclRule` in `ACL SETUSER`'s own token vocabulary -- the single source of truth
+/// both `render_user_line` and `GETUSER` (Task 3) build their output from.
+fn rule_token(rule: &crate::acl::AclRule) -> String {
+    use crate::acl::AclRule;
+    match rule {
+        AclRule::AllCommands => "+@all".to_string(),
+        AclRule::NoCommands => "-@all".to_string(),
+        AclRule::AllowCommand(c) => format!("+{}", c.to_lowercase()),
+        AclRule::DenyCommand(c) => format!("-{}", c.to_lowercase()),
+        AclRule::AllKeys => "~*".to_string(),
+        AclRule::KeyPattern(p) => format!("~{p}"),
+    }
+}
+
+fn render_user_line(user: &crate::acl::AclUser) -> String {
+    let mut parts = vec!["user".to_string(), user.username.clone()];
+    parts.push(if user.enabled {
+        "on".to_string()
+    } else {
+        "off".to_string()
+    });
+    parts.push(match &user.password_hash {
+        None => "nopass".to_string(),
+        Some(h) => format!("#{h}"),
+    });
+    parts.extend(user.rules.iter().map(rule_token));
+    parts.join(" ")
+}
+
+fn acl_whoami(session: &Session) -> Frame {
+    match session.authenticated_user() {
+        Some(u) => Frame::Bulk(Bytes::from(u.username.clone())),
+        None => Frame::Bulk(Bytes::from_static(b"default")),
+    }
+}
+
+fn acl_list(replication: &crate::replication::ReplicationHandle) -> Frame {
+    Frame::Array(
+        replication
+            .acl
+            .list()
+            .into_iter()
+            .map(|u| Frame::Bulk(Bytes::from(render_user_line(&u))))
+            .collect(),
+    )
 }
 
 fn acl_setuser(items: &[Frame], replication: &crate::replication::ReplicationHandle) -> Frame {
@@ -3105,6 +3153,77 @@ mod tests {
         assert_eq!(
             auth_reply,
             Frame::Error("WRONGPASS invalid username-password pair or user is disabled.".into())
+        );
+    }
+
+    #[test]
+    fn acl_whoami_reports_default_when_unauthenticated() {
+        let replication = ReplicationHandle::default();
+        let session = Session::new();
+        let reply = handle_acl(&acl_cmd(&[b"WHOAMI"]), &session, &replication).unwrap();
+        assert_eq!(reply, Frame::Bulk(Bytes::from_static(b"default")));
+    }
+
+    #[test]
+    fn acl_whoami_reports_the_authenticated_username() {
+        let replication = ReplicationHandle::default();
+        let session = Session::new();
+        session.set_authenticated_user(Some(std::sync::Arc::new(crate::acl::AclUser {
+            username: "app".to_string(),
+            password_hash: None,
+            enabled: true,
+            rules: vec![],
+        })));
+        let reply = handle_acl(&acl_cmd(&[b"WHOAMI"]), &session, &replication).unwrap();
+        assert_eq!(reply, Frame::Bulk(Bytes::from_static(b"app")));
+    }
+
+    #[test]
+    fn acl_list_renders_one_line_per_user_real_redis_shaped() {
+        let replication = ReplicationHandle::default();
+        replication
+            .acl
+            .set_user(
+                "app",
+                &[
+                    Bytes::from_static(b"on"),
+                    Bytes::from_static(b">pw"),
+                    Bytes::from_static(b"~app:*"),
+                    Bytes::from_static(b"+get"),
+                ],
+            )
+            .unwrap();
+        let session = Session::new();
+        let reply = handle_acl(&acl_cmd(&[b"LIST"]), &session, &replication).unwrap();
+        let Frame::Array(lines) = reply else {
+            panic!("expected an array")
+        };
+        assert_eq!(lines.len(), 1);
+        let Frame::Bulk(line) = &lines[0] else {
+            panic!("expected a bulk string")
+        };
+        let line = String::from_utf8_lossy(line);
+        assert!(line.starts_with("user app on "), "got: {line}");
+        assert!(line.contains("~app:*"));
+        assert!(line.contains("+get"));
+    }
+
+    #[test]
+    fn rule_token_renders_every_variant() {
+        assert_eq!(rule_token(&crate::acl::AclRule::AllCommands), "+@all");
+        assert_eq!(rule_token(&crate::acl::AclRule::NoCommands), "-@all");
+        assert_eq!(
+            rule_token(&crate::acl::AclRule::AllowCommand("GET".to_string())),
+            "+get"
+        );
+        assert_eq!(
+            rule_token(&crate::acl::AclRule::DenyCommand("SET".to_string())),
+            "-set"
+        );
+        assert_eq!(rule_token(&crate::acl::AclRule::AllKeys), "~*");
+        assert_eq!(
+            rule_token(&crate::acl::AclRule::KeyPattern("app:*".to_string())),
+            "~app:*"
         );
     }
 
