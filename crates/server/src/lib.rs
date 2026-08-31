@@ -1,3 +1,4 @@
+pub mod acl;
 pub mod aof;
 pub mod cluster;
 pub mod config;
