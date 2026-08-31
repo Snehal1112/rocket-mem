@@ -241,6 +241,32 @@ fn apply_tokens(mut base: AclUser, tokens: &[AclToken]) -> AclUser {
     base
 }
 
+/// Converts one TOML `[[acl.users]]` entry into a fully-formed `AclUser`. `cfg.rules` must
+/// contain only rule tokens (`+CMD`/`-CMD`/`~pattern`/`allcommands`/`nocommands`/`allkeys`) --
+/// `enabled` and `password` are `AclUserConfig`'s own fields precisely so they don't also need
+/// to appear as `on`/`off`/`>pw` tokens inside `rules`, and a `rules` entry that parses as one of
+/// those (or fails to parse at all) is rejected rather than silently ignored.
+pub fn from_bootstrap_config(cfg: &crate::config::AclUserConfig) -> Result<AclUser, AclError> {
+    let mut rules = Vec::with_capacity(cfg.rules.len());
+    for raw in &cfg.rules {
+        match parse_token(raw.as_bytes())? {
+            AclToken::Rule(r) => rules.push(r),
+            AclToken::On | AclToken::Off | AclToken::NoPass | AclToken::Password(_) => {
+                return Err(AclError::SyntaxError(raw.clone()))
+            }
+        }
+    }
+    Ok(AclUser {
+        username: cfg.username.clone(),
+        password_hash: cfg
+            .password
+            .as_deref()
+            .map(|pw| hash_password(pw.as_bytes())),
+        enabled: cfg.enabled,
+        rules,
+    })
+}
+
 /// One configured ACL user: its login state, password hash (`None` for `nopass`), and the
 /// ordered list of rules `is_allowed` folds to answer permission questions.
 #[derive(Debug, Clone)]
@@ -657,5 +683,62 @@ mod tests {
         });
         assert!(!store.is_empty());
         assert!(store.get_user("seed").unwrap().enabled);
+    }
+
+    fn cfg(
+        username: &str,
+        password: Option<&str>,
+        enabled: bool,
+        rules: &[&str],
+    ) -> crate::config::AclUserConfig {
+        crate::config::AclUserConfig {
+            username: username.to_string(),
+            password: password.map(|p| p.to_string()),
+            enabled,
+            rules: rules.iter().map(|r| r.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn from_bootstrap_config_builds_a_matching_acl_user() {
+        let user =
+            from_bootstrap_config(&cfg("app", Some("pw"), true, &["~app:*", "+get", "-set"]))
+                .unwrap();
+        assert_eq!(user.username, "app");
+        assert!(user.enabled);
+        assert!(user.password_hash.is_some());
+        assert!(verify_password(
+            b"pw",
+            user.password_hash.as_deref().unwrap()
+        ));
+        assert_eq!(
+            user.rules,
+            vec![
+                AclRule::KeyPattern("app:*".to_string()),
+                AclRule::AllowCommand("GET".to_string()),
+                AclRule::DenyCommand("SET".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn from_bootstrap_config_with_no_password_is_nopass() {
+        let user =
+            from_bootstrap_config(&cfg("nopass-user", None, true, &["allcommands", "allkeys"]))
+                .unwrap();
+        assert_eq!(user.password_hash, None);
+    }
+
+    #[test]
+    fn from_bootstrap_config_rejects_an_on_off_or_password_token_inside_rules() {
+        // `enabled`/`password` are their own AclUserConfig fields; the `rules` list must contain
+        // only rule tokens (+CMD/-CMD/~pattern/allcommands/.../allkeys), not "on"/"off"/">pw".
+        assert!(from_bootstrap_config(&cfg("bad", None, true, &["on"])).is_err());
+        assert!(from_bootstrap_config(&cfg("bad", None, true, &[">oops"])).is_err());
+    }
+
+    #[test]
+    fn from_bootstrap_config_rejects_a_malformed_rule_token() {
+        assert!(from_bootstrap_config(&cfg("bad", None, true, &["garbage"])).is_err());
     }
 }

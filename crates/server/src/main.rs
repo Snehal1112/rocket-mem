@@ -53,6 +53,19 @@ async fn main() -> std::io::Result<()> {
         (None, None) => None,
     };
 
+    let acl_users: Vec<rocket_mem::acl::AclUser> = config
+        .acl
+        .users
+        .iter()
+        .map(rocket_mem::acl::from_bootstrap_config)
+        .collect::<Result<_, _>>()
+        .map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("acl bootstrap: {e}"),
+            )
+        })?;
+
     let engine = Arc::new(rocket_mem::aof::recover(aof_path, snapshot_path)?);
     println!(
         "Recovered state from {} and {}",
@@ -73,7 +86,8 @@ async fn main() -> std::io::Result<()> {
         snapshot_path.to_path_buf(),
     )
     .with_aof(Arc::clone(&aof))
-    .with_slowlog_threshold(slowlog_threshold);
+    .with_slowlog_threshold(slowlog_threshold)
+    .with_acl_bootstrap(acl_users);
     if let Some(cluster) = cluster {
         handle = handle.with_cluster(cluster);
     }
