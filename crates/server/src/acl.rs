@@ -12,7 +12,7 @@ use argon2::password_hash::{
 };
 use argon2::Argon2;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 /// One permission grant or restriction parsed from an `ACL SETUSER` rule token. `on`/`off` and
 /// password tokens live on `AclToken` instead -- they're user-level state, not permission rules,
@@ -130,6 +130,16 @@ pub fn verify_password(password: &[u8], hash: &str) -> bool {
         return false;
     };
     Argon2::default().verify_password(password, &parsed).is_ok()
+}
+
+/// A fixed argon2 hash of a placeholder password, computed once (on first use, not at process
+/// start) and reused by every `AclStore::authenticate` call that rejects on a path which would
+/// otherwise skip argon2 entirely -- see `authenticate`'s own doc comment for why that matters.
+static DUMMY_PASSWORD_HASH: OnceLock<String> = OnceLock::new();
+
+fn dummy_password_hash() -> &'static str {
+    DUMMY_PASSWORD_HASH
+        .get_or_init(|| hash_password(b"dummy-password-for-constant-time-comparison"))
 }
 
 /// Rejects a username that would corrupt plan 08's future `ACL LIST` output -- one
@@ -295,6 +305,13 @@ impl AclStore {
     /// as arbitrary bytes, so narrowing to `&str` here would force a lossy UTF-8 conversion at
     /// the call site (`String::from_utf8_lossy` collapses distinct invalid byte sequences to the
     /// same string -- a narrow auth-bypass shape).
+    ///
+    /// Both the "no such user" and "user disabled" paths call `verify_password` against a fixed
+    /// dummy hash before returning `None`, even though the result is discarded. Without this, an
+    /// unknown or disabled username returns in well under a millisecond while a known, enabled
+    /// user with the wrong password takes argon2's ~10-20ms -- a response-latency side channel
+    /// that lets a caller enumerate valid usernames without ever guessing a password. Paying the
+    /// same argon2 cost on every rejection path closes that timing oracle.
     pub fn authenticate(&self, username: &str, password: &[u8]) -> Option<Arc<AclUser>> {
         let user = {
             self.users
@@ -302,8 +319,13 @@ impl AclStore {
                 .unwrap_or_else(|e| e.into_inner())
                 .get(username)
                 .cloned()
-        }?;
+        };
+        let Some(user) = user else {
+            verify_password(password, dummy_password_hash());
+            return None;
+        };
         if !user.enabled {
+            verify_password(password, dummy_password_hash());
             return None;
         }
         match &user.password_hash {
@@ -739,6 +761,23 @@ mod tests {
     fn authenticate_an_unknown_username_fails() {
         let store = AclStore::default();
         assert!(store.authenticate("nobody", b"anything").is_none());
+    }
+
+    #[test]
+    fn authenticate_still_returns_none_on_the_paths_that_now_pay_the_dummy_argon2_cost() {
+        // Timing-oracle fix: an unknown username or a disabled user now calls `verify_password`
+        // against a fixed dummy hash before returning `None`, so both rejection paths take
+        // comparable time to a wrong-password rejection below (which always ran argon2). This
+        // test can't assert the timing itself -- real timing-equalization checks are flaky in a
+        // unit test -- it only documents that the fix left the `Some`/`None` return shape
+        // unchanged for both paths.
+        let store = AclStore::default();
+        assert!(store.authenticate("nobody", b"anything").is_none());
+
+        store
+            .set_user("app", &tokens(&["off", ">hunter2"]))
+            .unwrap();
+        assert!(store.authenticate("app", b"hunter2").is_none());
     }
 
     #[test]
