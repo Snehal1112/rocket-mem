@@ -1028,13 +1028,11 @@ pub fn dispatch(engine: &Engine, frame: Frame, _protocol: &mut Protocol, _client
 /// Shared by `handle_auth` and `handle_hello`'s inline `AUTH` support -- both need the exact same
 /// "check the ACL store, verify the password" logic, differing only in what each does with the
 /// result: `handle_auth` replies `OK`, `handle_hello` continues on to its own success reply.
-/// `session` isn't read here -- it's threaded through so both call sites have it at hand without
-/// needing a second helper signature, and so this function's shape stays parallel to the ones it
-/// replaces (`handle_auth`'s pre-Task-2 body, `handle_hello`'s syntax-error-only check) --
-/// setting the authenticated user on success is each caller's own responsibility, not this one's.
+/// Setting the authenticated user on success is each caller's own responsibility, not this one's
+/// -- both call sites already hold their own `session` and call `set_authenticated_user` after
+/// this returns.
 fn try_authenticate(
     replication: &crate::replication::ReplicationHandle,
-    _session: &Session,
     username: &str,
     password: &[u8],
 ) -> Result<std::sync::Arc<crate::acl::AclUser>, Frame> {
@@ -1087,15 +1085,13 @@ fn handle_auth(
             ))
         }
     };
-    Some(
-        match try_authenticate(replication, session, &username, password) {
-            Ok(user) => {
-                session.set_authenticated_user(Some(user));
-                Frame::Simple("OK".into())
-            }
-            Err(frame) => frame,
-        },
-    )
+    Some(match try_authenticate(replication, &username, password) {
+        Ok(user) => {
+            session.set_authenticated_user(Some(user));
+            Frame::Simple("OK".into())
+        }
+        Err(frame) => frame,
+    })
 }
 
 fn hello_reply(
@@ -1171,6 +1167,7 @@ fn extract_write_command_name(frame: &Frame) -> Option<CommandName> {
 /// reach, quietly breaking the routing invariant. Step 3a below is the check.
 pub(crate) const KNOWN_COMMANDS: &[&str] = &[
     "APPEND",
+    "AUTH",
     "CLUSTER",
     "COMMAND",
     "DEBUG",
@@ -1277,7 +1274,12 @@ enum KeySpec {
 fn key_spec(name: &str) -> KeySpec {
     match name {
         "PING" | "ECHO" | "SELECT" | "COMMAND" | "INFO" | "HELLO" | "KEYS" | "SCAN"
-        | "RANDOMKEY" | "CLUSTER" | "SAVE" | "REPLICAOF" | "PSYNC" | "SLOWLOG" | "DEBUG" => {
+        | "RANDOMKEY" | "CLUSTER" | "SAVE" | "REPLICAOF" | "PSYNC" | "SLOWLOG" | "DEBUG"
+        | "AUTH" => {
+            // AUTH has no keys -- its arguments are a username/password, never a routable key.
+            // Without this exception it would fall through to the `KNOWN_COMMANDS` catch-all
+            // below and get `KeySpec::First`, which in cluster mode would hash the plaintext
+            // password to a slot and potentially -MOVED it before it's ever authenticated.
             KeySpec::None
         }
         "MEMORY" | "OBJECT" => KeySpec::Second,
@@ -1843,7 +1845,7 @@ fn apply_hello_extra_args(
         return Err(Frame::Error("ERR syntax error".into()));
     }
     let username = String::from_utf8_lossy(user).into_owned();
-    match try_authenticate(replication, session, &username, pass) {
+    match try_authenticate(replication, &username, pass) {
         Ok(authenticated) => {
             session.set_authenticated_user(Some(authenticated));
             Ok(())
@@ -2055,10 +2057,24 @@ fn command_name_upper(frame: &Frame) -> Option<CommandName> {
 /// arguments followed the name. Read before `frame` is moved into `dispatch_and_log_inner`,
 /// because `dispatch` consumes the frame; see this plan's Global Constraints for why the slow log
 /// carries this instead of the whole argument list.
+///
+/// `AUTH` is special-cased to never surface an argument as a "key": its 2-arg form's
+/// `items.get(1)` is the plaintext password, not a key, and logging it would leak the password
+/// through `SLOWLOG GET` to any client with SLOWLOG permission (argon2 verification alone
+/// reliably clears the default 10ms slowlog threshold, so essentially every AUTH call would be
+/// logged). Real Redis redacts AUTH the same way for SLOWLOG/MONITOR/logs. This is also just
+/// semantically correct independent of the security angle -- AUTH's arguments were never real
+/// keys, so nothing about slowlog's purpose is lost by not logging them. The arg count is still
+/// reported accurately for slowlog/metrics purposes.
 fn command_key_and_arity(frame: &Frame) -> (Option<Bytes>, usize) {
     let Frame::Array(items) = frame else {
         return (None, 0);
     };
+    if let Some(Frame::Bulk(name)) = items.first() {
+        if name.eq_ignore_ascii_case(b"AUTH") {
+            return (None, items.len().saturating_sub(1));
+        }
+    }
     let key = match items.get(1) {
         Some(Frame::Bulk(b)) => Some(b.clone()),
         _ => None,
@@ -2818,6 +2834,25 @@ mod tests {
             (Some(Bytes::from_static(b"mylist")), 3)
         );
         assert_eq!(command_key_and_arity(&Frame::Simple("x".into())), (None, 0));
+    }
+
+    /// AUTH's arguments are never real keys, and its 2-arg form's first argument is the
+    /// plaintext password -- surfacing it as a "key" would leak it through `SLOWLOG GET`. The
+    /// arg count must still come back accurate for slowlog/metrics purposes.
+    #[test]
+    fn command_key_and_arity_never_surfaces_auths_password_as_a_key() {
+        assert_eq!(
+            command_key_and_arity(&cmd(&[b"AUTH", b"somepassword"])),
+            (None, 1)
+        );
+        assert_eq!(
+            command_key_and_arity(&cmd(&[b"AUTH", b"someuser", b"somepassword"])),
+            (None, 2)
+        );
+        assert_eq!(
+            command_key_and_arity(&cmd(&[b"auth", b"somepassword"])),
+            (None, 1)
+        );
     }
 
     #[test]
@@ -6683,6 +6718,11 @@ mod tests {
             cmd(&[b"REPLICAOF", b"NO", b"ONE"]),
             cmd(&[b"PSYNC"]),
             cmd(&[b"SLOWLOG", b"GET"]),
+            // AUTH's arguments are a username/password, never a routable key -- in cluster mode
+            // treating the password as a key would hash it to a slot and could -MOVED it before
+            // it's ever authenticated.
+            cmd(&[b"AUTH", b"somepassword"]),
+            cmd(&[b"AUTH", b"someuser", b"somepassword"]),
         ] {
             assert!(command_keys(&c).is_empty(), "expected no keys for {c:?}");
         }
