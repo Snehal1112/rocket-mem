@@ -96,6 +96,17 @@ async fn main() -> std::io::Result<()> {
         Arc::clone(&replication),
     ));
 
+    let rmp_addr =
+        std::env::var("ROCKET_MEM_RMP_ADDR").unwrap_or_else(|_| "127.0.0.1:6380".to_string());
+    let rmp_listener = tokio::net::TcpListener::bind(&rmp_addr).await?;
+    println!("RMP listening on {}", rmp_listener.local_addr()?);
+    tokio::spawn(rocket_mem::rmp_connection::serve(
+        rmp_listener,
+        Arc::clone(&engine),
+        Arc::clone(&aof),
+        Arc::clone(&replication),
+    ));
+
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     println!("Listening on {}", listener.local_addr()?);
     rocket_mem::serve(listener, engine, aof, replication).await;
