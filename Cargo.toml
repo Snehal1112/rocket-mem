@@ -4,7 +4,7 @@ members = ["crates/common", "crates/engine", "crates/protocol", "crates/rmp-clie
 
 [workspace.package]
 edition = "2021"
-version = "0.1.3"
+version = "0.1.4"
 
 [workspace.dependencies]
 argon2 = "0.5"
