@@ -1,249 +1,200 @@
 # rocket-mem
 
-![CI](https://github.com/Snehal1112/rocket-mem/actions/workflows/ci.yml/badge.svg)
+[![CI](https://github.com/Snehal1112/rocket-mem/actions/workflows/ci.yml/badge.svg)](https://github.com/Snehal1112/rocket-mem/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Snehal1112/rocket-mem)](https://github.com/Snehal1112/rocket-mem/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-A from-scratch, RESP-compatible (Redis wire protocol) in-memory data store written in Rust. The goal is a server real Redis clients (`redis-cli`, `redis-py`, `ioredis`, `go-redis`, ...) can talk to unmodified, built on a storage engine that stays protocol-agnostic — proven out in Sprint 7, which layered **RMP**, a second binary protocol of rocket-mem's own, on top without touching the engine at all.
+A Redis-compatible in-memory data store, written from scratch in Rust.
 
-This is a 16-week solo build, tracked in 2-week sprints. Full rationale and week-by-week detail live in [`docs/rocket-mem-production-plan.md`](docs/rocket-mem-production-plan.md); sprint capacity/priorities/DoD live in [`docs/rocket-mem-sprint-plan.md`](docs/rocket-mem-sprint-plan.md).
+rocket-mem speaks **RESP2 and RESP3**, so `redis-cli`, `redis-py`, `ioredis`, `go-redis` and
+every other Redis client connect to it unmodified. It also speaks **RMP**, its own binary
+protocol, which adds the one thing RESP structurally cannot do: request multiplexing — many
+in-flight requests on one connection, answered in any order and correlated by request id.
+
+Both protocols read and write the same keyspace through the same dispatcher, so persistence,
+replication, clustering, and access control apply identically whichever one a client uses.
+
+> **Project status.** rocket-mem is complete and tested — 731 tests, durability verified under a
+> `kill -9` chaos loop — but it is not yet production-hardened: there is no failover and no live
+> resharding. Read [Limitations](#limitations) before deploying it.
+
+## Quick start
+
+**Docker**
+
+```bash
+docker run --rm -p 6379:6379 -p 6380:6380 ghcr.io/snehal1112/rocket-mem:latest
+```
+
+**Download a binary** — Linux x86-64, macOS arm64, and Windows x86-64 builds are attached to
+[every release](https://github.com/Snehal1112/rocket-mem/releases/latest), each with a `.sha256`
+checksum and a minisign `.sig`:
+
+```bash
+VERSION=v0.1.3
+curl -LO https://github.com/Snehal1112/rocket-mem/releases/download/$VERSION/rocket-mem-$VERSION-linux-amd64.tar.gz
+curl -LO https://github.com/Snehal1112/rocket-mem/releases/download/$VERSION/rocket-mem-$VERSION-linux-amd64.tar.gz.sha256
+sha256sum -c rocket-mem-$VERSION-linux-amd64.tar.gz.sha256
+tar -xzf rocket-mem-$VERSION-linux-amd64.tar.gz
+./rocket-mem-$VERSION-linux-amd64
+```
+
+**Build from source** — needs a stable Rust toolchain:
+
+```bash
+git clone https://github.com/Snehal1112/rocket-mem.git
+cd rocket-mem
+cargo build --release --bin rocket-mem
+./target/release/rocket-mem
+```
+
+It starts with no configuration file and no environment variables, binding three loopback
+listeners:
+
+| Address | Protocol | Notes |
+|---|---|---|
+| `127.0.0.1:6379` | RESP | Any Redis client connects here |
+| `127.0.0.1:6380` | RMP | rocket-mem's own binary protocol |
+| `127.0.0.1:9121` | HTTP | Prometheus `/metrics`; loopback because it is unauthenticated |
+
+Talk to it with the client you already have:
+
+```console
+$ redis-cli -p 6379 SET user:1 alice
+OK
+$ redis-cli -p 6379 GET user:1
+"alice"
+```
+
+Everything beyond this — authentication, TLS, clustering, custom paths — is opt-in. See
+[`docs/getting-started.md`](docs/getting-started.md) for a fuller tour.
+
+## Features
+
+- **Redis wire compatibility** — RESP2 and RESP3, with full `HELLO` version negotiation.
+- **A second protocol, RMP** — hand-rolled binary framing with request multiplexing, reachable
+  on its own port, covering almost the entire command set.
+- **Data types** — strings, hashes, lists, sets, and sorted sets, with Redis's `WRONGTYPE` and
+  missing-key semantics matched command for command.
+- **Durability** — every write is appended to an AOF with a configurable fsync policy, plus
+  point-in-time snapshots; startup replays the snapshot and only the AOF tail written after it.
+- **Replication** — leader/follower over the ordinary RESP port; followers reject writes with
+  `-READONLY` until promoted.
+- **Clustering** — Redis-Cluster-compatible hash slots (`CRC16(hash_tag(key)) % 16384`), with
+  `-MOVED` redirection and `CROSSSLOT` enforcement.
+- **Security** — Argon2-hashed passwords, per-user ACL rules over commands and key patterns, and
+  optional TLS listeners for both protocols.
+- **Observability** — a Prometheus `/metrics` endpoint, `INFO` in Redis's own format across eight
+  sections, and a bounded slow log.
 
 ## Architecture
 
-Three layers, fixed in Sprint 1 and respected throughout:
+Three layers, with a strict rule: the storage engine knows nothing about any wire protocol.
 
 ```
-┌─────────────────────────────────────────┐
-│  Protocol Layer (RESP2/RESP3, RMP)       │
-├─────────────────────────────────────────┤
-│  Command Dispatcher (maps commands →     │
-│  engine calls, arg validation)           │
-├─────────────────────────────────────────┤
-│  Storage Engine (data structures,        │
-│  persistence, expiry, protocol-agnostic) │
-└─────────────────────────────────────────┘
+┌──────────────────────────────────────────┐
+│  Protocol layer      RESP2/RESP3, RMP    │
+├──────────────────────────────────────────┤
+│  Command dispatcher  routing, arg checks │
+│                      auth, cluster, AOF  │
+├──────────────────────────────────────────┤
+│  Storage engine      data structures,    │
+│                      expiry, persistence │
+└──────────────────────────────────────────┘
 ```
 
-Concurrency model: one Tokio task per client connection, keyspace split into 16 shards each behind its own lock — any task can read/write any key by acquiring that key's shard lock. See [`docs/design/sharding-decision.md`](docs/design/sharding-decision.md) for why.
+That separation is what let RMP be added on top of the existing dispatcher without a single
+change to engine code — both protocols build the same command shape and call the same function.
 
-## Status
+**Concurrency:** one Tokio task per connection; the keyspace is split into 16 shards, each behind
+its own lock, so any task can reach any key by taking that key's shard lock. See
+[`docs/design/sharding-decision.md`](docs/design/sharding-decision.md) for why 16, and
+[`docs/architecture.md`](docs/architecture.md) for the full design.
 
-**Sprint 1 (engine core & core data types) — done.** A protocol-agnostic, sharded storage engine with full String/Hash/List/Set command coverage and a WRONGTYPE/missing-key test matrix. No networking yet.
+## Performance
 
-**Sprint 2 (RESP protocol, networking & client compatibility) — done.** The `protocol` crate has a protocol-aware `Frame` enum (RESP2 plus RESP3's `Map`) and a `RespCodec` that encodes/decodes both, including split-read reassembly. The `server` crate has a Tokio TCP accept loop, a per-connection task, and a dispatcher wired to the full engine command surface (String/Hash/List/Set, table below), plus `PING`/`ECHO`/`SELECT`/`COMMAND`/`INFO`. `HELLO` implements full RESP2/RESP3 negotiation — reporting the current protocol, switching via `HELLO 2`/`HELLO 3`, and returning `NOPROTO`/syntax errors for unsupported versions or malformed args.
+Measured against `redis-server` 8.10.1 on the same host with matching durability settings
+(`appendonly yes`, `appendfsync everysec`), via `redis-benchmark -t set,get -n 100000 -c 50`:
 
-**Sprint 3 (full command set: keys, collections & sorted sets) — done.** `KEYS` now supports glob patterns (`*`, `?`, `[abc]`); `SCAN` walks the keyspace one shard per call without blocking it the way `KEYS` can, proven safe under concurrent writes by a stress test. A new `SortedSet` type backs `ZADD`/`ZSCORE`/`ZREM`/`ZCARD`/`ZINCRBY`/`ZRANGE`/`ZRANK`. String/key commands gained `GETSET`/`MSET`/`MGET`/`MSETNX`/`RENAME`/`RENAMENX`/`TYPE`/`RANDOMKEY` — the `EXPIRE` family (`EXPIRE`/`PEXPIRE`/`EXPIREAT`/`PEXPIREAT`/`TTL`/`PTTL`/`PERSIST`) is an explicit stub returning a clear error, deferred to Sprint 4 alongside the expiry reaper it actually needs (see `docs/superpowers/specs/2026-08-29-sprint-3-spec.md`). Lists, Hashes, and Sets each gained their remaining command coverage (table below).
+| Workload | redis-server | rocket-mem | Ratio |
+|---|---:|---:|---:|
+| GET, 3B, no pipeline | 109,290 | 105,708 | 1.03x |
+| GET, 1KB, no pipeline | 103,093 | 98,619 | 1.05x |
+| SET, 1KB, no pipeline | 103,734 | 92,764 | 1.12x |
+| SET, 3B, no pipeline | 112,740 | 99,800 | 1.13x |
+| GET, 3B, `-P 16` | 1,639,344 | 1,428,571 | 1.15x |
+| SET, 1KB, `-P 16` | 450,450 | 245,700 | 1.83x |
+| SET, 3B, `-P 16` | 934,579 | 390,625 | 2.39x |
+| GET, 1KB, `-P 16` | 1,136,364 | 19,493 | **58.30x** |
 
-**Sprint 4 (expiry, eviction & AOF persistence) — done.** Keys can now carry a TTL: the
-`EXPIRE` family (`EXPIRE`/`PEXPIRE`/`EXPIREAT`/`PEXPIREAT`/`TTL`/`PTTL`/`PERSIST`) and `SET`'s
-`EX`/`PX` flags — both stubs since Sprint 3 — are fully implemented, backed by passive
-expiry (a read finds an expired key gone) and an active background sweep (one shard swept
-every 100ms, so memory doesn't quietly fill with dead entries nobody happens to read). Every
-write command is appended to an on-disk append-only file (`AofWriter`, configurable
-`fsync` policy — `Always`/`EverySecond`/`Never`) and replayed on startup, with a corrupted
-tail truncated rather than merely skipped in memory — data now survives a `kill -9` and
-restart, this sprint's headline goal, proven by a real-subprocess-and-SIGKILL integration
-test. `Engine::with_maxmemory` bounds memory usage via approximated LRU eviction (a
-`Store`-wide recency clock plus per-shard sampling, matching real Redis's own
-"approximated LRU" rather than a maintained-list-based exact one). `MEMORY USAGE` and
-`OBJECT ENCODING` respond usefully for tooling that probes them, rather than "unknown
-command." See `docs/superpowers/specs/2026-08-30-sprint-4-spec.md` for the full set of
-design decisions (why `Entry` wraps `Value` instead of a new `Value` variant, why AOF
-rewrites `SPOP`→`SREM` and the `EXPIRE` family→absolute `PEXPIREAT`, why eviction samples
-instead of maintaining an exact LRU list).
+Seven of eight cases land within 1.03x–2.39x of real Redis. The eighth does not: pipelined 1KB
+`GET` collapses to ~19,500 req/s, an unexplained cliff that no candidate explanation accounts
+for and that remains open. Full methodology, the raw traces, and the profiling that followed are
+in [`docs/benchmarks/`](docs/benchmarks/).
 
-**Sprint 5 (snapshotting & replication) — done.** `SAVE` writes a full, consistent
-point-in-time snapshot (`bincode`-encoded, atomically written via write-then-rename) to
-`ROCKET_MEM_SNAPSHOT_PATH`; startup loads that snapshot plus only the AOF bytes written
-after it — the offset is embedded in the snapshot itself — instead of Sprint 4's
-full-AOF-replay-from-empty, cutting recovery time (numbers below). `PSYNC`/`REPLICAOF <host>
-<port>` add real leader→follower replication over the server's normal RESP port: a follower
-receives a full snapshot, then applies every subsequent write the leader's AOF already logs —
-inheriting the `SPOP`→`SREM`/`EXPIRE`-family→`PEXPIREAT` rewrites for free — while rejecting
-client-originated writes of its own with a `READONLY` error until `REPLICAOF NO ONE` returns
-it to normal operation. Every (re)sync, first or after a dropped connection, is a full resync;
-there is no partial-resync/offset-resume support this sprint. See
-`docs/superpowers/specs/2026-08-30-sprint-5-spec.md` for the full set of design decisions (why
-replication piggybacks on the AOF's already-rewritten frame stream instead of a separate
-mechanism, why a follower keeps no AOF of its own, the `SAVE`/`PSYNC` atomicity arguments).
+## Command coverage
 
-Known limits, called out explicitly rather than left to be discovered: no partial resync (a
-dropped follower connection always triggers a full resnapshot, per above); no authentication
-on `PSYNC` (any client that sends it is treated as a legitimate replica — Sprint 8 closed this:
-`PSYNC` is now gated by the same auth check every other command goes through, though only once
-ACL users are configured, since a deployment with none still authenticates nobody); a stalled
-replica's fan-out queue is
-unbounded and grows the leader's memory invisibly to `MAXMEMORY` accounting rather than
-stalling every writer
-(`HELLO` and `INFO` now report the real role — that Sprint 5 limitation was fixed in Sprint 6).
-
-Recovery-time benchmark (5,000 keys, `cargo test -p rocket-mem --test replication
-snapshot_plus_tail_recovery -- --nocapture`): full AOF replay took `14.170081ms`, snapshot+tail took
-`10.958109ms`.
-
-**Sprint 6 (clustering & observability) — done.** Keys now route across a multi-node cluster by
-Redis-Cluster-compatible hash slot: `CLUSTER KEYSLOT` computes `CRC16(hash_tag(key)) % 16384`
-byte-for-byte the way real Redis does (hash tags included, so `{user1000}.name` and
-`{user1000}.city` are guaranteed to share a node), and a node handed a key it doesn't own replies
-`-MOVED <slot> <host>:<port>` without touching its engine, its AOF, or any lock. Slot ownership
-comes from one static config file every node reads at startup, validated to cover all 16384 slots
-exactly once — see "Running a cluster" below. `CLUSTER SHARDS`/`NODES`/`INFO`/`MYID` report that
-topology to cluster-aware clients. On the observability side, every command is counted and timed
-into a Prometheus registry served from its own `/metrics` listener, `INFO` grew the eight real
-sections tooling parses (server, clients, memory, persistence, stats, replication, cluster,
-keyspace), and a bounded slow log records commands over a configurable threshold
-(`SLOWLOG GET`/`LEN`/`RESET`). A head-to-head `redis-benchmark` report against real Redis is
-committed at [`docs/benchmarks/2026-08-30-redis-benchmark.md`](docs/benchmarks/2026-08-30-redis-benchmark.md),
-alongside the flamegraph pass that motivated this sprint's one performance fix
-([`docs/benchmarks/2026-08-30-flamegraph-notes.md`](docs/benchmarks/2026-08-30-flamegraph-notes.md)).
-See `docs/superpowers/specs/2026-08-30-sprint-6-spec.md` for the full set of design decisions
-(why `-MOVED` takes precedence over `-READONLY`, why `CROSSSLOT` is enforced rather than skipped,
-why `INFO`/`HELLO` moved out of `dispatch`).
-
-**Sprint 7 (custom protocol) — done.** rocket-mem now speaks a second wire protocol of its own,
-**RMP**, alongside RESP — both read and write the same shared keyspace, and a client can prove it
-by writing over one and reading over the other. RMP's headline capability is the one thing RESP
-structurally cannot do: request multiplexing. A client sends many requests on one connection
-without waiting for each reply, tagging each with its own `request_id`; the server may answer them
-in any order, and the client correlates each reply back to its request by that id rather than by
-arrival order. RMP is a hand-rolled binary framing (magic bytes, version, a 16-byte envelope,
-length-prefixed values) rather than Protobuf/Cap'n Proto, reachable on its own port
-(`ROCKET_MEM_RMP_ADDR`, default `127.0.0.1:6380`) — see "Running the custom protocol (RMP)" below.
-Crucially, RMP reaches almost rocket-mem's entire command set, including `INFO`, `CLUSTER`, `SAVE`,
-`REPLICAOF`, and `SLOWLOG`, for free: its connection handler builds the same `Array`-of-`Bulk`
-command shape RESP already builds and calls the identical, unmodified `dispatch_and_log` function
-every RESP command goes through, so AOF logging, replica fan-out, cluster redirection, and the
-read-only-replica gate all apply to an RMP write exactly as they do to a RESP one. The one genuine
-exception is `PSYNC`: it's intercepted above `dispatch_and_log`, in RESP's `connection.rs`, before
-that function is even called, and RMP's connection handler has no equivalent interception, so
-`PSYNC` over RMP falls through to the ordinary "unknown command" error. (`HELLO` is not an
-exception — it's intercepted *inside* `dispatch_and_log` itself, so RMP gets a normal success
-reply from it, just always as if freshly negotiated, since RMP has no per-connection protocol
-state for it to persist.) A new
-`rmp-client` crate is a minimal async Rust client (`connect`/`call`/`get`/`set`/`del`) proving the
-whole design end-to-end, including a test that deliberately has the server answer two concurrent
-requests out of order and confirms the client still resolves each to the right caller. See
-`docs/superpowers/specs/2026-08-31-sprint-7-spec.md` for the full wire format (byte-exact worked
-examples for a request, a response, and a multiplexed pair) and the connection concurrency model.
-
-Known limits, called out explicitly rather than left to be discovered: **there is no cluster bus
-and no gossip** — nodes never talk to each other, so `CLUSTER NODES` reports every configured node
-as `connected` and `cluster_state` is always `ok`, because a static config cannot honestly say
-otherwise, and the `@<port+10000>` cluster-bus port shown in `CLUSTER NODES` is advertised by
-convention but never bound; **no live resharding and no failover** (slot ownership is fixed at process start;
-`CLUSTER SETSLOT`, `MIGRATE`, and `ASK`/`ASKING` redirection do not exist, and `ASK` would have
-nothing to cover without migrations); **no request forwarding** — a `-MOVED` reply requires the
-*client* to reconnect, this server never proxies to another shard; `CLUSTER SLOTS` is not
-implemented (deprecated since Redis 7.0 in favour of `CLUSTER SHARDS`); a shard has exactly one
-node, so cluster-level replicas are not represented even when a node is separately a Sprint-5
-replication follower; slow-log entries carry 4 fields, not real Redis's 6 (the client address and
-name are omitted — the dispatcher never learns the peer address); a slow-log entry records the
-command name and its first argument rather than the full argument list, with real Redis's
-`... (N more arguments)` marker standing in for the rest; `INFO`'s `expired_keys` counts only
-*actively* expired keys, since passive expiry would need a counter on the hottest read path;
-`INFO` omits `keyspace_hits`/`keyspace_misses` and `tcp_port` entirely rather than faking them;
-`maxmemory` always reports 0 in the shipped binary because there is no env var to set a ceiling
-yet; there is no true replication-*offset* lag metric, because Sprint 5's full-resync-only design
-means no offsets exist — `rocket_mem_replication_last_apply_timestamp_seconds` is the honest
-substitute; the `/metrics` endpoint is unauthenticated (hence its loopback default); and
-`ReplicationHandle` is still misnamed — it carries the snapshot path, AOF handle, cluster config,
-slow log, and server counters. Sprint 7 turned out not to force this rename after all: its RMP
-connection handler takes the exact same `Arc<ReplicationHandle>` every RESP connection already
-does, unchanged. The rename remains deferred, with no forcing sprint currently scoped.
-RMP connections are now counted in `rocket_mem_connected_clients`/`rocket_mem_connections_total`
-alongside RESP's — both protocols share the same `ClientGuard` (`connection.rs`).
-
-**Sprint 8 (auth, ACLs, TLS & release) — done.** rocket-mem now authenticates. `AUTH` accepts
-both the single-argument (`default`-user) and `<user> <pass>` forms, and a RESP3 client's inline
-`HELLO 3 AUTH <user> <pass>` works too. Users carry rules — `allcommands`/`nocommands`,
-`allkeys`, `+CMD`/`-CMD`, and `~pattern` key globs — folded left to right, so a user can be
-restricted to one command against one key prefix. Users come from either a `[[acl.users]]` array
-in the config file, bootstrapped at startup, or `ACL SETUSER` at runtime
-(`ACL DELUSER`/`WHOAMI`/`LIST`/`GETUSER` round out the family); passwords are hashed with Argon2
-and the plaintext never reaches the AOF, the snapshot, the slow log, or an error message. The
-gate sits in `dispatch_and_log` ahead of cluster redirection and the `-READONLY` check, matching
-real Redis's own ordering, and re-resolves the live user on every command so an admin's
-`SETUSER`/`DELUSER` takes effect on already-open connections instead of waiting for a reconnect.
-Only `AUTH` and `HELLO` are reachable before authenticating — `ACL` deliberately is not.
-Both listeners can now run over TLS on their own addresses alongside the plaintext ones
-(`tls_resp_addr`/`tls_rmp_addr` plus a shared cert and key), with the handshake bounded by a
-10-second timeout and a TLS address without a cert/key rejected at startup rather than silently
-never bound. Configuration moved onto layered `figment`/`clap` loading — built-in defaults, then
-a TOML file, then `ROCKET_MEM_*` environment variables, then CLI flags — with every pre-Sprint-8
-environment variable still working identically; layering is purely additive. Durability was
-re-proven under a real `kill -9` chaos loop against a live leader+follower pair, verified against
-the load generator's own independent write log
-([`docs/chaos/2026-09-01-chaos-log.md`](docs/chaos/2026-09-01-chaos-log.md)). Four user-facing
-docs land with this sprint — getting-started, config reference, command compatibility, and
-architecture — listed under "Documentation" below. See
-`docs/superpowers/specs/2026-08-31-sprint-8-spec.md` for the full set of design decisions (why
-`Session` replaced a bare `Protocol` parameter, why ACL state is in-memory and leader-local, why
-the chaos test is a committed script plus a committed log rather than a CI job).
-
-Known limits, called out explicitly rather than left to be discovered: ACL users live in memory
-only — a runtime `ACL SETUSER` is lost on restart unless the same user is also in the bootstrap
-array — and ACL changes are neither logged to the AOF nor fanned out to replicas, so a
-follower's ACL state can diverge from its leader's unless both start from the same config; there
-are no `@category` grants (`+@read`, `+@write`), only explicit `+CMD`/`-CMD` plus
-`allcommands`/`nocommands`; `ACL LIST` renders a password as its stored `#<hash>`, which
-`ACL SETUSER` will not accept back as input; and the `/metrics` endpoint remains unauthenticated
-(hence its loopback default). See
-[`docs/command-compatibility.md`](docs/command-compatibility.md) for these and every other known
-divergence from real Redis, collected in one place.
-
-### Command coverage
-
-| Type | Implemented |
+| Type | Commands |
 |---|---|
-| String/Key | `GET`, `SET` (`NX`/`XX`/`EX`/`PX`), `GETSET`, `GETRANGE`, `SETRANGE`, `APPEND`, `STRLEN`, `INCR`/`DECR`/`INCRBY`, `MSET`, `MGET`, `MSETNX`, `RENAME`, `RENAMENX`, `TYPE`, `RANDOMKEY`, `KEYS` (glob: `*`, `?`, `[abc]` only), `SCAN`, `DEL`/`EXISTS` (variadic), `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`, `TTL`, `PTTL`, `PERSIST`, `MEMORY USAGE`, `OBJECT ENCODING` |
+| String/Key | `GET`, `SET` (`NX`/`XX`/`EX`/`PX`), `GETSET`, `GETRANGE`, `SETRANGE`, `APPEND`, `STRLEN`, `INCR`/`DECR`/`INCRBY`, `MSET`, `MGET`, `MSETNX`, `RENAME`, `RENAMENX`, `TYPE`, `RANDOMKEY`, `KEYS`, `SCAN`, `DEL`/`EXISTS` (variadic), `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`, `TTL`, `PTTL`, `PERSIST`, `MEMORY USAGE`, `OBJECT ENCODING` |
 | Hash | `HSET`, `HGET`, `HDEL`, `HEXISTS`, `HGETALL`, `HLEN`, `HINCRBY`, `HKEYS`, `HVALS`, `HMGET`, `HSETNX`, `HSCAN` |
-| List | `LPUSH`, `RPUSH` (both variadic), `LPOP`, `RPOP`, `LRANGE`, `LLEN`, `LINDEX`, `LSET`, `LTRIM`, `LREM`, `LINSERT` |
+| List | `LPUSH`, `RPUSH` (variadic), `LPOP`, `RPOP`, `LRANGE`, `LLEN`, `LINDEX`, `LSET`, `LTRIM`, `LREM`, `LINSERT` |
 | Set | `SADD`, `SREM`, `SMEMBERS`, `SISMEMBER`, `SCARD`, `SINTER`, `SUNION`, `SDIFF`, `SINTERSTORE`, `SUNIONSTORE`, `SDIFFSTORE`, `SPOP`, `SRANDMEMBER` |
 | Sorted Set | `ZADD`, `ZSCORE`, `ZREM`, `ZCARD`, `ZINCRBY`, `ZRANGE`, `ZRANK` |
-| Server/Cluster | `PING`, `ECHO`, `DEBUG SLEEP`[^debug-sleep-cap], `SELECT`, `COMMAND`, `HELLO`, `INFO [section]`, `SAVE`, `REPLICAOF`, `PSYNC`, `CLUSTER KEYSLOT`/`SHARDS`/`NODES`/`INFO`/`MYID`, `SLOWLOG GET`/`LEN`/`RESET` |
-| Auth/ACL | `AUTH` (both single-arg and `<user> <pass>` forms), `ACL SETUSER`/`DELUSER`/`WHOAMI`/`LIST`/`GETUSER` |
+| Server/Cluster | `PING`, `ECHO`, `SELECT`, `COMMAND`, `HELLO`, `INFO [section]`, `SAVE`, `REPLICAOF`, `PSYNC`, `DEBUG SLEEP`, `CLUSTER KEYSLOT`/`SHARDS`/`NODES`/`INFO`/`MYID`, `SLOWLOG GET`/`LEN`/`RESET` |
+| Auth/ACL | `AUTH` (single-arg and `<user> <pass>`), `ACL SETUSER`/`DELUSER`/`WHOAMI`/`LIST`/`GETUSER` |
 
-[^debug-sleep-cap]: `DEBUG SLEEP` is capped at a 10-second maximum duration; a longer request is rejected with an error rather than accepted and blocking a server thread indefinitely.
+Behavioural differences from real Redis — `KEYS` glob support is partial, `OBJECT ENCODING`
+reports engine type names rather than Redis's internal encodings, and others — are catalogued in
+[`docs/command-compatibility.md`](docs/command-compatibility.md).
 
-`KEYS`'s glob support is intentionally partial: no character ranges (`[a-z]`), negation
-(`[^abc]`), or escaping. Active expiry sweeps one whole shard per 100ms tick rather than
-sampling individual keys within a shard the way real Redis does — an accepted
-simplification, not a bug (see the Sprint 4 spec). `OBJECT ENCODING` reports this engine's
-own type name (`string`/`list`/`hash`/`set`/`zset` — exactly what `TYPE` returns, since both
-come from `Value::type_name()`), not real Redis's actual internal
-encodings (`embstr`/`listpack`/etc.), which this engine doesn't implement. All of the above
-are exercised directly by engine tests and reachable over RESP through the dispatcher.
+## Configuration
 
-### Running with persistence and replication
+Configuration is layered, each level overriding the one before: built-in defaults → a TOML file →
+`ROCKET_MEM_*` environment variables → CLI flags. Nothing is required.
 
-The server binary reads these environment variables at startup:
-
-| Variable | Default | Purpose |
+| Setting | Default | Purpose |
 |---|---|---|
-| `ROCKET_MEM_ADDR` | `127.0.0.1:6379` | TCP address to bind |
-| `ROCKET_MEM_RMP_ADDR` | `127.0.0.1:6380` | TCP address the RMP (custom protocol) listener binds — always on, no opt-out |
-| `ROCKET_MEM_AOF_PATH` | `./appendonly.aof` | Append-only file path — replayed on startup if it already exists, then opened for appending with an `EverySecond` fsync policy |
-| `ROCKET_MEM_SNAPSHOT_PATH` | `./dump.snapshot` | Snapshot file path — loaded on startup if present (together with only the AOF bytes written after the offset embedded in it), written by the `SAVE` command |
-| `ROCKET_MEM_CLUSTER_CONFIG` | unset | Path to the cluster topology file. Unset means cluster mode is off (no `-MOVED`, no `-CROSSSLOT`). Must be set together with `ROCKET_MEM_CLUSTER_NODE_ID` |
-| `ROCKET_MEM_CLUSTER_NODE_ID` | unset | Which line of that file describes this process. Startup fails if it is missing or names an unknown id |
-| `ROCKET_MEM_METRICS_ADDR` | `127.0.0.1:9121` | Where the Prometheus `/metrics` endpoint listens. Loopback by default because it is unauthenticated |
-| `ROCKET_MEM_SLOWLOG_THRESHOLD_MICROS` | `10000` (10ms) | Commands at or over this duration are recorded in the slow log. `0` disables it |
-| `ROCKET_MEM_TLS_RESP_ADDR` | unset | TCP address for a TLS-wrapped RESP listener, run alongside the plaintext one. Unset means no TLS RESP listener |
-| `ROCKET_MEM_TLS_RMP_ADDR` | unset | TCP address for a TLS-wrapped RMP listener, run alongside the plaintext one. Unset means no TLS RMP listener |
-| `ROCKET_MEM_TLS_CERT_PATH` | unset | PEM certificate chain, shared by both TLS listeners. Required if either TLS address is set — startup fails otherwise |
-| `ROCKET_MEM_TLS_KEY_PATH` | unset | PEM private key, shared by both TLS listeners. Required if either TLS address is set — startup fails otherwise |
+| `addr` | `127.0.0.1:6379` | RESP listener |
+| `rmp_addr` | `127.0.0.1:6380` | RMP listener |
+| `metrics_addr` | `127.0.0.1:9121` | Prometheus endpoint; loopback because it is unauthenticated |
+| `aof_path` | `./appendonly.aof` | Append-only file, replayed at startup |
+| `snapshot_path` | `./dump.snapshot` | Snapshot written by `SAVE`, loaded at startup |
+| `tls_resp_addr` / `tls_rmp_addr` | unset | TLS listeners, run alongside the plaintext ones |
+| `tls_cert_path` / `tls_key_path` | unset | PEM cert and key; required if either TLS address is set |
+| `cluster_config` / `cluster_node_id` | unset | Cluster topology file and this node's entry |
+| `slowlog_threshold_micros` | `10000` | Commands at or over this are recorded; `0` disables |
 
-See [`docs/config-reference.md`](docs/config-reference.md) for the full list including TOML/CLI
-equivalents and ACL bootstrap — this table covers only the env-var layer, matching this
-section's existing scope.
+Every field, with its TOML key, environment variable, CLI flag, and ACL bootstrap format, is in
+[`docs/config-reference.md`](docs/config-reference.md).
 
-Turn a running node into a follower with `REPLICAOF <host> <port>` (sent over its own RESP
-connection, e.g. via `redis-cli -p <port> replicaof <host> <port>`); `REPLICAOF NO ONE`
-returns it to normal, writable operation. A follower rejects client-originated writes with a
-`READONLY` error for as long as it's replicating.
+## Deployment
 
-### Running a cluster
+### Replication
 
-Every node reads the same topology file and is told which line is its own. Slot ranges must cover
-all 16384 slots exactly once — a gap or an overlap is a startup error, not a runtime surprise.
+Start a second node on its own ports, then point it at the leader over its normal RESP
+connection:
+
+```bash
+# Follower: RESP on 6389, RMP and metrics moved off their defaults so both nodes can bind.
+ROCKET_MEM_ADDR=127.0.0.1:6389 \
+ROCKET_MEM_RMP_ADDR=127.0.0.1:6390 \
+ROCKET_MEM_METRICS_ADDR=127.0.0.1:9122 \
+ROCKET_MEM_AOF_PATH=./follower.aof \
+ROCKET_MEM_SNAPSHOT_PATH=./follower.snapshot \
+  ./target/release/rocket-mem
+
+redis-cli -p 6389 REPLICAOF 127.0.0.1 6379   # follow the leader on 6379
+redis-cli -p 6389 REPLICAOF NO ONE           # promote back to writable
+```
+
+The follower receives a full snapshot, then applies every subsequent write the leader logs, and
+rejects client writes with `-READONLY` while it is following.
+
+### Clustering
+
+Every node reads the same topology file and is told which entry is its own. Slot ranges must
+cover all 16384 slots exactly once — a gap or overlap fails at startup, not at runtime.
 
 ```
 # cluster.conf — <node-id> <host:port> <first-slot> <last-slot>
@@ -254,46 +205,29 @@ shard-c 127.0.0.1:7003 10923 16383
 
 ```bash
 ROCKET_MEM_ADDR=127.0.0.1:7001 \
+ROCKET_MEM_RMP_ADDR=127.0.0.1:7101 \
+ROCKET_MEM_METRICS_ADDR=127.0.0.1:9201 \
 ROCKET_MEM_CLUSTER_CONFIG=./cluster.conf \
 ROCKET_MEM_CLUSTER_NODE_ID=shard-a \
-  cargo run --release --bin rocket-mem
+  ./target/release/rocket-mem
 ```
 
-Not shown above: running more than one node on one host also needs a distinct `ROCKET_MEM_RMP_ADDR`
-and `ROCKET_MEM_METRICS_ADDR` per node, since each defaults to the same fixed port on every node —
-without that, the second and third node fail to bind.
+A key's slot is computed exactly as real Redis computes it, so any cluster-aware client agrees:
 
-A key's slot is `CRC16(hash_tag(key)) % 16384`, identical to real Redis Cluster, so any
-cluster-aware client computes the same answer:
-
-```
-$ redis-cli -p 7001 cluster keyslot foo
+```console
+$ redis-cli -p 7001 CLUSTER KEYSLOT foo
 (integer) 12182
-$ redis-cli -p 7001 get foo
+$ redis-cli -p 7001 GET foo
 (error) MOVED 12182 127.0.0.1:7003
 ```
 
-Multi-key commands must have all their keys in one slot, or they are rejected with
-`CROSSSLOT Keys in request don't hash to the same slot` — use a hash tag (`{user1000}.name`,
-`{user1000}.city`) to force related keys onto one node. This server never forwards a command to
-another node: following a `-MOVED` is the client's job.
+Use a hash tag to pin related keys to one node: `{user1000}.name` and `{user1000}.city` always
+share a slot. Following a `-MOVED` is the client's job — this server never proxies.
 
-### Running the custom protocol (RMP)
+### RMP, the multiplexing protocol
 
-Every node also listens for **RMP** on its own port, unconditionally. A client can send several
-requests without waiting for each reply — each carries a `request_id` the matching response
-echoes back, so replies may arrive in any order. Because each request is handled on its own spawned
-task, commands sent back-to-back on one RMP connection may also *execute* out of order relative to
-each other, not just reply out of order — unlike RESP's strict send-order execution, a client that
-needs command B to see command A's effect must await A's reply before sending B. Each connection
-caps how many requests can be mid-dispatch at once at 256 — pipelining beyond that applies ordinary
-TCP backpressure (the read loop pauses) rather than spawning unbounded tasks:
-
-```bash
-ROCKET_MEM_RMP_ADDR=127.0.0.1:6380 cargo run --release --bin rocket-mem
-```
-
-The `rmp-client` crate is a minimal async client proving the design end-to-end:
+Every node listens for RMP unconditionally. A client may send many requests without waiting for
+replies, each tagged with a `request_id` the response echoes back:
 
 ```rust
 let client = rmp_client::RmpClient::connect("127.0.0.1:6380").await?;
@@ -301,75 +235,70 @@ client.set("foo", "bar").await?;
 assert_eq!(client.get("foo").await?, Some(bytes::Bytes::from_static(b"bar")));
 ```
 
-RMP reaches almost the same command set RESP does — `PSYNC` (raw-socket takeover) is the one
-command genuinely unreachable over RMP; `HELLO` works too, just as a no-op negotiation — see
-[`docs/superpowers/specs/2026-08-31-sprint-7-spec.md`](docs/superpowers/specs/2026-08-31-sprint-7-spec.md)
-for the wire format's exact byte layout and the multiplexing design.
+Because each request is dispatched on its own task, commands sent back-to-back may also *execute*
+out of order — if B must observe A's effect, await A's reply first. Each connection allows 256
+requests in flight before applying TCP backpressure.
 
-### Observability
+## Limitations
 
-`GET http://$ROCKET_MEM_METRICS_ADDR/metrics` serves a Prometheus text-format registry:
+Stated plainly, so they are not discovered in production:
 
-| Metric | Type | Labels |
-|---|---|---|
-| `rocket_mem_commands_total` | counter | `cmd` |
-| `rocket_mem_command_errors_total` | counter | `cmd` |
-| `rocket_mem_command_duration_seconds` | histogram | `cmd` |
-| `rocket_mem_connected_clients` | gauge | — |
-| `rocket_mem_connections_total` | counter | — |
-| `rocket_mem_memory_used_bytes` | gauge | — |
-| `rocket_mem_keys` / `rocket_mem_keys_with_expiry` | gauge | — |
-| `rocket_mem_expired_keys_total` | counter | — |
-| `rocket_mem_evicted_keys_total` | counter | — |
-| `rocket_mem_connected_replicas` | gauge | — |
-| `rocket_mem_replication_last_apply_timestamp_seconds` | gauge | — |
-| `rocket_mem_slowlog_entries_total` | counter | — |
+- **No failover and no live resharding.** Slot ownership is fixed at process start;
+  `CLUSTER SETSLOT`, `MIGRATE`, and `ASK` redirection do not exist.
+- **No cluster bus or gossip.** Nodes never talk to each other, so `CLUSTER NODES` reports every
+  configured node as connected and `cluster_state` is always `ok`.
+- **No request forwarding.** A `-MOVED` requires the client to reconnect.
+- **Full resync only.** A dropped follower connection triggers a complete resnapshot; there are
+  no replication offsets, and therefore no true replication-lag metric.
+- **ACL state is in-memory and leader-local.** A runtime `ACL SETUSER` is lost on restart unless
+  the user is also in the bootstrap config, and ACL changes never reach followers.
+- **No `@category` ACL grants** — only explicit `+CMD`/`-CMD` plus `allcommands`/`nocommands`.
+- **A stalled replica's fan-out queue is unbounded** and grows leader memory outside `MAXMEMORY`
+  accounting.
+- **`/metrics` is unauthenticated**, which is why it binds loopback by default.
 
-The `cmd` label is drawn from a fixed list of known command names, with everything else collapsed
-to `other`, so an unknown command cannot create unbounded series. Commands a follower applies from
-its leader are not counted: only client-originated commands reach the instrumented path.
+[`docs/command-compatibility.md`](docs/command-compatibility.md) collects these together with
+every command-level divergence from real Redis.
 
-`INFO [section]` reports the same state in real Redis's own format — `server`, `clients`,
-`memory`, `persistence`, `stats`, `replication`, `cluster`, `keyspace`, or all of them at once.
-`SLOWLOG GET [count]` / `SLOWLOG LEN` / `SLOWLOG RESET` read and clear the last
-`ROCKET_MEM_SLOWLOG_THRESHOLD_MICROS`-exceeding commands.
-
-## Workspace layout
+## Project layout
 
 Five crates under `crates/`:
 
-- **`common`** — shared `EngineError` enum (`WrongType`, `NotAnInteger`, `NoSuchKey`). No dependencies on the other crates.
-- **`engine`** — the storage engine: `Value` enum, 16-shard `Store`, and one free function per command under `commands/`. Everything in "Status" above lives here.
-- **`protocol`** — wire formats: RESP's `Frame` type (RESP2 plus RESP3's `Map`) and `RespCodec`, and RMP's envelope/value codec (`rmp` module) reusing the same `Frame` as its value model. Both codecs handle split-read reassembly.
-- **`server`** — the binary (package name `rocket-mem`): Tokio TCP accept loops for both RESP and RMP, per-connection tasks, the shared command dispatcher every protocol calls, AOF writer/replayer, snapshotting, leader/follower replication, the active-expiry and fsync background loops, cluster hash-slot routing and `-MOVED` redirection, the Prometheus metrics endpoint, and the slow log.
-- **`rmp-client`** — a minimal async Rust client for RMP (`connect`/`call`/`get`/`set`/`del`), proving the protocol end-to-end.
+| Crate | Contents |
+|---|---|
+| `common` | The shared `EngineError` type. Depends on nothing else. |
+| `engine` | `Value`, the 16-shard `Store`, and one function per command. Protocol-agnostic. |
+| `protocol` | RESP's `Frame`/`RespCodec` and RMP's envelope codec. Both handle split reads. |
+| `server` | The binary: accept loops, dispatcher, AOF, snapshots, replication, cluster routing, metrics, slow log. |
+| `rmp-client` | A minimal async Rust client for RMP. |
 
-## Building & testing
+## Building and testing
 
 ```bash
-cargo build --workspace                 # build everything
-cargo test --workspace                  # run all tests
-cargo fmt --all -- --check              # CI's format check
-cargo clippy --workspace -- -D warnings # CI's lint gate — must be clean
+cargo build --workspace
+cargo test --workspace
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-CI (`.github/workflows/ci.yml`) runs exactly those fmt/clippy/test commands on every push and PR.
+CI runs exactly those four commands on every push and pull request; all must pass.
 
 ## Documentation
 
-- [`docs/rocket-mem-production-plan.md`](docs/rocket-mem-production-plan.md) — 16-week phase plan and the architecture decision record (why sharded locks, task-per-connection).
-- [`docs/rocket-mem-sprint-plan.md`](docs/rocket-mem-sprint-plan.md) — 2-week sprint breakdown with capacity, priorities, risks, and definition of done.
-- [`docs/getting-started.md`](docs/getting-started.md) — install, first run, first `redis-cli`/`rmp-client` session, enabling TLS.
-- [`docs/config-reference.md`](docs/config-reference.md) — every config field: TOML key, env var, CLI flag, default.
-- [`docs/command-compatibility.md`](docs/command-compatibility.md) — full command table plus known divergences from real Redis, collected in one place.
-- [`docs/architecture.md`](docs/architecture.md) — the three-layer design and concurrency model, pulling together the per-sprint specs.
-- [`docs/design/sharding-decision.md`](docs/design/sharding-decision.md) — the Sprint 1 design doc on shard count and locking strategy.
-- [`docs/superpowers/specs/`](docs/superpowers/specs/) and [`docs/superpowers/plans/`](docs/superpowers/plans/) — per-sprint specs and numbered TDD implementation plans.
-- [`docs/benchmarks/`](docs/benchmarks/) — the committed `redis-benchmark` head-to-head report and the flamegraph profiling notes.
+| Document | Covers |
+|---|---|
+| [Getting started](docs/getting-started.md) | Install, first run, first client session, enabling TLS |
+| [Configuration reference](docs/config-reference.md) | Every field: TOML key, env var, CLI flag, default |
+| [Command compatibility](docs/command-compatibility.md) | Full command table and every divergence from Redis |
+| [Architecture](docs/architecture.md) | The three-layer design and concurrency model |
+| [Sharding decision](docs/design/sharding-decision.md) | Why 16 shards, and the locking strategy |
+| [Benchmarks](docs/benchmarks/) | The `redis-benchmark` head-to-head and profiling notes |
+| [QA playbook](docs/qa-playbook.md) | 135 manual test cases |
 
 ## Contributing
 
-See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the development workflow, code conventions, and commit/PR expectations.
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the development workflow, code conventions, and
+commit and pull-request expectations.
 
 ## License
 
