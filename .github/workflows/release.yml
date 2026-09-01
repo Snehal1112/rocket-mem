@@ -142,9 +142,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download all artifacts
+      # Only the `build` job's archives. Without a pattern this downloads every
+      # artifact in the run, which includes the `.dockerbuild` build summary that
+      # docker/build-push-action uploads on its own -- that one fails to extract
+      # and takes the whole step down with it.
+      - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
+          pattern: rocket-mem-*
           path: dist
           merge-multiple: true
 
