@@ -4,9 +4,14 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>rocket-mem QA Playbook</title>
+<script>
+// Stamp the saved theme before first paint, so the page never flashes the wrong one.
+(function(){try{var m=localStorage.getItem('rm-theme');
+if(m==='light'||m==='dark')document.documentElement.setAttribute('data-theme',m);}catch(e){}})();
+</script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Serif:ital@1&display=swap">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Serif:ital@1&family=JetBrains+Mono:wght@400;500;600&display=swap">
 <style>
 :root{
   --ground:#F6F8F9; --surface:#FFFFFF; --surface-2:#EDF1F3; --surface-3:#E3EAED;
@@ -15,10 +20,10 @@
   --accent:#0B6E75; --accent-soft:#DFEFF0; --accent-line:#8FC4C7;
   --pass:#2C7A44; --pass-soft:#E3F1E7;
   --fail:#B02128; --fail-soft:#FAE6E7;
-  --gap:#9A5A08; --gap-soft:#FAEEDC;
-  --shadow:0 1px 2px rgba(16,22,25,.06), 0 4px 14px rgba(16,22,25,.05);
+  --gap:#9A5A08;
+  --tick:#CAD7DC;
   --sans:"IBM Plex Sans",ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
-  --mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  --mono:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
   --serif:"IBM Plex Serif",Georgia,"Times New Roman",serif;
 }
 @media (prefers-color-scheme:dark){
@@ -29,8 +34,8 @@
     --accent:#41C0C8; --accent-soft:#0E2E31; --accent-line:#1E5B60;
     --pass:#63C384; --pass-soft:#14291C;
     --fail:#F2818A; --fail-soft:#2E1517;
-    --gap:#DFA34A; --gap-soft:#2B2011;
-    --shadow:0 1px 2px rgba(0,0,0,.4), 0 4px 14px rgba(0,0,0,.3);
+    --gap:#DFA34A;
+    --tick:#2E3D46;
   }
 }
 :root[data-theme="dark"]{
@@ -40,49 +45,74 @@
   --accent:#41C0C8; --accent-soft:#0E2E31; --accent-line:#1E5B60;
   --pass:#63C384; --pass-soft:#14291C;
   --fail:#F2818A; --fail-soft:#2E1517;
-  --gap:#DFA34A; --gap-soft:#2B2011;
-  --shadow:0 1px 2px rgba(0,0,0,.4), 0 4px 14px rgba(0,0,0,.3);
+  --gap:#DFA34A;
+  --tick:#2E3D46;
 }
 *{box-sizing:border-box}
+/* A class-level display rule outranks the UA [hidden] rule, so restate it. */
+[hidden]{display:none!important}
+/* Column flex keeps the footer at the viewport bottom when a filter empties the list. */
 body{margin:0;background:var(--ground);color:var(--ink);font-family:var(--sans);line-height:1.5;
-  -webkit-font-smoothing:antialiased;font-size:15px}
+  -webkit-font-smoothing:antialiased;font-size:15px;
+  min-height:100vh;display:flex;flex-direction:column}
+.shell{flex:1 0 auto;width:100%}
 a{color:var(--accent)}
 h1,h2,h3{text-wrap:balance;margin:0}
+button:focus-visible,a:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.vh{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
 
 /* ---- masthead ---- */
 .masthead{border-bottom:1px solid var(--line);background:var(--surface)}
-.masthead-in{max-width:1240px;margin:0 auto;padding:26px 24px 22px;
-  display:flex;flex-wrap:wrap;gap:20px;align-items:flex-end;justify-content:space-between}
-.brand{display:flex;flex-direction:column;gap:7px;min-width:0}
-.eyebrow{font-family:var(--mono);font-size:11px;letter-spacing:.13em;text-transform:uppercase;
-  color:var(--accent);font-weight:600}
-h1{font-size:clamp(25px,3.4vw,34px);font-weight:700;letter-spacing:-.02em}
-.sub{font-family:var(--serif);font-style:italic;color:var(--ink-2);font-size:15.5px;max-width:60ch}
-.build{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.masthead-in{max-width:1240px;margin:0 auto;padding:24px 24px 20px;
+  display:flex;flex-direction:column;gap:14px}
+.idrow{display:flex;flex-wrap:wrap;gap:10px 16px;align-items:baseline}
+h1{font-size:clamp(25px,3.4vw,33px);font-weight:700;letter-spacing:-.022em}
+.sub{font-family:var(--serif);font-style:italic;color:var(--ink-2);font-size:15.5px;
+  max-width:58ch;margin:-8px 0 0}
+.build{display:flex;gap:7px;flex-wrap:wrap;align-items:center;margin-left:auto}
 .tag{font-family:var(--mono);font-size:11.5px;padding:4px 9px;border:1px solid var(--line-2);
   border-radius:3px;color:var(--ink-2);background:var(--surface-2)}
+.tag b{font-weight:600;color:var(--ink)}
 
-/* ---- scoreboard ---- */
-.scoreboard{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:1px;
-  background:var(--line);border:1px solid var(--line);border-radius:5px;overflow:hidden;min-width:290px}
-.score{background:var(--surface);padding:11px 14px;display:flex;flex-direction:column;gap:2px}
-.score .n{font-family:var(--mono);font-size:23px;font-weight:600;font-variant-numeric:tabular-nums;
-  line-height:1.1}
-.score .l{font-size:10.5px;letter-spacing:.09em;text-transform:uppercase;color:var(--ink-3);font-weight:600}
-.score.is-pass .n{color:var(--pass)} .score.is-fail .n{color:var(--fail)}
-.score.is-todo .n{color:var(--ink-3)}
-
-.meter{height:5px;background:var(--surface-3);display:flex;overflow:hidden}
-.meter i{display:block;height:100%;transition:width .3s ease}
-.meter .mp{background:var(--pass)} .meter .mf{background:var(--fail)}
+/* ---- run strip: one tick per case, suites proportional to their case counts ---- */
+.run{margin-top:4px}
+.strip{display:flex;gap:7px;align-items:flex-end;overflow:hidden;
+  border-bottom:1px solid var(--line-2)}
+.grp{display:flex;gap:2px;min-width:0;padding-bottom:5px;border-bottom:2px solid transparent;
+  border-radius:2px;text-decoration:none}
+.grp:hover,.grp:focus-visible{border-bottom-color:var(--accent)}
+.t{flex:1 1 0;min-width:1px;height:22px;border-radius:1.5px;background:var(--tick)}
+.t.p{background:var(--pass)}
+.t.f{background:var(--fail);height:29px}
+.readout{display:flex;align-items:baseline;gap:8px 24px;flex-wrap:wrap;margin-top:9px}
+.fig{display:flex;align-items:baseline;gap:7px}
+.fig .n{font-family:var(--mono);font-size:22px;font-weight:600;line-height:1;
+  font-variant-numeric:tabular-nums}
+.fig .l{font-size:12.5px;color:var(--ink-3)}
+.fig.p .n{color:var(--pass)} .fig.f .n{color:var(--fail)} .fig.u .n{color:var(--ink-3)}
+.runnote{margin:0;font-size:12.5px;color:var(--ink-3);max-width:52ch}
+@media(min-width:760px){.runnote{margin-left:auto;text-align:right}}
+@media(max-width:560px){
+  .alert summary{flex-wrap:wrap}
+  .alert-c{order:3;flex-basis:100%}
+  .alert .mk{order:2}
+  .masthead-in{padding:20px 16px 16px}
+  .shell{padding:18px 16px 60px}
+}
+@media(max-width:760px){
+  .strip{gap:4px}
+  .grp{gap:1px}
+  .build{margin-left:0}
+}
 
 /* ---- shell ---- */
-.shell{max-width:1240px;margin:0 auto;padding:22px 24px 80px;
+.shell{max-width:1240px;margin:0 auto;padding:22px 24px 48px;
   display:grid;grid-template-columns:236px minmax(0,1fr);gap:30px;align-items:start}
-@media(max-width:900px){.shell{grid-template-columns:1fr;gap:18px}}
+@media(max-width:900px){.shell{grid-template-columns:minmax(0,1fr);gap:18px}}
 
-.rail{position:sticky;top:16px;display:flex;flex-direction:column;gap:16px}
-@media(max-width:900px){.rail{position:static}}
+.rail{position:sticky;top:16px;display:flex;flex-direction:column;gap:14px}
+/* On one column the cases come first; the run strip above still navigates by suite. */
+@media(max-width:900px){.rail{position:static;order:2}.shell main{order:1}}
 .rail h2{font-size:10.5px;letter-spacing:.11em;text-transform:uppercase;color:var(--ink-3);
   font-weight:600;margin-bottom:8px}
 .navlist{display:flex;flex-direction:column;gap:1px}
@@ -93,11 +123,25 @@ h1{font-size:clamp(25px,3.4vw,34px);font-weight:700;letter-spacing:-.02em}
 .navlist a .c{font-family:var(--mono);font-size:11px;color:var(--ink-3);font-variant-numeric:tabular-nums}
 .navlist a.done{border-left-color:var(--pass)}
 .navlist a.has-fail{border-left-color:var(--fail)}
+.navlist a[aria-current="true"]{background:var(--surface-2);color:var(--ink);font-weight:600}
+.navlist a[aria-current="true"] .c{color:var(--ink-2)}
 .railbox{background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:13px 14px}
+.railnote{font-size:12.5px;color:var(--ink-2);margin:0 0 9px}
+.railbtns{display:flex;flex-direction:column;gap:6px}
+
+/* keycap hints */
+.keys{display:flex;flex-direction:column;gap:5px}
+.keyrow{display:flex;align-items:baseline;gap:7px}
+.keyrow kbd{font-family:var(--mono);font-size:10.5px;font-weight:600;color:var(--ink-2);
+  background:var(--surface-2);border:1px solid var(--line-2);border-bottom-width:2px;
+  border-radius:3px;padding:0 5px;line-height:1.7}
+.keyrow span{font-size:12px;color:var(--ink-3)}
+@media(max-width:900px){.railkeys{display:none}}
 
 /* ---- controls ---- */
-.controls{display:flex;flex-wrap:wrap;gap:9px;align-items:center;margin-bottom:18px}
-.search{flex:1 1 210px;min-width:170px;position:relative;display:flex}
+.controls{position:sticky;top:0;z-index:5;display:flex;flex-wrap:wrap;gap:8px;align-items:center;
+  background:var(--ground);padding:12px 0 11px;margin-bottom:16px;border-bottom:1px solid var(--line)}
+.search{flex:1 1 210px;min-width:170px;display:flex}
 .search input{width:100%;font-family:var(--mono);font-size:13px;padding:8px 11px;
   border:1px solid var(--line-2);border-radius:5px;background:var(--surface);color:var(--ink)}
 .search input::placeholder{color:var(--ink-3)}
@@ -111,52 +155,68 @@ h1{font-size:clamp(25px,3.4vw,34px);font-weight:700;letter-spacing:-.02em}
 .btn{font-family:var(--sans);font-size:12.5px;font-weight:500;padding:7px 11px;border-radius:5px;
   cursor:pointer;border:1px solid var(--line-2);background:var(--surface);color:var(--ink-2)}
 .btn:hover{border-color:var(--accent-line);color:var(--ink)}
-button:focus-visible,a:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
-/* ---- alert ---- */
-.alert{border:1px solid var(--gap);border-left-width:3px;background:var(--gap-soft);
-  border-radius:5px;padding:14px 16px;margin-bottom:22px}
-.alert h3{font-size:13.5px;font-weight:700;color:var(--gap);margin-bottom:6px;
-  letter-spacing:.01em}
-.alert p{margin:0 0 8px;font-size:13.5px;color:var(--ink-2);max-width:74ch}
-.alert ul{margin:0;padding-left:17px;font-size:13.5px;color:var(--ink-2);display:flex;
+/* ---- known defects ---- */
+.alert{background:var(--surface);border:1px solid var(--line);border-left:3px solid var(--gap);
+  border-radius:0 6px 6px 0;padding:12px 16px;margin-bottom:20px}
+.alert summary{display:flex;align-items:baseline;gap:10px;cursor:pointer;list-style:none}
+.alert summary::-webkit-details-marker{display:none}
+.alert-t{font-size:13px;font-weight:600;color:var(--gap)}
+.alert-c{font-family:var(--mono);font-size:11.5px;color:var(--ink-3)}
+.alert .mk{margin-left:auto;color:var(--ink-3);font-size:10px;transition:transform .15s ease}
+.alert[open] .mk{transform:rotate(90deg)}
+.alert[open] .alert-body{margin-top:10px}
+.alert p{margin:0 0 8px;font-size:13px;color:var(--ink-2);max-width:76ch}
+.alert p:last-child{margin-bottom:0}
+.alert ul{margin:0;padding-left:17px;font-size:13px;color:var(--ink-2);display:flex;
   flex-direction:column;gap:4px}
-.alert code{font-family:var(--mono);font-size:12.5px;color:var(--ink)}
+.alert code{font-family:var(--mono);font-size:12px;color:var(--ink)}
 
-/* ---- sections & cases ---- */
-.sec{margin-bottom:34px;scroll-margin-top:16px}
-.sec-head{display:flex;align-items:baseline;gap:11px;flex-wrap:wrap;
-  padding-bottom:8px;border-bottom:2px solid var(--ink);margin-bottom:14px}
-.sec-head h2{font-size:19px;font-weight:700;letter-spacing:-.01em}
+/* ---- sections ---- */
+.sec{margin-bottom:32px;scroll-margin-top:76px}
+.sec-head{display:flex;align-items:center;gap:8px 14px;flex-wrap:wrap;
+  padding-bottom:8px;border-bottom:2px solid var(--ink);margin-bottom:12px}
+.sec-head h2{font-size:18px;font-weight:700;letter-spacing:-.012em;margin-right:auto}
+.secstrip{display:flex;gap:2px;align-items:flex-end}
+.secstrip i{width:5px;height:12px;border-radius:1px;background:var(--tick)}
+.secstrip i.p{background:var(--pass)}
+.secstrip i.f{background:var(--fail);height:16px}
 .sec-head .n{font-family:var(--mono);font-size:11.5px;color:var(--ink-3);
-  font-variant-numeric:tabular-nums;margin-left:auto}
+  font-variant-numeric:tabular-nums}
+.sec-head .nf{font-family:var(--mono);font-size:11.5px;color:var(--fail);font-weight:600}
 
-.case{background:var(--surface);border:1px solid var(--line);border-radius:6px;
-  margin-bottom:9px;box-shadow:var(--shadow);overflow:hidden}
-.case.s-pass{border-color:var(--pass)}
-.case.s-fail{border-color:var(--fail)}
-.case-head{display:flex;gap:11px;align-items:center;padding:11px 13px;cursor:pointer;
+/* ---- cases: one grouped list, verdict carried in a left gutter ---- */
+.cases{background:var(--surface);border:1px solid var(--line);border-radius:7px;overflow:hidden}
+.case{border-top:1px solid var(--line);border-left:3px solid transparent;scroll-margin-top:76px}
+.case:first-child{border-top:0}
+.case.s-pass{border-left-color:var(--pass)}
+.case.s-fail{border-left-color:var(--fail)}
+.case-head{display:flex;gap:11px;align-items:center;padding:10px 13px;cursor:pointer;
   width:100%;background:none;border:0;text-align:left;font-family:inherit;color:inherit}
 .case-head:hover{background:var(--surface-2)}
+.case-head:focus-visible{outline-offset:-2px}
 .cid{font-family:var(--mono);font-size:11.5px;font-weight:600;padding:3px 7px;border-radius:3px;
   background:var(--surface-3);color:var(--ink-2);white-space:nowrap;letter-spacing:.02em}
 .case.s-pass .cid{background:var(--pass-soft);color:var(--pass)}
 .case.s-fail .cid{background:var(--fail-soft);color:var(--fail)}
 .ctitle{font-size:14.5px;font-weight:500;flex:1;min-width:0}
-.cstate{font-family:var(--mono);font-size:11px;letter-spacing:.07em;text-transform:uppercase;
-  font-weight:600;color:var(--ink-3);white-space:nowrap}
+.cstate{font-family:var(--mono);font-size:11.5px;font-weight:500;color:var(--ink-3);
+  white-space:nowrap}
 .case.s-pass .cstate{color:var(--pass)} .case.s-fail .cstate{color:var(--fail)}
-.caret{color:var(--ink-3);font-size:11px;transition:transform .15s}
+.caret{color:var(--ink-3);font-size:10px;transition:transform .15s ease}
 .case[open-state="1"] .caret{transform:rotate(90deg)}
 
-.case-body{padding:2px 13px 14px;border-top:1px solid var(--line);display:flex;
-  flex-direction:column;gap:12px}
+.case-body{padding:12px 13px 14px;border-top:1px solid var(--line);background:var(--surface);
+  display:flex;flex-direction:column;gap:12px}
 .field{display:flex;flex-direction:column;gap:5px}
 .flabel{font-family:var(--mono);font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;
   color:var(--ink-3);font-weight:600}
-.ftext{font-size:13.5px;color:var(--ink-2);max-width:76ch}
+.ftext{font-size:13.5px;color:var(--ink-2);max-width:76ch;margin:0}
 .ftext code{font-family:var(--mono);font-size:12.5px;background:var(--surface-2);
   padding:1px 4px;border-radius:3px;color:var(--ink)}
+/* JetBrains Mono ligates -- -> :: and //, which the commands and output here are full of.
+   A tester compares expected against actual character by character, so keep every glyph literal. */
+pre,code{font-variant-ligatures:none;font-feature-settings:"liga" 0,"calt" 0}
 pre{margin:0;font-family:var(--mono);font-size:12.5px;line-height:1.62;background:var(--surface-2);
   border:1px solid var(--line);border-radius:5px;padding:11px 12px;overflow-x:auto;
   color:var(--ink);white-space:pre;tab-size:2}
@@ -164,44 +224,75 @@ pre.expected{background:var(--accent-soft);border-color:var(--accent-line)}
 .codewrap{position:relative}
 .copy{position:absolute;top:6px;right:6px;font-family:var(--mono);font-size:10.5px;
   padding:3px 7px;border-radius:3px;border:1px solid var(--line-2);background:var(--surface);
-  color:var(--ink-3);cursor:pointer;opacity:0;transition:opacity .13s}
+  color:var(--ink-3);cursor:pointer;opacity:0;transition:opacity .13s ease}
 .codewrap:hover .copy,.copy:focus-visible{opacity:1}
 .copy:hover{color:var(--accent);border-color:var(--accent-line)}
-.verdict{display:flex;gap:7px;align-items:center;padding-top:2px;flex-wrap:wrap}
+.verdict{display:flex;gap:7px;align-items:center;flex-wrap:wrap}
 .vb{font-family:var(--mono);font-size:12px;font-weight:600;padding:6px 15px;border-radius:5px;
   cursor:pointer;border:1px solid var(--line-2);background:var(--surface);color:var(--ink-2)}
 .vb.p:hover,.vb.p[aria-pressed="true"]{background:var(--pass);border-color:var(--pass);color:#fff}
 .vb.f:hover,.vb.f[aria-pressed="true"]{background:var(--fail);border-color:var(--fail);color:#fff}
 .vb.c{margin-left:auto;font-weight:500}
 .vb.c:hover{color:var(--ink)}
-.empty{padding:34px 4px;color:var(--ink-3);font-family:var(--mono);font-size:13px;text-align:center}
-.foot{max-width:1240px;margin:0 auto;padding:0 24px 46px;color:var(--ink-3);font-size:12.5px;
-  max-width:78ch}
-.foot code{font-family:var(--mono);font-size:12px}
+
+.empty{padding:40px 4px;color:var(--ink-3);font-family:var(--mono);font-size:13px;text-align:center}
+/* ---- footer: bookends the masthead, so the page opens and closes on --surface ---- */
+.foot{border-top:1px solid var(--line);background:var(--surface)}
+.foot-in{max-width:1240px;margin:0 auto;padding:26px 24px 30px}
+/* Every track needs the 0 floor, or the env <pre> widens its column instead of scrolling. */
+.foot-grid{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(0,1fr) minmax(0,1fr);
+  gap:26px 34px}
+.foot-col h2{font-size:10.5px;letter-spacing:.11em;text-transform:uppercase;color:var(--ink-3);
+  font-weight:600;margin-bottom:9px}
+.foot-col p{margin:9px 0 0;font-size:12.5px;line-height:1.55;color:var(--ink-2);max-width:58ch}
+.foot-col code{font-family:var(--mono);font-size:12px;color:var(--ink)}
+.foot-col pre{font-size:12px}
+.foot-links{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:7px}
+.foot-links a{align-self:flex-start;font-size:13px;color:var(--accent);text-decoration:none;
+  border-bottom:1px solid transparent}
+.foot-links a:hover{border-bottom-color:var(--accent-line)}
+.foot-bar{display:flex;align-items:center;gap:12px 16px;flex-wrap:wrap;
+  margin-top:26px;padding-top:16px;border-top:1px solid var(--line)}
+.foot-id{font-family:var(--mono);font-size:11.5px;color:var(--ink-3);margin-right:auto}
+
+/* three-state theme control; shares the storage key with docs/manual.html */
+.themectl{display:inline-flex;border:1px solid var(--line-2);border-radius:5px;overflow:hidden}
+.tbtn{font-family:var(--mono);font-size:11.5px;padding:6px 12px;border:0;cursor:pointer;
+  background:var(--surface);color:var(--ink-3);border-left:1px solid var(--line-2)}
+.tbtn:first-child{border-left:0}
+.tbtn:hover{background:var(--surface-2);color:var(--ink)}
+.tbtn:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+.tbtn[aria-pressed="true"]{background:var(--accent);color:#fff}
+:root[data-theme="dark"] .tbtn[aria-pressed="true"]{color:#08181A}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]) .tbtn[aria-pressed="true"]{color:#08181A}}
+
+@media(max-width:820px){.foot-grid{grid-template-columns:minmax(0,1fr);gap:22px}}
+@media(max-width:560px){.foot-in{padding:22px 16px 26px}.foot-id{margin-right:0}}
 @media(prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
 </style>
 </head>
 <body>
 <header class="masthead">
   <div class="masthead-in">
-    <div class="brand">
-      <div class="eyebrow">Test Playbook</div>
-      <h1>rocket-mem QA</h1>
-      <p class="sub">135 cases across 11 suites. Every expected output below was captured from a
-        real run, not predicted.</p>
+    <div class="idrow">
+      <h1 tabindex="-1">rocket-mem QA</h1>
       <div class="build">
-        <span class="tag">v0.1.3</span><span class="tag">61f40ae</span>
+        <span class="tag"><b id="s-total">135</b> cases</span>
+        <span class="tag">v0.1.3</span>
+        <span class="tag">61f40ae</span>
         <span class="tag">RESP2/RESP3 + RMP</span>
       </div>
     </div>
-    <div style="display:flex;flex-direction:column;gap:8px">
-      <div class="scoreboard">
-        <div class="score"><span class="n" id="s-total">0</span><span class="l">Cases</span></div>
-        <div class="score is-pass"><span class="n" id="s-pass">0</span><span class="l">Passed</span></div>
-        <div class="score is-fail"><span class="n" id="s-fail">0</span><span class="l">Failed</span></div>
-        <div class="score is-todo"><span class="n" id="s-todo">0</span><span class="l">Untested</span></div>
+    <p class="sub">Every expected output below was captured from a real run, not predicted.</p>
+
+    <div class="run">
+      <div class="strip" id="strip"></div>
+      <div class="readout">
+        <div class="fig p"><span class="n" id="s-pass">0</span><span class="l">passed</span></div>
+        <div class="fig f"><span class="n" id="s-fail">0</span><span class="l">failed</span></div>
+        <div class="fig u"><span class="n" id="s-todo">0</span><span class="l">untested</span></div>
+        <p class="runnote" id="runnote"></p>
       </div>
-      <div class="meter"><i class="mp" id="m-pass" style="width:0"></i><i class="mf" id="m-fail" style="width:0"></i></div>
     </div>
   </div>
 </header>
@@ -214,39 +305,57 @@ pre.expected{background:var(--accent-soft);border-color:var(--accent-line)}
     </div>
     <div class="railbox">
       <h2>Your run</h2>
-      <p style="font-size:12.5px;color:var(--ink-2);margin:0 0 9px">Results are saved in this
-        browser only. They are not shared with anyone.</p>
-      <div style="display:flex;flex-direction:column;gap:6px">
+      <p class="railnote">Results are saved in this browser only. They are not shared with anyone.</p>
+      <div class="railbtns">
+        <button class="btn" id="next-todo">Go to next untested</button>
         <button class="btn" id="copy-report">Copy result summary</button>
         <button class="btn" id="reset">Reset all results</button>
+      </div>
+    </div>
+    <div class="railbox railkeys">
+      <h2>Keyboard</h2>
+      <div class="keys">
+        <div class="keyrow"><kbd>j</kbd><kbd>k</kbd><span>Move between cases</span></div>
+        <div class="keyrow"><kbd>n</kbd><span>Next untested</span></div>
+        <div class="keyrow"><kbd>p</kbd><kbd>f</kbd><span>Record pass or fail</span></div>
+        <div class="keyrow"><kbd>x</kbd><span>Clear the verdict</span></div>
+        <div class="keyrow"><kbd>e</kbd><span>Expand every case</span></div>
+        <div class="keyrow"><kbd>/</kbd><span>Search</span></div>
       </div>
     </div>
   </aside>
 
   <main>
-    <div class="alert">
-      <h3>Read before filing a defect</h3>
-      <p>Four defects were already found and confirmed while writing this playbook. They are
-        reproducible on <code>v0.1.3</code> — do not open duplicates:</p>
-      <ul>
-        <li><code>ZADD k 1 a 2 b 3 c</code> returns <code>1</code> and stores only <code>a</code>.
-          Surplus score/member pairs are silently dropped (CORE-28).</li>
-        <li><code>LPOP</code>, <code>RPOP</code>, <code>SPOP</code>, <code>SRANDMEMBER</code>
-          accept a count argument and ignore it (CORE-19, CORE-23b).</li>
-        <li><code>INCR</code> on a non-numeric value and <code>RENAME</code> on a missing key
-          reply without the <code>ERR</code> prefix (CORE-06, CORE-32).</li>
-        <li><code>SET k v NX XX</code> and <code>SET k v EX 100 PX 5000</code> are accepted
-          instead of rejected as a syntax error (CORE-03).</li>
-      </ul>
-      <p style="margin:9px 0 0">Intentional divergences from real Redis — partial
-        <code>KEYS</code> globs, 4-field <code>SLOWLOG</code>, full-resync-only replication and
-        more — are listed under “Known limits” in <code>docs/qa-playbook.md</code>. Check there
-        before reporting anything.</p>
-    </div>
+    <details class="alert" id="known" open>
+      <summary>
+        <span class="alert-t">Read before filing a defect</span>
+        <span class="alert-c">4 already confirmed on v0.1.3</span>
+        <span class="mk" aria-hidden="true">&#9656;</span>
+      </summary>
+      <div class="alert-body">
+        <p>These four were found and confirmed while writing this playbook. They reproduce on
+          <code>v0.1.3</code> — do not open duplicates:</p>
+        <ul>
+          <li><code>ZADD k 1 a 2 b 3 c</code> returns <code>1</code> and stores only <code>a</code>.
+            Surplus score/member pairs are silently dropped (CORE-28).</li>
+          <li><code>LPOP</code>, <code>RPOP</code>, <code>SPOP</code>, <code>SRANDMEMBER</code>
+            accept a count argument and ignore it (CORE-19, CORE-23b).</li>
+          <li><code>INCR</code> on a non-numeric value and <code>RENAME</code> on a missing key
+            reply without the <code>ERR</code> prefix (CORE-06, CORE-32).</li>
+          <li><code>SET k v NX XX</code> and <code>SET k v EX 100 PX 5000</code> are accepted
+            instead of rejected as a syntax error (CORE-03).</li>
+        </ul>
+        <p style="margin:9px 0 0">Intentional divergences from real Redis — partial
+          <code>KEYS</code> globs, 4-field <code>SLOWLOG</code>, full-resync-only replication and
+          more — are listed under “Known limits” in <code>docs/qa-playbook.md</code>. Check there
+          before reporting anything.</p>
+      </div>
+    </details>
 
     <div class="controls">
       <label class="search">
-        <input type="search" id="q" placeholder="Search cases, commands, output…" aria-label="Search cases">
+        <span class="vh">Search cases</span>
+        <input type="search" id="q" placeholder="Search cases, commands, output…">
       </label>
       <div class="chips" role="group" aria-label="Filter by result">
         <button class="chip" data-f="all" aria-pressed="true">All</button>
@@ -262,12 +371,46 @@ pre.expected{background:var(--accent-soft);border-color:var(--accent-line)}
 </div>
 
 <footer class="foot">
-  <p>Generated from <code>docs/qa-playbook.md</code> at commit <code>61f40ae</code>. The markdown
-  file is the source of truth — this page is a view of it. Set
-  <code>ROCKET_MEM_REPO</code> and <code>ROCKET_MEM_BIN</code> in your shell before running any
-  case; the Environment setup suite covers all three ways to get a running server.</p>
+  <div class="foot-in">
+    <div class="foot-grid">
+      <div class="foot-col">
+        <h2>Before you run anything</h2>
+        <div class="codewrap">
+<pre>export ROCKET_MEM_REPO=/path/to/your/rocket-mem
+export ROCKET_MEM_BIN="$ROCKET_MEM_REPO/target/release/rocket-mem"</pre>
+          <button class="copy" id="copy-env">Copy</button>
+        </div>
+        <p>Every case reads those two. The Environment setup suite covers all three ways to get a
+          running server — build from source, run the Docker image, or download a release.</p>
+      </div>
+      <div class="foot-col">
+        <h2>Where this comes from</h2>
+        <p style="margin-top:0">Generated from <code>docs/qa-playbook.md</code> at commit
+          <code>61f40ae</code>. The markdown is the source of truth; this page is a view of it, so
+          corrections to a case belong there.</p>
+      </div>
+      <div class="foot-col">
+        <h2>Also worth reading</h2>
+        <ul class="foot-links">
+          <li><a href="qa-playbook.md#known-limits-and-expected-divergences">Known limits and
+            expected divergences</a></li>
+          <li><a href="manual.html">Command manual</a></li>
+          <li><a href="getting-started.md">Getting started</a></li>
+          <li><a href="command-compatibility.md">Redis command compatibility</a></li>
+        </ul>
+      </div>
+    </div>
+    <div class="foot-bar">
+      <span class="foot-id">rocket-mem QA</span>
+      <div class="themectl" role="group" aria-label="Colour theme">
+        <button class="tbtn" data-theme-set="system" aria-pressed="true">System</button>
+        <button class="tbtn" data-theme-set="light" aria-pressed="false">Light</button>
+        <button class="tbtn" data-theme-set="dark" aria-pressed="false">Dark</button>
+      </div>
+      <button class="btn" id="to-top">Back to top</button>
+    </div>
+  </div>
 </footer>
-
 <script type="application/json" id="data">[{"title": "Environment setup", "cases": [{"id": "ENV-01", "area": "ENV", "title": "Confirm `redis-cli` is installed", "precondition": "None.", "steps": "redis-cli --version", "expected": "redis-cli 8.10.1", "notes": "Any reasonably recent `redis-cli` works — it is a generic RESP client, not\nrocket-mem-specific. Exact version will differ per machine; what matters is that the command\nresolves at all."}, {"id": "ENV-02", "area": "ENV", "title": "Confirm OpenSSL is installed", "precondition": "None. Needed for the TLS suite (self-signed cert generation) and for probing\nthe RMP TLS listener with `openssl s_client`.", "steps": "openssl version", "expected": "OpenSSL 3.0.13 30 Jan 2024 (Library: OpenSSL 3.0.13 30 Jan 2024)", "notes": ""}, {"id": "ENV-03", "area": "ENV", "title": "Confirm `curl` is installed", "precondition": "None. Needed to hit the Prometheus `/metrics` endpoint and, for Method C, to\ndownload release archives.", "steps": "curl --version | head -1", "expected": "curl 8.5.0 (x86_64-pc-linux-gnu) libcurl/8.5.0 OpenSSL/3.0.13 zlib/1.3 brotli/1.1.0 zstd/1.5.5 libidn2/2.3.7 libpsl/0.21.2 (+libidn2/2.3.7) libssh/0.10.6/openssl/zlib nghttp2/1.59.0 librtmp/2.3 OpenLDAP/2.6.10", "notes": ""}, {"id": "ENV-04", "area": "ENV", "title": "Confirm Docker is installed and its daemon is reachable", "precondition": "None. Only needed for Method B and for pulling the ghcr.io image under Method C.", "steps": "docker --version\ndocker ps", "expected": "Docker version 29.7.2, build a7dcaa6\nCONTAINER ID   IMAGE     COMMAND   CREATED   STATUS    PORTS     NAMES", "notes": ""}, {"id": "ENV-05", "area": "ENV", "title": "Confirm a Rust toolchain is installed (source builds and RMP tests only)", "precondition": "None. Only required for Method A, and — regardless of which method starts the\nserver under test — for the RMP suite, because the only RMP client that exists is the\n`rmp-client` crate; there is no standalone RMP CLI.", "steps": "rustc --version\ncargo --version", "expected": "rustc 1.94.0 (4a4ef493e 2026-03-02)\ncargo 1.94.0 (85eff7c80 2026-01-15)", "notes": "No minimum supported Rust version is documented in this repo; any recent stable\ntoolchain that successfully runs ENV-06 is sufficient."}, {"id": "ENV-06", "area": "ENV", "title": "Method A: build rocket-mem from source", "precondition": "ENV-05 passed. Network access to GitHub.", "steps": "git clone https://github.com/Snehal1112/rocket-mem.git\ncd rocket-mem\ncargo build --release --bin rocket-mem\n./target/release/rocket-mem --version", "expected": "rocket-mem 0.1.3", "notes": "This was run for real — clean clone, cold build, ~37s on this machine (yours will\nvary with core count and cache state). `--version` and `--help` are only supported by the current\nsource build (Sprint 8's clap-based CLI). Do not assume this of Method C's release binary — see\nENV-10."}, {"id": "ENV-07", "area": "ENV", "title": "Method B: build the Docker image", "precondition": "ENV-04 passed.", "steps": "docker build -t rocket-mem:local .", "expected": "#16 exporting to image\n#16 writing image sha256:...\n#16 naming to docker.io/library/rocket-mem:local done", "notes": "An image may already exist locally as `rocket-mem:local` from a previous run — that is\nfine, `docker build` overwrites it. Cold build (no layer cache) took ~47s here; the `cargo build\n--release --bin rocket-mem` step inside the container is the dominant cost, same as ENV-06."}, {"id": "ENV-08", "area": "ENV", "title": "Method B: run the Docker image and confirm it's reachable", "precondition": "ENV-07 passed.", "steps": "docker run -d --name rocket-mem-qa -p 16540:6379 -p 16541:6380 -p 19340:9121 rocket-mem:local\ndocker logs rocket-mem-qa\nredis-cli -p 16540 PING\ndocker exec rocket-mem-qa whoami", "expected": "Recovered state from ./dump.snapshot and ./appendonly.aof\nMetrics on http://0.0.0.0:9121/metrics\nRMP listening on 0.0.0.0:6380\nListening on 0.0.0.0:6379", "notes": "- The Dockerfile sets `ROCKET_MEM_ADDR`/`ROCKET_MEM_RMP_ADDR`/`ROCKET_MEM_METRICS_ADDR` to\n  `0.0.0.0:*` so the container is reachable from outside its network namespace — unlike a bare\n  `cargo run` on the host, which defaults to loopback-only. This is why the log lines above show\n  `0.0.0.0`, not `127.0.0.1`.\n- `whoami` returning `rocket-mem` (not `root`) confirms the image's non-root `USER` directive is\n  in effect.\n- **Cleanup trap, confirmed on this host:** `docker stop`, `docker kill`, `docker restart`, and\n  `docker rm -f` against a running container all failed here with\n  `Error response from daemon: cannot kill container: ...: permission denied` — reproducible,\n  not transient, and not fixable without root (this Docker install is a snap package running\n  inside a nested LXD container; it is a host-level AppArmor/Docker signal-mediation bug, not a\n  rocket-mem defect). `docker pause`/`docker unpause` and image operations (`docker rmi`) worked\n  fine; only signaling a running container's process failed. **Before relying on `docker rm -f`\n  for cleanup in a later suite, prove it works on your host with a disposable container first.**\n  If it doesn't, you need a host admin (`sudo systemctl restart docker`, or an AppArmor profile\n  fix) before Method B testing can be cleaned up — plan for that, since a stuck container ties up\n  its ports indefinitely.\n- Separately (a real product observation, not an environment quirk): rocket-mem installs no\n  `SIGTERM`/`SIGINT` handler. Outside a container this doesn't matter — the kernel's default\n  disposition terminates it. As a container's PID 1, though, an unhandled `SIGTERM` is not\n  applied by default, so `docker stop`'s graceful-then-`SIGKILL` sequence will, if your host's\n  Docker actually delivers the signal, ride out the full stop timeout (10s default) before the\n  `SIGKILL` finishes it, rather than exiting promptly. Confirmed independently: `docker exec\n  rocket-mem-qa kill 1` returns exit 0 but the process does not exit."}, {"id": "ENV-09", "area": "ENV", "title": "Method C: download and verify a prebuilt release archive", "precondition": "ENV-03 passed. Network access to GitHub.", "steps": "curl -sL -o rocket-mem-v0.1.2-linux-amd64.tar.gz \\\n  https://github.com/Snehal1112/rocket-mem/releases/download/v0.1.2/rocket-mem-v0.1.2-linux-amd64.tar.gz\ncurl -sL -o rocket-mem-v0.1.2-linux-amd64.tar.gz.sha256 \\\n  https://github.com/Snehal1112/rocket-mem/releases/download/v0.1.2/rocket-mem-v0.1.2-linux-amd64.tar.gz.sha256\nsha256sum -c rocket-mem-v0.1.2-linux-amd64.tar.gz.sha256\ntar -xzf rocket-mem-v0.1.2-linux-amd64.tar.gz\nchmod +x rocket-mem-v0.1.2-linux-amd64", "expected": "rocket-mem-v0.1.2-linux-amd64.tar.gz: OK", "notes": "- As of this writing the only published, non-draft GitHub Releases are `v0.1.1` and `v0.1.2`\n  (checked via `git tag` plus the GitHub API — `v0.1.3` is tagged and pushed but has no visible\n  public release, i.e. it is either still a draft or the `release` job hasn't completed for it).\n  Use `v0.1.2` — it's the newest one actually downloadable. Check\n  `https://github.com/Snehal1112/rocket-mem/releases` for anything newer before you run this.\n- The release job also produces a detached minisign `.sig` file\n  (`rocket-mem-v0.1.2-linux-amd64.tar.gz.sig`) per `CONTRIBUTING.md`. It cannot be verified in\n  this playbook: `CONTRIBUTING.md` says the maintainer should commit the public key as\n  `RELEASE_SIGNING_KEY.pub` at the repo root, but no such file exists in the repo as of `v0.1.3`.\n  The sha256 check above is the only verification currently possible for a QA engineer."}, {"id": "ENV-10", "area": "ENV", "title": "Method C: run the prebuilt release binary", "precondition": "ENV-09 passed.", "steps": "ROCKET_MEM_ADDR=127.0.0.1:6540 ./rocket-mem-v0.1.2-linux-amd64 &\nredis-cli -p 6540 ping\nredis-cli -p 6540 info server | grep redis_version\nkill %1", "expected": "Replayed AOF from ./appendonly.aof\nListening on 127.0.0.1:6540", "notes": ""}, {"id": "ENV-11", "area": "ENV", "title": "Method C: pull the ghcr.io image", "precondition": "ENV-04 passed.", "steps": "docker pull ghcr.io/snehal1112/rocket-mem:v0.1.3", "expected": "v0.1.3: Pulling from snehal1112/rocket-mem\n...\nStatus: Downloaded newer image for ghcr.io/snehal1112/rocket-mem:v0.1.3\nghcr.io/snehal1112/rocket-mem:v0.1.3", "notes": "- `:v0.1.3` and `:latest` both pull successfully (`.github/workflows/release.yml`'s `docker` job\n  publishes both tags on every `v*.*.*` push). `:v0.1.2` does **not** exist on ghcr.io —\n  `docker pull ghcr.io/snehal1112/rocket-mem:v0.1.2` fails with `manifest unknown`. The\n  `docker` publish job was evidently added to the release workflow after `v0.1.2` was cut (commit\n  `8ac55c4`, \"CI: publish a ghcr.io image on release tags\"), so `v0.1.3`'s image is, unlike the\n  binary archive in ENV-09/ENV-10, actually current — it should have RMP and metrics.\n  This playbook did not `docker run` it: see the cleanup trap noted under ENV-08. Verify on your\n  own host that `docker rm -f` works against a disposable container before running this image and\n  relying on being able to tear it down.\n- Marking this **not independently run-verified** (pull only) for the reason above — everything\n  else in this case is real captured output."}]}, {"title": "Smoke suite", "cases": [{"id": "SMOKE-01", "area": "SMOKE", "title": "Server starts with no config and prints its three listeners", "precondition": "ENV-06 passed. Working directory is empty of any prior `dump.snapshot` /\n`appendonly.aof` (or accept that it will replay whatever is there).", "steps": "ROCKET_MEM_ADDR=127.0.0.1:6540 ROCKET_MEM_RMP_ADDR=127.0.0.1:6541 ROCKET_MEM_METRICS_ADDR=127.0.0.1:9340 \\\n  ./target/release/rocket-mem &", "expected": "Recovered state from ./dump.snapshot and ./appendonly.aof\nMetrics on http://127.0.0.1:9340/metrics\nRMP listening on 127.0.0.1:6541\nListening on 127.0.0.1:6540", "notes": "No `--config` and no `rocket-mem.toml` in the working directory is not an error — see\nthe port note at the top of this document for why the addresses aren't the documented defaults.\nOn a single-tenant machine, drop the three `ROCKET_MEM_*` env vars entirely and you'll see\n`127.0.0.1:9121` / `127.0.0.1:6380` / `127.0.0.1:6379` instead, which is the literal zero-config\ncase the docs describe."}, {"id": "SMOKE-02", "area": "SMOKE", "title": "PING", "precondition": "SMOKE-01's server is running.", "steps": "redis-cli -p 6540 PING", "expected": "PONG", "notes": ""}, {"id": "SMOKE-03", "area": "SMOKE", "title": "SET / GET", "precondition": "SMOKE-01's server is running.", "steps": "redis-cli -p 6540 SET foo bar\nredis-cli -p 6540 GET foo", "expected": "OK\nbar", "notes": ""}, {"id": "SMOKE-04", "area": "SMOKE", "title": "DEL / EXISTS", "precondition": "SMOKE-03 ran (key `foo` exists).", "steps": "redis-cli -p 6540 EXISTS foo\nredis-cli -p 6540 DEL foo\nredis-cli -p 6540 EXISTS foo", "expected": "1\n1\n0", "notes": ""}, {"id": "SMOKE-05", "area": "SMOKE", "title": "Hash operation", "precondition": "SMOKE-01's server is running.", "steps": "redis-cli -p 6540 HSET myhash field1 value1\nredis-cli -p 6540 HGET myhash field1", "expected": "1\nvalue1", "notes": ""}, {"id": "SMOKE-06", "area": "SMOKE", "title": "List operation", "precondition": "SMOKE-01's server is running.", "steps": "redis-cli -p 6540 RPUSH mylist a b c\nredis-cli -p 6540 LRANGE mylist 0 -1", "expected": "3\na\nb\nc", "notes": ""}, {"id": "SMOKE-07", "area": "SMOKE", "title": "TTL via EXPIRE", "precondition": "SMOKE-01's server is running.", "steps": "redis-cli -p 6540 SET ttlkey val\nredis-cli -p 6540 EXPIRE ttlkey 100\nredis-cli -p 6540 TTL ttlkey", "expected": "OK\n1\n99", "notes": "`TTL` came back `99`, not `100` — real, expected: a moment of wall-clock time passed\nbetween `EXPIRE` and `TTL`. Don't treat an off-by-a-couple-seconds value as a failure; only flag\nit if it's off by much more, or negative/missing."}, {"id": "SMOKE-08", "area": "SMOKE", "title": "INFO server", "precondition": "SMOKE-01's server is running.", "steps": "redis-cli -p 6540 INFO server", "expected": "# Server\nredis_version:rocket-mem-0.1.3\nrocket_mem_version:0.1.3\nredis_mode:standalone\nos:linux\narch_bits:64\nprocess_id:<pid>\nuptime_in_seconds:<n>\nuptime_in_days:0", "notes": ""}, {"id": "SMOKE-09", "area": "SMOKE", "title": "INFO replication", "precondition": "SMOKE-01's server is running.", "steps": "redis-cli -p 6540 INFO replication", "expected": "# Replication\nrole:master\nconnected_slaves:0", "notes": ""}, {"id": "SMOKE-10", "area": "SMOKE", "title": "Prometheus `/metrics` endpoint", "precondition": "SMOKE-01's server is running. At least one command already issued (SMOKE-02\nthrough SMOKE-09), so the counters below aren't all zero.", "steps": "curl -s -o /dev/null -w \"HTTP %{http_code}\\n\" http://127.0.0.1:9340/metrics\ncurl -s http://127.0.0.1:9340/metrics | grep -A1 '^# TYPE rocket_mem_commands_total'", "expected": "HTTP 200", "notes": ""}, {"id": "SMOKE-11", "area": "SMOKE", "title": "SAVE writes a snapshot", "precondition": "SMOKE-01's server is running, working directory known.", "steps": "ls dump.snapshot 2>&1\nredis-cli -p 6540 SAVE\nls -la dump.snapshot", "expected": "ls: cannot access 'dump.snapshot': No such file or directory\nOK\n-rw-rw-r-- 1 <user> <group> 163 <date> dump.snapshot", "notes": "File size will vary with what's in the keyspace at `SAVE` time; the point is the file\ndid not exist before and does after, with `SAVE` returning `OK`."}, {"id": "SMOKE-12", "area": "SMOKE", "title": "Graceful shutdown", "precondition": "SMOKE-01's server is running; you know its PID.", "steps": "kill -TERM <pid>\nsleep 1\nps -p <pid>            # should report no such process\nss -tlnp | grep -E ':(6540|6541|9340)\\b'   # should print nothing — ports released", "expected": "", "notes": "Confirmed no special log line on `SIGTERM` — don't wait for one. This is the plain\nhost-process case (not PID 1 in a container); see ENV-08's notes for how this differs when\nrocket-mem is PID 1 inside Docker."}]}, {"title": "Core data types and keys", "cases": [{"id": "CORE-01", "area": "CORE", "title": "SET/GET and SET NX/XX", "precondition": "Key `core:str1` does not exist.", "steps": "redis-cli -p 6550 set core:str1 hello\nredis-cli -p 6550 get core:str1\nredis-cli -p 6550 set core:str1 world NX\nredis-cli -p 6550 set core:str1 world XX\nredis-cli -p 6550 get core:str1\nredis-cli -p 6550 set core:nx1 v1 NX\nredis-cli -p 6550 get core:nx1\nredis-cli -p 6550 set core:missing v1 XX", "expected": "OK\nhello\n\nOK\nworld\nOK\nv1", "notes": "`SET ... NX` on an existing key returns a nil bulk reply (blank line) and\nleaves the value unchanged. `SET ... XX` on a missing key also returns nil and does not\ncreate the key."}, {"id": "CORE-02", "area": "CORE", "title": "SET EX/PX set a TTL", "precondition": "None.", "steps": "redis-cli -p 6550 set core:ex1 v1 EX 100\nredis-cli -p 6550 ttl core:ex1\nredis-cli -p 6550 set core:px1 v1 PX 100000\nredis-cli -p 6550 pttl core:px1", "expected": "OK\n99\nOK\n99997", "notes": "`TTL`/`PTTL` are already counting down by the time the follow-up call runs,\nso exact values will be a few units below the value passed to `EX`/`PX`. That is\nexpected, not a bug."}, {"id": "CORE-03", "area": "CORE", "title": "SET with conflicting NX+XX or EX+PX does not error", "precondition": "None.", "steps": "redis-cli -p 6550 set core:bothexpx v1 EX 100 PX 5000\nredis-cli -p 6550 ttl core:bothexpx\nredis-cli -p 6550 pttl core:bothexpx\nredis-cli -p 6550 set core:bothnxxx2 initial\nredis-cli -p 6550 set core:bothnxxx2 shouldnotset NX XX\nredis-cli -p 6550 get core:bothnxxx2\nredis-cli -p 6550 del core:bothnxxx3\nredis-cli -p 6550 set core:bothnxxx3 v1 NX XX\nredis-cli -p 6550 get core:bothnxxx3", "expected": "OK\n99\n99991\nOK\nOK\n\ninitial\n0\nOK\nv1", "notes": "Divergence from real Redis, which rejects `EX`+`PX` together and `NX`+`XX`\ntogether with `ERR syntax error`. Here: with both `EX` and `PX` given, `EX` silently\nwins and `PX` is ignored (100s TTL, not 5s). With both `NX` and `XX` given, only `NX`\nis honored: on an existing key the call returns nil and does not overwrite the value\n(as `set ... shouldnotset NX XX` did above — note it returned `OK` in the transcript\norder shown, i.e. the second `set core:bothnxxx2 initial` — the `NX XX` call itself\nreturned nil, confirmed by `get` still showing `initial`); on a missing key it\nsucceeds and creates it, exactly as if `XX` weren't there at all."}, {"id": "CORE-04", "area": "CORE", "title": "GETSET", "precondition": "`core:str1` holds `world` (from CORE-01).", "steps": "redis-cli -p 6550 getset core:str1 newval\nredis-cli -p 6550 get core:str1", "expected": "world\nnewval", "notes": ""}, {"id": "CORE-05", "area": "CORE", "title": "APPEND, STRLEN, GETRANGE, SETRANGE", "precondition": "`core:app1` does not exist.", "steps": "redis-cli -p 6550 del core:app1\nredis-cli -p 6550 append core:app1 \"Hello \"\nredis-cli -p 6550 append core:app1 \"World\"\nredis-cli -p 6550 get core:app1\nredis-cli -p 6550 strlen core:app1\nredis-cli -p 6550 getrange core:app1 0 4\nredis-cli -p 6550 getrange core:app1 -5 -1\nredis-cli -p 6550 setrange core:app1 6 \"Redis\"\nredis-cli -p 6550 get core:app1\nredis-cli -p 6550 getrange core:app1 0 100", "expected": "0\n6\n11\nHello World\n11\nHello\nWorld\n11\nHello Redis\nHello Redis", "notes": "`APPEND` on a missing key creates it (returns the new length, `6`).\n`GETRANGE` with an end index past the string's length clamps to the string's end\nrather than erroring."}, {"id": "CORE-06", "area": "CORE", "title": "INCR/DECR/INCRBY, and INCR on a non-numeric value", "precondition": "`core:cnt` does not exist; `core:nonnum` will be set to a\nnon-numeric string.", "steps": "redis-cli -p 6550 del core:cnt\nredis-cli -p 6550 incr core:cnt\nredis-cli -p 6550 incrby core:cnt 10\nredis-cli -p 6550 decr core:cnt\nredis-cli -p 6550 set core:nonnum abc\nredis-cli -p 6550 incr core:nonnum", "expected": "0\n1\n11\n10\nOK\nvalue is not an integer or out of range", "notes": "The error text has no `ERR` prefix — real Redis's is `ERR value is not an\ninteger or out of range`. This engine's error frame is the bare message\n(`-value is not an integer or out of range\\r\\n` on the wire, confirmed with a raw RESP\nprobe). This is a real, undocumented divergence — a client that pattern-matches on\n`ERR value is not an integer` will not match here. `WRONGTYPE` errors, by contrast, do\ncarry a literal prefix (see CORE-40) — the missing-prefix issue is specific to this\nkind of value-validation error, not error frames in general."}, {"id": "CORE-07", "area": "CORE", "title": "MSET/MGET/MSETNX", "precondition": "`core:k1`, `core:k2` unset; `core:k3` unset.", "steps": "redis-cli -p 6550 mset core:k1 v1 core:k2 v2\nredis-cli -p 6550 mget core:k1 core:k2 core:nosuch\nredis-cli -p 6550 msetnx core:k3 v3 core:k1 vX\nredis-cli -p 6550 get core:k1\nredis-cli -p 6550 get core:k3", "expected": "OK\nv1\nv2\n\n0\nv1", "notes": "`MSETNX` is all-or-nothing: because `core:k1` already existed, the whole\nbatch was rejected (returns `0`) and `core:k3` was **not** created either, even though\n`core:k3` alone was free."}, {"id": "CORE-08", "area": "CORE", "title": "HSET/HGET/HDEL/HEXISTS", "precondition": "`core:h1` does not exist.", "steps": "redis-cli -p 6550 del core:h1\nredis-cli -p 6550 hset core:h1 f1 v1 f2 v2\nredis-cli -p 6550 hget core:h1 f1\nredis-cli -p 6550 hexists core:h1 f1\nredis-cli -p 6550 hexists core:h1 fnosuch\nredis-cli -p 6550 hdel core:h1 f1\nredis-cli -p 6550 hexists core:h1 f1", "expected": "0\n2\nv1\n1\n0\n1\n0", "notes": "`HSET` is variadic (multiple field/value pairs in one call) and returns\nthe count of *new* fields set (`2` here, since both `f1` and `f2` were new)."}, {"id": "CORE-09", "area": "CORE", "title": "HGETALL/HLEN/HKEYS/HVALS", "precondition": "Continuing from CORE-08: `core:h1` has `f2=v2`.", "steps": "redis-cli -p 6550 hset core:h1 f2 v2new f3 v3\nredis-cli -p 6550 hgetall core:h1\nredis-cli -p 6550 hlen core:h1\nredis-cli -p 6550 hkeys core:h1\nredis-cli -p 6550 hvals core:h1", "expected": "1\nf3\nv3\nf2\nv2new\n2\nf3\nf2\nv3\nv2new", "notes": "`HGETALL` interleaves field/value pairs; ordering is hash-map order (not\ninsertion order) — do not assert on field order, only on the set of pairs."}, {"id": "CORE-10", "area": "CORE", "title": "HMGET/HSETNX", "precondition": "Continuing from CORE-09: `core:h1` has `f2=v2new`, `f3=v3`.", "steps": "redis-cli -p 6550 hmget core:h1 f2 f3 fnosuch\nredis-cli -p 6550 hsetnx core:h1 f2 shouldnotchange\nredis-cli -p 6550 hget core:h1 f2\nredis-cli -p 6550 hsetnx core:h1 f4 newval\nredis-cli -p 6550 hget core:h1 f4", "expected": "v2new\nv3\n\n0\nv2new\n1\nnewval", "notes": ""}, {"id": "CORE-11", "area": "CORE", "title": "HINCRBY", "precondition": "`core:h1` exists (from prior cases).", "steps": "redis-cli -p 6550 hset core:h1 cnt 5\nredis-cli -p 6550 hincrby core:h1 cnt 3\nredis-cli -p 6550 hincrby core:h1 cnt -10", "expected": "1\n8\n-2", "notes": ""}, {"id": "CORE-12", "area": "CORE", "title": "HSCAN", "precondition": "`core:h1` has fields `f2`, `f3`, `f4`, `cnt` (from prior cases).", "steps": "redis-cli -p 6550 hscan core:h1 0", "expected": "0\nf2\nv2new\nf4\nnewval\ncnt\n-2\nf3\nv3", "notes": "Cursor returned is `0` — the whole hash fit in one call. Field/value pairs\nare interleaved like `HGETALL`; order is unspecified."}, {"id": "CORE-13", "area": "CORE", "title": "LPUSH/RPUSH (variadic) and LRANGE", "precondition": "`core:l1` does not exist.", "steps": "redis-cli -p 6550 del core:l1\nredis-cli -p 6550 rpush core:l1 a b c\nredis-cli -p 6550 lpush core:l1 z y\nredis-cli -p 6550 lrange core:l1 0 -1", "expected": "0\n3\n5\ny\nz\na\nb\nc", "notes": "`LPUSH core:l1 z y` pushes `z` then `y`, each onto the head, giving final\nhead-to-tail order `y z a b c` — mind the reversal versus argument order."}, {"id": "CORE-14", "area": "CORE", "title": "LPOP/RPOP, LLEN, LINDEX", "precondition": "Continuing from CORE-13: `core:l1` = `[y z a b c]`.", "steps": "redis-cli -p 6550 lpop core:l1\nredis-cli -p 6550 rpop core:l1\nredis-cli -p 6550 lrange core:l1 0 -1\nredis-cli -p 6550 llen core:l1\nredis-cli -p 6550 lindex core:l1 0\nredis-cli -p 6550 lindex core:l1 -1", "expected": "y\nc\nz\na\nb\n3\nz\nb", "notes": ""}, {"id": "CORE-15", "area": "CORE", "title": "LSET, including out-of-range error", "precondition": "`core:lsrange` = `[a b c]`.", "steps": "redis-cli -p 6550 del core:lsrange\nredis-cli -p 6550 rpush core:lsrange a b c\nredis-cli -p 6550 lset core:lsrange 0 Y2\nredis-cli -p 6550 lrange core:lsrange 0 -1\nredis-cli -p 6550 lset core:lsrange 10 z", "expected": "0\n3\nOK\nY2\nb\nc\nERR index out of range", "notes": ""}, {"id": "CORE-16", "area": "CORE", "title": "LTRIM", "precondition": "`core:l2` does not exist.", "steps": "redis-cli -p 6550 del core:l2\nredis-cli -p 6550 rpush core:l2 a b c d e\nredis-cli -p 6550 ltrim core:l2 1 3\nredis-cli -p 6550 lrange core:l2 0 -1", "expected": "0\n5\nOK\nb\nc\nd", "notes": ""}, {"id": "CORE-17", "area": "CORE", "title": "LREM", "precondition": "`core:l3` does not exist.", "steps": "redis-cli -p 6550 del core:l3\nredis-cli -p 6550 rpush core:l3 a b a c a\nredis-cli -p 6550 lrem core:l3 2 a\nredis-cli -p 6550 lrange core:l3 0 -1", "expected": "0\n5\n2\nb\nc\na", "notes": "`LREM key 2 a` removes the first 2 occurrences of `a` scanning head-to-tail,\nleaving the third `a` (which was last in the list) in place."}, {"id": "CORE-18", "area": "CORE", "title": "LINSERT, including pivot-not-found", "precondition": "Continuing from CORE-17: `core:l3` = `[b c a]`.", "steps": "redis-cli -p 6550 linsert core:l3 BEFORE c INSERTED\nredis-cli -p 6550 lrange core:l3 0 -1\nredis-cli -p 6550 linsert core:l3 BEFORE nosuchpivot z", "expected": "4\nb\nINSERTED\nc\na\n-1", "notes": ""}, {"id": "CORE-19", "area": "CORE", "title": "LPOP/RPOP count argument is silently ignored", "precondition": "`core:l4` does not exist.", "steps": "redis-cli -p 6550 del core:l4\nredis-cli -p 6550 rpush core:l4 x y z\nredis-cli -p 6550 lpop core:l4 2\nredis-cli -p 6550 lrange core:l4 0 -1", "expected": "0\n3\nx\ny\nz", "notes": "Real Redis's `LPOP key count` pops `count` elements and returns an array.\nHere the `2` is accepted (no \"wrong number of arguments\" error) but silently ignored —\nexactly one element (`x`) is popped, same as plain `LPOP`. Confirmed on the wire with\na raw RESP probe: `LPOP core:l4 2` returns a single bulk reply, not an array. A test\nsuite that asserts \"count elements returned\" against this server will get 1 element\nand pass/fail depending on how strictly it checks — flag this as a functional gap, not\na crash."}, {"id": "CORE-20", "area": "CORE", "title": "SADD/SREM/SMEMBERS/SISMEMBER/SCARD", "precondition": "`core:s1` does not exist.", "steps": "redis-cli -p 6550 del core:s1\nredis-cli -p 6550 sadd core:s1 a b c\nredis-cli -p 6550 sadd core:s1 a\nredis-cli -p 6550 sismember core:s1 a\nredis-cli -p 6550 sismember core:s1 z\nredis-cli -p 6550 scard core:s1\nredis-cli -p 6550 srem core:s1 a\nredis-cli -p 6550 smembers core:s1", "expected": "0\n3\n0\n1\n0\n3\n1\nc\nb", "notes": "Second `SADD core:s1 a` returns `0` — `a` was already a member, no change.\nMember order in `SMEMBERS` is unspecified (hash-set order)."}, {"id": "CORE-21", "area": "CORE", "title": "SINTER/SUNION/SDIFF", "precondition": "`core:s2` and `core:s3` do not exist.", "steps": "redis-cli -p 6550 del core:s2 core:s3\nredis-cli -p 6550 sadd core:s2 b c d\nredis-cli -p 6550 sadd core:s3 c d e\nredis-cli -p 6550 sinter core:s2 core:s3\nredis-cli -p 6550 sunion core:s2 core:s3\nredis-cli -p 6550 sdiff core:s2 core:s3", "expected": "0\n3\n3\nd\nc\nc\nb\nd\ne\nb", "notes": ""}, {"id": "CORE-22", "area": "CORE", "title": "SINTERSTORE/SUNIONSTORE/SDIFFSTORE", "precondition": "`core:s2` = `{b c d}`, `core:s3` = `{c d e}` (from CORE-21).", "steps": "redis-cli -p 6550 sinterstore core:sdest core:s2 core:s3\nredis-cli -p 6550 smembers core:sdest\nredis-cli -p 6550 sunionstore core:sudest core:s2 core:s3\nredis-cli -p 6550 smembers core:sudest\nredis-cli -p 6550 sdiffstore core:sddest core:s2 core:s3\nredis-cli -p 6550 smembers core:sddest", "expected": "2\nd\nc\n4\nd\nc\nb\ne\n1\nb", "notes": ""}, {"id": "CORE-23", "area": "CORE", "title": "SPOP/SRANDMEMBER, and their count argument is silently ignored", "precondition": "`core:s4` does not exist.", "steps": "redis-cli -p 6550 del core:s4\nredis-cli -p 6550 sadd core:s4 a b c d e\nredis-cli -p 6550 spop core:s4\nredis-cli -p 6550 scard core:s4\nredis-cli -p 6550 srandmember core:s4\nredis-cli -p 6550 scard core:s4", "expected": "0\n5\na\n4\nc\n4", "notes": "`SRANDMEMBER` (no count) does not remove the member — `scard` stays `4`."}, {"id": "CORE-23b", "area": "CORE", "title": "SPOP/SRANDMEMBER with an explicit count", "precondition": "`core:spopcount` = `{a b c d e}` (5 members).", "steps": "redis-cli -p 6550 del core:spopcount\nredis-cli -p 6550 sadd core:spopcount a b c d e\nredis-cli -p 6550 spop core:spopcount 2\nredis-cli -p 6550 scard core:spopcount\nredis-cli -p 6550 srandmember core:spopcount 2", "expected": "0\n5\na\n4\nb", "notes": "Same gap as CORE-19: the `count` argument is accepted but ignored. `SPOP\nkey 2` pops exactly one member (`scard` drops by only 1, from 5 to 4), and\n`SRANDMEMBER key 2` returns exactly one member, not two. Neither errors, so this is\neasy to miss in an integration test that only checks the call succeeds."}, {"id": "CORE-24", "area": "CORE", "title": "ZADD/ZSCORE/ZCARD (single pair)", "precondition": "`core:zz` does not exist.", "steps": "redis-cli -p 6550 del core:zz\nredis-cli -p 6550 zadd core:zz 1 a\nredis-cli -p 6550 zscore core:zz a\nredis-cli -p 6550 zcard core:zz", "expected": "0\n1\n1\n1", "notes": ""}, {"id": "CORE-25", "area": "CORE", "title": "ZINCRBY", "precondition": "`core:zz` has member `a` with score `1` (from CORE-24).", "steps": "redis-cli -p 6550 zincrby core:zz 5 a\nredis-cli -p 6550 zscore core:zz a", "expected": "6\n6", "notes": ""}, {"id": "CORE-26", "area": "CORE", "title": "ZRANGE, ZRANGE WITHSCORES, ZRANK", "precondition": "`core:zbug` has `a` (score 1) and `b` (score 2) — see CORE-28 for\nhow it gets there.", "steps": "redis-cli -p 6550 zrange core:zbug 0 -1\nredis-cli -p 6550 zrange core:zbug 0 -1 WITHSCORES\nredis-cli -p 6550 zrank core:zbug b\nredis-cli -p 6550 zrank core:zbug nosuch", "expected": "a\nb\na\n1\nb\n2\n1", "notes": "`ZRANK` on a member that isn't in the set returns nil (blank line), not an\nerror."}, {"id": "CORE-27", "area": "CORE", "title": "ZREM", "precondition": "`core:z1` has members `a` (score 6) and `b` (score 2) — built via\nrepeated single-pair `ZADD` calls.", "steps": "redis-cli -p 6550 zrem core:z1 b\nredis-cli -p 6550 zrange core:z1 0 -1", "expected": "1\na", "notes": ""}, {"id": "CORE-28", "area": "CORE", "title": "ZADD is NOT variadic: extra score/member pairs are silently dropped", "precondition": "`core:zbug` does not exist.", "steps": "redis-cli -p 6550 del core:zbug\nredis-cli -p 6550 zadd core:zbug 1 a\nredis-cli -p 6550 zadd core:zbug 2 b 3 c\nredis-cli -p 6550 zcard core:zbug\nredis-cli -p 6550 zrange core:zbug 0 -1 WITHSCORES", "expected": "0\n1\n1\n2\na\nb", "notes": "This is the single biggest divergence found in this playbook and is"}, {"id": "CORE-29", "area": "CORE", "title": "ZRANGEBYSCORE and ZCOUNT are not implemented", "precondition": "None.", "steps": "redis-cli -p 6550 zrangebyscore core:zz 0 10\nredis-cli -p 6550 zcount core:zz 0 10", "expected": "ERR unknown command 'ZRANGEBYSCORE'\nERR unknown command 'ZCOUNT'", "notes": ""}, {"id": "CORE-30", "area": "CORE", "title": "DEL/EXISTS (variadic)", "precondition": "`core:d1`, `core:d2` set; `core:nosuch` absent.", "steps": "redis-cli -p 6550 set core:d1 v1\nredis-cli -p 6550 set core:d2 v2\nredis-cli -p 6550 exists core:d1 core:d2 core:nosuch\nredis-cli -p 6550 del core:d1 core:d2 core:nosuch\nredis-cli -p 6550 exists core:d1", "expected": "OK\nOK\n2\n2\n0", "notes": "`EXISTS` with repeated/multiple keys counts matches, not distinct keys\n(matches real Redis semantics). `DEL` on 3 args where only 2 exist still returns `2`\n(count actually removed)."}, {"id": "CORE-31", "area": "CORE", "title": "TYPE", "precondition": "`core:tstr` (string) and `core:tlist` (list) exist; `core:nosuchkey`\nabsent.", "steps": "redis-cli -p 6550 set core:tstr v\nredis-cli -p 6550 type core:tstr\nredis-cli -p 6550 del core:tlist\nredis-cli -p 6550 rpush core:tlist a\nredis-cli -p 6550 type core:tlist\nredis-cli -p 6550 type core:nosuchkey", "expected": "OK\nstring\n0\n1\nlist\nnone", "notes": ""}, {"id": "CORE-32", "area": "CORE", "title": "RENAME/RENAMENX", "precondition": "`core:rn1`=`v1`, `core:rn2` absent initially.", "steps": "redis-cli -p 6550 set core:rn1 v1\nredis-cli -p 6550 rename core:rn1 core:rn2\nredis-cli -p 6550 get core:rn2\nredis-cli -p 6550 exists core:rn1\nredis-cli -p 6550 set core:rn3 v3\nredis-cli -p 6550 renamenx core:rn3 core:rn2\nredis-cli -p 6550 set core:rn4 v4\nredis-cli -p 6550 renamenx core:rn4 core:rn5\nredis-cli -p 6550 get core:rn5\nredis-cli -p 6550 rename core:nosuchsrc core:whatever", "expected": "OK\nOK\nv1\n0\nOK\n0\nOK\n1\nv4\nno such key", "notes": "`RENAMENX` returns `0` and leaves both keys alone when the destination\nalready exists (`core:rn2` already existed from the earlier `RENAME`). The\nmissing-source error is `no such key` — again with no `ERR` prefix, matching the\npattern noted in CORE-06."}, {"id": "CORE-33", "area": "CORE", "title": "RANDOMKEY and KEYS with a glob", "precondition": "Keyspace is non-empty (many keys created by prior cases).", "steps": "redis-cli -p 6550 randomkey\nredis-cli -p 6550 mset core:glob:a 1 core:glob:b 2 core:globx:c 3\nredis-cli -p 6550 keys \"core:glob:?\"", "expected": "core:l3\nOK\ncore:glob:b\ncore:glob:a", "notes": "`RANDOMKEY`'s actual value depends on keyspace state at run time; only\nassert it returns *some* existing key, not this exact one. The glob `core:glob:?`\ncorrectly excludes `core:globx:c` (the `?` matches exactly one character, and `:` is\nnot what precedes `c` there) — confirms `?`-glob support per\n`docs/command-compatibility.md`."}, {"id": "CORE-34", "area": "CORE", "title": "SCAN walks the whole keyspace via a shard cursor", "precondition": "Keyspace non-empty.", "steps": "redis-cli -p 6550 scan 0", "expected": "1\ncore:z1\ncore:nonnum\ncore:rn2", "notes": "The cursor returned (`1`) is not `0`, meaning more data remains; repeat\n`SCAN <cursor>` (`scan 1`, `scan 2`, ...) until a `0` cursor comes back to walk the\nfull keyspace. Per `docs/command-compatibility.md`, this implementation's cursor walks\none shard (of 16) per call rather than real Redis's incremental-rehash cursor scheme —\nso cursor values here are small sequential shard indices, not opaque bit-reversed\ncursors. Do not assume cursor-value compatibility with real Redis clients that\ninspect the cursor value itself."}, {"id": "CORE-35", "area": "CORE", "title": "EXPIRE/PEXPIRE/EXPIREAT/PEXPIREAT and TTL/PTTL", "precondition": "`core:exp1` does not exist.", "steps": "redis-cli -p 6550 set core:exp1 v1\nredis-cli -p 6550 expire core:exp1 100\nredis-cli -p 6550 ttl core:exp1\nredis-cli -p 6550 pexpire core:exp1 50000\nredis-cli -p 6550 pttl core:exp1\nFUTURE=$(( $(date +%s) + 100 ))\nredis-cli -p 6550 expireat core:exp1 $FUTURE\nredis-cli -p 6550 ttl core:exp1\nFUTUREMS=$(( ($(date +%s) + 100) * 1000 ))\nredis-cli -p 6550 pexpireat core:exp1 $FUTUREMS\nredis-cli -p 6550 ttl core:exp1", "expected": "OK\n1\n99\n1\n49997\n1\n99\n1\n99", "notes": ""}, {"id": "CORE-36", "area": "CORE", "title": "PERSIST, and TTL/PTTL on keys with no expiry or missing keys", "precondition": "`core:exp1` has a TTL (from CORE-35); `core:noexp` has no TTL;\n`core:doesnotexist` is absent.", "steps": "redis-cli -p 6550 persist core:exp1\nredis-cli -p 6550 ttl core:exp1\nredis-cli -p 6550 set core:noexp v1\nredis-cli -p 6550 ttl core:noexp\nredis-cli -p 6550 ttl core:doesnotexist\nredis-cli -p 6550 persist core:noexp\nredis-cli -p 6550 persist core:nosuchpersist", "expected": "1\n-1\nOK\n-1\n-2\n0\n0", "notes": "Matches real Redis's TTL sentinel convention: `-1` = key exists, no TTL;\n`-2` = key does not exist. `PERSIST` returns `0` (no-op) both for a key that already\nhas no TTL and for a key that doesn't exist — same code, two different reasons, so\ndon't over-interpret a `0` return as \"key not found\"."}, {"id": "CORE-37", "area": "CORE", "title": "A key actually expires", "precondition": "`core:shortlived` does not exist.", "steps": "redis-cli -p 6550 set core:shortlived v1 PX 300\nredis-cli -p 6550 get core:shortlived\nsleep 0.5\nredis-cli -p 6550 get core:shortlived\nredis-cli -p 6550 exists core:shortlived", "expected": "OK\nv1\n\n0", "notes": ""}, {"id": "CORE-38", "area": "CORE", "title": "EXPIRE with a negative TTL deletes the key immediately", "precondition": "`core:negttl` does not exist.", "steps": "redis-cli -p 6550 set core:negttl v1\nredis-cli -p 6550 expire core:negttl -1\nredis-cli -p 6550 exists core:negttl", "expected": "OK\n1\n0", "notes": ""}, {"id": "CORE-39", "area": "CORE", "title": "Unimplemented commands return an unknown-command error", "precondition": "None.", "steps": "redis-cli -p 6550 flushall\nredis-cli -p 6550 dbsize", "expected": "ERR unknown command 'FLUSHALL'\nERR unknown command 'DBSIZE'", "notes": "Confirmed against `crates/server/src/dispatcher.rs`'s `KNOWN_COMMANDS`:\n`FLUSHALL`, `DBSIZE`, `LPOS`, `COPY`, `SETEX`, and `DECRBY` are all absent from that\nlist and all produce this same error shape. Do not write positive test cases assuming\nany of them exist."}, {"id": "CORE-40", "area": "CORE", "title": "WRONGTYPE is enforced, never silently coerced", "precondition": "`core:wt1` holds a string value.", "steps": "redis-cli -p 6550 set core:wt1 stringval\nredis-cli -p 6550 lpush core:wt1 x\nredis-cli -p 6550 sadd core:wt1 x\nredis-cli -p 6550 hset core:wt1 f v\nredis-cli -p 6550 zadd core:wt1 1 x\nredis-cli -p 6550 get core:wt1", "expected": "OK\nWRONGTYPE Operation against a key holding the wrong kind of value\nWRONGTYPE Operation against a key holding the wrong kind of value\nWRONGTYPE Operation against a key holding the wrong kind of value\nWRONGTYPE Operation against a key holding the wrong kind of value\nstringval", "notes": "Every collection command against the string key is rejected outright — the\noriginal string value is untouched (`GET` still returns `stringval`) — never coerced\nor partially applied. Unlike the `INCR`/`RENAME` errors in CORE-06/CORE-32, this error\ntext does carry a real prefix (`WRONGTYPE `)."}, {"id": "CORE-41", "area": "CORE", "title": "Reads on a missing key return nil/empty, not an error", "precondition": "`core:missinglist`, `core:missingset`, `core:missinghash` all absent.", "steps": "redis-cli -p 6550 del core:missinglist\nredis-cli -p 6550 lrange core:missinglist 0 -1\nredis-cli -p 6550 llen core:missinglist\nredis-cli -p 6550 del core:missinghash\nredis-cli -p 6550 hget core:missinghash field1", "expected": "0\n\n0\n0", "notes": "`LRANGE` on a missing key returns an empty array (blank/nothing), `LLEN`\nreturns `0`, `HGET` returns nil (blank line) — none of these are errors."}, {"id": "CORE-42", "area": "CORE", "title": "A mutation that finds nothing does not leave a phantom collection", "precondition": "`core:missinglist`, `core:missingset`, `core:missinghash` all absent.", "steps": "redis-cli -p 6550 del core:missinglist\nredis-cli -p 6550 lpop core:missinglist\nredis-cli -p 6550 exists core:missinglist\nredis-cli -p 6550 del core:missingset\nredis-cli -p 6550 srem core:missingset member1\nredis-cli -p 6550 exists core:missingset\nredis-cli -p 6550 del core:missinghash\nredis-cli -p 6550 hdel core:missinghash field1\nredis-cli -p 6550 exists core:missinghash", "expected": "0\n\n0\n0\n0\n0\n0\n0\n0", "notes": "This is the exact regression the engine's\n`commands/missing_key_semantics_tests.rs` suite guards: `LPOP`/`SREM`/`HDEL` (and by\nthe same logic `RPOP`) on a key that was never set must return their normal\nzero/nil/false result and must **not** create an empty List/Set/Hash behind it —\nverified here by `EXISTS` returning `0` after each mutation attempt."}, {"id": "CORE-43", "area": "CORE", "title": "OBJECT ENCODING per type, and on a missing key", "precondition": "One key of each type exists: `core:oe_str`, `core:oe_list`,\n`core:oe_hash`, `core:oe_set`, `core:oe_zset`.", "steps": "redis-cli -p 6550 set core:oe_str v\nredis-cli -p 6550 object encoding core:oe_str\nredis-cli -p 6550 rpush core:oe_list a\nredis-cli -p 6550 object encoding core:oe_list\nredis-cli -p 6550 hset core:oe_hash f v\nredis-cli -p 6550 object encoding core:oe_hash\nredis-cli -p 6550 sadd core:oe_set a\nredis-cli -p 6550 object encoding core:oe_set\nredis-cli -p 6550 zadd core:oe_zset 1 a\nredis-cli -p 6550 object encoding core:oe_zset\nredis-cli -p 6550 object encoding core:nosuchkey", "expected": "OK\nstring\n1\nlist\n1\nhash\n1\nset\n1\nzset\nERR no such key", "notes": "Confirms `docs/command-compatibility.md`: `OBJECT ENCODING` returns this\nengine's own type name (`string`/`list`/`hash`/`set`/`zset` — identical to what `TYPE`\nreturns), not real Redis's internal encoding names (`embstr`, `listpack`,\n`skiplist`, etc.). Do not write assertions expecting `embstr`-style values."}, {"id": "CORE-44", "area": "CORE", "title": "MEMORY USAGE", "precondition": "`core:oe_str` and `core:oe_list` exist (from CORE-43);\n`core:nosuchkey` absent.", "steps": "redis-cli -p 6550 memory usage core:oe_str\nredis-cli -p 6550 memory usage core:oe_list\nredis-cli -p 6550 memory usage core:nosuchkey", "expected": "49\n57", "notes": "Returns a plausible byte estimate for existing keys and nil (blank line)\nfor a missing key. These are this engine's own approximate accounting, not\nbyte-for-byte comparable to real Redis's `MEMORY USAGE` output — treat as \"some\npositive integer\" in an assertion, not an exact value."}, {"id": "CORE-45", "area": "CORE", "title": "Argument-count and unknown-command error shapes", "precondition": "None.", "steps": "redis-cli -p 6550 get\nredis-cli -p 6550 set core:x\nredis-cli -p 6550 notacommand foo bar", "expected": "ERR wrong number of arguments for 'get' command\nERR wrong number of arguments for 'set' command\nERR unknown command 'NOTACOMMAND'", "notes": ""}]}, {"title": "Persistence", "cases": [{"id": "PERSIST-01", "area": "PERSIST", "title": "AOF captures writes and survives a graceful restart", "precondition": "No server running on 6560/6561/9360. `$DATA/prc-persist.aof` and\n`$DATA/prc-persist.snap` do not exist (fresh start).", "steps": "ROCKET_MEM_ADDR=127.0.0.1:6560 ROCKET_MEM_RMP_ADDR=127.0.0.1:6561 \\\nROCKET_MEM_AOF_PATH=$DATA/prc-persist.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-persist.snap \\\nROCKET_MEM_METRICS_ADDR=127.0.0.1:9360 \\\n  $BIN &\necho $! > /tmp/prc-persist.pid\nsleep 0.6\n\nwc -c $DATA/prc-persist.aof                 # 0 bytes before any write\n\nredis-cli -p 6560 set foo bar\nredis-cli -p 6560 set baz qux\nredis-cli -p 6560 get foo\n\nsleep 1.5                                    # default fsync policy is EverySecond\nwc -c $DATA/prc-persist.aof                  # must now be > 0\ncat $DATA/prc-persist.aof\n\nkill $(cat /tmp/prc-persist.pid)\nsleep 0.3\n\n# restart, same paths\nROCKET_MEM_ADDR=127.0.0.1:6560 ROCKET_MEM_RMP_ADDR=127.0.0.1:6561 \\\nROCKET_MEM_AOF_PATH=$DATA/prc-persist.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-persist.snap \\\nROCKET_MEM_METRICS_ADDR=127.0.0.1:9360 \\\n  $BIN &\necho $! > /tmp/prc-persist.pid\nsleep 0.6\nredis-cli -p 6560 get foo\nredis-cli -p 6560 get baz", "expected": "0\nOK\nOK\nbar\n62\n*3\n$3\nset\n$3\nfoo\n$3\nbar\n*3\n$3\nset\n$3\nbaz\n$3\nqux\nbar\nqux", "notes": "The AOF is written but not fsynced immediately — a write issued right after startup\nis not on disk until the next `EverySecond` tick (observed here as up to ~1s). Don't check file\nsize right after a write with no sleep; it reads 0 and looks broken when it isn't."}, {"id": "PERSIST-02", "area": "PERSIST", "title": "`SAVE` writes a snapshot file; restart loads it", "precondition": "Server from PERSIST-01 still running on 6560, with `foo`/`baz` set.", "steps": "redis-cli -p 6560 set snapkey snapval\nredis-cli -p 6560 save\nls -la $DATA/prc-persist.snap\n\nkill $(cat /tmp/prc-persist.pid)\nsleep 0.3\n\nROCKET_MEM_ADDR=127.0.0.1:6560 ROCKET_MEM_RMP_ADDR=127.0.0.1:6561 \\\nROCKET_MEM_AOF_PATH=$DATA/prc-persist.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-persist.snap \\\nROCKET_MEM_METRICS_ADDR=127.0.0.1:9360 \\\n  $BIN &\necho $! > /tmp/prc-persist.pid\nsleep 0.6\nredis-cli -p 6560 get snapkey\nredis-cli -p 6560 get foo", "expected": "OK\nOK\n-rw-rw-r-- 1 numericlabs numericlabs 105 <date> $DATA/prc-persist.snap\nRecovered state from $DATA/prc-persist.snap and $DATA/prc-persist.aof\nMetrics on http://127.0.0.1:9360/metrics\nRMP listening on 127.0.0.1:6561\nListening on 127.0.0.1:6560\nsnapval\nbar", "notes": ""}, {"id": "PERSIST-03", "area": "PERSIST", "title": "Snapshot plus AOF tail load together, in that order", "precondition": "Server from PERSIST-02 running on 6560, snapshot already contains\n`foo`/`baz`/`snapkey`. `$DATA/prc-persist.aof` is **not** truncated or rewritten by `SAVE` — it\nstill holds the full command history from before the snapshot, plus whatever is appended after.", "steps": "redis-cli -p 6560 get snapkey             # proves snapshot half loaded\nredis-cli -p 6560 get foo                 # proves it, plus the pre-snapshot AOF portion, loaded\n\nredis-cli -p 6560 set posttail tailval    # written AFTER the snapshot, only in the AOF tail\nsleep 1.5\n\nkill $(cat /tmp/prc-persist.pid)\nsleep 0.3\n\nROCKET_MEM_ADDR=127.0.0.1:6560 ROCKET_MEM_RMP_ADDR=127.0.0.1:6561 \\\nROCKET_MEM_AOF_PATH=$DATA/prc-persist.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-persist.snap \\\nROCKET_MEM_METRICS_ADDR=127.0.0.1:9360 \\\n  $BIN &\necho $! > /tmp/prc-persist.pid\nsleep 0.6\nredis-cli -p 6560 get snapkey    # from the snapshot\nredis-cli -p 6560 get posttail   # from the AOF tail written after the snapshot offset", "expected": "snapval\nbar\nOK\nRecovered state from $DATA/prc-persist.snap and $DATA/prc-persist.aof\nMetrics on http://127.0.0.1:9360/metrics\nRMP listening on 127.0.0.1:6561\nListening on 127.0.0.1:6560\nsnapval\ntailval", "notes": "The one-line \"Recovered state from `<snapshot>` and `<aof>`\" banner is the only place\nthe load order is stated; there's no separate \"loading snapshot...\" / \"replaying AOF tail...\"\npair of lines. Per `README.md`'s Sprint 5 entry, the snapshot embeds the AOF byte offset it was\ntaken at, so only the AOF bytes written after that offset are replayed on top of it — not the\nwhole file from scratch (that full-replay-from-empty behavior was Sprint 4's, superseded in\nSprint 5). The AOF file itself keeps growing forever across every `SAVE`; nothing truncates or\nrewrites it, so don't expect its size to reset after a snapshot."}, {"id": "PERSIST-04", "area": "PERSIST", "title": "Different AOF/snapshot path starts empty", "precondition": "Server from PERSIST-03 running on 6560. `$DATA/prc-persist-other.aof` and\n`$DATA/prc-persist-other.snap` do not exist.", "steps": "kill $(cat /tmp/prc-persist.pid)\nsleep 0.3\n\nROCKET_MEM_ADDR=127.0.0.1:6560 ROCKET_MEM_RMP_ADDR=127.0.0.1:6561 \\\nROCKET_MEM_AOF_PATH=$DATA/prc-persist-other.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-persist-other.snap \\\nROCKET_MEM_METRICS_ADDR=127.0.0.1:9360 \\\n  $BIN &\necho $! > /tmp/prc-persist.pid\nsleep 0.6\nredis-cli -p 6560 get foo\nredis-cli -p 6560 get snapkey\nredis-cli -p 6560 keys '*'\n\nkill $(cat /tmp/prc-persist.pid)\nsleep 0.3", "expected": "Recovered state from $DATA/prc-persist-other.snap and $DATA/prc-persist-other.aof\nMetrics on http://127.0.0.1:9360/metrics\nRMP listening on 127.0.0.1:6561\nListening on 127.0.0.1:6560\n(nil)\n(nil)\n(empty array)", "notes": "This is the control case proving PERSIST-01 through -03 actually read the data back\nfrom the file, not from some other in-process cache — same binary, same host, only the path\nchanged, and the store comes up empty. The banner still says \"Recovered state from...\" even\nthough nothing was actually recovered; see the note at the top of this document."}, {"id": "PERSIST-05", "area": "PERSIST", "title": "Data survives an ungraceful `kill -9`", "precondition": "No server running on 6560/6561/9360. `$DATA/prc-kill9.aof` and\n`$DATA/prc-kill9.snap` removed if present, for a clean slate.", "steps": "rm -f $DATA/prc-kill9.aof $DATA/prc-kill9.snap\n\nROCKET_MEM_ADDR=127.0.0.1:6560 ROCKET_MEM_RMP_ADDR=127.0.0.1:6561 \\\nROCKET_MEM_AOF_PATH=$DATA/prc-kill9.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-kill9.snap \\\nROCKET_MEM_METRICS_ADDR=127.0.0.1:9360 \\\n  $BIN &\necho $! > /tmp/prc-kill9.pid\nsleep 0.6\n\nredis-cli -p 6560 set survive yes\nredis-cli -p 6560 set counter 1\nsleep 1.5                              # let EverySecond fsync land before the SIGKILL\nwc -c $DATA/prc-kill9.aof\n\nkill -9 $(cat /tmp/prc-kill9.pid)      # no clean shutdown, no chance to flush anything extra\nsleep 0.3\nps -p $(cat /tmp/prc-kill9.pid)        # confirm it's actually dead\n\nROCKET_MEM_ADDR=127.0.0.1:6560 ROCKET_MEM_RMP_ADDR=127.0.0.1:6561 \\\nROCKET_MEM_AOF_PATH=$DATA/prc-kill9.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-kill9.snap \\\nROCKET_MEM_METRICS_ADDR=127.0.0.1:9360 \\\n  $BIN &\necho $! > /tmp/prc-kill9.pid\nsleep 0.6\nredis-cli -p 6560 get survive\nredis-cli -p 6560 get counter", "expected": "OK\nOK\n68\n(stopped, ps shows no matching PID)\nRecovered state from $DATA/prc-kill9.snap and $DATA/prc-kill9.aof\nMetrics on http://127.0.0.1:9360/metrics\nRMP listening on 127.0.0.1:6561\nListening on 127.0.0.1:6560\nyes\n1", "notes": "This is the property the project's own chaos test (`scripts/chaos.sh`,\n`docs/chaos/2026-09-01-chaos-log.md`) exercises continuously against a live leader+follower pair\nunder repeated `kill -9`. This case only proves the single-node, single-kill version of it; it\ndoes not attempt to synthesize a torn/mid-write AOF record. `README.md`'s Sprint 4 entry claims a\ncorrupted tail is truncated rather than merely skipped in memory — that specific claim is not\nindependently re-verified here, only cited."}]}, {"title": "Replication", "cases": [{"id": "REPL-01", "area": "REPL", "title": "`REPLICAOF` attaches a follower and transfers a full snapshot", "precondition": "No servers on 6560-6563/9360-9361. `$DATA/prc-leader.*` and\n`$DATA/prc-follower.*` removed if present.", "steps": "rm -f $DATA/prc-leader.aof $DATA/prc-leader.snap $DATA/prc-follower.aof $DATA/prc-follower.snap\n\n# leader\nROCKET_MEM_ADDR=127.0.0.1:6560 ROCKET_MEM_RMP_ADDR=127.0.0.1:6561 \\\nROCKET_MEM_AOF_PATH=$DATA/prc-leader.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-leader.snap \\\nROCKET_MEM_METRICS_ADDR=127.0.0.1:9360 \\\n  $BIN &\necho $! > /tmp/prc-repl-leader.pid\n\n# follower\nROCKET_MEM_ADDR=127.0.0.1:6562 ROCKET_MEM_RMP_ADDR=127.0.0.1:6563 \\\nROCKET_MEM_AOF_PATH=$DATA/prc-follower.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-follower.snap \\\nROCKET_MEM_METRICS_ADDR=127.0.0.1:9361 \\\n  $BIN &\necho $! > /tmp/prc-repl-follower.pid\nsleep 0.6\n\n# write BEFORE attaching, to prove the initial sync is a full snapshot, not just future writes\nredis-cli -p 6560 set preexisting value1\nredis-cli -p 6560 set foo bar\n\nredis-cli -p 6562 replicaof 127.0.0.1 6560\nsleep 0.5\nredis-cli -p 6562 get preexisting\nredis-cli -p 6562 get foo", "expected": "OK\nOK\nOK\nvalue1\nbar", "notes": ""}, {"id": "REPL-02", "area": "REPL", "title": "Live writes on the leader stream to the follower", "precondition": "REPL-01's leader/follower pair still running and attached.", "steps": "redis-cli -p 6560 set livekey liveval\nsleep 0.3\nredis-cli -p 6562 get livekey", "expected": "OK\nliveval", "notes": "A brief sleep is required — replication is asynchronous, there is no synchronous\n\"write acknowledged by replica\" mode to wait on instead."}, {"id": "REPL-03", "area": "REPL", "title": "Follower rejects direct client writes with `READONLY`", "precondition": "Same pair, follower still attached.", "steps": "redis-cli -p 6562 set nope x", "expected": "(error) READONLY You can't write against a read only replica.", "notes": ""}, {"id": "REPL-04", "area": "REPL", "title": "`INFO replication` reports role and link status correctly on both sides", "precondition": "Same pair, follower still attached.", "steps": "redis-cli -p 6560 info replication\nredis-cli -p 6562 info replication", "expected": "# Replication\nrole:master\nconnected_slaves:1\n\n# Replication\nrole:slave\nmaster_host:127.0.0.1\nmaster_port:6560\nmaster_link_status:up", "notes": ""}, {"id": "REPL-05", "area": "REPL", "title": "`REPLICAOF NO ONE` promotes the follower back to read-write", "precondition": "Same pair, follower still attached.", "steps": "redis-cli -p 6562 replicaof no one\nsleep 0.3\nredis-cli -p 6562 info replication\nredis-cli -p 6562 set promoted yes\nredis-cli -p 6562 get promoted\n\nkill $(cat /tmp/prc-repl-leader.pid) $(cat /tmp/prc-repl-follower.pid)\nsleep 0.3", "expected": "OK\n# Replication\nrole:master\nconnected_slaves:0\nOK\nyes", "notes": ""}, {"id": "REPL-06", "area": "REPL", "title": "Every resync is a full resync (known limit, not a bug)", "precondition": "No servers on 6560-6563/9360-9361. `$DATA/prc-leader2.*` and\n`$DATA/prc-follower2.*` removed if present.", "steps": "rm -f $DATA/prc-leader2.aof $DATA/prc-leader2.snap $DATA/prc-follower2.aof $DATA/prc-follower2.snap\n\nROCKET_MEM_ADDR=127.0.0.1:6560 ROCKET_MEM_RMP_ADDR=127.0.0.1:6561 \\\nROCKET_MEM_AOF_PATH=$DATA/prc-leader2.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-leader2.snap \\\nROCKET_MEM_METRICS_ADDR=127.0.0.1:9360 \\\n  $BIN &\necho $! > /tmp/prc-repl2-leader.pid\n\nROCKET_MEM_ADDR=127.0.0.1:6562 ROCKET_MEM_RMP_ADDR=127.0.0.1:6563 \\\nROCKET_MEM_AOF_PATH=$DATA/prc-follower2.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-follower2.snap \\\nROCKET_MEM_METRICS_ADDR=127.0.0.1:9361 \\\n  $BIN &\necho $! > /tmp/prc-repl2-follower.pid\nsleep 0.6\n\nredis-cli -p 6560 set leaderkey leaderval\nredis-cli -p 6562 set divergedkey divergedval   # data that only ever existed on the \"follower\"\nredis-cli -p 6562 get divergedkey               # present before attaching\n\nredis-cli -p 6562 replicaof 127.0.0.1 6560\nsleep 0.5\nredis-cli -p 6562 get divergedkey               # gone: full resync overwrote local state\nredis-cli -p 6562 get leaderkey                 # leader's data now present\n\ncurl -s http://127.0.0.1:9360/metrics | grep -i replic\n\nkill $(cat /tmp/prc-repl2-leader.pid) $(cat /tmp/prc-repl2-follower.pid)\nsleep 0.3", "expected": "OK\nOK\ndivergedval\nOK\n(nil)\nleaderval\n# TYPE rocket_mem_replication_last_apply_timestamp_seconds gauge\nrocket_mem_replication_last_apply_timestamp_seconds 0\n# TYPE rocket_mem_connected_replicas gauge\nrocket_mem_connected_replicas 0", "notes": "This is expected behavior, not a bug: Sprint 5's design has no partial-resync/offset-\nresume support, so a dropped or freshly-attached follower always gets a fresh full snapshot,\nwhich silently discards anything the follower had written locally before rejecting further\nclient writes wasn't yet in effect. There is no replication-offset lag metric either —\n`rocket_mem_replication_last_apply_timestamp_seconds` (a timestamp of last applied write, not an\noffset) is the documented substitute, confirmed present above; `rocket_mem_connected_replicas`\nis the follower-count gauge. Separately (not re-verified in this run, see `README.md`'s Sprint 5\nentry and Sprint 8 entry): `PSYNC` has no dedicated auth mechanism of its own — it goes through\nthe same `AUTH`/ACL gate every other command does, and only actually blocks anything once ACL\nusers are configured; a server with none configured authenticates nobody, replica included."}]}, {"title": "Cluster", "cases": [{"id": "CLUSTER-01", "area": "CLUSTER", "title": "Topology file must cover all 16384 slots exactly once", "precondition": "No server on 7101/9360/6561.", "steps": "cat > $DATA/prc-cluster.conf <<'EOF'\nshard-a 127.0.0.1:7101 0     5460\nshard-b 127.0.0.1:7102 5461  10922\nshard-c 127.0.0.1:7103 10923 16383\nEOF", "expected": "cat > $DATA/prc-cluster-gap.conf <<'EOF'\nshard-a 127.0.0.1:7101 0     5460\nshard-b 127.0.0.1:7102 5462  10922\nshard-c 127.0.0.1:7103 10923 16383\nEOF\n\nROCKET_MEM_ADDR=127.0.0.1:7101 ROCKET_MEM_AOF_PATH=$DATA/prc-a-bad.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-a-bad.snap \\\nROCKET_MEM_CLUSTER_CONFIG=$DATA/prc-cluster-gap.conf ROCKET_MEM_CLUSTER_NODE_ID=shard-a \\\nROCKET_MEM_METRICS_ADDR=127.0.0.1:9360 ROCKET_MEM_RMP_ADDR=127.0.0.1:6561 \\\n  $BIN\necho \"exit code: $?\"", "notes": "Both errors abort before any listener binds — no partial startup, no port left open.\nThe valid `prc-cluster.conf` written in the first step is reused by every following CLUSTER case."}, {"id": "CLUSTER-02", "area": "CLUSTER", "title": "Three nodes start with distinct metrics/RMP ports", "precondition": "`$DATA/prc-cluster.conf` exists (from CLUSTER-01). No servers on\n7101-7103/9360-9362/6561-6563.", "steps": "rm -f $DATA/prc-a.aof $DATA/prc-a.snap $DATA/prc-b.aof $DATA/prc-b.snap $DATA/prc-c.aof $DATA/prc-c.snap\n\nROCKET_MEM_ADDR=127.0.0.1:7101 ROCKET_MEM_AOF_PATH=$DATA/prc-a.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-a.snap \\\nROCKET_MEM_CLUSTER_CONFIG=$DATA/prc-cluster.conf ROCKET_MEM_CLUSTER_NODE_ID=shard-a \\\nROCKET_MEM_METRICS_ADDR=127.0.0.1:9360 ROCKET_MEM_RMP_ADDR=127.0.0.1:6561 \\\n  $BIN &\necho $! > /tmp/prc-cluster-a.pid\n\nROCKET_MEM_ADDR=127.0.0.1:7102 ROCKET_MEM_AOF_PATH=$DATA/prc-b.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-b.snap \\\nROCKET_MEM_CLUSTER_CONFIG=$DATA/prc-cluster.conf ROCKET_MEM_CLUSTER_NODE_ID=shard-b \\\nROCKET_MEM_METRICS_ADDR=127.0.0.1:9361 ROCKET_MEM_RMP_ADDR=127.0.0.1:6562 \\\n  $BIN &\necho $! > /tmp/prc-cluster-b.pid\n\nROCKET_MEM_ADDR=127.0.0.1:7103 ROCKET_MEM_AOF_PATH=$DATA/prc-c.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-c.snap \\\nROCKET_MEM_CLUSTER_CONFIG=$DATA/prc-cluster.conf ROCKET_MEM_CLUSTER_NODE_ID=shard-c \\\nROCKET_MEM_METRICS_ADDR=127.0.0.1:9362 ROCKET_MEM_RMP_ADDR=127.0.0.1:6563 \\\n  $BIN &\necho $! > /tmp/prc-cluster-c.pid\nsleep 0.7", "expected": "Cluster mode enabled: node 'shard-a' at 127.0.0.1:7101 owns slots 0-5460 of 3 nodes\nRecovered state from $DATA/prc-a.snap and $DATA/prc-a.aof\nMetrics on http://127.0.0.1:9360/metrics\nRMP listening on 127.0.0.1:6561\nListening on 127.0.0.1:7101", "notes": "All three RMP ports (6561-6563) collide with the leader/follower bank used in the\nReplication section above — that's fine as long as those servers were already killed first.\nNever run the Replication and Cluster sections concurrently against the port list in this\ndocument."}, {"id": "CLUSTER-03", "area": "CLUSTER", "title": "`CLUSTER KEYSLOT` / `SHARDS` / `NODES` / `INFO` / `MYID`", "precondition": "Three-node cluster from CLUSTER-02 running.", "steps": "redis-cli -p 7101 cluster keyslot foo\nredis-cli -p 7101 cluster shards\nredis-cli -p 7101 cluster nodes\nredis-cli -p 7101 cluster info\nredis-cli -p 7101 cluster myid", "expected": "(integer) 12182\n1) 1) \"slots\"\n   2) 1) (integer) 0\n      2) (integer) 5460\n   3) \"nodes\"\n   ...(shard-a entry: id shard-a, port 7101, ip 127.0.0.1, role master, health online)...\n2) ... (shard-b: slots 5461-10922) ...\n3) ... (shard-c: slots 10923-16383) ...\nshard-a 127.0.0.1:7101@17101 myself,master - 0 0 0 connected 0-5460\nshard-b 127.0.0.1:7102@17102 master - 0 0 0 connected 5461-10922\nshard-c 127.0.0.1:7103@17103 master - 0 0 0 connected 10923-16383\ncluster_enabled:1\ncluster_state:ok\ncluster_slots_assigned:16384\ncluster_known_nodes:3\ncluster_size:3\ncluster_my_epoch:0\ncluster_current_epoch:0\n\"shard-a\"", "notes": "`foo` hashes to slot 12182, owned by shard-c — used as the MOVED example in\nCLUSTER-04. `CLUSTER NODES`'s `@17101` cluster-bus port suffix is advertised by convention only;\nnothing is ever bound there (no cluster bus exists — see CLUSTER-06)."}, {"id": "CLUSTER-04", "area": "CLUSTER", "title": "`MOVED` on the wrong node, success on the right one", "precondition": "Same cluster, `foo` maps to slot 12182 (shard-c, port 7103) per CLUSTER-03.", "steps": "redis-cli -p 7101 set foo bar     # shard-a does not own slot 12182\nredis-cli -p 7101 get foo         # still redirected — proves no local write happened either\n\nredis-cli -p 7103 set foo bar     # right node\nredis-cli -p 7103 get foo", "expected": "(error) MOVED 12182 127.0.0.1:7103\n(error) MOVED 12182 127.0.0.1:7103\nOK\n\"bar\"", "notes": "`GET foo` on the wrong node also comes back `MOVED`, never a value — that's the\npractical proof \"no write happened\": the node handing the key elsewhere is itself unable to\nserve a locally-written copy back through the normal read path. There's no redis-cli-level way to\npeek at a foreign shard's underlying store directly to confirm this any more literally than that."}, {"id": "CLUSTER-05", "area": "CLUSTER", "title": "`CROSSSLOT` on a multi-key command spanning slots", "precondition": "Same cluster.", "steps": "redis-cli -p 7101 mset hello 1 foo 2", "expected": "(error) CROSSSLOT Keys in request don't hash to the same slot", "notes": ""}, {"id": "CLUSTER-06", "area": "CLUSTER", "title": "Hash tags route related keys to the same slot", "precondition": "Same cluster.", "steps": "redis-cli -p 7101 cluster keyslot '{user1000}.name'\nredis-cli -p 7101 cluster keyslot '{user1000}.city'\n\nkill $(cat /tmp/prc-cluster-a.pid) $(cat /tmp/prc-cluster-b.pid) $(cat /tmp/prc-cluster-c.pid)\nsleep 0.3", "expected": "(integer) 3443\n(integer) 3443", "notes": ""}]}, {"title": "Configuration layering", "cases": [{"id": "CFG-01", "area": "CFG", "title": "Explicit `--config <path>` loads that TOML file", "precondition": "A working directory with no `rocket-mem.toml` of its own (e.g. `/tmp/rm-qa-work`).", "steps": "mkdir -p /tmp/rm-qa-cfg\ncat > /tmp/rm-qa-cfg/my-config.toml <<'EOF'\naddr = \"127.0.0.1:6570\"\nrmp_addr = \"127.0.0.1:6571\"\nmetrics_addr = \"127.0.0.1:9370\"\naof_path = \"/tmp/rm-qa-cfg1.aof\"\nsnapshot_path = \"/tmp/rm-qa-cfg1.snap\"\nEOF\n\ncd /tmp/rm-qa-work\nrm -f /tmp/rm-qa-cfg1.aof /tmp/rm-qa-cfg1.snap\n\"$ROCKET_MEM_BIN\" \\\n  --config /tmp/rm-qa-cfg/my-config.toml &\nPID=$!\nsleep 0.5\nredis-cli -p 6570 ping\nkill $PID", "expected": "Recovered state from /tmp/rm-qa-cfg1.snap and /tmp/rm-qa-cfg1.aof\nMetrics on http://127.0.0.1:9370/metrics\nRMP listening on 127.0.0.1:6571\nListening on 127.0.0.1:6570\nPONG", "notes": "The \"Recovered state from ...\" line prints even on a brand-new AOF/snapshot path with\nnothing to recover — it is not proof a prior snapshot actually existed. Don't read it as a\nwarning sign."}, {"id": "CFG-02", "area": "CFG", "title": "Auto-pickup of `./rocket-mem.toml` when no `--config` is given", "precondition": "CFG-01's `my-config.toml` exists at `/tmp/rm-qa-cfg/my-config.toml`.", "steps": "mkdir -p /tmp/rm-qa-auto\ncp /tmp/rm-qa-cfg/my-config.toml /tmp/rm-qa-auto/rocket-mem.toml\ncd /tmp/rm-qa-auto\nrm -f /tmp/rm-qa-cfg1.aof /tmp/rm-qa-cfg1.snap\n\"$ROCKET_MEM_BIN\" &\nPID=$!\nsleep 0.5\nredis-cli -p 6570 ping\nkill $PID", "expected": "Recovered state from /tmp/rm-qa-cfg1.snap and /tmp/rm-qa-cfg1.aof\nMetrics on http://127.0.0.1:9370/metrics\nRMP listening on 127.0.0.1:6571\nListening on 127.0.0.1:6570\nPONG", "notes": "No `--config` flag was passed at all. The `./rocket-mem.toml` sitting in the current\ndirectory was picked up automatically and its `addr` (6570) is what got bound."}, {"id": "CFG-03", "area": "CFG", "title": "Neither `--config` nor `./rocket-mem.toml`: falls through to env/defaults, not an error", "precondition": "A working directory with no `rocket-mem.toml` in it.", "steps": "mkdir -p /tmp/rm-qa-empty && cd /tmp/rm-qa-empty\nls   # confirm it's empty — no rocket-mem.toml here\nrm -f /tmp/rm-qa-envonly.aof /tmp/rm-qa-envonly.snap\nROCKET_MEM_ADDR=127.0.0.1:6570 ROCKET_MEM_RMP_ADDR=127.0.0.1:6571 \\\nROCKET_MEM_METRICS_ADDR=127.0.0.1:9370 \\\nROCKET_MEM_AOF_PATH=/tmp/rm-qa-envonly.aof ROCKET_MEM_SNAPSHOT_PATH=/tmp/rm-qa-envonly.snap \\\n  \"$ROCKET_MEM_BIN\" &\nPID=$!\nsleep 0.5\nredis-cli -p 6570 ping\nredis-cli -p 6570 set envkey envval\nredis-cli -p 6570 get envkey\nkill $PID", "expected": "Recovered state from /tmp/rm-qa-envonly.snap and /tmp/rm-qa-envonly.aof\nMetrics on http://127.0.0.1:9370/metrics\nRMP listening on 127.0.0.1:6571\nListening on 127.0.0.1:6570\nPONG\nOK\nenvval", "notes": "This is also the backward-compatibility case: a pure `ROCKET_MEM_*` invocation with no\nTOML anywhere works exactly as it did before config layering existed. A missing TOML at both the\n`--config` layer and the auto-pickup layer is explicitly not a startup error."}, {"id": "CFG-04", "area": "CFG", "title": "A `--config` path that doesn't exist is silently ignored, not an error", "precondition": "`/tmp/rm-qa-cfg/does-not-exist.toml` must not exist.", "steps": "cd /tmp/rm-qa-empty\nls /tmp/rm-qa-cfg/does-not-exist.toml   # confirm it really doesn't exist\nrm -f /tmp/rm-qa-envonly.aof /tmp/rm-qa-envonly.snap\nROCKET_MEM_ADDR=127.0.0.1:6570 ROCKET_MEM_RMP_ADDR=127.0.0.1:6571 \\\nROCKET_MEM_METRICS_ADDR=127.0.0.1:9370 \\\nROCKET_MEM_AOF_PATH=/tmp/rm-qa-envonly.aof ROCKET_MEM_SNAPSHOT_PATH=/tmp/rm-qa-envonly.snap \\\n  \"$ROCKET_MEM_BIN\" \\\n  --config /tmp/rm-qa-cfg/does-not-exist.toml &\nPID=$!\nsleep 0.5\nkill -0 $PID && echo STILL_RUNNING\nredis-cli -p 6570 ping\nkill $PID", "expected": "ls: cannot access '/tmp/rm-qa-cfg/does-not-exist.toml': No such file or directory\nSTILL_RUNNING\nRecovered state from /tmp/rm-qa-envonly.snap and /tmp/rm-qa-envonly.aof\nMetrics on http://127.0.0.1:9370/metrics\nRMP listening on 127.0.0.1:6571\nListening on 127.0.0.1:6570\nPONG", "notes": "A typo'd `--config` path fails open, not loud: the process starts normally, the TOML\nlayer is silently skipped, and configuration falls through to the env-var layer (here) or\ndefaults. There is no warning printed anywhere. A deployment that relies on `--config` actually\nloading will not notice a typo."}, {"id": "CFG-05", "area": "CFG", "title": "Precedence step 1: TOML file alone sets the bound address", "precondition": "`/tmp/rm-qa-cfg/my-config.toml` from CFG-01 exists (addr=6570, rmp_addr=6571,\nmetrics_addr=9370).", "steps": "cd /tmp/rm-qa-work\nrm -f /tmp/rm-qa-cfg1.aof /tmp/rm-qa-cfg1.snap\n\"$ROCKET_MEM_BIN\" \\\n  --config /tmp/rm-qa-cfg/my-config.toml &\nPID=$!\nsleep 0.5\nkill $PID", "expected": "Recovered state from /tmp/rm-qa-cfg1.snap and /tmp/rm-qa-cfg1.aof\nMetrics on http://127.0.0.1:9370/metrics\nRMP listening on 127.0.0.1:6571\nListening on 127.0.0.1:6570", "notes": ""}, {"id": "CFG-06", "area": "CFG", "title": "Precedence step 2: `ROCKET_MEM_ADDR` beats the TOML file", "precondition": "Same TOML file as CFG-05.", "steps": "cd /tmp/rm-qa-work\nrm -f /tmp/rm-qa-cfg1.aof /tmp/rm-qa-cfg1.snap\nROCKET_MEM_ADDR=127.0.0.1:6572 \\\n  \"$ROCKET_MEM_BIN\" \\\n  --config /tmp/rm-qa-cfg/my-config.toml &\nPID=$!\nsleep 0.5\nkill $PID", "expected": "Recovered state from /tmp/rm-qa-cfg1.snap and /tmp/rm-qa-cfg1.aof\nMetrics on http://127.0.0.1:9370/metrics\nRMP listening on 127.0.0.1:6571\nListening on 127.0.0.1:6572", "notes": "`addr` bound on **6572** (the env value), not 6570 (the TOML value) — env beats file.\n`rmp_addr`/`metrics_addr` are untouched, still from the TOML, since no env var set them."}, {"id": "CFG-07", "area": "CFG", "title": "Precedence step 3: `--addr` beats the env var, and unpassed CLI flags don't clobber lower layers", "precondition": "Same TOML file and env var as CFG-06.", "steps": "cd /tmp/rm-qa-work\nrm -f /tmp/rm-qa-cfg1.aof /tmp/rm-qa-cfg1.snap\nROCKET_MEM_ADDR=127.0.0.1:6572 \\\n  \"$ROCKET_MEM_BIN\" \\\n  --config /tmp/rm-qa-cfg/my-config.toml --addr 127.0.0.1:6573 &\nPID=$!\nsleep 0.5\nredis-cli -p 6573 ping\nkill $PID", "expected": "Recovered state from /tmp/rm-qa-cfg1.snap and /tmp/rm-qa-cfg1.aof\nMetrics on http://127.0.0.1:9370/metrics\nRMP listening on 127.0.0.1:6571\nListening on 127.0.0.1:6573\nPONG", "notes": "Only `--addr` was passed on the command line. `addr` bound on 6573 (CLI beats env\nbeats file). `rmp_addr` (6571) and `metrics_addr` (9370) are still the TOML's values, not the\nbuilt-in defaults (`127.0.0.1:6380`/`127.0.0.1:9121`) and not reset by the unpassed flags — an\nunset CLI flag is genuinely absent from the merge, not serialized as null."}, {"id": "CFG-08", "area": "CFG", "title": "A malformed env var value is a hard startup failure, not a fallback to the default", "precondition": "None (works in any empty directory).", "steps": "cd /tmp/rm-qa-empty\nROCKET_MEM_SLOWLOG_THRESHOLD_MICROS=abc \\\n  \"$ROCKET_MEM_BIN\"\necho \"exit=$?\"", "expected": "Error: Custom { kind: InvalidInput, error: \"config error: invalid type: found string \\\"abc\\\", expected u64 for key \\\"SLOWLOG_THRESHOLD_MICROS\\\" in `ROCKET_MEM_` environment variable(s)\" }\nexit=1", "notes": "This is `std::io::Error`'s `Debug` output, not a hand-written message — noisy, but the\nfield name, expected type, and source layer are all in there. Nothing binds; the process exits\nbefore any listener starts."}, {"id": "CFG-09", "area": "CFG", "title": "A malformed TOML value is also a hard startup failure", "precondition": "None.", "steps": "cd /tmp/rm-qa-empty\ncat > /tmp/rm-qa-cfg/bad.toml <<'EOF'\naddr = \"127.0.0.1:6570\"\nslowlog_threshold_micros = \"not-a-number\"\nEOF\n\"$ROCKET_MEM_BIN\" --config /tmp/rm-qa-cfg/bad.toml\necho \"exit=$?\"", "expected": "Error: Custom { kind: InvalidInput, error: \"config error: invalid type: found string \\\"not-a-number\\\", expected u64 for key \\\"default.slowlog_threshold_micros\\\" in ../cro-cfg/bad.toml TOML file\" }\nexit=1", "notes": "Same failure mode as CFG-08, just from the TOML layer instead of the env layer — the\nerror text names the TOML file and identifies the layer as `TOML file` rather than `environment\nvariable(s)`. The exact path text in the error will differ based on your cwd relative to the\nTOML file; the important part is the \"expected u64\" / exit=1 shape, which is stable."}]}, {"title": "RMP protocol", "cases": [{"id": "RMP-01", "area": "RMP", "title": "RMP listens on its own port, banner printed unconditionally", "precondition": "Server started per the setup block above.", "steps": "# (just re-check the server's already-printed startup banner, or PING RESP to confirm it's up)\nredis-cli -p 6570 ping", "expected": "Recovered state from /tmp/rm-qa-rmp.snap and /tmp/rm-qa-rmp.aof\nMetrics on http://127.0.0.1:9370/metrics\nRMP listening on 127.0.0.1:6571\nListening on 127.0.0.1:6570\nPONG", "notes": "`RMP listening on 127.0.0.1:6571` is printed with no config needed to turn it on and\nno flag that turns it off."}, {"id": "RMP-02", "area": "RMP", "title": "Round trip via a throwaway `rmp-client` example", "precondition": "Server from the setup block still running on 6570/6571/9370. This case writes\na temporary file into the repo under `crates/rmp-client/examples/` and deletes it afterward —\nnever commit it.", "steps": "cat > crates/rmp-client/examples/qa_scratch.rs <<'EOF'\n#[tokio::main]\nasync fn main() -> Result<(), Box<dyn std::error::Error>> {\n    let client = rmp_client::RmpClient::connect(\"127.0.0.1:6571\").await?;\n    client.set(\"foo\", \"bar\").await?;\n    let got = client.get(\"foo\").await?;\n    println!(\"round-trip: foo -> {:?}\", got);\n    Ok(())\n}\nEOF\n\ncd \"$ROCKET_MEM_REPO\"\ncargo run -p rmp-client --example qa_scratch\n\nrm crates/rmp-client/examples/qa_scratch.rs\ngit status --porcelain   # must print nothing — confirms the scratch file is gone", "expected": "round-trip: foo -> Some(b\"bar\")", "notes": "`rmp-client` is library-only — there is no CLI equivalent to `redis-cli` for RMP. This\nis the one area of the product where testing it by hand requires a Rust toolchain, not just a\nterminal."}, {"id": "RMP-03", "area": "RMP", "title": "RESP and RMP share one keyspace, verified in both directions", "precondition": "Server from the setup block still running. `foo`=`bar` already exists from\nRMP-02 (harmless either way).", "steps": "# Direction 1: write over RESP, read over RMP.\nredis-cli -p 6570 set fromresp viaresp\n\ncat > crates/rmp-client/examples/qa_scratch2.rs <<'EOF'\n#[tokio::main]\nasync fn main() -> Result<(), Box<dyn std::error::Error>> {\n    let client = rmp_client::RmpClient::connect(\"127.0.0.1:6571\").await?;\n    let v = client.get(\"fromresp\").await?;\n    println!(\"RESP->RMP: fromresp -> {:?}\", v.map(|b| String::from_utf8_lossy(&b).into_owned()));\n    // Direction 2: write over RMP, will be read back over RESP below.\n    client.set(\"fromrmp\", \"viarmp\").await?;\n    println!(\"RMP wrote fromrmp=viarmp\");\n    Ok(())\n}\nEOF\ncd \"$ROCKET_MEM_REPO\"\ncargo run -p rmp-client --example qa_scratch2\nrm crates/rmp-client/examples/qa_scratch2.rs\n\n# Direction 2 check: read back over RESP.\nredis-cli -p 6570 get fromrmp", "expected": "OK\nRESP->RMP: fromresp -> Some(\"viaresp\")\nRMP wrote fromrmp=viarmp\nviarmp", "notes": "One `Engine`, one set of shards behind both protocols — no sync step involved."}, {"id": "RMP-04", "area": "RMP", "title": "RMP reaches nearly the whole command set through the same dispatcher", "precondition": "Server from the setup block still running.", "steps": "cat > crates/rmp-client/examples/qa_scratch3.rs <<'EOF'\nuse bytes::Bytes;\n#[tokio::main]\nasync fn main() -> Result<(), Box<dyn std::error::Error>> {\n    let client = rmp_client::RmpClient::connect(\"127.0.0.1:6571\").await?;\n    let info = client.call(vec![Bytes::from_static(b\"INFO\"), Bytes::from_static(b\"server\")]).await?;\n    println!(\"INFO server -> {:?}\", info);\n    let save = client.call(vec![Bytes::from_static(b\"SAVE\")]).await?;\n    println!(\"SAVE -> {:?}\", save);\n    let len = client.call(vec![Bytes::from_static(b\"SLOWLOG\"), Bytes::from_static(b\"LEN\")]).await?;\n    println!(\"SLOWLOG LEN -> {:?}\", len);\n    Ok(())\n}\nEOF\ncd \"$ROCKET_MEM_REPO\"\ncargo run -p rmp-client --example qa_scratch3\nrm crates/rmp-client/examples/qa_scratch3.rs", "expected": "INFO server -> Bulk(b\"# Server\\r\\nredis_version:rocket-mem-0.1.3\\r\\nrocket_mem_version:0.1.3\\r\\n...\")\nSAVE -> Simple(\"OK\")\nSLOWLOG LEN -> Integer(0)", "notes": "`client.call(vec![...])` builds the same `Array`-of-`Bulk` shape RESP sends and reaches\nthe identical `dispatch_and_log` — `INFO`, `SAVE`, `SLOWLOG`, `CLUSTER`, `REPLICAOF` all work over\nRMP with AOF logging and the replica fan-out applying exactly as over RESP."}, {"id": "RMP-05", "area": "RMP", "title": "`PSYNC` is the one command RMP cannot reach", "precondition": "Server from the setup block still running.", "steps": "cat > crates/rmp-client/examples/qa_scratch4.rs <<'EOF'\nuse bytes::Bytes;\n#[tokio::main]\nasync fn main() -> Result<(), Box<dyn std::error::Error>> {\n    let client = rmp_client::RmpClient::connect(\"127.0.0.1:6571\").await?;\n    let reply = client.call(vec![Bytes::from_static(b\"PSYNC\")]).await?;\n    println!(\"PSYNC -> {:?}\", reply);\n    Ok(())\n}\nEOF\ncd \"$ROCKET_MEM_REPO\"\ncargo run -p rmp-client --example qa_scratch4\nrm crates/rmp-client/examples/qa_scratch4.rs\n\n# Tear down the server started for RMP-01..05.\nkill $PID", "expected": "PSYNC -> Error(\"ERR unknown command 'PSYNC'\")", "notes": "RESP intercepts `PSYNC` in `connection.rs` above `dispatch_and_log` for its raw-socket\ntakeover to stream replication data; RMP's handler has no equivalent, so the command falls all the\nway through to \"unknown command\". `HELLO` is *not* an exception the same way — it succeeds over\nRMP as a stateless no-op, since RMP has no per-connection negotiation state to persist."}]}, {"title": "Observability", "cases": [{"id": "OBS-01", "area": "OBS", "title": "`INFO server` returns real values, not stubs", "precondition": "A server running with `ROCKET_MEM_ADDR=127.0.0.1:6570`,\n`ROCKET_MEM_RMP_ADDR=127.0.0.1:6571`, `ROCKET_MEM_METRICS_ADDR=127.0.0.1:9370` (same shape as the\nRMP setup block above; start it the same way and keep it running through OBS-05).", "steps": "redis-cli -p 6570 info server\nsleep 3\nredis-cli -p 6570 info server | grep uptime_in_seconds", "expected": "# Server\nredis_version:rocket-mem-0.1.3\nrocket_mem_version:0.1.3\nredis_mode:standalone\nos:linux\narch_bits:64\nprocess_id:2389374\nuptime_in_seconds:17\nuptime_in_days:0\n\nuptime_in_seconds:24", "notes": "`process_id` is the real PID of the running process (yours will differ).\n`uptime_in_seconds` visibly increased across the 3-second sleep — proof it's a live clock, not a\nhardcoded `0`."}, {"id": "OBS-02", "area": "OBS", "title": "`INFO replication`", "precondition": "Same server as OBS-01.", "steps": "redis-cli -p 6570 info replication", "expected": "# Replication\nrole:master\nconnected_slaves:0", "notes": ""}, {"id": "OBS-03", "area": "OBS", "title": "Bare `INFO` lists every section", "precondition": "Same server.", "steps": "redis-cli -p 6570 info | grep -E \"^# \"", "expected": "# Server\n# Clients\n# Memory\n# Persistence\n# Stats\n# Replication\n# Cluster\n# Keyspace", "notes": ""}, {"id": "OBS-04", "area": "OBS", "title": "`/metrics` Prometheus endpoint", "precondition": "Same server. Its metrics endpoint is at `http://127.0.0.1:9370/metrics`.", "steps": "curl -s http://127.0.0.1:9370/metrics | grep -E \"^rocket_mem_commands_total|^rocket_mem_connected_clients|^rocket_mem_command_errors_total\"\n\n# Generate a command error and confirm it's counted.\nredis-cli -p 6570 set   # missing args -> error\ncurl -s http://127.0.0.1:9370/metrics | grep \"rocket_mem_command_errors_total\"", "expected": "rocket_mem_commands_total{cmd=\"set\"} 3\nrocket_mem_commands_total{cmd=\"save\"} 1\nrocket_mem_commands_total{cmd=\"ping\"} 1\nrocket_mem_commands_total{cmd=\"get\"} 4\nrocket_mem_commands_total{cmd=\"psync\"} 1\nrocket_mem_commands_total{cmd=\"info\"} 5\nrocket_mem_commands_total{cmd=\"slowlog\"} 1\nrocket_mem_command_errors_total{cmd=\"psync\"} 1\nrocket_mem_connected_clients 0\n\nERR wrong number of arguments for 'set' command\n\n# TYPE rocket_mem_command_errors_total counter\nrocket_mem_command_errors_total{cmd=\"psync\"} 1\nrocket_mem_command_errors_total{cmd=\"set\"} 1", "notes": "Exact counter values depend on what ran on this server instance before you got here\n(this capture followed the RMP cases, hence `cmd=\"psync\"` already present) — what matters is that\nthe families exist and increase with real traffic, not the specific numbers.\n`rocket_mem_connected_clients` reads 0 here because `redis-cli` closes its connection after each\ncommand; it only shows non-zero while a connection is actually open (e.g. inside a pipe held open\nwith `printf ... | redis-cli`). `/metrics` has **no authentication of its own** — it is\nunauthenticated by design, which is why it defaults to binding loopback only; never expose it\npublicly without a reverse-proxy or firewall in front of it."}, {"id": "OBS-05", "area": "OBS", "title": "`SLOWLOG GET`/`LEN`/`RESET`, generating a real entry with `DEBUG SLEEP`", "precondition": "Same server, default `slowlog_threshold_micros` (10000, i.e. 10ms).", "steps": "redis-cli -p 6570 slowlog len\nredis-cli -p 6570 slowlog reset\nredis-cli -p 6570 slowlog len\n\nredis-cli -p 6570 debug sleep 0.05\nredis-cli -p 6570 slowlog len\nredis-cli -p 6570 slowlog get\n\nredis-cli -p 6570 slowlog reset\nredis-cli -p 6570 slowlog len\n\n# DEBUG SLEEP is capped at 10 seconds.\nredis-cli -p 6570 debug sleep 15", "expected": "0\nOK\n0\nOK\n1\n0\n1788234694\n50102\nDEBUG\nsleep\n... (1 more arguments)\nOK\n0\nERR DEBUG SLEEP duration exceeds the 10s maximum allowed on this server", "notes": "A slow-log entry has **4 fields** (id, unix time, duration in microseconds, and an args\narray), not real Redis's 6 — there is no client-address or client-name field. The args array\ncarries only the command name as sent (here lowercase `sleep`... actually `debug`, verbatim as\ntyped) plus its first argument (`sleep`, the DEBUG subcommand acting as the \"key\" position), and\nsummarizes anything past that with real Redis's own `... (N more arguments)` truncation marker —\nhere 1 more argument (the `0.05` duration) was not carried. `DEBUG SLEEP` above 10 seconds is\nrejected outright rather than clamped."}, {"id": "OBS-06", "area": "OBS", "title": "`ROCKET_MEM_SLOWLOG_THRESHOLD_MICROS=0` disables the slow log entirely", "precondition": "Kill any server bound to 6570/6571/9370 first (`ss -tlnp | grep -E ':(6570|6571|9370)'` should be empty), since the threshold can only be set at startup.", "steps": "cd /tmp/rm-qa-work\nrm -f /tmp/rm-qa-obs6.aof /tmp/rm-qa-obs6.snap\nROCKET_MEM_ADDR=127.0.0.1:6570 ROCKET_MEM_RMP_ADDR=127.0.0.1:6571 \\\nROCKET_MEM_METRICS_ADDR=127.0.0.1:9370 \\\nROCKET_MEM_AOF_PATH=/tmp/rm-qa-obs6.aof ROCKET_MEM_SNAPSHOT_PATH=/tmp/rm-qa-obs6.snap \\\nROCKET_MEM_SLOWLOG_THRESHOLD_MICROS=0 \\\n  \"$ROCKET_MEM_BIN\" &\nPID=$!\nsleep 0.5\nredis-cli -p 6570 debug sleep 0.2\nredis-cli -p 6570 slowlog len\nkill $PID", "expected": "OK\n0", "notes": "A 200ms `DEBUG SLEEP` — 20x the default 10ms threshold — produces zero slow-log\nentries when the threshold is `0`. `0` disables the slow log entirely rather than meaning\n\"log everything.\""}, {"id": "OBS-07", "area": "OBS", "title": "`expired_keys` counts only active expiry, not passive", "precondition": "A fresh server on 6570/6571/9370 (default threshold is fine), nothing else\ntouching TTL'd keys on it during this case.", "steps": "cd /tmp/rm-qa-work\nrm -f /tmp/rm-qa-obs7.aof /tmp/rm-qa-obs7.snap\nROCKET_MEM_ADDR=127.0.0.1:6570 ROCKET_MEM_RMP_ADDR=127.0.0.1:6571 \\\nROCKET_MEM_METRICS_ADDR=127.0.0.1:9370 \\\nROCKET_MEM_AOF_PATH=/tmp/rm-qa-obs7.aof ROCKET_MEM_SNAPSHOT_PATH=/tmp/rm-qa-obs7.snap \\\n  \"$ROCKET_MEM_BIN\" &\nPID=$!\nsleep 0.5\nredis-cli -p 6570 info stats | grep expired_keys\n\n# Passive path: read the key yourself after it expires.\nredis-cli -p 6570 set pkey pval px 50\nsleep 0.15\nredis-cli -p 6570 get pkey                      # -> nil, passive removal on read\nsleep 2                                          # > one full active-sweep rotation (16 shards x 100ms)\nredis-cli -p 6570 info stats | grep expired_keys # still 0 -- passive removal is invisible to it\n\n# Active path: never read the key, let the background sweep find it.\nredis-cli -p 6570 set akey aval px 50\nsleep 2\nredis-cli -p 6570 info stats | grep expired_keys # now 1 -- only the never-read key counted\nredis-cli -p 6570 get akey                       # -> nil, confirms it's gone\n\nkill $PID", "expected": "expired_keys:0\nOK\n(nil)\nexpired_keys:0\nOK\nexpired_keys:1\n(nil)", "notes": "`expired_keys` is only incremented from the background active-expiry sweep\n(`crates/server/src/connection.rs`'s `active_expire_loop`, which walks one of the 16 shards every\n100ms). A key removed by a client's own read (lazy/passive expiry) is deleted from its shard\nbefore the sweep ever gets there, so the sweep finds nothing and the counter never moves for that\nkey — passive expiry is invisible to `expired_keys` forever, not just delayed. This is a\ndocumented known limit, not a bug to file."}]}, {"title": "ACL and authentication", "cases": [{"id": "ACL-01", "area": "ACL", "title": "Bootstrap four ACL users from TOML and start the server", "precondition": "`/tmp/acltls-qa` exists. Ports 6510, 6511 and 9310 are free\n(`ss -lnt | grep -E ':(6510|6511|9310)\\b'` prints nothing).", "steps": "cat > /tmp/acltls-qa/acl.toml <<'EOF'\naddr = \"127.0.0.1:6510\"\nrmp_addr = \"127.0.0.1:6511\"\nmetrics_addr = \"127.0.0.1:9310\"\naof_path = \"/tmp/acltls-qa/acl.aof\"\nsnapshot_path = \"/tmp/acltls-qa/acl.snap\"\n\n[[acl.users]]\nusername = \"admin\"\npassword = \"adminpw\"\nenabled = true\nrules = [\"allcommands\", \"allkeys\"]\n\n[[acl.users]]\nusername = \"app\"\npassword = \"apppw\"\nenabled = true\nrules = [\"~app:*\", \"+get\"]\n\n[[acl.users]]\nusername = \"retired\"\npassword = \"retiredpw\"\nenabled = false\nrules = [\"allcommands\", \"allkeys\"]\n\n[[acl.users]]\nusername = \"scoped\"\npassword = \"scopedpw\"\nenabled = true\nrules = [\"allcommands\", \"~app:*\"]\nEOF\n\ncd /tmp/acltls-qa\nnohup \"$ROCKET_MEM_BIN\" \\\n  --config /tmp/acltls-qa/acl.toml > /tmp/acltls-qa/acl-server.log 2>&1 &\necho \"PID=$!\" > /tmp/acltls-qa/acl.pid\n\nsleep 1.5\ncat /tmp/acltls-qa/acl.pid\ncat /tmp/acltls-qa/acl-server.log", "expected": "PID=2373827\nRecovered state from /tmp/acltls-qa/acl.snap and /tmp/acltls-qa/acl.aof\nMetrics on http://127.0.0.1:9310/metrics\nRMP listening on 127.0.0.1:6511\nListening on 127.0.0.1:6510", "notes": "The PID number will differ; that is the only line that varies by value. The three\nlistener lines are printed from concurrently-started tasks, so their **order can vary between\nruns** — check that all three are present, not that they are in this sequence.\n\nThe `Recovered state from ...` line is printed even on a completely fresh run where neither\n`acl.snap` nor `acl.aof` exists. It is not evidence that anything was loaded; do not treat its\npresence as a recovery signal. (Flagged as a maintainer-facing wording problem, not a test\nfailure.)\n\nThe four users define the whole ACL surface used by ACL-02 through ACL-10: `admin` is\nfull-access, `app` is narrowly scoped (one command, one key pattern), `retired` is a valid but\ndisabled account, and `scoped` has every command but only `app:*` keys."}, {"id": "ACL-02", "area": "ACL", "title": "Confirm defining one user arms the auth gate for everything, including PING", "precondition": "ACL-01 completed; the server is running on port 6510.", "steps": "redis-cli -p 6510 ping\nredis-cli -p 6510 get app:1\nredis-cli -p 6510 acl whoami", "expected": "NOAUTH Authentication required.\n\nNOAUTH Authentication required.\n\nNOAUTH Authentication required.", "notes": "There is no `requirepass`-style on/off switch. The presence of at least one\n`[[acl.users]]` entry is what turns authentication on for the entire server, and it applies to\nevery command including keyless, harmless ones like `PING`. A server started with an empty user\nlist performs no authentication at all.\n\nThe blank line after each message is `redis-cli`'s own error rendering. Exit status is still 0."}, {"id": "ACL-03", "area": "ACL", "title": "Confirm `ACL` itself is not reachable before authenticating", "precondition": "ACL-01 completed; the server is running on port 6510.", "steps": "redis-cli -p 6510 acl setuser attacker on '>x' allcommands allkeys\nredis-cli -p 6510 acl list", "expected": "NOAUTH Authentication required.\n\nNOAUTH Authentication required.", "notes": "This is the privilege-escalation guard, and it is the reason `ACL` is deliberately not\nexempted from the gate the way `AUTH` and `HELLO` are. If `ACL SETUSER` were reachable\nanonymously, any client could mint itself an `allcommands allkeys` account and then log in to it.\nTreat any output other than `NOAUTH` here as a critical failure.\n\nThe inverse holds on a server with **no** ACL configured at all: there, an anonymous client can\ncreate the first user and lock everyone else out. Always bootstrap an admin in the TOML before\nthe port is reachable by anything untrusted."}, {"id": "ACL-04", "area": "ACL", "title": "Verify AUTH success and the single WRONGPASS message for all three failure modes", "precondition": "ACL-01 completed; the server is running on port 6510.", "steps": "redis-cli -p 6510 auth admin adminpw\nredis-cli -p 6510 auth admin nope\nredis-cli -p 6510 auth retired retiredpw\nredis-cli -p 6510 auth ghost x", "expected": "OK\nWRONGPASS invalid username-password pair or user is disabled.\n\nWRONGPASS invalid username-password pair or user is disabled.\n\nWRONGPASS invalid username-password pair or user is disabled.", "notes": "The three failures are a wrong password for a valid user, a **correct** password for a\ndisabled user (`retired`, `enabled = false`), and an entirely unknown username. All three produce\nbyte-identical replies on purpose — the message must not reveal which usernames exist.\n\nAll three also pay the same argon2 verification cost (roughly 20-30ms), so the *latency* does not\nreveal it either. If you want to sanity-check that, time each of the three: they should be within\nthe same order of magnitude. A near-instant reply on the unknown-username path would be a timing\noracle and is a real bug."}, {"id": "ACL-05", "area": "ACL", "title": "Verify HELLO is exempt from the gate only when it carries inline credentials", "precondition": "ACL-01 completed; the server is running on port 6510.", "steps": "redis-cli -p 6510 hello 3\nredis-cli -p 6510 hello 3 auth admin adminpw", "expected": "NOAUTH Authentication required.\n\nserver redis\nversion rocket-mem-0.1.0\nproto 3\nid 9\nmode standalone\nrole master\nmodules", "notes": "`AUTH` and `HELLO` are the only two commands allowed through unauthenticated, because\nRESP3 clients negotiate with credentials inline. A *bare* `HELLO` gets no such exemption. The `id`\nfield is a per-connection counter and will differ on your run."}, {"id": "ACL-06", "area": "ACL", "title": "Verify auth state is per-connection, not per-server", "precondition": "ACL-01 completed; the server is running on port 6510.", "steps": "# Two separate redis-cli invocations = two separate connections.\nredis-cli -p 6510 auth admin adminpw\nredis-cli -p 6510 ping\n\n# One piped session = one connection, so auth sticks.\nprintf 'auth admin adminpw\\nping\\nset k1 v1\\nget k1\\n' | redis-cli -p 6510\n\n# --user/--pass authenticates the connection redis-cli opens for the command.\nredis-cli -p 6510 --user admin --pass adminpw --no-auth-warning ping", "expected": "OK\nNOAUTH Authentication required.\n\nOK\nPONG\nOK\nv1\nPONG", "notes": "The `NOAUTH` on line 2 is the point of the case, not a failure. Nothing about a\nsuccessful `AUTH` survives the connection that ran it. This trips people up constantly when\nhand-testing: an `AUTH` that returned `OK` tells you nothing about the next `redis-cli` call.\n\nUse the piped form when you need several commands to share one authenticated connection, and\n`--user`/`--pass` for single commands. There is no `RESET` command, so a connection cannot drop\nits identity short of reconnecting."}, {"id": "ACL-07", "area": "ACL", "title": "Verify the key-pattern NOPERM message", "precondition": "ACL-01 completed; the server is running on port 6510. Seed the keyspace first —\nACL-08 through ACL-10 depend on these three keys existing.", "steps": "redis-cli -p 6510 --user admin --pass adminpw --no-auth-warning set app:1 hello\nredis-cli -p 6510 --user admin --pass adminpw --no-auth-warning set app:2 world\nredis-cli -p 6510 --user admin --pass adminpw --no-auth-warning set secret:1 topsecret\n\n# User `app` has rules = [\"~app:*\", \"+get\"].\nredis-cli -p 6510 --user app --pass apppw --no-auth-warning get app:1\nredis-cli -p 6510 --user app --pass apppw --no-auth-warning get other:1", "expected": "OK\nOK\nOK\nhello\nNOPERM no permissions to access a key", "notes": "Read this message as \"your `~pattern` is too narrow\". The command itself *was* granted\n(`+get`); it was the key that fell outside every `~` rule. Note that `other:1` does not exist —\nthe ACL check runs before the key lookup, so a denied key never reveals whether it exists."}, {"id": "ACL-08", "area": "ACL", "title": "Verify the command-not-granted NOPERM message, including for keyless commands", "precondition": "ACL-07 completed (server running, keys seeded).", "steps": "redis-cli -p 6510 --user app --pass apppw --no-auth-warning ping\nredis-cli -p 6510 --user app --pass apppw --no-auth-warning set app:1 x\nredis-cli -p 6510 --user app --pass apppw --no-auth-warning acl whoami", "expected": "NOPERM this user has no permissions to run this command\n\nNOPERM this user has no permissions to run this command\n\nNOPERM this user has no permissions to run this command", "notes": "This is the second, distinct NOPERM message; read it as \"you need a `+cmd` grant\". The\ntwo messages are the main debugging signal, so a case where the wrong one is returned is a real\ndefect even though access is correctly denied either way.\n\n`PING` takes no keys at all and is still refused. A command grant is required for **every**\ncommand, keyless ones included — `~app:*` alone grants nothing. Likewise `ACL WHOAMI`: even\nfinding out who you are needs `+acl`.\n\n`SET` is refused with the command message rather than the key message even though `app:1` matches\n`~app:*`, because the command check runs first."}, {"id": "ACL-09", "area": "ACL", "title": "Verify a multi-key command is denied outright when any one key is out of pattern", "precondition": "ACL-07 completed (server running, keys seeded).", "steps": "# User `scoped` has rules = [\"allcommands\", \"~app:*\"] — every command, app:* keys only.\nredis-cli -p 6510 --user scoped --pass scopedpw --no-auth-warning mget app:1 app:2\nredis-cli -p 6510 --user scoped --pass scopedpw --no-auth-warning mget app:1 secret:1\nredis-cli -p 6510 --user scoped --pass scopedpw --no-auth-warning get secret:1", "expected": "hello\nworld\nNOPERM no permissions to access a key\n\nNOPERM no permissions to access a key", "notes": "`MGET app:1 secret:1` is rejected in full — it is **not** partially served with a nil\nin the denied position. That is the correct and safe behavior: a partial reply would let a caller\nprobe which keys exist outside their pattern."}, {"id": "ACL-10", "area": "ACL", "title": "KNOWN OPEN GAP: `KEYS` and `SCAN` leak key names across the `~pattern` boundary", "precondition": "ACL-09 completed (server running, keys `app:1`, `app:2`, `secret:1` seeded, user\n`scoped` available with `allcommands ~app:*`).", "steps": "# Value access to secret:1 is correctly denied.\nredis-cli -p 6510 --user scoped --pass scopedpw --no-auth-warning get secret:1\n\n# Key NAMES are not.\nredis-cli -p 6510 --user scoped --pass scopedpw --no-auth-warning keys '*'\n\n# SCAN leaks it too. The cursor is a shard index; secret:1 lands in shard 7.\nredis-cli -p 6510 --user scoped --pass scopedpw --no-auth-warning scan 7", "expected": "NOPERM no permissions to access a key\n\napp:1\napp:2\nsecret:1\n8\nsecret:1", "notes": "**This is a confirmed, already-known security gap. Do not file a new bug for it.**\n\n`KEYS` and `SCAN` take a glob pattern / a cursor as their argument, not a key, so the ACL layer\nsees them as *keyless* commands and runs no key check at all. Every key name in the store comes\nback regardless of the user's `~pattern`. Values stay protected — `GET secret:1` is still denied,\nas line 1 shows — but names, and therefore the shape of the whole keyspace, are not.\n\nPractical impact for anyone evaluating this build: a `~app:*` restriction is **not** a\nconfidentiality boundary for key names. Key names frequently encode tenant ids, user ids,\ncustomer names, or feature flags, so this can be a meaningful disclosure on its own.\n\nThe `scan 7` cursor is stable because it is derived from `DefaultHasher(\"secret:1\") % 16`. If your\nrun shows an empty result at cursor 7, sweep the whole space to find it — the leak is what\nmatters, not the shard:"}, {"id": "ACL-11", "area": "ACL", "title": "Verify runtime `ACL WHOAMI`, `ACL LIST` and `ACL GETUSER`", "precondition": "ACL-01 completed; the server is running on port 6510.", "steps": "redis-cli -p 6510 --user admin --pass adminpw --no-auth-warning acl whoami\nredis-cli -p 6510 --user admin --pass adminpw --no-auth-warning acl list\nredis-cli -p 6510 --user admin --pass adminpw --no-auth-warning acl getuser app\nredis-cli -p 6510 --user admin --pass adminpw --no-auth-warning acl getuser nobody", "expected": "admin\nuser admin on #$argon2id$v=19$m=19456,t=2,p=1$OPHgcsV/dVHnIOriFp6Ltw$eVHSkyW7ilQCuktH/RBgP8omeUclaeBiihrzy8xDrCQ +@all ~*\nuser scoped on #$argon2id$v=19$m=19456,t=2,p=1$1aifAU8Dw97eOU/Oi51BNA$X+iQwwBMM6ZmMpcpw9Y0vxTyyRjIYy3CrdtYLXiJET0 +@all ~app:*\nuser app on #$argon2id$v=19$m=19456,t=2,p=1$oqQQ5b+DIk31Bp7EmobzCQ$UMySJ81JsIguaRCKRVfJW/ro8EqYK84V5+i8JRr2uWo ~app:* +get\nuser retired off #$argon2id$v=19$m=19456,t=2,p=1$xe5KLzYiYbHkAhCt4VjCmg$x2X2RMn9a5y88B3Z78nA9n0GZuZpwOJQEj5YyffSwh4 +@all ~*\nflags\non\npasswords\n$argon2id$v=19$m=19456,t=2,p=1$oqQQ5b+DIk31Bp7EmobzCQ$UMySJ81JsIguaRCKRVfJW/ro8EqYK84V5+i8JRr2uWo\ncommands\n+get\nkeys\n~app:*", "notes": "The argon2 salts are generated fresh at every startup, so the hash strings will differ\non every run — they are not comparable across runs. The *line order* of `ACL LIST` is HashMap\niteration order and also changes between runs; never script against it.\n\n`ACL LIST` renders users in `ACL SETUSER` vocabulary, which is why `allcommands`/`allkeys` from\nthe TOML come back as `+@all`/`~*`. That is a display normalization, not a rule change."}, {"id": "ACL-12", "area": "ACL", "title": "Verify `ACL SETUSER` creates a user at runtime and appends rules incrementally", "precondition": "ACL-11 completed; the server is running on port 6510.", "steps": "redis-cli -p 6510 --user admin --pass adminpw --no-auth-warning acl setuser ro on '>ropw' '~app:*' +get\nredis-cli -p 6510 --user admin --pass adminpw --no-auth-warning acl setuser ro +set\nredis-cli -p 6510 --user admin --pass adminpw --no-auth-warning acl setuser ro -set\nredis-cli -p 6510 --user admin --pass adminpw --no-auth-warning acl getuser ro\n\n# The new user works immediately — no restart, no reconnect.\nredis-cli -p 6510 --user ro --pass ropw --no-auth-warning get app:1\nredis-cli -p 6510 --user ro --pass ropw --no-auth-warning set app:1 nope", "expected": "OK\nOK\nOK\nflags\non\npasswords\n$argon2id$v=19$m=19456,t=2,p=1$5O40PQ4fgO7jI9PitlMaQg$J/KdBLPqwPGK7rDGvIDmtcRYM0FnlUQx5fsHEunyPcw\ncommands\n+get +set -set\nkeys\n~app:*\nhello\nNOPERM this user has no permissions to run this command", "notes": "The `commands` field reads `+get +set -set`, not `+get`. `ACL SETUSER` is"}, {"id": "ACL-13", "area": "ACL", "title": "Verify `ACL DELUSER` returns the count actually removed", "precondition": "ACL-12 completed; user `ro` exists.", "steps": "redis-cli -p 6510 --user admin --pass adminpw --no-auth-warning acl deluser ro\nredis-cli -p 6510 --user admin --pass adminpw --no-auth-warning acl deluser ro", "expected": "1\n0", "notes": "Deleting a user that does not exist is `0`, not an error. Do not delete every user: the\n\"auth is on\" flag is sticky and is never cleared, so an empty user table leaves the server\npermanently unreachable — every connection gets `NOAUTH` and there is nobody left to `AUTH` as.\nThe only recovery is a restart, which rebuilds the table from `[[acl.users]]`."}, {"id": "ACL-14", "area": "ACL", "title": "Verify revocation reaches an already-open, already-authenticated connection", "precondition": "ACL-07 completed (server running, key `app:1` seeded).", "steps": "redis-cli -p 6510 --user admin --pass adminpw --no-auth-warning \\\n  acl setuser revoketest on '>revokepw' '~app:*' +get\n\n# Open a session that reads app:1, waits 2.5s, then reads it again.\n{ echo \"auth revoketest revokepw\"; echo \"get app:1\"; sleep 2.5; echo \"get app:1\"; } \\\n  | redis-cli -p 6510 &\nSESS=$!\n\n# ~1s in — while that connection is still open and authenticated — delete the user.\nsleep 1\nredis-cli -p 6510 --user admin --pass adminpw --no-auth-warning acl deluser revoketest\nwait $SESS", "expected": "OK\nOK\nhello\n1\nNOAUTH Authentication required.", "notes": "Read the output in order: `OK` (SETUSER), then from the piped session `OK` (its AUTH)\nand `hello` (the first GET), then `1` from the concurrent DELUSER, then `NOAUTH` — the piped\nsession's *second* GET, on the same connection that was authenticated a moment earlier.\n\nThe two streams interleave, so the exact position of the `1` relative to `hello` can shift. What\nmust hold is that the second `get app:1` fails with `NOAUTH` on a connection that was never\nreconnected. ACL changes take effect on the next command, without a restart and without forcing\nclients to reconnect.\n\nDo not skip the `wait` — without it the case appears to pass while the session is still running."}, {"id": "ACL-15", "area": "ACL", "title": "Verify TOML field syntax is rejected as an `ACL SETUSER` token, with no partial apply", "precondition": "ACL-01 completed; the server is running on port 6510.", "steps": "redis-cli -p 6510 --user admin --pass adminpw --no-auth-warning acl setuser tmp1 enabled=true\nredis-cli -p 6510 --user admin --pass adminpw --no-auth-warning acl setuser tmp1 on secret123\nredis-cli -p 6510 --user admin --pass adminpw --no-auth-warning acl setuser tmp1 on '>pw' '+@read'\nredis-cli -p 6510 --user admin --pass adminpw --no-auth-warning acl getuser tmp1", "expected": "ERR syntax error at 'enabled=true'\n\nERR syntax error at 'secret123'\n\nERR syntax error at '+@read'", "notes": "The two vocabularies overlap only for *rule* tokens. Login state and password are TOML"}, {"id": "ACL-16", "area": "ACL", "title": "Verify a `>password` or `on`/`off` token inside TOML `rules` fails startup, with the password redacted", "precondition": "The server from ACL-01 is **stopped** (see the teardown block below), and ports\n6510, 6511 and 9310 are free. These runs fail before binding anything, but starting from a clean\nslate keeps the output unambiguous.", "steps": "cat > /tmp/acltls-qa/acl-bad.toml <<'EOF'\naddr = \"127.0.0.1:6510\"\nrmp_addr = \"127.0.0.1:6511\"\nmetrics_addr = \"127.0.0.1:9310\"\n\n[[acl.users]]\nusername = \"admin\"\nenabled = true\nrules = [\"on\", \">secret123\", \"allcommands\", \"allkeys\"]\nEOF\n\n\"$ROCKET_MEM_BIN\" --config /tmp/acltls-qa/acl-bad.toml\necho \"exit=$?\"\n\n# Same file with the `on` token removed, so the password token is the first failure.\nsed 's/\"on\", //' /tmp/acltls-qa/acl-bad.toml > /tmp/acltls-qa/acl-bad2.toml\n\"$ROCKET_MEM_BIN\" --config /tmp/acltls-qa/acl-bad2.toml\necho \"exit=$?\"\n\nss -lnt | grep -E ':(6510|6511|9310)\\b' || echo \"ports free\"", "expected": "Error: Custom { kind: InvalidInput, error: \"acl bootstrap: ERR syntax error at 'on'\" }\nexit=1\nError: Custom { kind: InvalidInput, error: \"acl bootstrap: ERR syntax error at '<password token>'\" }\nexit=1\nports free", "notes": "Two things to check beyond the exit code.\n\nFirst, the second error says `'<password token>'` — the literal string `secret123` is **not**\nechoed. A misconfigured password must not leak into stderr, journald, container logs or CI output.\nIf you ever see the actual password there, that is a security defect worth filing.\n\nSecond, no listener lines are printed at all: the ACL bootstrap check runs before *anything* is\nbound, so the process leaves no half-started state. (This differs from the TLS failures in TLS-08,\nwhich abort after the metrics and RMP listeners are already up.)\n\nThe `Error: Custom { ... }` wrapper is `std::io::Error`'s `Debug` output rather than a hand-written\nmessage. Noisy, but the useful part is inside it."}, {"id": "ACL-17", "area": "ACL", "title": "Verify no credential reaches the slow log or the AOF", "precondition": "ACL-01 through ACL-14 have been run against a live server on port 6510, so the\nslow log and AOF have content. The server is still running.", "steps": "redis-cli -p 6510 --user admin --pass adminpw --no-auth-warning slowlog get | head -12\ngrep -aic -E 'AUTH|ACL|adminpw|apppw' /tmp/acltls-qa/acl.aof", "expected": "61\n1788234467\n25797\nAUTH\n... (2 more arguments)\n60\n1788234454\n28587\nAUTH\n... (2 more arguments)\n59\n1788234453\n23238", "notes": "Entry ids, timestamps and durations differ on every run. What matters is the shape:\nevery `AUTH` entry shows the command name followed by `... (2 more arguments)`, never the username\nor the password. `ACL setuser` entries are redacted the same way (`... (5 more arguments)`).\n\nNearly every `AUTH` lands in the slow log because argon2 verification costs roughly 20-30ms (the\nthird field of each entry is the duration in microseconds — `25797`, `28587` above), well over the\ndefault 10ms slow-log threshold. That is expected, not a performance regression.\n\nThe `grep -c` returning `0` proves nothing ACL-related reaches durable state: no `AUTH` command,\nno `ACL` command, and no plaintext password ever enters the AOF or the snapshot. The direct\nconsequence is that runtime users created with `ACL SETUSER` are **not persisted** — a restart\nrebuilds the user table from `[[acl.users]]` alone, and the runtime users are silently gone while\nthe data they guarded survives. ACL changes are also leader-local: they are not replicated, so a\nfollower's user table can drift from its leader's."}, {"id": "ACL-18", "area": "ACL", "title": "Verify `/metrics` has no authentication of its own but does count auth failures", "precondition": "ACL-01 through ACL-14 have been run against a live server; the server is still\nrunning with metrics on 9310.", "steps": "curl -s http://127.0.0.1:9310/metrics | grep -E 'rocket_mem_command_errors_total' | head -10", "expected": "# TYPE rocket_mem_command_errors_total counter\nrocket_mem_command_errors_total{cmd=\"acl\"} 6\nrocket_mem_command_errors_total{cmd=\"auth\"} 3\nrocket_mem_command_errors_total{cmd=\"get\"} 3\nrocket_mem_command_errors_total{cmd=\"mget\"} 2\nrocket_mem_command_errors_total{cmd=\"hello\"} 1\nrocket_mem_command_errors_total{cmd=\"set\"} 2\nrocket_mem_command_errors_total{cmd=\"ping\"} 4", "notes": "The counter values depend on exactly which of the earlier cases you ran and how many\ntimes; only the label shape is fixed. The two findings here are:\n\n1. `curl` succeeded with **no credentials of any kind**, on a server where every RESP command is\n   behind `NOAUTH`. The metrics endpoint is not covered by the ACL system at all. Bind it to\n   loopback or firewall it — never expose it publicly, ACL configured or not.\n2. Failed logins (`cmd=\"auth\"`) and NOPERM refusals (`cmd=\"get\"`, `cmd=\"ping\"`, ...) do increment\n   the counter, which makes it a usable alerting hook for brute-force detection."}]}, {"title": "TLS", "cases": [{"id": "TLS-01", "area": "TLS", "title": "Generate a self-signed certificate for local testing", "precondition": "`openssl` is installed and `/tmp/acltls-qa` exists.", "steps": "mkdir -p /tmp/acltls-qa/tls\ncd /tmp/acltls-qa/tls\nopenssl req -x509 -newkey rsa:2048 \\\n  -keyout key.pem -out cert.pem -days 3650 -nodes -subj \"/CN=localhost\"\necho \"exit=$?\"\nls -l /tmp/acltls-qa/tls", "expected": "exit=0\ntotal 8\n-rw-rw-r-- 1 numericlabs numericlabs 1115 Sep  1 09:18 cert.pem\n-rw------- 1 numericlabs numericlabs 1704 Sep  1 09:18 key.pem", "notes": "`openssl req` also prints a long line of dots and `+` characters to stderr while\ngenerating the key. That is progress output, not an error; ignore it."}, {"id": "TLS-02", "area": "TLS", "title": "Verify TLS listeners run alongside the plaintext ones, not instead of them", "precondition": "TLS-01 completed. Ports 6510, 6511, 6530, 6531 and 9310 are all free — run the\nACL teardown above first if the ACL server is still up.", "steps": "cd /tmp/acltls-qa\nROCKET_MEM_ADDR=127.0.0.1:6510 ROCKET_MEM_RMP_ADDR=127.0.0.1:6511 \\\nROCKET_MEM_METRICS_ADDR=127.0.0.1:9310 \\\nROCKET_MEM_AOF_PATH=/tmp/acltls-qa/tls.aof ROCKET_MEM_SNAPSHOT_PATH=/tmp/acltls-qa/tls.snap \\\nROCKET_MEM_TLS_RESP_ADDR=127.0.0.1:6530 ROCKET_MEM_TLS_RMP_ADDR=127.0.0.1:6531 \\\nROCKET_MEM_TLS_CERT_PATH=/tmp/acltls-qa/tls/cert.pem \\\nROCKET_MEM_TLS_KEY_PATH=/tmp/acltls-qa/tls/key.pem \\\nnohup \"$ROCKET_MEM_BIN\" \\\n  > /tmp/acltls-qa/tls-server.log 2>&1 &\necho \"PID=$!\" > /tmp/acltls-qa/tls.pid\n\nsleep 1.5\ncat /tmp/acltls-qa/tls-server.log\nss -lnt | grep -E ':(6510|6511|6530|6531|9310)\\b'", "expected": "Recovered state from /tmp/acltls-qa/tls.snap and /tmp/acltls-qa/tls.aof\nMetrics on http://127.0.0.1:9310/metrics\nRMP listening on 127.0.0.1:6511\nTLS listening on 127.0.0.1:6530\nRMP TLS listening on 127.0.0.1:6531\nListening on 127.0.0.1:6510\nLISTEN 0      128                   127.0.0.1:9310       0.0.0.0:*\nLISTEN 0      128                   127.0.0.1:6510       0.0.0.0:*\nLISTEN 0      128                   127.0.0.1:6511       0.0.0.0:*\nLISTEN 0      128                   127.0.0.1:6530       0.0.0.0:*\nLISTEN 0      128                   127.0.0.1:6531       0.0.0.0:*", "notes": "Five listeners, not three. Enabling TLS does **not** disable or replace the plaintext\n`addr`/`rmp_addr` listeners — there is no setting that turns them off. Anyone who assumes\n\"TLS is configured, therefore traffic is encrypted\" is wrong on this build: 6510 is still fully\nopen and unencrypted. If you need plaintext closed, you must firewall it.\n\nThe four settings are available identically as TOML keys (`tls_resp_addr`, `tls_rmp_addr`,\n`tls_cert_path`, `tls_key_path`), as `ROCKET_MEM_TLS_*` env vars, or as `--tls-*` flags.\n\nBanner line order varies between runs; `ss` row order varies too. Check for presence.\n\nThis is server-authentication TLS only. There is no mutual TLS — the server never asks the client\nfor a certificate, so anyone who can reach the port can complete a handshake."}, {"id": "TLS-03", "area": "TLS", "title": "Verify a working `redis-cli --tls --cacert` round-trip", "precondition": "TLS-02 completed; the server is running with TLS on 6530.", "steps": "redis-cli --tls --cacert /tmp/acltls-qa/tls/cert.pem -p 6530 ping\nredis-cli --tls --cacert /tmp/acltls-qa/tls/cert.pem -p 6530 set tlskey 1\nredis-cli --tls --cacert /tmp/acltls-qa/tls/cert.pem -p 6530 get tlskey\nredis-cli --tls --cacert /tmp/acltls-qa/tls/cert.pem -p 6530 -3 ping", "expected": "PONG\nOK\n1\nPONG", "notes": "Because the certificate is self-signed, it is its own CA — passing `cert.pem` to\n`--cacert` is what makes verification succeed.\n\nRESP3 (`-3`) works over TLS exactly as it does in plaintext; the TLS layer wraps the socket and\nchanges nothing above it.\n\nThere is **no hostname check**. This command addresses `127.0.0.1` while the certificate says\n`CN=localhost`, and it still connects. Do not read a successful connection as proof the name\nmatched."}, {"id": "TLS-04", "area": "TLS", "title": "Verify the TLS and plaintext ports share one keyspace", "precondition": "TLS-03 completed; the server is running with both 6510 and 6530 up.", "steps": "redis-cli --tls --cacert /tmp/acltls-qa/tls/cert.pem -p 6530 set both 1\nredis-cli -p 6510 incr both\nredis-cli --tls --cacert /tmp/acltls-qa/tls/cert.pem -p 6530 get both", "expected": "OK\n2\n2", "notes": "One `Engine`, one set of shards, four RESP/RMP front doors. There is no per-listener\nisolation and no synchronization involved — a write over TLS is immediately visible in plaintext\nand vice versa. That also means a plaintext client on 6510 can read anything a TLS client wrote,\nwhich is the practical reason TLS-02's \"plaintext is still open\" note matters."}, {"id": "TLS-05", "area": "TLS", "title": "Verify `--insecure` skips verification and omitting `--cacert` fails it", "precondition": "TLS-02 completed; the server is running with TLS on 6530.", "steps": "redis-cli --tls --insecure -p 6530 ping\necho \"exit=$?\"\nredis-cli --tls -p 6530 ping\necho \"exit=$?\"", "expected": "PONG\nexit=0\nCould not connect to Redis at 127.0.0.1:6530: SSL_connect failed: certificate verify failed\nexit=1", "notes": "The second command is the important one: without a `--cacert` naming the self-signed\ncertificate, the client has nothing to chain to and correctly refuses the connection. A build that\nconnected anyway would mean certificate verification is not actually being enforced.\n\nNote the exit codes. Unlike the server-side errors in the ACL section, a TLS handshake failure is\na connection failure, so `redis-cli` does exit 1 and this one *is* safe to script against.\n\n`--insecure` disables verification entirely. It is fine for a quick \"is the listener up\" check and\nmust never appear in anything resembling a production client configuration."}, {"id": "TLS-06", "area": "TLS", "title": "Verify the TLS RMP listener with `openssl s_client`", "precondition": "TLS-02 completed; the server is running with TLS RMP on 6531.", "steps": "echo | openssl s_client -connect 127.0.0.1:6531 \\\n  -CAfile /tmp/acltls-qa/tls/cert.pem -servername localhost 2>&1 \\\n  | grep -E 'New, TLS|Verify return code'", "expected": "New, TLSv1.3, Cipher is TLS_AES_256_GCM_SHA384\nVerify return code: 0 (ok)", "notes": "RMP is rocket-mem's own binary protocol and `redis-cli` cannot speak it, so `s_client`\nis the only hand-testing route for 6531 — the `rmp-client` crate in the workspace speaks plaintext\nRMP only and has no TLS mode. This case proves the listener is up and the handshake completes; it\ndoes not exercise any RMP command.\n\nThe same command against `-connect 127.0.0.1:6530` produces the same two lines, which is a quick\nway to confirm both TLS listeners share the one certificate.\n\n`s_client` does not verify the hostname unless you pass `-verify_hostname`, so `Verify return\ncode: 0 (ok)` against `127.0.0.1` with a `CN=localhost` certificate is expected here and is not\nevidence of a name match. Same caveat as TLS-03."}, {"id": "TLS-07", "area": "TLS", "title": "Verify what a plaintext client gets on the TLS port", "precondition": "TLS-02 completed; the server is running with TLS on 6530.", "steps": "redis-cli -p 6530 ping\necho \"exit=$?\"", "expected": "Error: Protocol error, got \"\\x15\" as reply type byte\nexit=1", "notes": "Match this string exactly, including the `\\x15`.\n\nRead it as three separate facts. The TCP connect **succeeded** — the port is open and accepting.\nThe TLS handshake then failed, because the client sent a RESP `PING` where a ClientHello was\nexpected. And `\\x15` is byte 21, the TLS record type for an **alert**: the server *does* answer,\nit just answers in TLS, and `redis-cli` tries to interpret that first byte as a RESP reply type.\n\nThis is explicitly **not** silence. Older documentation claimed the server sends no reply at all,\nwhich sends you hunting for a hung connection that does not exist. If you ever see a hang here\ninstead of this error, that is a genuine regression."}, {"id": "TLS-08", "area": "TLS", "title": "Verify a TLS address without a cert/key is a startup error, not an unbound listener", "precondition": "The server from TLS-02 is **stopped** and ports 6510, 6511, 6530, 6531 and 9310\nare free. These runs bind the metrics and RMP listeners before aborting, so a running server would\nmask the real error with `AddrInUse`.", "steps": "cd /tmp/acltls-qa\n\n# A: TLS address set, no cert or key at all.\nROCKET_MEM_ADDR=127.0.0.1:6510 ROCKET_MEM_RMP_ADDR=127.0.0.1:6511 \\\nROCKET_MEM_METRICS_ADDR=127.0.0.1:9310 ROCKET_MEM_TLS_RESP_ADDR=127.0.0.1:6530 \\\n\"$ROCKET_MEM_BIN\"; echo \"exit=$?\"\n\n# B: cert path points at a file that does not exist.\nROCKET_MEM_ADDR=127.0.0.1:6510 ROCKET_MEM_RMP_ADDR=127.0.0.1:6511 \\\nROCKET_MEM_METRICS_ADDR=127.0.0.1:9310 ROCKET_MEM_TLS_RESP_ADDR=127.0.0.1:6530 \\\nROCKET_MEM_TLS_CERT_PATH=/tmp/acltls-qa/tls/missing.pem \\\nROCKET_MEM_TLS_KEY_PATH=/tmp/acltls-qa/tls/key.pem \\\n\"$ROCKET_MEM_BIN\"; echo \"exit=$?\"\n\n# C: cert and key swapped.\nROCKET_MEM_ADDR=127.0.0.1:6510 ROCKET_MEM_RMP_ADDR=127.0.0.1:6511 \\\nROCKET_MEM_METRICS_ADDR=127.0.0.1:9310 ROCKET_MEM_TLS_RESP_ADDR=127.0.0.1:6530 \\\nROCKET_MEM_TLS_CERT_PATH=/tmp/acltls-qa/tls/key.pem \\\nROCKET_MEM_TLS_KEY_PATH=/tmp/acltls-qa/tls/cert.pem \\\n\"$ROCKET_MEM_BIN\"; echo \"exit=$?\"", "expected": "Recovered state from ./dump.snapshot and ./appendonly.aof\nMetrics on http://127.0.0.1:9310/metrics\nRMP listening on 127.0.0.1:6511\nError: Custom { kind: InvalidInput, error: \"tls_resp_addr is set but tls_cert_path/tls_key_path is not -- TLS requires both\" }\nexit=1\nRecovered state from ./dump.snapshot and ./appendonly.aof\nMetrics on http://127.0.0.1:9310/metrics\nRMP listening on 127.0.0.1:6511\nError: Os { code: 2, kind: NotFound, message: \"No such file or directory\" }\nexit=1\nRecovered state from ./dump.snapshot and ./appendonly.aof\nMetrics on http://127.0.0.1:9310/metrics\nRMP listening on 127.0.0.1:6511\nError: Custom { kind: InvalidData, error: \"no certificate found in cert file\" }\nexit=1", "notes": "The behavior under test is that all three exit 1. A TLS misconfiguration must never\nresult in a server that comes up happily with its TLS listener silently missing — that would look\nhealthy while serving nothing but plaintext.\n\nAll three abort **after** the metrics and plaintext RMP listeners are already bound and printed,\nso the error scrolls past two success lines. The plaintext `Listening on 127.0.0.1:6510` line\nnever appears, which is the reliable signal that startup did not complete. (Contrast ACL-16, where\nthe failure happens before anything binds.)\n\nCase B's error does not say **which** path was missing. If you hit `NotFound`, check both\n`tls_cert_path` and `tls_key_path`.\n\nThese runs use the default AOF/snapshot paths (`./dump.snapshot`, `./appendonly.aof`) relative to\nthe cwd, which is why the first line differs from TLS-02's. They abort before writing anything.\n\nNot covered by any check: setting `tls_resp_addr` to the same port as `addr`. TLS binds first, then\nthe plaintext listener dies with `AddrInUse` and nothing hints that the two settings collided."}, {"id": "TLS-09", "area": "TLS", "title": "Verify cert/key paths resolve against the process CWD, not the config file", "precondition": "TLS-01 completed (certificates exist in `/tmp/acltls-qa/tls`). Ports 6510, 6511,\n6530 and 9310 are free.", "steps": "mkdir -p /tmp/acltls-qa/cfgdir\ncat > /tmp/acltls-qa/cfgdir/tls-relative.toml <<'EOF'\naddr = \"127.0.0.1:6510\"\nrmp_addr = \"127.0.0.1:6511\"\nmetrics_addr = \"127.0.0.1:9310\"\naof_path = \"/tmp/acltls-qa/tls.aof\"\nsnapshot_path = \"/tmp/acltls-qa/tls.snap\"\ntls_resp_addr = \"127.0.0.1:6530\"\ntls_cert_path = \"cert.pem\"\ntls_key_path = \"key.pem\"\nEOF\n\n# Run from the directory holding the CONFIG. The certs are not there.\ncd /tmp/acltls-qa/cfgdir\n\"$ROCKET_MEM_BIN\" \\\n  --config /tmp/acltls-qa/cfgdir/tls-relative.toml; echo \"exit=$?\"\n\nsleep 1\n\n# Same config file, unchanged. Run from the directory holding the CERTS.\ncd /tmp/acltls-qa/tls\ntimeout 2 \"$ROCKET_MEM_BIN\" \\\n  --config /tmp/acltls-qa/cfgdir/tls-relative.toml; echo \"exit=$?\"", "expected": "Recovered state from /tmp/acltls-qa/tls.snap and /tmp/acltls-qa/tls.aof\nMetrics on http://127.0.0.1:9310/metrics\nRMP listening on 127.0.0.1:6511\nError: Os { code: 2, kind: NotFound, message: \"No such file or directory\" }\nexit=1\nRecovered state from /tmp/acltls-qa/tls.snap and /tmp/acltls-qa/tls.aof\nMetrics on http://127.0.0.1:9310/metrics\nRMP listening on 127.0.0.1:6511\nTLS listening on 127.0.0.1:6530\nListening on 127.0.0.1:6510\nexit=124", "notes": "This is a real trap. The **same config file** fails from one directory and starts\ncleanly from another, with no diagnostic naming the path it actually tried. `tls_cert_path` and\n`tls_key_path` are resolved against the server process's working directory, not against the\ndirectory the config file lives in — which is the intuition most people bring.\n\n`exit=124` on the second run is `timeout` killing a healthy server after 2 seconds. That is the\npass condition; the five banner lines ending in `Listening on 127.0.0.1:6510` are what matters.\n\nRecommendation to pass on: always use absolute paths for `tls_cert_path`/`tls_key_path` unless you\ncontrol the working directory the process is launched from (a systemd unit's `WorkingDirectory`,\na container's `WORKDIR`)."}, {"id": "TLS-10", "area": "TLS", "title": "Verify ACL enforcement applies on the TLS port", "precondition": "TLS-01 completed. All five ports free. Any server from an earlier case is\nstopped.", "steps": "cat > /tmp/acltls-qa/acl-tls.toml <<'EOF'\naddr = \"127.0.0.1:6510\"\nrmp_addr = \"127.0.0.1:6511\"\nmetrics_addr = \"127.0.0.1:9310\"\naof_path = \"/tmp/acltls-qa/acltls.aof\"\nsnapshot_path = \"/tmp/acltls-qa/acltls.snap\"\ntls_resp_addr = \"127.0.0.1:6530\"\ntls_rmp_addr = \"127.0.0.1:6531\"\ntls_cert_path = \"/tmp/acltls-qa/tls/cert.pem\"\ntls_key_path = \"/tmp/acltls-qa/tls/key.pem\"\n\n[[acl.users]]\nusername = \"admin\"\npassword = \"adminpw\"\nenabled = true\nrules = [\"allcommands\", \"allkeys\"]\nEOF\n\ncd /tmp/acltls-qa\nnohup \"$ROCKET_MEM_BIN\" \\\n  --config /tmp/acltls-qa/acl-tls.toml > /tmp/acltls-qa/acltls-server.log 2>&1 &\necho \"PID=$!\" > /tmp/acltls-qa/acltls.pid\nsleep 1.5\ncat /tmp/acltls-qa/acltls-server.log\n\nredis-cli --tls --cacert /tmp/acltls-qa/tls/cert.pem -p 6530 ping\nredis-cli --tls --cacert /tmp/acltls-qa/tls/cert.pem -p 6530 \\\n  --user admin --pass adminpw --no-auth-warning ping", "expected": "Recovered state from /tmp/acltls-qa/acltls.snap and /tmp/acltls-qa/acltls.aof\nMetrics on http://127.0.0.1:9310/metrics\nRMP listening on 127.0.0.1:6511\nTLS listening on 127.0.0.1:6530\nRMP TLS listening on 127.0.0.1:6531\nListening on 127.0.0.1:6510\nNOAUTH Authentication required.\n\nPONG", "notes": "TLS and ACL are independent layers and compose as expected: transport encryption grants\nno identity, so a TLS client starts out just as unauthenticated as a plaintext one. Completing the\nhandshake is not authentication — there is no mutual TLS and no certificate-derived identity\nanywhere in this build."}]}]
 </script>
 <script>
@@ -281,24 +424,27 @@ pre.expected{background:var(--accent-soft);border-color:var(--accent-line)}
 
   var filter = 'all', query = '', allOpen = false;
   var list = document.getElementById('list'), nav = document.getElementById('nav');
+  var strip = document.getElementById('strip'), runnote = document.getElementById('runnote');
   var cases = [];
   DATA.forEach(function(s){ s.cases.forEach(function(c){ c.section = s.title; cases.push(c); }); });
 
   function esc(t){ return String(t == null ? '' : t)
     .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+  function attr(t){ return esc(t).replace(/"/g,'&quot;'); }
   // Render the small subset of inline markdown the source actually uses.
   function inline(t){
     return esc(t).replace(/`([^`]+)`/g, '<code>$1</code>')
                  .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
                  .replace(/\n/g, ' ');
   }
+  // Same subset, stripped rather than rendered, for tooltips and labels.
+  function plain(t){ return String(t == null ? '' : t).replace(/[`*]/g,'').replace(/\n/g,' '); }
   function slug(t){ return t.toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,''); }
+  function verdictOf(c){ return state[c.id] || 'todo'; }
+  function label(st){ return st === 'pass' ? 'Passed' : st === 'fail' ? 'Failed' : 'Untested'; }
 
   function matches(c){
-    if (filter !== 'all'){
-      var st = state[c.id] || 'todo';
-      if (st !== filter) return false;
-    }
+    if (filter !== 'all' && verdictOf(c) !== filter) return false;
     if (query){
       var hay = (c.id+' '+c.title+' '+c.precondition+' '+c.steps+' '+c.expected+' '+c.notes).toLowerCase();
       if (hay.indexOf(query) === -1) return false;
@@ -311,20 +457,28 @@ pre.expected{background:var(--accent-soft);border-color:var(--accent-line)}
     DATA.forEach(function(sec){
       var shown = sec.cases.filter(matches);
       if (!shown.length) return;
-      var p = sec.cases.filter(function(c){ return state[c.id] === 'pass'; }).length;
-      var f = sec.cases.filter(function(c){ return state[c.id] === 'fail'; }).length;
+      var p = 0, f = 0, ticks = '';
+      sec.cases.forEach(function(c){
+        var st = verdictOf(c);
+        if (st === 'pass') p++; else if (st === 'fail') f++;
+        ticks += '<i class="'+(st === 'pass' ? 'p' : st === 'fail' ? 'f' : '')+'"></i>';
+      });
       html += '<section class="sec" id="sec-'+slug(sec.title)+'">'
         + '<div class="sec-head"><h2>'+esc(sec.title)+'</h2>'
-        + '<span class="n">'+p+' passed &middot; '+f+' failed &middot; '+sec.cases.length+' total</span></div>';
+        + '<span class="secstrip" aria-hidden="true">'+ticks+'</span>'
+        + (f ? '<span class="nf">'+f+' failed</span>' : '')
+        + '<span class="n">'+p+'/'+sec.cases.length+'</span></div><div class="cases">';
       shown.forEach(function(c){
-        var st = state[c.id] || 'todo';
+        var st = verdictOf(c);
         var open = allOpen || st === 'fail';
-        html += '<article class="case s-'+st+'" data-id="'+c.id+'" open-state="'+(open?1:0)+'">'
+        html += '<article class="case s-'+st+'" data-id="'+attr(c.id)+'" open-state="'+(open?1:0)+'">'
           + '<button class="case-head" aria-expanded="'+open+'">'
-          + '<span class="caret">&#9656;</span>'
           + '<span class="cid">'+esc(c.id)+'</span>'
           + '<span class="ctitle">'+inline(c.title)+'</span>'
-          + '<span class="cstate">'+(st==='todo'?'Untested':st==='pass'?'Passed':'Failed')+'</span>'
+          // Untested is the default, so saying so on every row is noise — keep it for AT only.
+          + (st === 'todo' ? '<span class="vh">Untested</span>'
+                           : '<span class="cstate">'+label(st)+'</span>')
+          + '<span class="caret" aria-hidden="true">&#9656;</span>'
           + '</button>'
           + '<div class="case-body"'+(open?'':' hidden')+'>';
         if (c.precondition) html += '<div class="field"><span class="flabel">Precondition</span>'
@@ -343,31 +497,66 @@ pre.expected{background:var(--accent-soft);border-color:var(--accent-line)}
           + '<button class="vb c" data-v="todo">Clear</button></div>';
         html += '</div></article>';
       });
-      html += '</section>';
+      html += '</div></section>';
     });
     list.innerHTML = html || '<p class="empty">No cases match this filter.</p>';
     scores();
+    markCurrent();
   }
 
   function scores(){
     var p = 0, f = 0;
     cases.forEach(function(c){
-      if (state[c.id] === 'pass') p++; else if (state[c.id] === 'fail') f++;
+      var st = verdictOf(c);
+      if (st === 'pass') p++; else if (st === 'fail') f++;
     });
     var t = cases.length;
     document.getElementById('s-total').textContent = t;
     document.getElementById('s-pass').textContent = p;
     document.getElementById('s-fail').textContent = f;
     document.getElementById('s-todo').textContent = t - p - f;
-    document.getElementById('m-pass').style.width = (p/t*100)+'%';
-    document.getElementById('m-fail').style.width = (f/t*100)+'%';
+    runnote.textContent = summary(p, f, t);
+    stripRender();
     navRender();
+  }
+
+  // A plain-language read of where the run stands, next to the raw counts.
+  function summary(p, f, t){
+    var done = p + f, out;
+    if (!done) return 'Nothing recorded yet. Press n to open the first case.';
+    if (done === t) out = f ? 'All ' + t + ' recorded, ' + f + ' still failing.'
+                            : 'All ' + t + ' recorded and passing.';
+    else out = done + ' of ' + t + ' recorded.';
+    if (!f) return out;
+    var where = DATA.filter(function(sec){
+      return sec.cases.some(function(c){ return verdictOf(c) === 'fail'; });
+    }).map(function(sec){ return sec.title; });
+    if (where.length > 3) return out + ' Failures across ' + where.length + ' suites.';
+    var joined = where.length === 1 ? where[0]
+      : where.slice(0, -1).join(', ') + ' and ' + where[where.length - 1];
+    return out + ' Failures in ' + joined + '.';
+  }
+
+  // One tick per case, suites sized in proportion to how many cases they hold.
+  function stripRender(){
+    strip.innerHTML = DATA.map(function(sec){
+      var p = 0, f = 0, ticks = '';
+      sec.cases.forEach(function(c){
+        var st = verdictOf(c);
+        if (st === 'pass') p++; else if (st === 'fail') f++;
+        ticks += '<i class="t '+(st === 'pass' ? 'p' : st === 'fail' ? 'f' : '')+'" title="'
+          + attr(c.id + ' — ' + plain(c.title) + ' · ' + label(st)) + '"></i>';
+      });
+      return '<a class="grp" href="#sec-'+slug(sec.title)+'" style="flex:'+sec.cases.length+' 1 0"'
+        + ' aria-label="'+attr(sec.title+': '+p+' passed, '+f+' failed, '+sec.cases.length+' cases')
+        + '">'+ticks+'</a>';
+    }).join('');
   }
 
   function navRender(){
     nav.innerHTML = DATA.map(function(sec){
-      var p = sec.cases.filter(function(c){ return state[c.id] === 'pass'; }).length;
-      var f = sec.cases.filter(function(c){ return state[c.id] === 'fail'; }).length;
+      var p = sec.cases.filter(function(c){ return verdictOf(c) === 'pass'; }).length;
+      var f = sec.cases.filter(function(c){ return verdictOf(c) === 'fail'; }).length;
       var cls = f ? 'has-fail' : (p === sec.cases.length ? 'done' : '');
       return '<a class="'+cls+'" href="#sec-'+slug(sec.title)+'">'
         + '<span>'+esc(sec.title)+'</span>'
@@ -375,43 +564,110 @@ pre.expected{background:var(--accent-soft);border-color:var(--accent-line)}
     }).join('');
   }
 
+  // Mark the suite the reader is currently scrolled into, so the rail keeps its place.
+  var ticking = false;
+  function markCurrent(){
+    var secs = list.querySelectorAll('.sec'), best = null, bestTop = -Infinity;
+    for (var i = 0; i < secs.length; i++){
+      var top = secs[i].getBoundingClientRect().top - 90;
+      if (top <= 0 && top > bestTop){ bestTop = top; best = secs[i]; }
+    }
+    if (!best && secs.length) best = secs[0];
+    var href = best ? '#' + best.id : '';
+    nav.querySelectorAll('a').forEach(function(a){
+      if (href && a.getAttribute('href') === href) a.setAttribute('aria-current', 'true');
+      else a.removeAttribute('aria-current');
+    });
+  }
+  window.addEventListener('scroll', function(){
+    if (ticking) return;
+    ticking = true;
+    requestAnimationFrame(function(){ ticking = false; markCurrent(); });
+  }, { passive: true });
+
+  function openCase(art, bring){
+    if (!art) return;
+    art.setAttribute('open-state', '1');
+    art.querySelector('.case-body').hidden = false;
+    var head = art.querySelector('.case-head');
+    head.setAttribute('aria-expanded', 'true');
+    if (bring){
+      head.focus({ preventScroll: true });
+      art.scrollIntoView({ block: 'center' });
+    }
+  }
+
+  function setVerdict(art, v){
+    var id = art.getAttribute('data-id');
+    if (v === 'todo') delete state[id]; else state[id] = v;
+    save();
+    var wasOpen = art.getAttribute('open-state') === '1';
+    var hadFocus = art.contains(document.activeElement);
+    render();
+    var again = list.querySelector('.case[data-id="'+id+'"]');
+    if (!again) return;
+    if (wasOpen){
+      again.setAttribute('open-state', '1');
+      again.querySelector('.case-body').hidden = false;
+      again.querySelector('.case-head').setAttribute('aria-expanded', 'true');
+    }
+    if (hadFocus) again.querySelector('.case-head').focus({ preventScroll: true });
+  }
+
+  // Shared by the per-case copy buttons and the footer's env block.
+  function copyFrom(cp){
+    var pre = cp.parentNode.querySelector('pre');
+    navigator.clipboard.writeText(pre.textContent).then(function(){
+      var was = cp.textContent; cp.textContent = 'Copied';
+      setTimeout(function(){ cp.textContent = was; }, 1100);
+    }, function(){ cp.textContent = 'Press Ctrl+C'; });
+  }
+
+  function focusedCase(){
+    var el = document.activeElement;
+    return el && el.closest ? el.closest('.case') : null;
+  }
+
+  function moveCase(dir){
+    var heads = Array.prototype.slice.call(list.querySelectorAll('.case-head'));
+    if (!heads.length) return;
+    var cur = focusedCase();
+    var i = cur ? heads.indexOf(cur.querySelector('.case-head')) : -1;
+    var next = i < 0 ? (dir > 0 ? 0 : heads.length - 1)
+                     : Math.max(0, Math.min(heads.length - 1, i + dir));
+    heads[next].focus({ preventScroll: true });
+    heads[next].closest('.case').scrollIntoView({ block: 'nearest' });
+  }
+
+  function nextTodo(){
+    var todo = Array.prototype.slice.call(list.querySelectorAll('.case.s-todo'));
+    if (!todo.length) return;
+    var cur = focusedCase(), target = todo[0];
+    if (cur){
+      for (var i = 0; i < todo.length; i++){
+        if (todo[i].compareDocumentPosition(cur) & Node.DOCUMENT_POSITION_PRECEDING){
+          target = todo[i]; break;
+        }
+      }
+    }
+    openCase(target, true);
+  }
+
   list.addEventListener('click', function(e){
     var head = e.target.closest('.case-head');
     var art = e.target.closest('.case');
     if (!art) return;
-    var body = art.querySelector('.case-body');
     if (head){
       var open = art.getAttribute('open-state') === '1';
       art.setAttribute('open-state', open ? '0' : '1');
-      body.hidden = open;
+      art.querySelector('.case-body').hidden = open;
       head.setAttribute('aria-expanded', String(!open));
       return;
     }
     var cp = e.target.closest('.copy');
-    if (cp){
-      var pre = cp.parentNode.querySelector('pre');
-      navigator.clipboard.writeText(pre.textContent).then(function(){
-        var was = cp.textContent; cp.textContent = 'Copied';
-        setTimeout(function(){ cp.textContent = was; }, 1100);
-      }, function(){ cp.textContent = 'Press Ctrl+C'; });
-      return;
-    }
+    if (cp){ copyFrom(cp); return; }
     var vb = e.target.closest('.vb');
-    if (vb){
-      var id = art.getAttribute('data-id'), v = vb.getAttribute('data-v');
-      if (v === 'todo') delete state[id]; else state[id] = v;
-      save();
-      var wasOpen = art.getAttribute('open-state') === '1';
-      render();
-      if (wasOpen){
-        var again = list.querySelector('.case[data-id="'+id+'"]');
-        if (again){
-          again.setAttribute('open-state','1');
-          again.querySelector('.case-body').hidden = false;
-          again.querySelector('.case-head').setAttribute('aria-expanded','true');
-        }
-      }
-    }
+    if (vb) setVerdict(art, vb.getAttribute('data-v'));
   });
 
   document.querySelectorAll('.chip').forEach(function(ch){
@@ -430,10 +686,49 @@ pre.expected{background:var(--accent-soft);border-color:var(--accent-line)}
     qt = setTimeout(function(){ query = qEl.value.trim().toLowerCase(); render(); }, 130);
   });
 
-  document.getElementById('expand').addEventListener('click', function(){
+  var expandBtn = document.getElementById('expand');
+  expandBtn.addEventListener('click', function(){
     allOpen = !allOpen;
-    this.textContent = allOpen ? 'Collapse all' : 'Expand all';
+    expandBtn.textContent = allOpen ? 'Collapse all' : 'Expand all';
     render();
+  });
+
+  document.getElementById('next-todo').addEventListener('click', nextTodo);
+
+  document.getElementById('copy-env').addEventListener('click', function(){ copyFrom(this); });
+
+  document.getElementById('to-top').addEventListener('click', function(){
+    window.scrollTo({ top: 0 });
+    document.querySelector('h1').focus({ preventScroll: true });
+  });
+
+  // Theme choice, shared with docs/manual.html through the 'rm-theme' key. The <head> script
+  // has already stamped the attribute; this only wires the control and keeps it in sync.
+  var tbtns = document.querySelectorAll('.tbtn');
+  function applyTheme(mode){
+    if (mode === 'light' || mode === 'dark'){
+      document.documentElement.setAttribute('data-theme', mode);
+    } else {
+      document.documentElement.removeAttribute('data-theme');
+      mode = 'system';
+    }
+    tbtns.forEach(function(b){
+      b.setAttribute('aria-pressed', String(b.getAttribute('data-theme-set') === mode));
+    });
+    try { localStorage.setItem('rm-theme', mode); } catch (e) {}
+  }
+  var savedTheme = 'system';
+  try { savedTheme = localStorage.getItem('rm-theme') || 'system'; } catch (e) {}
+  applyTheme(savedTheme);
+  tbtns.forEach(function(b){
+    b.addEventListener('click', function(){ applyTheme(b.getAttribute('data-theme-set')); });
+  });
+
+  // Fold the known-defect list away once read; remember that across visits.
+  var known = document.getElementById('known');
+  try { if (localStorage.getItem(KEY + '-known') === 'closed') known.open = false; } catch (e) {}
+  known.addEventListener('toggle', function(){
+    try { localStorage.setItem(KEY + '-known', known.open ? 'open' : 'closed'); } catch (e) {}
   });
 
   document.getElementById('reset').addEventListener('click', function(){
@@ -445,8 +740,9 @@ pre.expected{background:var(--accent-soft);border-color:var(--accent-line)}
     var btn = this, lines = ['rocket-mem QA run — v0.1.3 (61f40ae)', ''];
     var p = 0, f = 0, fails = [];
     cases.forEach(function(c){
-      if (state[c.id] === 'pass') p++;
-      else if (state[c.id] === 'fail'){ f++; fails.push(c.id + ' — ' + c.title + '  [' + c.section + ']'); }
+      var st = verdictOf(c);
+      if (st === 'pass') p++;
+      else if (st === 'fail'){ f++; fails.push(c.id + ' — ' + c.title + '  [' + c.section + ']'); }
     });
     lines.push('Passed:   ' + p);
     lines.push('Failed:   ' + f);
@@ -457,6 +753,28 @@ pre.expected{background:var(--accent-soft);border-color:var(--accent-line)}
       btn.textContent = 'Copied to clipboard';
       setTimeout(function(){ btn.textContent = 'Copy result summary'; }, 1400);
     }, function(){ btn.textContent = 'Copy failed'; });
+  });
+
+  // Single-key operation, so the page can be worked without leaving the keyboard.
+  document.addEventListener('keydown', function(e){
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    var tag = (e.target.tagName || '').toLowerCase();
+    var typing = tag === 'input' || tag === 'textarea' || e.target.isContentEditable;
+    if (typing){
+      if (e.key === 'Escape'){ e.target.value = ''; query = ''; e.target.blur(); render(); }
+      return;
+    }
+    var art;
+    switch (e.key){
+      case '/': e.preventDefault(); qEl.focus(); break;
+      case 'j': moveCase(1); break;
+      case 'k': moveCase(-1); break;
+      case 'n': nextTodo(); break;
+      case 'e': expandBtn.click(); break;
+      case 'p': art = focusedCase(); if (art) setVerdict(art, 'pass'); break;
+      case 'f': art = focusedCase(); if (art) setVerdict(art, 'fail'); break;
+      case 'x': art = focusedCase(); if (art) setVerdict(art, 'todo'); break;
+    }
   });
 
   render();
