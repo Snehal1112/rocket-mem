@@ -2278,6 +2278,12 @@ fn handle_save(
 /// exactly the location startup will try to load next boot — `aof::recover` treats an
 /// unreadable snapshot as a safe fallback to full AOF replay, so this never corrupts recovery,
 /// but silently losing every snapshot on a crash defeats the feature's point.
+///
+/// The parent directory is fsynced after the rename for the same reason
+/// `aof::write_generation_atomically` does it (see `aof::fsync_parent_dir`). That mattered less
+/// when the fallback was always available; a rewrite's snapshot is the *only* copy of the
+/// pre-rotation history once the old generation's files are cleaned up, so the entry has to be
+/// durable, not merely written.
 fn write_snapshot_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let mut tmp_os = path.as_os_str().to_owned();
@@ -2291,6 +2297,7 @@ fn write_snapshot_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::R
         writer.get_ref().sync_data()?;
     }
     std::fs::rename(&tmp_path, path)?;
+    crate::aof::fsync_parent_dir(path)?;
     Ok(())
 }
 

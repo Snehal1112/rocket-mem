@@ -401,6 +401,30 @@ pub fn read_generation(snapshot_path: &Path) -> std::io::Result<u64> {
 /// as the new current generation. This rename is the single commit point of a rewrite: before
 /// it, generation `gen - 1`'s files are authoritative; after it, generation `gen`'s are. See the
 /// design spec's "Decision: `BGREWRITEAOF` command", step 3.
+/// fsyncs the directory holding `path`, making a rename *into* that directory durable. Without
+/// it, `tmp + fsync + rename` only guarantees the tmp file's *contents* survive a crash: the
+/// directory entry the rename creates can still be lost, leaving the manifest reading stale
+/// while a rewrite's best-effort cleanup has already deleted the old generation's files -- the
+/// one ordering in which `recover()` finds nothing at all.
+///
+/// A path with no directory component (a bare relative filename) has an empty `parent()`, which
+/// is not openable; the process's own working directory is the implicit parent, so `.` is synced
+/// instead. Unix-only: Windows cannot open a directory as a file, and this project's release
+/// matrix builds there, so the sync degrades to a no-op rather than failing every commit.
+#[cfg(unix)]
+pub(crate) fn fsync_parent_dir(path: &Path) -> std::io::Result<()> {
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    std::fs::File::open(parent)?.sync_all()
+}
+
+#[cfg(not(unix))]
+pub(crate) fn fsync_parent_dir(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 pub fn write_generation_atomically(snapshot_path: &Path, gen: u64) -> std::io::Result<()> {
     use std::io::Write;
     let path = manifest_path(snapshot_path);
@@ -415,6 +439,10 @@ pub fn write_generation_atomically(snapshot_path: &Path, gen: u64) -> std::io::R
         writer.get_ref().sync_data()?;
     }
     std::fs::rename(&tmp_path, &path)?;
+    // The rename is this rewrite's commit point, and `handle_bgrewriteaof` deletes the previous
+    // generation's files immediately after it returns -- so the entry has to be durable before
+    // the only other copy of that state goes away.
+    fsync_parent_dir(&path)?;
     Ok(())
 }
 
@@ -1086,6 +1114,20 @@ mod tests {
         write_generation_atomically(&snapshot_path, 1).unwrap();
         write_generation_atomically(&snapshot_path, 2).unwrap();
         assert_eq!(read_generation(&snapshot_path).unwrap(), 2);
+    }
+
+    #[test]
+    fn fsync_parent_dir_succeeds_for_a_path_inside_a_real_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        // The file itself need not exist -- it is the *directory entry* being made durable.
+        fsync_parent_dir(&dir.path().join("dump.snapshot.manifest")).unwrap();
+    }
+
+    #[test]
+    fn fsync_parent_dir_on_a_bare_relative_filename_is_not_an_error() {
+        // `Path::parent()` yields an empty path here, which is not openable. A manifest commit
+        // configured with a bare relative path must still succeed, not fail on the dir sync.
+        fsync_parent_dir(std::path::Path::new("dump.snapshot.manifest")).unwrap();
     }
 
     #[test]
