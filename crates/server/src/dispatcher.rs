@@ -2168,9 +2168,6 @@ fn acl_deluser(items: &[Frame], replication: &crate::replication::ReplicationHan
 /// snapshot bytes still to be written to disk, done by the caller outside this lock. See the
 /// design spec's "Decision: `BGREWRITEAOF` command", step 1.
 ///
-/// Only exercised by this module's own tests for now -- `handle_bgrewriteaof` (this plan's next
-/// task) is what calls it from production code, hence the `allow` below until that lands.
-#[allow(dead_code)]
 fn start_rewrite(
     aof: &crate::aof::AofWriter,
     replication: &crate::replication::ReplicationHandle,
@@ -2181,6 +2178,46 @@ fn start_rewrite(
     let bytes = replication.engine().snapshot(0);
     aof.rotate_to(&crate::aof::generation_path(aof.base_path(), next_gen))?;
     Ok((next_gen, bytes))
+}
+
+/// `BGREWRITEAOF`: discards AOF bytes a snapshot has already made obsolete, without the
+/// crash-unsafety a naive in-place truncation has. See the design spec's "Decision:
+/// `BGREWRITEAOF` command" for the full protocol and why each step is ordered this way.
+///
+/// Only exercised by this module's own tests for now -- wiring an actual `BGREWRITEAOF` command
+/// into `dispatch`'s match arm is a later plan's job, hence the `allow` below until that lands.
+#[allow(dead_code)]
+fn handle_bgrewriteaof(
+    aof: &crate::aof::AofWriter,
+    replication: &crate::replication::ReplicationHandle,
+) -> Frame {
+    let (next_gen, bytes) = match start_rewrite(aof, replication) {
+        Ok(r) => r,
+        Err(e) => return Frame::Error(format!("ERR failed to start AOF rewrite: {e}")),
+    };
+
+    let new_snapshot_path = crate::aof::generation_path(replication.snapshot_path(), next_gen);
+    if let Err(e) = write_snapshot_atomically(&new_snapshot_path, &bytes) {
+        return Frame::Error(format!("ERR failed to write rewritten snapshot: {e}"));
+    }
+
+    // The commit point: before this rename, generation `next_gen - 1` is still authoritative;
+    // after it, `next_gen` is. See the design spec's crash-safety argument.
+    if let Err(e) = crate::aof::write_generation_atomically(replication.snapshot_path(), next_gen) {
+        return Frame::Error(format!("ERR failed to commit AOF rewrite: {e}"));
+    }
+
+    // Best-effort: an old generation's files are simply unreferenced once the manifest commit
+    // above lands. A failure or a crash here is harmless — never a correctness problem, only
+    // delayed disk reclamation. See the design spec's "Decision: `BGREWRITEAOF` command", step 4.
+    let old_gen = next_gen - 1;
+    let _ = std::fs::remove_file(crate::aof::generation_path(aof.base_path(), old_gen));
+    let _ = std::fs::remove_file(crate::aof::generation_path(
+        replication.snapshot_path(),
+        old_gen,
+    ));
+
+    Frame::Simple("OK".into())
 }
 
 fn handle_save(
@@ -6502,6 +6539,17 @@ mod tests {
         std::fs::read_to_string(dir.path().join("test.aof")).unwrap()
     }
 
+    fn write_raw(path: &std::path::Path, bytes: &[u8]) {
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap()
+            .write_all(bytes)
+            .unwrap();
+    }
+
     #[test]
     fn dispatch_and_log_appends_a_write_command_verbatim() {
         let engine = Engine::new();
@@ -7255,6 +7303,100 @@ mod tests {
             aof.path(),
             crate::aof::generation_path(&dir.path().join("test.aof"), 2)
         );
+    }
+
+    #[test]
+    fn handle_bgrewriteaof_commits_a_readable_generation_1() {
+        let engine = std::sync::Arc::new(Engine::new());
+        dispatch(
+            &engine,
+            cmd(&[b"SET", b"k", b"v"]),
+            &mut Protocol::default(),
+            1,
+        );
+        let (dir, aof) = test_aof();
+        let snapshot_path = dir.path().join("test.snapshot");
+        let replication =
+            ReplicationHandle::new(std::sync::Arc::clone(&engine), snapshot_path.clone());
+
+        let reply = handle_bgrewriteaof(&aof, &replication);
+
+        assert_eq!(reply, Frame::Simple("OK".into()));
+        assert_eq!(crate::aof::read_generation(&snapshot_path).unwrap(), 1);
+        let bytes = std::fs::read(crate::aof::generation_path(&snapshot_path, 1)).unwrap();
+        let loaded = Engine::new();
+        loaded.load_snapshot(&bytes).unwrap();
+        assert_eq!(
+            loaded.get(b"k"),
+            Some(Value::String(Bytes::from_static(b"v")))
+        );
+    }
+
+    #[test]
+    fn handle_bgrewriteaof_does_not_leave_a_tmp_snapshot_file_behind() {
+        let engine = std::sync::Arc::new(Engine::new());
+        let (dir, aof) = test_aof();
+        let snapshot_path = dir.path().join("test.snapshot");
+        let replication =
+            ReplicationHandle::new(std::sync::Arc::clone(&engine), snapshot_path.clone());
+
+        handle_bgrewriteaof(&aof, &replication);
+
+        let gen1_snapshot = crate::aof::generation_path(&snapshot_path, 1);
+        let mut tmp = gen1_snapshot.into_os_string();
+        tmp.push(".tmp");
+        assert!(!std::path::Path::new(&tmp).exists());
+    }
+
+    #[test]
+    fn a_second_bgrewriteaof_advances_to_generation_2() {
+        let engine = std::sync::Arc::new(Engine::new());
+        let (dir, aof) = test_aof();
+        let snapshot_path = dir.path().join("test.snapshot");
+        let replication =
+            ReplicationHandle::new(std::sync::Arc::clone(&engine), snapshot_path.clone());
+
+        handle_bgrewriteaof(&aof, &replication);
+        let reply = handle_bgrewriteaof(&aof, &replication);
+
+        assert_eq!(reply, Frame::Simple("OK".into()));
+        assert_eq!(crate::aof::read_generation(&snapshot_path).unwrap(), 2);
+    }
+
+    #[test]
+    fn handle_bgrewriteaof_deletes_the_old_generations_files_after_committing() {
+        let engine = std::sync::Arc::new(Engine::new());
+        let (dir, aof) = test_aof();
+        let aof_path = dir.path().join("test.aof");
+        let snapshot_path = dir.path().join("test.snapshot");
+        write_raw(&aof_path, b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n"); // generation 0's AOF has content
+        let replication =
+            ReplicationHandle::new(std::sync::Arc::clone(&engine), snapshot_path.clone());
+
+        handle_bgrewriteaof(&aof, &replication);
+
+        assert!(!aof_path.exists()); // generation 0's AOF, now superseded, is gone
+        assert!(!snapshot_path.exists()); // generation 0's snapshot never existed, but must not error
+        assert!(crate::aof::generation_path(&aof_path, 1).exists()); // rotated-to file remains
+        assert!(crate::aof::generation_path(&snapshot_path, 1).exists()); // committed snapshot remains
+    }
+
+    #[test]
+    fn handle_bgrewriteaof_cleanup_deletes_the_immediately_prior_generation_only() {
+        let engine = std::sync::Arc::new(Engine::new());
+        let (dir, aof) = test_aof();
+        let aof_path = dir.path().join("test.aof");
+        let snapshot_path = dir.path().join("test.snapshot");
+        let replication =
+            ReplicationHandle::new(std::sync::Arc::clone(&engine), snapshot_path.clone());
+
+        handle_bgrewriteaof(&aof, &replication); // -> generation 1
+        handle_bgrewriteaof(&aof, &replication); // -> generation 2, deletes generation 1
+
+        assert!(!crate::aof::generation_path(&aof_path, 1).exists());
+        assert!(!crate::aof::generation_path(&snapshot_path, 1).exists());
+        assert!(crate::aof::generation_path(&aof_path, 2).exists());
+        assert!(crate::aof::generation_path(&snapshot_path, 2).exists());
     }
 
     #[test]
