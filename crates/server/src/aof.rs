@@ -1131,4 +1131,36 @@ mod tests {
         assert_eq!(writer.base_path(), original_path); // unchanged despite two rotations
         assert_eq!(writer.path(), dir.path().join("gen2.aof")); // this one does change
     }
+
+    #[test]
+    fn recover_uses_the_new_generation_once_committed_even_if_old_files_remain() {
+        let dir = tempfile::tempdir().unwrap();
+        let aof_path = dir.path().join("test.aof");
+        let snapshot_path = dir.path().join("test.snapshot");
+
+        // Generation 0's files are still present on disk (cleanup hasn't run yet) but must be
+        // ignored -- this is the exact state `handle_bgrewriteaof` leaves one line before its
+        // best-effort `remove_file` calls run.
+        write_raw(&aof_path, b"*3\r\n$3\r\nSET\r\n$1\r\nold\r\n$1\r\n1\r\n");
+
+        // Generation 1 is complete and committed.
+        let gen1_engine = Engine::new();
+        gen1_engine.set(
+            Bytes::from_static(b"new"),
+            Value::String(Bytes::from_static(b"2")),
+        );
+        std::fs::write(generation_path(&snapshot_path, 1), gen1_engine.snapshot(0)).unwrap();
+        std::fs::write(generation_path(&aof_path, 1), b"").unwrap();
+        write_generation_atomically(&snapshot_path, 1).unwrap();
+
+        let engine = recover(&aof_path, &snapshot_path).unwrap();
+        assert_eq!(
+            engine.get(b"new"),
+            Some(Value::String(Bytes::from_static(b"2")))
+        ); // from generation 1
+        assert_eq!(engine.get(b"old"), None); // generation 0 ignored once the manifest points past it
+
+        // The old files being merely unreferenced, not gone, must not change the outcome.
+        assert!(aof_path.exists());
+    }
 }
