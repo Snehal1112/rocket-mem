@@ -405,3 +405,90 @@ async fn psync_is_denied_after_deluser_empties_a_once_configured_store() {
         protocol::Frame::Error("NOAUTH Authentication required.".into())
     );
 }
+
+/// Real-socket proof that `PSYNC` is gated by ACL permission, not just authentication:
+/// `handle_connection`'s PSYNC interception previously only checked whether the connection was
+/// authenticated at all, never whether the authenticated user's ACL rules actually grant
+/// `PSYNC` -- so a user scoped to e.g. `+get +set` on their own key prefix could still issue
+/// `PSYNC` and receive a full snapshot of the entire keyspace plus a live write stream,
+/// bypassing per-user isolation entirely. An authenticated user with a grant that omits `PSYNC`
+/// must get `NOPERM this user has no permissions to run this command`, not the snapshot blob.
+#[tokio::test]
+async fn psync_is_denied_to_an_authenticated_user_without_a_psync_grant() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let engine = std::sync::Arc::new(engine::Engine::new());
+    let dir = tempfile::tempdir().unwrap();
+    let aof = std::sync::Arc::new(
+        rocket_mem::aof::AofWriter::open(
+            &dir.path().join("test.aof"),
+            rocket_mem::aof::FsyncPolicy::Never,
+        )
+        .unwrap(),
+    );
+    let replication = std::sync::Arc::new(rocket_mem::replication::ReplicationHandle::default());
+    replication
+        .acl
+        .set_user(
+            "app",
+            &[
+                bytes::Bytes::from_static(b"on"),
+                bytes::Bytes::from_static(b">pw"),
+                bytes::Bytes::from_static(b"~app:*"),
+                bytes::Bytes::from_static(b"+get"),
+                bytes::Bytes::from_static(b"+set"),
+            ],
+        )
+        .unwrap();
+    tokio::spawn(rocket_mem::serve(
+        listener,
+        engine,
+        aof,
+        std::sync::Arc::clone(&replication),
+    ));
+
+    use futures_util::{SinkExt, StreamExt};
+    let mut framed = tokio_util::codec::Framed::new(
+        tokio::net::TcpStream::connect(addr).await.unwrap(),
+        protocol::codec::RespCodec::default(),
+    );
+
+    framed
+        .send(protocol::Frame::Array(vec![
+            protocol::Frame::Bulk(bytes::Bytes::from_static(b"AUTH")),
+            protocol::Frame::Bulk(bytes::Bytes::from_static(b"app")),
+            protocol::Frame::Bulk(bytes::Bytes::from_static(b"pw")),
+        ]))
+        .await
+        .unwrap();
+    assert_eq!(
+        framed.next().await.unwrap().unwrap(),
+        protocol::Frame::Simple("OK".into())
+    );
+
+    framed
+        .send(protocol::Frame::Array(vec![
+            protocol::Frame::Bulk(bytes::Bytes::from_static(b"PSYNC")),
+            protocol::Frame::Bulk(bytes::Bytes::from_static(b"?")),
+            protocol::Frame::Bulk(bytes::Bytes::from_static(b"-1")),
+        ]))
+        .await
+        .unwrap();
+    assert_eq!(
+        framed.next().await.unwrap().unwrap(),
+        protocol::Frame::Error("NOPERM this user has no permissions to run this command".into())
+    );
+
+    // The connection must still be alive and usable afterward -- PSYNC being rejected must not
+    // tear down the connection, only decline to serve the replica stream on it. `GET` (unlike
+    // `PING`) is within this user's actual grant, so a real reply -- not another NOPERM --
+    // proves the connection and its authenticated session both survived.
+    framed
+        .send(protocol::Frame::Array(vec![
+            protocol::Frame::Bulk(bytes::Bytes::from_static(b"GET")),
+            protocol::Frame::Bulk(bytes::Bytes::from_static(b"app:k")),
+        ]))
+        .await
+        .unwrap();
+    assert_eq!(framed.next().await.unwrap().unwrap(), protocol::Frame::Null);
+}

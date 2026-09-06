@@ -2207,7 +2207,7 @@ fn write_snapshot_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::R
 /// engine, the AOF, the replica fan-out, or any lock -- same shape as `cluster_redirect` above.
 /// Checked first, ahead of `cluster_redirect`, matching real Redis's own auth-before-everything
 /// ordering: an unauthenticated client should not learn cluster topology or reach any other gate.
-fn auth_gate(
+pub(crate) fn auth_gate(
     replication: &crate::replication::ReplicationHandle,
     session: &Session,
     frame: &Frame,

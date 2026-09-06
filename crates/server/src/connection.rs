@@ -158,23 +158,17 @@ async fn handle_connection<S>(
             Some(Err(_)) | None => return, // malformed input or a dropped connection — end this task quietly
         };
         if is_psync_command(&frame) {
-            // Same auth condition `dispatcher::auth_gate` enforces for every other command --
             // PSYNC never reaches `dispatch_and_log` (it's intercepted here, before the frame
-            // loop even calls it), so without this check an unauthenticated client could send
-            // PSYNC first and receive a full snapshot of the entire keyspace plus a live stream
-            // of every subsequent write, bypassing the auth gate entirely.
-            if replication.acl.has_ever_been_configured() && session.authenticated_user().is_none()
-            {
-                if framed
-                    .send(protocol::Frame::Error(
-                        "NOAUTH Authentication required.".into(),
-                    ))
-                    .await
-                    .is_err()
-                {
+            // loop even calls it), so it must run the same `auth_gate` every other command goes
+            // through -- both the NOAUTH check and, critically, the NOPERM check: without the
+            // latter, any authenticated user regardless of their ACL grants could PSYNC and
+            // receive a full snapshot of the entire keyspace plus a live stream of every
+            // subsequent write, bypassing per-user ACL isolation entirely.
+            if let Some(reply) = dispatcher::auth_gate(&replication, &session, &frame) {
+                if framed.send(reply).await.is_err() {
                     return; // client went away
                 }
-                continue; // let the client retry after AUTH/HELLO ... AUTH
+                continue; // let the client retry after AUTH/HELLO ... AUTH, or give up
             }
             serve_replica(framed, &aof, &replication).await;
             return; // serve_replica never returns until the replica connection dies
