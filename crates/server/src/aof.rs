@@ -66,6 +66,28 @@ pub struct AofWriter {
 
 impl AofWriter {
     pub fn open(path: &Path, policy: FsyncPolicy) -> std::io::Result<Self> {
+        Self::open_with_base(path, path, policy)
+    }
+
+    /// Opens the AOF at generation `gen`'s file (`generation_path(base_path, gen)`) while keeping
+    /// `base_path()` equal to the *unresolved* `base_path` it was handed. That split is the whole
+    /// point of this constructor: `open(generation_path(base, gen), policy)` would look equivalent
+    /// but sets `base_path` to the already-suffixed path, so the next rewrite's `rotate_to` would
+    /// compute `<base>.1.2` instead of `<base>.2`. Startup (`main.rs`) must use this, not `open`,
+    /// or every write made after a restart lands in a file the manifest no longer names and is
+    /// lost at the following restart.
+    pub fn open_at_generation(
+        base_path: &Path,
+        gen: u64,
+        policy: FsyncPolicy,
+    ) -> std::io::Result<Self> {
+        Self::open_with_base(&generation_path(base_path, gen), base_path, policy)
+    }
+
+    /// The shared body of `open`/`open_at_generation`: `path` is the file actually opened and
+    /// appended to, `base_path` is what `base_path()` reports and all generation-path math starts
+    /// from. They differ only when opening at a non-zero generation.
+    fn open_with_base(path: &Path, base_path: &Path, policy: FsyncPolicy) -> std::io::Result<Self> {
         let file = OpenOptions::new().create(true).append(true).open(path)?;
         let mut writer = BufWriter::new(file);
         let (tx, rx) = mpsc::sync_channel::<AofMsg>(AOF_QUEUE_CAPACITY);
@@ -121,7 +143,7 @@ impl AofWriter {
             policy,
             order: Mutex::new(()),
             path: Mutex::new(path.to_path_buf()),
-            base_path: path.to_path_buf(),
+            base_path: base_path.to_path_buf(),
         })
     }
 
@@ -1117,6 +1139,42 @@ mod tests {
             std::fs::read(&new_path).unwrap(),
             b"*3\r\n$3\r\nSET\r\n$1\r\nx\r\n$1\r\n0\r\n*3\r\n$3\r\nSET\r\n$1\r\ny\r\n$1\r\n1\r\n"
         );
+    }
+
+    #[test]
+    fn open_at_generation_writes_to_the_generation_file_but_reports_the_bare_base_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("test.aof");
+        let writer = AofWriter::open_at_generation(&base, 1, FsyncPolicy::Never).unwrap();
+
+        writer.append(frame(&[b"SET", b"a", b"1"])).unwrap();
+        writer.fsync().unwrap();
+
+        assert_eq!(writer.path(), generation_path(&base, 1)); // appends land in generation 1's file
+        assert!(!base.exists()); // the bare generation-0 file is never touched
+        assert_eq!(writer.base_path(), base); // unresolved, so the next rotation targets `.2`
+    }
+
+    #[test]
+    fn open_at_generation_zero_is_identical_to_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("test.aof");
+        let writer = AofWriter::open_at_generation(&base, 0, FsyncPolicy::Never).unwrap();
+        assert_eq!(writer.path(), base);
+        assert_eq!(writer.base_path(), base);
+    }
+
+    #[test]
+    fn a_rotation_after_open_at_generation_does_not_double_suffix_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("test.aof");
+        let writer = AofWriter::open_at_generation(&base, 1, FsyncPolicy::Never).unwrap();
+
+        writer
+            .rotate_to(&generation_path(writer.base_path(), 2))
+            .unwrap();
+
+        assert_eq!(writer.path(), dir.path().join("test.aof.2")); // not `test.aof.1.2`
     }
 
     #[test]

@@ -7511,6 +7511,82 @@ mod tests {
         assert!(crate::aof::generation_path(&snapshot_path, 2).exists());
     }
 
+    /// The full restart lifecycle `main.rs` performs, run twice: a rewrite commits generation 1,
+    /// the process "restarts" and writes more, then restarts again. Two cycles are the minimum
+    /// that reproduces the real bug — a writer opened at the bare `aof_path` after a rewrite
+    /// still writes *somewhere*, so only the *next* recovery reveals that the file it wrote to is
+    /// one the manifest no longer names.
+    #[test]
+    fn a_write_made_after_restarting_at_the_committed_generation_survives_the_next_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let aof_path = dir.path().join("test.aof");
+        let snapshot_path = dir.path().join("test.snapshot");
+
+        // Session 1: a fresh server at generation 0, one write, then a rewrite committing gen 1.
+        {
+            let engine = std::sync::Arc::new(Engine::new());
+            let gen = crate::aof::read_generation(&snapshot_path).unwrap();
+            let aof = AofWriter::open_at_generation(&aof_path, gen, FsyncPolicy::Never).unwrap();
+            let replication =
+                ReplicationHandle::new(std::sync::Arc::clone(&engine), snapshot_path.clone());
+            dispatch_and_log(
+                &engine,
+                &aof,
+                &replication,
+                cmd(&[b"SET", b"pre", b"1"]),
+                &Session::new(),
+                1,
+            );
+            assert_eq!(
+                handle_bgrewriteaof(&aof, &replication),
+                Frame::Simple("OK".into())
+            );
+            aof.fsync().unwrap();
+        }
+
+        // Restart 1: resolve the generation once, recover from it, open the writer at it --
+        // exactly the startup sequence `main.rs` runs.
+        {
+            let gen = crate::aof::read_generation(&snapshot_path).unwrap();
+            assert_eq!(gen, 1); // the rewrite above committed it
+            let engine =
+                std::sync::Arc::new(crate::aof::recover(&aof_path, &snapshot_path).unwrap());
+            let aof = AofWriter::open_at_generation(&aof_path, gen, FsyncPolicy::Never).unwrap();
+            let replication =
+                ReplicationHandle::new(std::sync::Arc::clone(&engine), snapshot_path.clone());
+            dispatch_and_log(
+                &engine,
+                &aof,
+                &replication,
+                cmd(&[b"SET", b"post", b"2"]),
+                &Session::new(),
+                1,
+            );
+            aof.fsync().unwrap();
+
+            // Reopening at generation 1 must not make generation-path math relative to the
+            // already-suffixed file: the next rewrite has to target `test.aof.2`, not
+            // `test.aof.1.2`.
+            assert_eq!(aof.base_path(), aof_path);
+            handle_bgrewriteaof(&aof, &replication);
+            assert_eq!(aof.path(), crate::aof::generation_path(&aof_path, 2));
+        }
+
+        // Restart 3 would resolve generation 2; recovery below re-resolves from the manifest, so
+        // the assertions cover whichever generation is current.
+
+        // Restart 2: everything written across both sessions must still be recoverable.
+        let recovered = crate::aof::recover(&aof_path, &snapshot_path).unwrap();
+        assert_eq!(
+            recovered.get(b"pre"),
+            Some(Value::String(Bytes::from_static(b"1")))
+        ); // from generation 1's snapshot
+        assert_eq!(
+            recovered.get(b"post"),
+            Some(Value::String(Bytes::from_static(b"2")))
+        ); // written after restart 1 -- must land in the generation the manifest names
+    }
+
     #[test]
     fn bgrewriteaof_is_reachable_through_dispatch_and_log() {
         let engine = std::sync::Arc::new(Engine::new());

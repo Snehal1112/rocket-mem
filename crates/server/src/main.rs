@@ -82,16 +82,29 @@ async fn main() -> std::io::Result<()> {
         }
     }
 
+    // The generation the manifest currently names -- 0, and so the bare configured paths, for
+    // every deployment that has never run `BGREWRITEAOF`. Read once and used for both halves of
+    // startup: `recover` resolves it internally, and the writer must be opened at the very same
+    // generation, or every write this process makes would land in a file the manifest does not
+    // name and be lost at the next restart.
+    let generation = rocket_mem::aof::read_generation(snapshot_path)?;
     let engine = Arc::new(rocket_mem::aof::recover(aof_path, snapshot_path)?);
     println!(
-        "Recovered state from {} and {}",
+        "Recovered state from {} and {} (generation {generation})",
         snapshot_path.display(),
         aof_path.display()
     );
 
+    // `open_at_generation`, never `open`: it opens generation `generation`'s file while keeping
+    // `base_path()` at the bare configured `aof_path`, so the next `BGREWRITEAOF` rotates onto
+    // `<aof_path>.<generation + 1>` rather than double-suffixing the resolved name.
     let aof = Arc::new(
-        rocket_mem::aof::AofWriter::open(aof_path, rocket_mem::aof::FsyncPolicy::EverySecond)
-            .expect("failed to open AOF file"),
+        rocket_mem::aof::AofWriter::open_at_generation(
+            aof_path,
+            generation,
+            rocket_mem::aof::FsyncPolicy::EverySecond,
+        )
+        .expect("failed to open AOF file"),
     );
 
     // `with_aof` hands the apply loop the same `AofWriter` `serve()` gets, so a replicated
