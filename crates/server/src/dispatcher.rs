@@ -2158,19 +2158,6 @@ fn acl_deluser(items: &[Frame], replication: &crate::replication::ReplicationHan
     Frame::Integer(deleted as i64)
 }
 
-/// Snapshots `replication.engine()` — in production this is always the same `Arc<Engine>` as
-/// `dispatch_and_log`'s own `engine` parameter (`main.rs` constructs one `Engine`, shares it
-/// into both `serve`'s `engine` argument and `ReplicationHandle::new`), so using the handle's
-/// copy here matches the pattern `04-replica-registry-and-leader-fanout.md`'s `PSYNC` handling
-/// already uses (`replication.engine().snapshot(0)`) instead of introducing a second,
-/// redundant `&Engine` parameter that would always alias it anyway — and writes the result to
-/// `replication.snapshot_path()`.
-///
-/// Holds `aof.lock_for_ordering()` across the offset read and the snapshot walk/encode (never
-/// across the disk write) — see the sprint-5 spec's SAVE atomicity decision for why: without
-/// this, a write landing between `current_offset()` and the snapshot walk would be captured in
-/// both the snapshot and the AOF tail after the recorded offset, double-applying on a future
-/// hybrid recovery for any non-idempotent command like `RPUSH`.
 /// The lock-protected first half of a rewrite: reads the current generation, snapshots the
 /// engine at offset 0 (this snapshot will pair with a brand-new, currently-empty next-generation
 /// AOF file), and rotates `aof` onto that new file — all under `lock_for_ordering()`, the same
@@ -2179,6 +2166,10 @@ fn acl_deluser(items: &[Frame], replication: &crate::replication::ReplicationHan
 /// snapshot bytes still to be written to disk, done by the caller outside this lock. See the
 /// design spec's "Decision: `BGREWRITEAOF` command", step 1.
 ///
+/// Deliberately does *not* commit the manifest: until `handle_bgrewriteaof`'s
+/// `write_generation_atomically` runs, the returned generation is only a proposal and the
+/// previous generation stays authoritative. Callers must hold `aof.lock_for_rewrite()` across
+/// this call and that commit together, or two rewrites will propose the same number.
 fn start_rewrite(
     aof: &crate::aof::AofWriter,
     replication: &crate::replication::ReplicationHandle,
@@ -2235,6 +2226,19 @@ fn handle_bgrewriteaof(
     Frame::Simple("OK".into())
 }
 
+/// Snapshots `replication.engine()` — in production this is always the same `Arc<Engine>` as
+/// `dispatch_and_log`'s own `engine` parameter (`main.rs` constructs one `Engine`, shares it
+/// into both `serve`'s `engine` argument and `ReplicationHandle::new`), so using the handle's
+/// copy here matches the pattern `04-replica-registry-and-leader-fanout.md`'s `PSYNC` handling
+/// already uses (`replication.engine().snapshot(0)`) instead of introducing a second,
+/// redundant `&Engine` parameter that would always alias it anyway — and writes the result to
+/// the current generation's snapshot path, resolved from `replication.snapshot_path()`.
+///
+/// Holds `aof.lock_for_ordering()` across the offset read and the snapshot walk/encode (never
+/// across the disk write) — see the sprint-5 spec's SAVE atomicity decision for why: without
+/// this, a write landing between `current_offset()` and the snapshot walk would be captured in
+/// both the snapshot and the AOF tail after the recorded offset, double-applying on a future
+/// hybrid recovery for any non-idempotent command like `RPUSH`.
 fn handle_save(
     aof: &crate::aof::AofWriter,
     replication: &crate::replication::ReplicationHandle,
