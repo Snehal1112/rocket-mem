@@ -2160,6 +2160,29 @@ fn acl_deluser(items: &[Frame], replication: &crate::replication::ReplicationHan
 /// this, a write landing between `current_offset()` and the snapshot walk would be captured in
 /// both the snapshot and the AOF tail after the recorded offset, double-applying on a future
 /// hybrid recovery for any non-idempotent command like `RPUSH`.
+/// The lock-protected first half of a rewrite: reads the current generation, snapshots the
+/// engine at offset 0 (this snapshot will pair with a brand-new, currently-empty next-generation
+/// AOF file), and rotates `aof` onto that new file — all under `lock_for_ordering()`, the same
+/// lock every write command already holds around "mutate, then log", so no concurrent append can
+/// land between the snapshot and the rotation. Returns the new generation number and the
+/// snapshot bytes still to be written to disk, done by the caller outside this lock. See the
+/// design spec's "Decision: `BGREWRITEAOF` command", step 1.
+///
+/// Only exercised by this module's own tests for now -- `handle_bgrewriteaof` (this plan's next
+/// task) is what calls it from production code, hence the `allow` below until that lands.
+#[allow(dead_code)]
+fn start_rewrite(
+    aof: &crate::aof::AofWriter,
+    replication: &crate::replication::ReplicationHandle,
+) -> std::io::Result<(u64, Vec<u8>)> {
+    let _order_guard = aof.lock_for_ordering();
+    let current_gen = crate::aof::read_generation(replication.snapshot_path())?;
+    let next_gen = current_gen + 1;
+    let bytes = replication.engine().snapshot(0);
+    aof.rotate_to(&crate::aof::generation_path(aof.base_path(), next_gen))?;
+    Ok((next_gen, bytes))
+}
+
 fn handle_save(
     aof: &crate::aof::AofWriter,
     replication: &crate::replication::ReplicationHandle,
@@ -7188,6 +7211,50 @@ mod tests {
             1,
         );
         assert!(matches!(reply, Frame::Error(_)));
+    }
+
+    #[test]
+    fn start_rewrite_rotates_the_aof_and_returns_the_next_generation_with_a_snapshot() {
+        let engine = std::sync::Arc::new(Engine::new());
+        dispatch(
+            &engine,
+            cmd(&[b"SET", b"k", b"v"]),
+            &mut Protocol::default(),
+            1,
+        );
+        let (dir, aof) = test_aof();
+        let snapshot_path = dir.path().join("test.snapshot");
+        let replication = ReplicationHandle::new(std::sync::Arc::clone(&engine), snapshot_path);
+
+        let (next_gen, bytes) = start_rewrite(&aof, &replication).unwrap();
+
+        assert_eq!(next_gen, 1); // no manifest yet -- current generation 0, next is 1
+        let loaded = Engine::new();
+        let embedded_offset = loaded.load_snapshot(&bytes).unwrap();
+        assert_eq!(embedded_offset, 0); // pairs with a brand-new, currently-empty generation-1 AOF
+        assert_eq!(
+            loaded.get(b"k"),
+            Some(Value::String(Bytes::from_static(b"v")))
+        );
+        assert_eq!(
+            aof.path(),
+            crate::aof::generation_path(&dir.path().join("test.aof"), 1)
+        ); // rotated onto the generation-1 file
+
+        // start_rewrite only reads the manifest, it never commits it -- that's Task 2's
+        // (`handle_bgrewriteaof`) `write_generation_atomically` step. Commit generation 1 here to
+        // mirror what a real caller does between the two, so the second call below sees
+        // `current_gen == 1` instead of re-reading the still-absent manifest as generation 0.
+        crate::aof::write_generation_atomically(replication.snapshot_path(), next_gen).unwrap();
+
+        // Prove the second-rewrite case doesn't double-suffix: rotating again must compute the
+        // next path from `base_path()`, never from `path()`'s already-rotated value.
+        let (next_gen2, _bytes2) = start_rewrite(&aof, &replication).unwrap();
+        assert_eq!(next_gen2, 2);
+        assert_eq!(
+            aof.path(),
+            crate::aof::generation_path(&dir.path().join("test.aof"), 2)
+        );
     }
 
     #[test]
