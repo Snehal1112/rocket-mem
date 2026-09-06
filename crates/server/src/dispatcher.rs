@@ -3045,6 +3045,56 @@ mod tests {
         assert!(replication.acl.get_user("attacker").is_none());
     }
 
+    #[test]
+    fn auth_gate_denies_bgrewriteaof_to_a_user_without_that_grant() {
+        let replication = ReplicationHandle::default();
+        // `auth_gate` re-resolves the LIVE user by username, so this fabricated `acl_user(...)`
+        // needs a matching real registration or it's treated as deleted (NOAUTH, not NOPERM).
+        replication
+            .acl
+            .set_user(
+                "app",
+                &[
+                    Bytes::from_static(b"on"),
+                    Bytes::from_static(b"+get"),
+                    Bytes::from_static(b"~*"),
+                ],
+            )
+            .unwrap();
+        let session = Session::new();
+        session.set_authenticated_user(Some(acl_user(vec![
+            crate::acl::AclRule::AllowCommand("GET".to_string()),
+            crate::acl::AclRule::AllKeys,
+        ])));
+        let frame = Frame::Array(vec![Frame::Bulk(Bytes::from_static(b"BGREWRITEAOF"))]);
+        let reply = auth_gate(&replication, &session, &frame).unwrap();
+        assert_eq!(
+            reply,
+            Frame::Error("NOPERM this user has no permissions to run this command".into())
+        );
+    }
+
+    #[test]
+    fn auth_gate_permits_bgrewriteaof_to_a_user_with_that_grant() {
+        let replication = ReplicationHandle::default();
+        replication
+            .acl
+            .set_user(
+                "app",
+                &[
+                    Bytes::from_static(b"on"),
+                    Bytes::from_static(b"+bgrewriteaof"),
+                ],
+            )
+            .unwrap();
+        let session = Session::new();
+        session.set_authenticated_user(Some(acl_user(vec![crate::acl::AclRule::AllowCommand(
+            "BGREWRITEAOF".to_string(),
+        )])));
+        let frame = Frame::Array(vec![Frame::Bulk(Bytes::from_static(b"BGREWRITEAOF"))]);
+        assert!(auth_gate(&replication, &session, &frame).is_none());
+    }
+
     /// Wiring test: proves an `ACL` frame genuinely reaches `handle_acl` when routed through the
     /// real `dispatch_and_log` entry point, not just by calling `handle_acl` directly (which is
     /// what every other `handle_acl` test in this module does) -- confirms the interception is
