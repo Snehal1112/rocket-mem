@@ -20,7 +20,7 @@ environment variables and config-file options, see
 | List | `LPUSH`, `RPUSH` (both variadic), `LPOP`, `RPOP`, `LRANGE`, `LLEN`, `LINDEX`, `LSET`, `LTRIM`, `LREM`, `LINSERT` |
 | Set | `SADD`, `SREM`, `SMEMBERS`, `SISMEMBER`, `SCARD`, `SINTER`, `SUNION`, `SDIFF`, `SINTERSTORE`, `SUNIONSTORE`, `SDIFFSTORE`, `SPOP`, `SRANDMEMBER` |
 | Sorted Set | `ZADD`, `ZSCORE`, `ZREM`, `ZCARD`, `ZINCRBY`, `ZRANGE`, `ZRANK` |
-| Server/Cluster | `PING`, `ECHO`, `DEBUG SLEEP`[^debug-sleep-cap], `SELECT`, `COMMAND`, `HELLO`, `INFO [section]`, `SAVE`, `REPLICAOF`, `PSYNC`, `CLUSTER KEYSLOT`/`SHARDS`/`NODES`/`INFO`/`MYID`, `SLOWLOG GET`/`LEN`/`RESET` |
+| Server/Cluster | `PING`, `ECHO`, `DEBUG SLEEP`[^debug-sleep-cap], `SELECT`, `COMMAND`, `HELLO`, `INFO [section]`, `SAVE`, `BGREWRITEAOF`, `REPLICAOF`, `PSYNC`, `CLUSTER KEYSLOT`/`SHARDS`/`NODES`/`INFO`/`MYID`, `SLOWLOG GET`/`LEN`/`RESET` |
 | Auth/ACL | `AUTH` (both single-arg and `<user> <pass>` forms), `ACL SETUSER`/`DELUSER`/`WHOAMI`/`LIST`/`GETUSER` |
 
 [^debug-sleep-cap]: `DEBUG SLEEP` is capped at a 10-second maximum duration; a longer request is rejected with an error rather than accepted and blocking a server thread indefinitely.

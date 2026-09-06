@@ -141,7 +141,7 @@ in [`docs/benchmarks/`](docs/benchmarks/).
 | List | `LPUSH`, `RPUSH` (variadic), `LPOP`, `RPOP`, `LRANGE`, `LLEN`, `LINDEX`, `LSET`, `LTRIM`, `LREM`, `LINSERT` |
 | Set | `SADD`, `SREM`, `SMEMBERS`, `SISMEMBER`, `SCARD`, `SINTER`, `SUNION`, `SDIFF`, `SINTERSTORE`, `SUNIONSTORE`, `SDIFFSTORE`, `SPOP`, `SRANDMEMBER` |
 | Sorted Set | `ZADD`, `ZSCORE`, `ZREM`, `ZCARD`, `ZINCRBY`, `ZRANGE`, `ZRANK` |
-| Server/Cluster | `PING`, `ECHO`, `SELECT`, `COMMAND`, `HELLO`, `INFO [section]`, `SAVE`, `REPLICAOF`, `PSYNC`, `DEBUG SLEEP`, `CLUSTER KEYSLOT`/`SHARDS`/`NODES`/`INFO`/`MYID`, `SLOWLOG GET`/`LEN`/`RESET` |
+| Server/Cluster | `PING`, `ECHO`, `SELECT`, `COMMAND`, `HELLO`, `INFO [section]`, `SAVE`, `BGREWRITEAOF`, `REPLICAOF`, `PSYNC`, `DEBUG SLEEP`, `CLUSTER KEYSLOT`/`SHARDS`/`NODES`/`INFO`/`MYID`, `SLOWLOG GET`/`LEN`/`RESET` |
 | Auth/ACL | `AUTH` (single-arg and `<user> <pass>`), `ACL SETUSER`/`DELUSER`/`WHOAMI`/`LIST`/`GETUSER` |
 
 Behavioural differences from real Redis — `KEYS` glob support is partial, `OBJECT ENCODING`
