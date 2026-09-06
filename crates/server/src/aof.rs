@@ -267,6 +267,40 @@ pub fn replay(path: &Path, engine: &engine::Engine, start_at: u64) -> std::io::R
     Ok(())
 }
 
+/// The manifest path derived from `snapshot_path` — always `<snapshot_path>.manifest`, never
+/// separately configured. See the design spec's "no new configuration surface" scope note.
+fn manifest_path(snapshot_path: &Path) -> PathBuf {
+    let mut os = snapshot_path.as_os_str().to_owned();
+    os.push(".manifest");
+    PathBuf::from(os)
+}
+
+/// `base` unchanged for generation 0 — so every pre-compaction deployment's files keep their
+/// exact names forever, no migration needed — or `<base>.<gen>` for generation 1 and up.
+pub fn generation_path(base: &Path, gen: u64) -> PathBuf {
+    if gen == 0 {
+        return base.to_path_buf();
+    }
+    let mut os = base.as_os_str().to_owned();
+    os.push(format!(".{gen}"));
+    PathBuf::from(os)
+}
+
+/// The current generation, read from `<snapshot_path>.manifest`. A missing manifest means
+/// generation 0 — every deployment that has never run `BGREWRITEAOF` — so `snapshot_path`/
+/// `aof_path` are used exactly as configured. See the design spec's "generations + a manifest"
+/// decision.
+pub fn read_generation(snapshot_path: &Path) -> std::io::Result<u64> {
+    match std::fs::read_to_string(manifest_path(snapshot_path)) {
+        Ok(contents) => contents
+            .trim()
+            .parse::<u64>()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(e) => Err(e),
+    }
+}
+
 /// Orchestrates startup recovery: loads `snapshot_path` if it exists and decodes cleanly,
 /// checks whether its embedded AOF offset still fits within `aof_path`'s actual length, and
 /// either replays just the AOF tail after that offset (the fast path) or falls back to a full
@@ -808,5 +842,55 @@ mod tests {
             engine.get(b"a"),
             Some(Value::String(bytes::Bytes::from_static(b"1")))
         ); // full AOF replay instead
+    }
+
+    #[test]
+    fn generation_path_for_generation_zero_is_the_bare_path_unchanged() {
+        let base = std::path::Path::new("/tmp/dump.snapshot");
+        assert_eq!(generation_path(base, 0), base);
+    }
+
+    #[test]
+    fn generation_path_for_a_later_generation_appends_dot_gen() {
+        let base = std::path::Path::new("/tmp/dump.snapshot");
+        assert_eq!(
+            generation_path(base, 1),
+            std::path::PathBuf::from("/tmp/dump.snapshot.1")
+        );
+        assert_eq!(
+            generation_path(base, 42),
+            std::path::PathBuf::from("/tmp/dump.snapshot.42")
+        );
+    }
+
+    #[test]
+    fn read_generation_with_no_manifest_on_disk_is_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot_path = dir.path().join("dump.snapshot"); // never created
+        assert_eq!(read_generation(&snapshot_path).unwrap(), 0);
+    }
+
+    #[test]
+    fn read_generation_reads_back_a_hand_written_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot_path = dir.path().join("dump.snapshot");
+        std::fs::write(dir.path().join("dump.snapshot.manifest"), "7").unwrap();
+        assert_eq!(read_generation(&snapshot_path).unwrap(), 7);
+    }
+
+    #[test]
+    fn read_generation_tolerates_a_trailing_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot_path = dir.path().join("dump.snapshot");
+        std::fs::write(dir.path().join("dump.snapshot.manifest"), "3\n").unwrap();
+        assert_eq!(read_generation(&snapshot_path).unwrap(), 3);
+    }
+
+    #[test]
+    fn read_generation_on_a_corrupt_manifest_is_an_error_not_a_silent_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot_path = dir.path().join("dump.snapshot");
+        std::fs::write(dir.path().join("dump.snapshot.manifest"), "not-a-number").unwrap();
+        assert!(read_generation(&snapshot_path).is_err());
     }
 }
