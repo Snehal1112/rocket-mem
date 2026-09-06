@@ -24,6 +24,10 @@ enum AofMsg {
     Append(Vec<u8>),
     AppendAndFsync(Vec<u8>, mpsc::SyncSender<std::io::Result<()>>),
     Flush(mpsc::SyncSender<std::io::Result<()>>),
+    /// Flushes and fsyncs the current file, opens `new_path` (create, append — so a rotation
+    /// onto a file an interrupted previous rewrite already partially wrote appends after its
+    /// content rather than clobbering it), and swaps the writer thread's target to it.
+    Rotate(PathBuf, mpsc::SyncSender<std::io::Result<()>>),
 }
 
 /// Bounds the writer thread's queue. Unbounded would let a stalled disk grow the queue
@@ -51,9 +55,13 @@ pub struct AofWriter {
     /// relative order their mutations committed in. See
     /// ../../docs/superpowers/specs/2026-08-30-tech-debt-cleanup-spec.md Item 2.
     order: Mutex<()>,
-    /// The file `open` was given. Read back by `current_offset` after an `fsync`, so it must
-    /// be the same path the writer thread is appending to — never mutated after `open`.
-    path: PathBuf,
+    /// The file currently being appended to. `Mutex`-wrapped (not a plain `PathBuf`) so
+    /// `rotate_to` can repoint it after a successful rotation; read by `current_offset`.
+    path: Mutex<PathBuf>,
+    /// The original path `open` was given. Never changes, even across `rotate_to` calls --
+    /// generation-path math (plan 03) must always start from this, never from `path`, which
+    /// already reflects whatever generation is currently active.
+    base_path: PathBuf,
 }
 
 impl AofWriter {
@@ -89,6 +97,20 @@ impl AofWriter {
                             let result = writer.flush().and_then(|_| writer.get_ref().sync_data());
                             let _ = ack.send(result);
                         }
+                        AofMsg::Rotate(new_path, ack) => {
+                            let result = writer.flush().and_then(|_| writer.get_ref().sync_data());
+                            let result = result.and_then(|_| {
+                                OpenOptions::new().create(true).append(true).open(&new_path)
+                            });
+                            let result = match result {
+                                Ok(file) => {
+                                    writer = BufWriter::new(file);
+                                    Ok(())
+                                }
+                                Err(e) => Err(e),
+                            };
+                            let _ = ack.send(result);
+                        }
                     }
                 }
             })
@@ -98,7 +120,8 @@ impl AofWriter {
             tx,
             policy,
             order: Mutex::new(()),
-            path: path.to_path_buf(),
+            path: Mutex::new(path.to_path_buf()),
+            base_path: path.to_path_buf(),
         })
     }
 
@@ -148,12 +171,38 @@ impl AofWriter {
     /// the worst case is a bounded wait for whatever's already queued ahead of the `Flush`.
     pub fn current_offset(&self) -> std::io::Result<u64> {
         self.fsync()?;
-        Ok(std::fs::metadata(&self.path)?.len())
+        let path = self.path.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(std::fs::metadata(&*path)?.len())
     }
 
     /// The fsync policy this writer was opened with. Never changes after `open`.
     pub fn policy(&self) -> FsyncPolicy {
         self.policy
+    }
+
+    /// The file currently being appended to.
+    pub fn path(&self) -> PathBuf {
+        self.path.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// The original path `open` was given — stable across any number of `rotate_to` calls. See
+    /// the `base_path` field's doc comment for why generation-path math must use this, not
+    /// `path()`.
+    pub fn base_path(&self) -> &Path {
+        &self.base_path
+    }
+
+    /// Flushes and fsyncs the current file, then redirects subsequent appends to `new_path`
+    /// (created fresh, or appended-to if it already exists). Must be called while the caller
+    /// already holds `lock_for_ordering()` — see this plan's Global Constraints for why no new
+    /// lock is needed here. Acked like `fsync()`, so the caller knows the rotation completed
+    /// (and `path()`/`current_offset()` reflect the new file) before proceeding.
+    pub fn rotate_to(&self, new_path: &Path) -> std::io::Result<()> {
+        let (ack_tx, ack_rx) = mpsc::sync_channel(1);
+        self.send(AofMsg::Rotate(new_path.to_path_buf(), ack_tx))?;
+        ack_rx.recv().map_err(writer_gone)??;
+        *self.path.lock().unwrap_or_else(|e| e.into_inner()) = new_path.to_path_buf();
+        Ok(())
     }
 
     /// Acquired by `dispatcher::dispatch_and_log` around "mutate, then log" for write
@@ -940,5 +989,86 @@ mod tests {
         let snapshot_path = dir.path().join("dump.snapshot");
         write_generation_atomically(&snapshot_path, 1).unwrap();
         assert!(!dir.path().join("dump.snapshot.manifest.tmp").exists());
+    }
+
+    #[test]
+    fn path_reports_the_file_aof_writer_was_opened_with() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.aof");
+        let writer = AofWriter::open(&path, FsyncPolicy::Never).unwrap();
+        assert_eq!(writer.path(), path);
+    }
+
+    #[test]
+    fn rotate_to_freezes_the_old_file_and_directs_new_appends_to_the_new_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_path = dir.path().join("old.aof");
+        let new_path = dir.path().join("new.aof");
+        let writer = AofWriter::open(&old_path, FsyncPolicy::Never).unwrap();
+
+        writer.append(frame(&[b"SET", b"a", b"1"])).unwrap();
+        writer.fsync().unwrap();
+
+        writer.rotate_to(&new_path).unwrap();
+
+        writer.append(frame(&[b"SET", b"b", b"2"])).unwrap();
+        writer.fsync().unwrap();
+
+        assert_eq!(
+            std::fs::read(&old_path).unwrap(),
+            b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n"
+        ); // frozen at rotation, never touched again
+        assert_eq!(
+            std::fs::read(&new_path).unwrap(),
+            b"*3\r\n$3\r\nSET\r\n$1\r\nb\r\n$1\r\n2\r\n"
+        ); // starts fresh at byte 0
+    }
+
+    #[test]
+    fn rotate_to_updates_path_and_current_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_path = dir.path().join("old.aof");
+        let new_path = dir.path().join("new.aof");
+        let writer = AofWriter::open(&old_path, FsyncPolicy::Never).unwrap();
+        writer.append(frame(&[b"SET", b"a", b"1"])).unwrap();
+        writer.fsync().unwrap();
+
+        writer.rotate_to(&new_path).unwrap();
+
+        assert_eq!(writer.path(), new_path);
+        assert_eq!(writer.current_offset().unwrap(), 0); // the new file starts empty
+    }
+
+    #[test]
+    fn rotate_to_an_already_existing_file_appends_after_its_current_content() {
+        // Mirrors `open_on_an_existing_file_appends_rather_than_truncating` — rotation must not
+        // clobber a new-generation file a previous, interrupted rewrite already partially wrote.
+        let dir = tempfile::tempdir().unwrap();
+        let old_path = dir.path().join("old.aof");
+        let new_path = dir.path().join("new.aof");
+        write_raw(&new_path, b"*3\r\n$3\r\nSET\r\n$1\r\nx\r\n$1\r\n0\r\n");
+
+        let writer = AofWriter::open(&old_path, FsyncPolicy::Never).unwrap();
+        writer.rotate_to(&new_path).unwrap();
+        writer.append(frame(&[b"SET", b"y", b"1"])).unwrap();
+        writer.fsync().unwrap();
+
+        assert_eq!(
+            std::fs::read(&new_path).unwrap(),
+            b"*3\r\n$3\r\nSET\r\n$1\r\nx\r\n$1\r\n0\r\n*3\r\n$3\r\nSET\r\n$1\r\ny\r\n$1\r\n1\r\n"
+        );
+    }
+
+    #[test]
+    fn base_path_never_changes_across_a_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let original_path = dir.path().join("original.aof");
+        let writer = AofWriter::open(&original_path, FsyncPolicy::Never).unwrap();
+
+        writer.rotate_to(&dir.path().join("gen1.aof")).unwrap();
+        writer.rotate_to(&dir.path().join("gen2.aof")).unwrap();
+
+        assert_eq!(writer.base_path(), original_path); // unchanged despite two rotations
+        assert_eq!(writer.path(), dir.path().join("gen2.aof")); // this one does change
     }
 }
