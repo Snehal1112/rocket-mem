@@ -1169,6 +1169,7 @@ pub(crate) const KNOWN_COMMANDS: &[&str] = &[
     "ACL",
     "APPEND",
     "AUTH",
+    "BGREWRITEAOF",
     "CLUSTER",
     "COMMAND",
     "DEBUG",
@@ -1275,8 +1276,8 @@ enum KeySpec {
 fn key_spec(name: &str) -> KeySpec {
     match name {
         "PING" | "ECHO" | "SELECT" | "COMMAND" | "INFO" | "HELLO" | "KEYS" | "SCAN"
-        | "RANDOMKEY" | "CLUSTER" | "SAVE" | "REPLICAOF" | "PSYNC" | "SLOWLOG" | "DEBUG"
-        | "AUTH" | "ACL" => {
+        | "RANDOMKEY" | "CLUSTER" | "SAVE" | "BGREWRITEAOF" | "REPLICAOF" | "PSYNC" | "SLOWLOG"
+        | "DEBUG" | "AUTH" | "ACL" => {
             // AUTH has no keys -- its arguments are a username/password, never a routable key.
             // ACL likewise -- its arguments are a subcommand/username/rule tokens, never a
             // routable key. Without this exception either would fall through to the
@@ -1364,6 +1365,16 @@ fn is_save_command(frame: &Frame) -> bool {
         return false;
     };
     name.eq_ignore_ascii_case(b"SAVE")
+}
+
+fn is_bgrewriteaof_command(frame: &Frame) -> bool {
+    let Frame::Array(items) = frame else {
+        return false;
+    };
+    let Some(Frame::Bulk(name)) = items.first() else {
+        return false;
+    };
+    name.eq_ignore_ascii_case(b"BGREWRITEAOF")
 }
 
 /// Returns `Some(reply)` if `frame` was `REPLICAOF` (in either form) — handled entirely here,
@@ -2184,9 +2195,8 @@ fn start_rewrite(
 /// crash-unsafety a naive in-place truncation has. See the design spec's "Decision:
 /// `BGREWRITEAOF` command" for the full protocol and why each step is ordered this way.
 ///
-/// Only exercised by this module's own tests for now -- wiring an actual `BGREWRITEAOF` command
-/// into `dispatch`'s match arm is a later plan's job, hence the `allow` below until that lands.
-#[allow(dead_code)]
+/// Wired into `dispatch_and_log_inner` via `is_bgrewriteaof_command`, mirroring `SAVE`'s
+/// interception.
 fn handle_bgrewriteaof(
     aof: &crate::aof::AofWriter,
     replication: &crate::replication::ReplicationHandle,
@@ -2465,6 +2475,9 @@ fn dispatch_and_log_inner(
 
     if is_save_command(&frame) {
         return handle_save(aof, replication);
+    }
+    if is_bgrewriteaof_command(&frame) {
+        return handle_bgrewriteaof(aof, replication);
     }
     if let Some(reply) = handle_replicaof(&frame, replication) {
         return reply;
@@ -7397,6 +7410,53 @@ mod tests {
         assert!(!crate::aof::generation_path(&snapshot_path, 1).exists());
         assert!(crate::aof::generation_path(&aof_path, 2).exists());
         assert!(crate::aof::generation_path(&snapshot_path, 2).exists());
+    }
+
+    #[test]
+    fn bgrewriteaof_is_reachable_through_dispatch_and_log() {
+        let engine = std::sync::Arc::new(Engine::new());
+        let (dir, aof) = test_aof();
+        let snapshot_path = dir.path().join("test.snapshot");
+        let replication =
+            ReplicationHandle::new(std::sync::Arc::clone(&engine), snapshot_path.clone());
+
+        let reply = dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"BGREWRITEAOF"]),
+            &Session::new(),
+            1,
+        );
+
+        assert_eq!(reply, Frame::Simple("OK".into()));
+        assert_eq!(crate::aof::read_generation(&snapshot_path).unwrap(), 1);
+    }
+
+    #[test]
+    fn bgrewriteaof_is_not_appended_to_the_aof() {
+        let engine = std::sync::Arc::new(Engine::new());
+        let (dir, aof) = test_aof();
+        let snapshot_path = dir.path().join("test.snapshot");
+        let replication = ReplicationHandle::new(std::sync::Arc::clone(&engine), snapshot_path);
+
+        dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"BGREWRITEAOF"]),
+            &Session::new(),
+            1,
+        );
+        aof.fsync().unwrap();
+
+        // The rotated-to generation-1 AOF must be empty -- BGREWRITEAOF itself is never logged.
+        assert_eq!(std::fs::read(aof.path()).unwrap(), b"");
+    }
+
+    #[test]
+    fn write_commands_excludes_bgrewriteaof() {
+        assert!(!crate::aof::WRITE_COMMANDS.contains(&"BGREWRITEAOF"));
     }
 
     #[test]
