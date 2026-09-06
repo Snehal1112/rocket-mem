@@ -2234,6 +2234,15 @@ fn handle_save(
     aof: &crate::aof::AofWriter,
     replication: &crate::replication::ReplicationHandle,
 ) -> Frame {
+    // Resolved, never bare: once a rewrite has committed, the manifest names the only
+    // snapshot/AOF pair `recover` will ever read, so a `SAVE` written to the bare path would be
+    // a permanent no-op that still reports success.
+    let gen = match crate::aof::read_generation(replication.snapshot_path()) {
+        Ok(g) => g,
+        Err(e) => return Frame::Error(format!("ERR failed to read AOF generation: {e}")),
+    };
+    let path = crate::aof::generation_path(replication.snapshot_path(), gen);
+
     let bytes = {
         let _order_guard = aof.lock_for_ordering();
         let offset = match aof.current_offset() {
@@ -2243,7 +2252,7 @@ fn handle_save(
         replication.engine().snapshot(offset)
     };
 
-    match write_snapshot_atomically(replication.snapshot_path(), &bytes) {
+    match write_snapshot_atomically(&path, &bytes) {
         Ok(()) => {
             replication.record_save();
             Frame::Simple("OK".into())
@@ -7585,6 +7594,48 @@ mod tests {
             recovered.get(b"post"),
             Some(Value::String(Bytes::from_static(b"2")))
         ); // written after restart 1 -- must land in the generation the manifest names
+    }
+
+    /// `SAVE` must resolve the manifest exactly like `handle_bgrewriteaof` and `recover` do.
+    /// Writing to the bare `snapshot_path` once a manifest names a later generation is a
+    /// permanent no-op that still answers `+OK`: recovery never reads that file again.
+    #[test]
+    fn save_after_a_rewrite_writes_the_snapshot_at_the_current_generation() {
+        let engine = std::sync::Arc::new(Engine::new());
+        let (dir, aof) = test_aof();
+        let aof_path = dir.path().join("test.aof");
+        let snapshot_path = dir.path().join("test.snapshot");
+        let replication =
+            ReplicationHandle::new(std::sync::Arc::clone(&engine), snapshot_path.clone());
+
+        handle_bgrewriteaof(&aof, &replication); // -> generation 1
+
+        dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"SET", b"after", b"1"]),
+            &Session::new(),
+            1,
+        );
+        assert_eq!(handle_save(&aof, &replication), Frame::Simple("OK".into()));
+
+        // The snapshot has to land where the manifest points, not at the superseded bare path.
+        assert!(!snapshot_path.exists());
+        let bytes = std::fs::read(crate::aof::generation_path(&snapshot_path, 1)).unwrap();
+        let loaded = Engine::new();
+        loaded.load_snapshot(&bytes).unwrap();
+        assert_eq!(
+            loaded.get(b"after"),
+            Some(Value::String(Bytes::from_static(b"1")))
+        );
+
+        // ...and recovery must pick it up.
+        let recovered = crate::aof::recover(&aof_path, &snapshot_path).unwrap();
+        assert_eq!(
+            recovered.get(b"after"),
+            Some(Value::String(Bytes::from_static(b"1")))
+        );
     }
 
     #[test]
