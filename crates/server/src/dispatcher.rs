@@ -7369,6 +7369,55 @@ mod tests {
     }
 
     #[test]
+    fn a_write_landing_between_rotation_and_manifest_commit_survives_recovery() {
+        let engine = std::sync::Arc::new(Engine::new());
+        let (dir, aof) = test_aof();
+        let aof_path = dir.path().join("test.aof");
+        let snapshot_path = dir.path().join("test.snapshot");
+        let replication =
+            ReplicationHandle::new(std::sync::Arc::clone(&engine), snapshot_path.clone());
+
+        dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"SET", b"before", b"1"]),
+            &Session::new(),
+            1,
+        );
+
+        // Manually walk `handle_bgrewriteaof`'s steps, interleaving a write right after rotation
+        // lands but before the new generation's snapshot/manifest are durable -- exactly the window
+        // a genuinely concurrent writer could land in, since rotation is the only part protected by
+        // `lock_for_ordering()`.
+        let (next_gen, bytes) = start_rewrite(&aof, &replication).unwrap();
+
+        dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"SET", b"during", b"2"]),
+            &Session::new(),
+            1,
+        );
+
+        let new_snapshot_path = crate::aof::generation_path(replication.snapshot_path(), next_gen);
+        write_snapshot_atomically(&new_snapshot_path, &bytes).unwrap();
+        crate::aof::write_generation_atomically(replication.snapshot_path(), next_gen).unwrap();
+        aof.fsync().unwrap();
+
+        let recovered = crate::aof::recover(&aof_path, &snapshot_path).unwrap();
+        assert_eq!(
+            recovered.get(b"before"),
+            Some(Value::String(Bytes::from_static(b"1")))
+        ); // captured in the snapshot
+        assert_eq!(
+            recovered.get(b"during"),
+            Some(Value::String(Bytes::from_static(b"2")))
+        ); // captured in generation 1's AOF tail, replayed after the snapshot
+    }
+
+    #[test]
     fn handle_bgrewriteaof_commits_a_readable_generation_1() {
         let engine = std::sync::Arc::new(Engine::new());
         dispatch(
