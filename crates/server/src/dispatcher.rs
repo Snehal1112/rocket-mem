@@ -2201,6 +2201,11 @@ fn handle_bgrewriteaof(
     aof: &crate::aof::AofWriter,
     replication: &crate::replication::ReplicationHandle,
 ) -> Frame {
+    // Held across every step below, not just the rotation: the generation read and the manifest
+    // commit are what two concurrent rewrites collide on, and `start_rewrite`'s own
+    // `lock_for_ordering()` is released long before the commit. See `AofWriter::lock_for_rewrite`.
+    let _rewrite_guard = aof.lock_for_rewrite();
+
     let (next_gen, bytes) = match start_rewrite(aof, replication) {
         Ok(r) => r,
         Err(e) => return Frame::Error(format!("ERR failed to start AOF rewrite: {e}")),
@@ -2237,6 +2242,13 @@ fn handle_save(
     // Resolved, never bare: once a rewrite has committed, the manifest names the only
     // snapshot/AOF pair `recover` will ever read, so a `SAVE` written to the bare path would be
     // a permanent no-op that still reports success.
+    //
+    // The rewrite lock spans the generation read *and* the write below. Without it a rewrite
+    // committing in between would leave this snapshot filed under generation `G` while the
+    // offset it embeds was measured against generation `G + 1`'s freshly-rotated AOF -- and if
+    // that rewrite then failed before its own commit, recovery would pair generation `G`'s AOF
+    // with an offset that means nothing in it.
+    let _rewrite_guard = aof.lock_for_rewrite();
     let gen = match crate::aof::read_generation(replication.snapshot_path()) {
         Ok(g) => g,
         Err(e) => return Frame::Error(format!("ERR failed to read AOF generation: {e}")),
@@ -7636,6 +7648,78 @@ mod tests {
             recovered.get(b"after"),
             Some(Value::String(Bytes::from_static(b"1")))
         );
+    }
+
+    /// `lock_for_ordering()` only covers `start_rewrite`, not the manifest commit, so without a
+    /// lock spanning the whole call two rewrites can both read generation `G`, both target
+    /// `G + 1`, and both commit it -- the second silently overwriting the first generation's
+    /// snapshot while its AOF rotation is already lost.
+    #[test]
+    fn concurrent_bgrewriteaof_calls_each_advance_the_generation_exactly_once() {
+        let engine = std::sync::Arc::new(Engine::new());
+        let dir = tempfile::tempdir().unwrap();
+        let aof_path = dir.path().join("test.aof");
+        let snapshot_path = dir.path().join("test.snapshot");
+        let aof = std::sync::Arc::new(AofWriter::open(&aof_path, FsyncPolicy::Never).unwrap());
+        let replication = std::sync::Arc::new(ReplicationHandle::new(
+            std::sync::Arc::clone(&engine),
+            snapshot_path.clone(),
+        ));
+
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let aof = std::sync::Arc::clone(&aof);
+                let replication = std::sync::Arc::clone(&replication);
+                std::thread::spawn(move || handle_bgrewriteaof(&aof, &replication))
+            })
+            .collect();
+        for t in threads {
+            assert_eq!(t.join().unwrap(), Frame::Simple("OK".into()));
+        }
+
+        assert_eq!(crate::aof::read_generation(&snapshot_path).unwrap(), 8);
+        assert_eq!(aof.path(), crate::aof::generation_path(&aof_path, 8));
+        assert!(crate::aof::generation_path(&snapshot_path, 8).exists());
+    }
+
+    /// The mutual exclusion above, proven directly rather than by outcome: while the rewrite lock
+    /// is held, a `BGREWRITEAOF` on another thread must make no progress at all -- not merely
+    /// finish in some safe order.
+    #[test]
+    fn handle_bgrewriteaof_makes_no_progress_while_the_rewrite_lock_is_held() {
+        let engine = std::sync::Arc::new(Engine::new());
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot_path = dir.path().join("test.snapshot");
+        let aof = std::sync::Arc::new(
+            AofWriter::open(&dir.path().join("test.aof"), FsyncPolicy::Never).unwrap(),
+        );
+        let replication = std::sync::Arc::new(ReplicationHandle::new(
+            std::sync::Arc::clone(&engine),
+            snapshot_path.clone(),
+        ));
+
+        let guard = aof.lock_for_rewrite();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = {
+            let aof = std::sync::Arc::clone(&aof);
+            let replication = std::sync::Arc::clone(&replication);
+            std::thread::spawn(move || {
+                let reply = handle_bgrewriteaof(&aof, &replication);
+                tx.send(reply).unwrap();
+            })
+        };
+
+        // Blocked, so nothing is committed and no reply arrives.
+        assert!(rx
+            .recv_timeout(std::time::Duration::from_millis(150))
+            .is_err());
+        assert_eq!(crate::aof::read_generation(&snapshot_path).unwrap(), 0);
+
+        drop(guard);
+        assert_eq!(rx.recv().unwrap(), Frame::Simple("OK".into()));
+        handle.join().unwrap();
+        assert_eq!(crate::aof::read_generation(&snapshot_path).unwrap(), 1);
     }
 
     #[test]

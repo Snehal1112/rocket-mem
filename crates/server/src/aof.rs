@@ -55,6 +55,12 @@ pub struct AofWriter {
     /// relative order their mutations committed in. See
     /// ../../docs/superpowers/specs/2026-08-30-tech-debt-cleanup-spec.md Item 2.
     order: Mutex<()>,
+    /// Serializes whole rewrites against each other and against `SAVE` -- see
+    /// `lock_for_rewrite`. Distinct from `order`, which is far too narrow for this: it is
+    /// released the moment `start_rewrite` returns, leaving the manifest read, the snapshot
+    /// write and the commit rename unprotected. Always acquired *before* `order`, never the
+    /// other way round, so the two can never deadlock.
+    rewrite: Mutex<()>,
     /// The file currently being appended to. `Mutex`-wrapped (not a plain `PathBuf`) so
     /// `rotate_to` can repoint it after a successful rotation; read by `current_offset`.
     path: Mutex<PathBuf>,
@@ -142,6 +148,7 @@ impl AofWriter {
             tx,
             policy,
             order: Mutex::new(()),
+            rewrite: Mutex::new(()),
             path: Mutex::new(path.to_path_buf()),
             base_path: base_path.to_path_buf(),
         })
@@ -238,6 +245,22 @@ impl AofWriter {
         // must not turn into a permanent, server-wide write outage. The guarded data is `()`
         // -- there is no invariant a panicking holder could have left broken.
         self.order.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Held by `dispatcher::handle_bgrewriteaof` across its *entire* sequence -- generation read,
+    /// rotation, snapshot write, manifest commit, cleanup -- and by `handle_save` across its own
+    /// generation-read-then-write. Two rewrites that interleave here do not merely race: both read
+    /// generation `G`, both target `G + 1`, and their `<snapshot>.<G+1>.tmp` renames collide, so
+    /// one fails outright while the other's AOF rotation has already been overwritten.
+    /// `lock_for_ordering` cannot serve this purpose -- it is deliberately released before the
+    /// snapshot write so no client write blocks on the disk I/O.
+    ///
+    /// Poison is recovered from rather than propagated, exactly as in `lock_for_ordering`: the
+    /// guarded data is `()`, and a panicking rewrite must not permanently break `SAVE`.
+    #[must_use = "the returned guard must be held across the whole rewrite; dropping it \
+                  immediately reintroduces the interleaved-generation race"]
+    pub fn lock_for_rewrite(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.rewrite.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn send(&self, msg: AofMsg) -> std::io::Result<()> {
