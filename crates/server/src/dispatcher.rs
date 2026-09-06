@@ -7525,6 +7525,11 @@ mod tests {
         assert!(crate::aof::generation_path(&snapshot_path, 1).exists()); // committed snapshot remains
     }
 
+    /// Cleanup is deliberately narrow: it reclaims the generation this rewrite just superseded
+    /// and nothing else. Older generations left behind by an earlier interrupted cleanup are not
+    /// its business, so the test seeds three of them -- driving a rewrite from a generation-5
+    /// manifest with 3, 4 and 5 all present on disk, a state two rewrites in a row could never
+    /// produce on their own.
     #[test]
     fn handle_bgrewriteaof_cleanup_deletes_the_immediately_prior_generation_only() {
         let engine = std::sync::Arc::new(Engine::new());
@@ -7534,13 +7539,26 @@ mod tests {
         let replication =
             ReplicationHandle::new(std::sync::Arc::clone(&engine), snapshot_path.clone());
 
-        handle_bgrewriteaof(&aof, &replication); // -> generation 1
-        handle_bgrewriteaof(&aof, &replication); // -> generation 2, deletes generation 1
+        for gen in [3, 4, 5] {
+            std::fs::write(crate::aof::generation_path(&aof_path, gen), b"").unwrap();
+            std::fs::write(crate::aof::generation_path(&snapshot_path, gen), b"").unwrap();
+        }
+        crate::aof::write_generation_atomically(&snapshot_path, 5).unwrap();
 
-        assert!(!crate::aof::generation_path(&aof_path, 1).exists());
-        assert!(!crate::aof::generation_path(&snapshot_path, 1).exists());
-        assert!(crate::aof::generation_path(&aof_path, 2).exists());
-        assert!(crate::aof::generation_path(&snapshot_path, 2).exists());
+        handle_bgrewriteaof(&aof, &replication); // -> generation 6, deletes generation 5 only
+
+        assert_eq!(crate::aof::read_generation(&snapshot_path).unwrap(), 6);
+        assert!(!crate::aof::generation_path(&aof_path, 5).exists());
+        assert!(!crate::aof::generation_path(&snapshot_path, 5).exists());
+
+        // Unreferenced but untouched -- cleanup is not a sweep.
+        for gen in [3, 4] {
+            assert!(crate::aof::generation_path(&aof_path, gen).exists());
+            assert!(crate::aof::generation_path(&snapshot_path, gen).exists());
+        }
+
+        assert!(crate::aof::generation_path(&aof_path, 6).exists());
+        assert!(crate::aof::generation_path(&snapshot_path, 6).exists());
     }
 
     /// The full restart lifecycle `main.rs` performs, run twice: a rewrite commits generation 1,
