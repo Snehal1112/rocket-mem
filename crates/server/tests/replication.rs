@@ -285,3 +285,124 @@ async fn a_follower_rejects_client_writes_over_a_real_connection_and_keeps_its_a
     let f_aof_len_after_write = std::fs::metadata(&f_aof_path).unwrap().len();
     assert_eq!(f_aof_len_after_write, f_aof_len_before_write);
 }
+
+fn fixture(name: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name)
+}
+
+/// Real-socket proof that a follower can resync from a leader over TLS, pinned to the leader's
+/// own certificate: without this, `sync_once`'s `TcpStream::connect` is always plaintext, so a
+/// leader/follower pair replicating across an untrusted network exposes every key/value it
+/// carries -- including anything sensitive a consumer might cache there -- in cleartext,
+/// regardless of any TLS configured for ordinary client connections. The leader here only
+/// accepts TLS (`serve_tls`, no plaintext listener at all), so a successful resync is only
+/// possible if the follower actually spoke TLS on the replication connection.
+#[tokio::test]
+async fn a_follower_resyncs_over_tls_when_pinned_to_the_leaders_certificate() {
+    let leader_dir = tempfile::tempdir().unwrap();
+    let leader_engine = Arc::new(engine::Engine::new());
+    // Present before replication starts, so it can only reach the follower via the snapshot
+    // blob read over the TLS-wrapped socket in `sync_once` -- not the plaintext streamed-frame
+    // path, which this test never exercises.
+    leader_engine.set(
+        bytes::Bytes::from_static(b"pre-existing"),
+        engine::Value::String(bytes::Bytes::from_static(b"secret")),
+    );
+    let leader_aof = Arc::new(
+        rocket_mem::aof::AofWriter::open(
+            &leader_dir.path().join("leader.aof"),
+            rocket_mem::aof::FsyncPolicy::Never,
+        )
+        .unwrap(),
+    );
+    let leader_replication = Arc::new(rocket_mem::replication::ReplicationHandle::new(
+        Arc::clone(&leader_engine),
+        leader_dir.path().join("leader.snapshot"),
+    ));
+    let leader_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let leader_addr = leader_listener.local_addr().unwrap();
+    let server_tls_config =
+        rocket_mem::tls::load_server_config(&fixture("test-cert.pem"), &fixture("test-key.pem"))
+            .unwrap();
+    tokio::spawn(rocket_mem::serve_tls(
+        leader_listener,
+        server_tls_config,
+        Arc::clone(&leader_engine),
+        Arc::clone(&leader_aof),
+        Arc::clone(&leader_replication),
+    ));
+
+    let follower_dir = tempfile::tempdir().unwrap();
+    let follower_engine = Arc::new(engine::Engine::new());
+    let client_tls_config = rocket_mem::tls::load_client_config(&fixture("test-cert.pem")).unwrap();
+    let follower_replication = Arc::new(
+        rocket_mem::replication::ReplicationHandle::new(
+            Arc::clone(&follower_engine),
+            follower_dir.path().join("follower.snapshot"),
+        )
+        .with_replication_tls_client_config(client_tls_config),
+    );
+
+    follower_replication.start_replicating(leader_addr.to_string());
+    wait_for(&follower_engine, b"pre-existing", b"secret").await;
+}
+
+/// A follower pinned to the wrong certificate must never resync -- proving `load_client_config`
+/// actually validates the leader's presented certificate against the pinned one, rather than
+/// accepting any certificate (which would make the previous test's success meaningless) or
+/// silently falling back to plaintext when the handshake fails.
+#[tokio::test]
+async fn a_follower_never_resyncs_when_pinned_to_the_wrong_certificate() {
+    let leader_dir = tempfile::tempdir().unwrap();
+    let leader_engine = Arc::new(engine::Engine::new());
+    leader_engine.set(
+        bytes::Bytes::from_static(b"pre-existing"),
+        engine::Value::String(bytes::Bytes::from_static(b"secret")),
+    );
+    let leader_aof = Arc::new(
+        rocket_mem::aof::AofWriter::open(
+            &leader_dir.path().join("leader.aof"),
+            rocket_mem::aof::FsyncPolicy::Never,
+        )
+        .unwrap(),
+    );
+    let leader_replication = Arc::new(rocket_mem::replication::ReplicationHandle::new(
+        Arc::clone(&leader_engine),
+        leader_dir.path().join("leader.snapshot"),
+    ));
+    let leader_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let leader_addr = leader_listener.local_addr().unwrap();
+    // The leader really does present `test-cert.pem` -- same as the positive test.
+    let server_tls_config =
+        rocket_mem::tls::load_server_config(&fixture("test-cert.pem"), &fixture("test-key.pem"))
+            .unwrap();
+    tokio::spawn(rocket_mem::serve_tls(
+        leader_listener,
+        server_tls_config,
+        Arc::clone(&leader_engine),
+        Arc::clone(&leader_aof),
+        Arc::clone(&leader_replication),
+    ));
+
+    let follower_dir = tempfile::tempdir().unwrap();
+    let follower_engine = Arc::new(engine::Engine::new());
+    // Pinned to a different certificate than the one the leader actually presents.
+    let client_tls_config =
+        rocket_mem::tls::load_client_config(&fixture("wrong-cert.pem")).unwrap();
+    let follower_replication = Arc::new(
+        rocket_mem::replication::ReplicationHandle::new(
+            Arc::clone(&follower_engine),
+            follower_dir.path().join("follower.snapshot"),
+        )
+        .with_replication_tls_client_config(client_tls_config),
+    );
+
+    follower_replication.start_replicating(leader_addr.to_string());
+    // No bounded-wait helper for "never happens" -- a fixed window past the point the positive
+    // test already resyncs within is the standard way to assert a negative here.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert_eq!(follower_engine.get(b"pre-existing"), None);
+    assert!(!follower_replication.link_up());
+}

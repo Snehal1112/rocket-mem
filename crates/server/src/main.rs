@@ -107,6 +107,11 @@ async fn main() -> std::io::Result<()> {
     if let Some(cluster) = cluster {
         handle = handle.with_cluster(cluster);
     }
+    if let Some(ca_path) = &config.tls_ca_path {
+        let client_config = rocket_mem::tls::load_client_config(std::path::Path::new(ca_path))
+            .expect("failed to load replication TLS CA certificate");
+        handle = handle.with_replication_tls_client_config(client_config);
+    }
     let replication = Arc::new(handle);
 
     let metrics_listener = tokio::net::TcpListener::bind(&config.metrics_addr).await?;

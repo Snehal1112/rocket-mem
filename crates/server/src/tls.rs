@@ -40,6 +40,39 @@ pub fn load_server_config(
     Ok(Arc::new(config))
 }
 
+/// Builds a client-auth-only `rustls::ClientConfig` that trusts exactly one certificate --
+/// pinning, not CA-chain validation. Chosen over standard CA-signed validation because this
+/// project's TLS story is already self-signed-cert-only (see `load_server_config`'s doc
+/// comment and Sprint 8's spec, "no alternatives evaluated further than the shortlist"): a
+/// follower configured with `tls_ca_path` is simply handed the leader's own certificate file
+/// and trusts that certificate, not a certificate authority. Used only for the replication
+/// client connection (`replication::sync_once`); ordinary RESP/RMP clients aren't affected.
+pub fn load_client_config(ca_cert_path: &Path) -> std::io::Result<Arc<rustls::ClientConfig>> {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+    let cert_file = std::fs::File::open(ca_cert_path)?;
+    let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+        rustls_pemfile::certs(&mut BufReader::new(cert_file)).collect::<Result<Vec<_>, _>>()?;
+    if certs.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "no certificate found in CA cert file",
+        ));
+    }
+
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in certs {
+        roots
+            .add(cert)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    }
+
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok(Arc::new(config))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

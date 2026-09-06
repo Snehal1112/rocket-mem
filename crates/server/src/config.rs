@@ -19,6 +19,10 @@ pub struct Config {
     pub tls_rmp_addr: Option<String>,
     pub tls_cert_path: Option<String>,
     pub tls_key_path: Option<String>,
+    /// The leader's certificate file, for a follower's replication connection to pin to via
+    /// `tls::load_client_config`. Unset means plaintext replication, matching every deployment
+    /// before this field existed.
+    pub tls_ca_path: Option<String>,
     pub acl: AclBootstrapConfig,
 }
 
@@ -39,6 +43,7 @@ impl Default for Config {
             tls_rmp_addr: None,
             tls_cert_path: None,
             tls_key_path: None,
+            tls_ca_path: None,
             acl: AclBootstrapConfig::default(),
         }
     }
@@ -144,6 +149,10 @@ pub struct Cli {
     /// Path to the TLS private key file [default: unset]
     #[arg(long)]
     pub tls_key_path: Option<String>,
+    /// Path to the leader's certificate file, for a follower to pin its replication connection
+    /// to over TLS [default: unset, replication stays plaintext]
+    #[arg(long)]
+    pub tls_ca_path: Option<String>,
 }
 
 /// `Serialized::defaults` embeds every field including the unset `None`s, which would make an
@@ -184,6 +193,7 @@ fn cli_overrides(
     set!(tls_rmp_addr);
     set!(tls_cert_path);
     set!(tls_key_path);
+    set!(tls_ca_path);
     if let Some(v) = cli.slowlog_threshold_micros {
         map.insert("slowlog_threshold_micros", Value::from(v));
     }
@@ -259,6 +269,7 @@ mod tests {
         assert_eq!(cfg.tls_rmp_addr, None);
         assert_eq!(cfg.tls_cert_path, None);
         assert_eq!(cfg.tls_key_path, None);
+        assert_eq!(cfg.tls_ca_path, None);
         assert!(cfg.acl.users.is_empty());
     }
 

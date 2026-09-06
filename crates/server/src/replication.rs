@@ -109,6 +109,11 @@ pub struct ReplicationHandle {
     /// leave it `None` and their apply loops take no lock, which is correct since no `SAVE` runs
     /// against them.
     aof: Option<Arc<AofWriter>>,
+    /// Follower side: when set, `sync_once` upgrades its connection to the leader to TLS,
+    /// pinned to exactly the one certificate this `ClientConfig` trusts (see
+    /// `tls::load_client_config`). `None` -- the default for `new`/`Default` -- means plaintext
+    /// replication, matching every existing test and pre-this-fix deployment.
+    replication_tls_client_config: Option<Arc<rustls::ClientConfig>>,
     /// The static cluster topology, when this node was started in cluster mode. `None` -- the
     /// default for `new`/`Default`, i.e. every existing test and every standalone deployment --
     /// means cluster mode is off: no `-MOVED`, no `-CROSSSLOT`, `cluster_enabled:0` in `INFO`.
@@ -175,6 +180,7 @@ impl ReplicationHandle {
             snapshot_path,
             generation: Arc::new(AtomicU64::new(0)),
             aof: None,
+            replication_tls_client_config: None,
             cluster: None,
             connected_clients: AtomicUsize::new(0),
             total_connections: AtomicU64::new(0),
@@ -200,6 +206,15 @@ impl ReplicationHandle {
     /// behavior for those.
     pub fn with_aof(mut self, aof: Arc<AofWriter>) -> Self {
         self.aof = Some(aof);
+        self
+    }
+
+    /// Configures this node's follower-side replication connection to upgrade to TLS, pinned
+    /// to `config`'s one trusted certificate (built via `tls::load_client_config`). A builder
+    /// method, matching `with_aof`/`with_cluster`'s existing pattern, so the ~25 existing
+    /// `ReplicationHandle::new` call sites (all tests, none configuring TLS) stay untouched.
+    pub fn with_replication_tls_client_config(mut self, config: Arc<rustls::ClientConfig>) -> Self {
+        self.replication_tls_client_config = Some(config);
         self
     }
 
@@ -262,17 +277,21 @@ impl ReplicationHandle {
         let engine = Arc::clone(&self.engine);
         let generation = Arc::clone(&self.generation);
         let aof = self.aof.clone();
+        let tls_client_config = self.replication_tls_client_config.clone();
         let last_apply = self.last_apply_slot();
         *self.master_addr.lock().unwrap_or_else(|e| e.into_inner()) = Some(host_port.clone());
         let link_up = self.link_up_slot();
         *task = Some(tokio::spawn(replication_client_loop(
             host_port,
             engine,
-            generation,
-            my_generation,
+            Generation {
+                counter: generation,
+                mine: my_generation,
+            },
             aof,
             last_apply,
             link_up,
+            tls_client_config,
         )));
         self.is_replica.store(true, Ordering::Relaxed);
     }
@@ -366,33 +385,48 @@ impl Default for ReplicationHandle {
     }
 }
 
+/// Pairs the shared generation counter with the value a task was started with -- every caller
+/// down this call chain needs both together to detect it has been superseded (see
+/// `ReplicationHandle::generation`'s doc comment), and bundling them here is what keeps
+/// `replication_client_loop`/`connect_and_sync` under clippy's argument-count limit.
+struct Generation {
+    counter: Arc<AtomicU64>,
+    mine: u64,
+}
+
+impl Generation {
+    fn is_stale(&self) -> bool {
+        self.counter.load(Ordering::SeqCst) != self.mine
+    }
+}
+
 /// Connects to `host_port`, syncs, applies the leader's stream forever, and reconnects (after
 /// a fixed ~1s backoff) on any failure — including the leader simply closing the connection.
 /// There is no distinction between "first sync" and "resync after disconnect": both run this
-/// same loop body. `generation`/`my_generation` let this task detect it has been superseded by
-/// a later `start_replicating`/`stop_replicating` call and stop applying state — see
+/// same loop body. `generation` lets this task detect it has been superseded by a later
+/// `start_replicating`/`stop_replicating` call and stop applying state — see
 /// `ReplicationHandle::generation`'s doc comment.
 async fn replication_client_loop(
     host_port: String,
     engine: Arc<Engine>,
-    generation: Arc<AtomicU64>,
-    my_generation: u64,
+    generation: Generation,
     aof: Option<Arc<AofWriter>>,
     last_apply: Arc<AtomicI64>,
     link_up: Arc<AtomicBool>,
+    tls_client_config: Option<Arc<rustls::ClientConfig>>,
 ) {
     loop {
-        if generation.load(Ordering::SeqCst) != my_generation {
+        if generation.is_stale() {
             return; // superseded before even starting this iteration's sync
         }
-        match sync_once(
+        match connect_and_sync(
             &host_port,
             &engine,
             &generation,
-            my_generation,
             aof.as_deref(),
             &last_apply,
             &link_up,
+            tls_client_config.as_ref(),
         )
         .await
         {
@@ -404,22 +438,78 @@ async fn replication_client_loop(
     }
 }
 
-/// One full sync: connect, `PSYNC`, load the snapshot, then apply every subsequent frame
-/// until the connection ends (cleanly or with an error). Never called `dispatch_and_log` —
-/// see this plan's Global Constraints. Checks `generation` against `my_generation` immediately
-/// before `load_snapshot` and before each `dispatch` call, bailing out the moment this task has
-/// been superseded rather than after a whole `sync_once` call — see
-/// `ReplicationHandle::generation`'s doc comment for why `abort()` alone isn't sufficient.
-async fn sync_once(
+/// Connects to `host_port`, optionally upgrading to TLS (pinned to `tls_client_config`'s one
+/// trusted certificate) when the follower was configured for it, then runs `sync_once` over
+/// whichever stream type resulted. Two monomorphizations of the generic `sync_once` rather than
+/// a boxed trait object, matching this codebase's existing avoidance of dynamic dispatch on the
+/// hot connection-setup path.
+async fn connect_and_sync(
     host_port: &str,
+    engine: &Engine,
+    generation: &Generation,
+    aof: Option<&AofWriter>,
+    last_apply: &AtomicI64,
+    link_up: &AtomicBool,
+    tls_client_config: Option<&Arc<rustls::ClientConfig>>,
+) -> std::io::Result<()> {
+    let tcp = tokio::net::TcpStream::connect(host_port).await?;
+    match tls_client_config {
+        Some(config) => {
+            let host = host_port.rsplit_once(':').map_or(host_port, |(h, _)| h);
+            let server_name =
+                rustls::pki_types::ServerName::try_from(host.to_string()).map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string())
+                })?;
+            let tls_stream = tokio_rustls::TlsConnector::from(Arc::clone(config))
+                .connect(server_name, tcp)
+                .await?;
+            sync_once(
+                tls_stream,
+                engine,
+                &generation.counter,
+                generation.mine,
+                aof,
+                last_apply,
+                link_up,
+            )
+            .await
+        }
+        None => {
+            sync_once(
+                tcp,
+                engine,
+                &generation.counter,
+                generation.mine,
+                aof,
+                last_apply,
+                link_up,
+            )
+            .await
+        }
+    }
+}
+
+/// One full sync: `PSYNC`, load the snapshot, then apply every subsequent frame until the
+/// connection ends (cleanly or with an error). Never called `dispatch_and_log` — see this
+/// plan's Global Constraints. Checks `generation` against `my_generation` immediately before
+/// `load_snapshot` and before each `dispatch` call, bailing out the moment this task has been
+/// superseded rather than after a whole `sync_once` call — see `ReplicationHandle::generation`'s
+/// doc comment for why `abort()` alone isn't sufficient. Generic over the stream type so the
+/// same body serves both plaintext and TLS-upgraded replication connections (`connect_and_sync`
+/// above), mirroring `connection::handle_connection`'s existing genericization for the
+/// server-accept side.
+async fn sync_once<S>(
+    stream: S,
     engine: &Engine,
     generation: &AtomicU64,
     my_generation: u64,
     aof: Option<&AofWriter>,
     last_apply: &AtomicI64,
     link_up: &AtomicBool,
-) -> std::io::Result<()> {
-    let stream = tokio::net::TcpStream::connect(host_port).await?;
+) -> std::io::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let mut framed = tokio_util::codec::Framed::new(stream, protocol::codec::RespCodec::default());
     framed
         .send(protocol::Frame::Array(vec![protocol::Frame::Bulk(
@@ -630,8 +720,9 @@ mod tests {
             let engine = std::sync::Arc::clone(&engine);
             let generation = Arc::clone(&generation);
             tokio::spawn(async move {
+                let stream = tokio::net::TcpStream::connect(&host_port).await.unwrap();
                 sync_once(
-                    &host_port,
+                    stream,
                     &engine,
                     &generation,
                     0,
@@ -691,8 +782,9 @@ mod tests {
         // generation check, this would go on to call load_snapshot and clobber whatever a
         // newer task has already loaded.
         let generation = Arc::new(AtomicU64::new(1));
+        let stream = tokio::net::TcpStream::connect(&host_port).await.unwrap();
         sync_once(
-            &host_port,
+            stream,
             &engine,
             &generation,
             0,
@@ -794,8 +886,9 @@ mod tests {
             let host_port = addr.to_string();
             let generation = Arc::new(AtomicU64::new(0));
             tokio::spawn(async move {
+                let stream = tokio::net::TcpStream::connect(&host_port).await.unwrap();
                 sync_once(
-                    &host_port,
+                    stream,
                     &engine,
                     &generation,
                     0,
