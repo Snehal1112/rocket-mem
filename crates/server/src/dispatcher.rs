@@ -8418,4 +8418,57 @@ mod tests {
             Frame::Error("READONLY You can't write against a read only replica.".into())
         );
     }
+
+    #[test]
+    fn bgrewriteaof_end_to_end_preserves_writes_before_and_after_the_rewrite() {
+        let engine = std::sync::Arc::new(Engine::new());
+        let (dir, aof) = test_aof();
+        let aof_path = dir.path().join("test.aof");
+        let snapshot_path = dir.path().join("test.snapshot");
+        let replication =
+            ReplicationHandle::new(std::sync::Arc::clone(&engine), snapshot_path.clone());
+
+        dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"SET", b"before", b"1"]),
+            &Session::new(),
+            1,
+        );
+
+        let reply = dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"BGREWRITEAOF"]),
+            &Session::new(),
+            1,
+        );
+        assert_eq!(reply, Frame::Simple("OK".into()));
+
+        dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"SET", b"after", b"2"]),
+            &Session::new(),
+            1,
+        );
+        aof.fsync().unwrap();
+
+        let recovered = crate::aof::recover(&aof_path, &snapshot_path).unwrap();
+        assert_eq!(
+            recovered.get(b"before"),
+            Some(Value::String(Bytes::from_static(b"1")))
+        );
+        assert_eq!(
+            recovered.get(b"after"),
+            Some(Value::String(Bytes::from_static(b"2")))
+        );
+
+        // Generation 0's original files are cleaned up once generation 1 is committed.
+        assert!(!aof_path.exists());
+        assert!(!snapshot_path.exists());
+    }
 }
