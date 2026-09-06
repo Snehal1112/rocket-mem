@@ -921,6 +921,35 @@ mod tests {
     }
 
     #[test]
+    fn recover_ignores_a_new_generation_whose_manifest_was_never_committed() {
+        let dir = tempfile::tempdir().unwrap();
+        let aof_path = dir.path().join("test.aof");
+        let snapshot_path = dir.path().join("test.snapshot");
+
+        // Generation 0: committed history, exactly as if no rewrite had ever been attempted.
+        write_raw(&aof_path, b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n");
+
+        // Simulate a rewrite that got as far as writing generation 1's files but crashed before
+        // the manifest commit -- this is the exact state `start_rewrite` + a snapshot write leave
+        // on disk one line before `write_generation_atomically` runs.
+        let gen1_engine = Engine::new();
+        gen1_engine.set(
+            Bytes::from_static(b"b"),
+            Value::String(Bytes::from_static(b"orphaned")),
+        );
+        std::fs::write(generation_path(&snapshot_path, 1), gen1_engine.snapshot(0)).unwrap();
+        std::fs::write(generation_path(&aof_path, 1), b"").unwrap();
+        // No manifest written -- this is the frozen crash point.
+
+        let engine = recover(&aof_path, &snapshot_path).unwrap();
+        assert_eq!(
+            engine.get(b"a"),
+            Some(Value::String(Bytes::from_static(b"1")))
+        ); // from generation 0's AOF, completely untouched by the abandoned attempt
+        assert_eq!(engine.get(b"b"), None); // generation 1 must be entirely ignored
+    }
+
+    #[test]
     fn recover_reads_generation_1_once_the_manifest_names_it() {
         let dir = tempfile::tempdir().unwrap();
         let aof_path = dir.path().join("test.aof");
