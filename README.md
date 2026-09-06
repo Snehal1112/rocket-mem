@@ -168,6 +168,23 @@ Configuration is layered, each level overriding the one before: built-in default
 Every field, with its TOML key, environment variable, CLI flag, and ACL bootstrap format, is in
 [`docs/config-reference.md`](docs/config-reference.md).
 
+### On-disk files after a `BGREWRITEAOF`
+
+`aof_path` and `snapshot_path` are the whole on-disk story until the first `BGREWRITEAOF`. Each
+rewrite then writes a new *generation* alongside them rather than compacting the files in place:
+
+| File | Meaning |
+|---|---|
+| `<snapshot_path>.manifest` | The generation currently in use. Absent means generation 0, i.e. the bare configured paths |
+| `<aof_path>.<N>` | Generation `N`'s AOF |
+| `<snapshot_path>.<N>` | Generation `N`'s snapshot |
+
+Startup reads the manifest and loads only the generation it names, so **a backup must capture the
+manifest together with the files it names** — the bare paths are stale once a rewrite has run, and
+`SAVE` writes to the current generation, not to them. The generation a rewrite supersedes is
+deleted on a best-effort basis; any older ones left behind by an interrupted cleanup are
+unreferenced and safe to delete.
+
 ## Deployment
 
 ### Replication

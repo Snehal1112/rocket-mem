@@ -61,6 +61,16 @@ implement.
   support. Relatedly, there is no true replication-*offset* lag metric, because this
   full-resync-only design means no offsets exist —
   `rocket_mem_replication_last_apply_timestamp_seconds` is the substitute reported instead.
+- **`BGREWRITEAOF` is synchronous, despite the `BG` prefix.** Nothing is forked or backgrounded:
+  the calling connection blocks through the full snapshot encode and write, and the AOF ordering
+  lock is held across the engine walk, so concurrent writes wait on it too. It also replies `+OK`
+  rather than real Redis's `+Background append only file rewriting started`, so a client matching
+  on that exact status string will not recognise the reply.
+- **`BGREWRITEAOF` writes new files instead of rewriting the AOF in place.** Each rewrite creates
+  a numbered *generation* — `<aof_path>.<N>`, `<snapshot_path>.<N>`, and a `<snapshot_path>.manifest`
+  naming the current one — rather than compacting `aof_path` itself. Backup scripts that assume
+  the two configured paths are the whole on-disk state need updating; see [README's Configuration
+  section](../README.md#configuration) for the layout.
 - **`DEBUG SLEEP` is capped at a 10-second maximum duration.** A longer request is rejected with
   an error rather than accepted and blocking a server thread indefinitely.
 - **No `@category` ACL grants (`+@read`, `+@write`, ...).** Real Redis's category taxonomy is
