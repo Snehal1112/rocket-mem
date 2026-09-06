@@ -382,6 +382,10 @@ pub fn write_generation_atomically(snapshot_path: &Path, gen: u64) -> std::io::R
 /// constraint is what makes "byte 0 onward is always the complete history" always true, and
 /// therefore why the fallback is always correct rather than merely convenient.
 pub fn recover(aof_path: &Path, snapshot_path: &Path) -> std::io::Result<engine::Engine> {
+    let gen = read_generation(snapshot_path)?;
+    let aof_path = &generation_path(aof_path, gen);
+    let snapshot_path = &generation_path(snapshot_path, gen);
+
     let engine = engine::Engine::new();
     let start_at = match std::fs::read(snapshot_path) {
         Ok(bytes) => match engine.load_snapshot(&bytes) {
@@ -914,6 +918,33 @@ mod tests {
             engine.get(b"a"),
             Some(Value::String(bytes::Bytes::from_static(b"1")))
         ); // full AOF replay instead
+    }
+
+    #[test]
+    fn recover_reads_generation_1_once_the_manifest_names_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let aof_path = dir.path().join("test.aof");
+        let snapshot_path = dir.path().join("test.snapshot");
+
+        // Generation 0 exists but must be ignored once the manifest points past it.
+        write_raw(&aof_path, b"*3\r\n$3\r\nSET\r\n$1\r\nold\r\n$1\r\n1\r\n");
+
+        // Generation 1 is complete and committed.
+        let gen1_engine = Engine::new();
+        gen1_engine.set(
+            Bytes::from_static(b"new"),
+            Value::String(Bytes::from_static(b"2")),
+        );
+        std::fs::write(generation_path(&snapshot_path, 1), gen1_engine.snapshot(0)).unwrap();
+        std::fs::write(generation_path(&aof_path, 1), b"").unwrap();
+        write_generation_atomically(&snapshot_path, 1).unwrap();
+
+        let engine = recover(&aof_path, &snapshot_path).unwrap();
+        assert_eq!(
+            engine.get(b"new"),
+            Some(Value::String(Bytes::from_static(b"2")))
+        ); // from generation 1
+        assert_eq!(engine.get(b"old"), None); // generation 0 must be ignored once superseded
     }
 
     #[test]
