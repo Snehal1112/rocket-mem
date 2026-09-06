@@ -301,6 +301,29 @@ pub fn read_generation(snapshot_path: &Path) -> std::io::Result<u64> {
     }
 }
 
+/// Atomically (tmp + fsync + rename — the same primitive `dispatcher::write_snapshot_atomically`
+/// uses, duplicated here rather than shared so `aof.rs` doesn't gain a dependency on
+/// `dispatcher.rs`, reversing this crate's existing one-way dependency direction) writes `gen`
+/// as the new current generation. This rename is the single commit point of a rewrite: before
+/// it, generation `gen - 1`'s files are authoritative; after it, generation `gen`'s are. See the
+/// design spec's "Decision: `BGREWRITEAOF` command", step 3.
+pub fn write_generation_atomically(snapshot_path: &Path, gen: u64) -> std::io::Result<()> {
+    use std::io::Write;
+    let path = manifest_path(snapshot_path);
+    let mut tmp_os = path.as_os_str().to_owned();
+    tmp_os.push(".tmp");
+    let tmp_path = PathBuf::from(tmp_os);
+    {
+        let file = std::fs::File::create(&tmp_path)?;
+        let mut writer = BufWriter::new(file);
+        write!(writer, "{gen}")?;
+        writer.flush()?;
+        writer.get_ref().sync_data()?;
+    }
+    std::fs::rename(&tmp_path, &path)?;
+    Ok(())
+}
+
 /// Orchestrates startup recovery: loads `snapshot_path` if it exists and decodes cleanly,
 /// checks whether its embedded AOF offset still fits within `aof_path`'s actual length, and
 /// either replays just the AOF tail after that offset (the fast path) or falls back to a full
@@ -892,5 +915,30 @@ mod tests {
         let snapshot_path = dir.path().join("dump.snapshot");
         std::fs::write(dir.path().join("dump.snapshot.manifest"), "not-a-number").unwrap();
         assert!(read_generation(&snapshot_path).is_err());
+    }
+
+    #[test]
+    fn write_generation_atomically_is_read_back_by_read_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot_path = dir.path().join("dump.snapshot");
+        write_generation_atomically(&snapshot_path, 5).unwrap();
+        assert_eq!(read_generation(&snapshot_path).unwrap(), 5);
+    }
+
+    #[test]
+    fn write_generation_atomically_overwrites_a_previous_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot_path = dir.path().join("dump.snapshot");
+        write_generation_atomically(&snapshot_path, 1).unwrap();
+        write_generation_atomically(&snapshot_path, 2).unwrap();
+        assert_eq!(read_generation(&snapshot_path).unwrap(), 2);
+    }
+
+    #[test]
+    fn write_generation_atomically_does_not_leave_a_tmp_file_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot_path = dir.path().join("dump.snapshot");
+        write_generation_atomically(&snapshot_path, 1).unwrap();
+        assert!(!dir.path().join("dump.snapshot.manifest.tmp").exists());
     }
 }
