@@ -14,7 +14,16 @@ in-flight requests on one connection, answered in any order and correlated by re
 Both protocols read and write the same keyspace through the same dispatcher, so persistence,
 replication, clustering, and access control apply identically whichever one a client uses.
 
-> **Project status.** rocket-mem is complete and tested — 731 tests, durability verified under a
+> **Multi-threaded, unlike Redis.** rocket-mem runs on Tokio's multi-threaded runtime
+> (`rt-multi-thread`), spawning one OS worker thread per CPU core plus a dedicated AOF-writer
+> thread — confirmed with `ps -T <pid>` (16 `tokio-rt-worker` threads on a 16-core box) and with
+> `pidstat -t` showing all of them busy at once under concurrent `redis-benchmark` load. Every
+> connection is its own Tokio task, and the keyspace is split into 16 independently-locked shards
+> (see [Architecture](#architecture)), so requests against different keys can execute on
+> different cores at the same instant. Real Redis is deliberately single-threaded for command
+> execution; rocket-mem chose sharded locks over that model instead.
+
+> **Project status.** rocket-mem is complete and tested — 773 tests, durability verified under a
 > `kill -9` chaos loop — but it is not yet production-hardened: there is no failover and no live
 > resharding. Read [Limitations](#limitations) before deploying it.
 
@@ -139,8 +148,8 @@ in [`docs/benchmarks/`](docs/benchmarks/).
 | String/Key | `GET`, `SET` (`NX`/`XX`/`EX`/`PX`), `GETSET`, `GETRANGE`, `SETRANGE`, `APPEND`, `STRLEN`, `INCR`/`DECR`/`INCRBY`, `MSET`, `MGET`, `MSETNX`, `RENAME`, `RENAMENX`, `TYPE`, `RANDOMKEY`, `KEYS`, `SCAN`, `DEL`/`EXISTS` (variadic), `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`, `TTL`, `PTTL`, `PERSIST`, `MEMORY USAGE`, `OBJECT ENCODING` |
 | Hash | `HSET`, `HGET`, `HDEL`, `HEXISTS`, `HGETALL`, `HLEN`, `HINCRBY`, `HKEYS`, `HVALS`, `HMGET`, `HSETNX`, `HSCAN` |
 | List | `LPUSH`, `RPUSH` (variadic), `LPOP`, `RPOP`, `LRANGE`, `LLEN`, `LINDEX`, `LSET`, `LTRIM`, `LREM`, `LINSERT` |
-| Set | `SADD`, `SREM`, `SMEMBERS`, `SISMEMBER`, `SCARD`, `SINTER`, `SUNION`, `SDIFF`, `SINTERSTORE`, `SUNIONSTORE`, `SDIFFSTORE`, `SPOP`, `SRANDMEMBER` |
-| Sorted Set | `ZADD`, `ZSCORE`, `ZREM`, `ZCARD`, `ZINCRBY`, `ZRANGE`, `ZRANK` |
+| Set | `SADD`, `SREM`, `SMEMBERS`, `SISMEMBER`, `SCARD`, `SINTER`, `SUNION`, `SDIFF`, `SINTERSTORE`, `SUNIONSTORE`, `SDIFFSTORE`, `SPOP`, `SRANDMEMBER`, `SSCAN` |
+| Sorted Set | `ZADD` (single pair only, no `NX`/`XX`/`GT`/`LT`/`CH`/`INCR`), `ZSCORE`, `ZREM`, `ZCARD`, `ZINCRBY`, `ZRANGE`, `ZRANK` |
 | Server/Cluster | `PING`, `ECHO`, `SELECT`, `COMMAND`, `HELLO`, `INFO [section]`, `SAVE`, `BGREWRITEAOF`, `REPLICAOF`, `PSYNC`, `DEBUG SLEEP`, `CLUSTER KEYSLOT`/`SHARDS`/`NODES`/`INFO`/`MYID`, `SLOWLOG GET`/`LEN`/`RESET` |
 | Auth/ACL | `AUTH` (single-arg and `<user> <pass>`), `ACL SETUSER`/`DELUSER`/`WHOAMI`/`LIST`/`GETUSER` |
 
