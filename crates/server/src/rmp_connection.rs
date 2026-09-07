@@ -28,7 +28,7 @@ pub async fn serve(
 ) {
     let mut next_client_id: u64 = 1;
     loop {
-        let (socket, _addr) = match listener.accept().await {
+        let (socket, peer) = match listener.accept().await {
             Ok(pair) => pair,
             Err(_) => continue, // a failed accept shouldn't take the whole listener down
         };
@@ -36,6 +36,8 @@ pub async fn serve(
         next_client_id += 1;
         tokio::spawn(handle_connection(
             socket,
+            peer,
+            false, // plaintext listener
             Arc::clone(&engine),
             Arc::clone(&aof),
             Arc::clone(&replication),
@@ -55,7 +57,7 @@ pub async fn serve_tls(
     let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
     let mut next_client_id: u64 = 1;
     loop {
-        let (socket, _addr) = match listener.accept().await {
+        let (socket, peer) = match listener.accept().await {
             Ok(pair) => pair,
             Err(_) => continue,
         };
@@ -77,16 +79,24 @@ pub async fn serve_tls(
             .await
             {
                 Ok(Ok(s)) => s,
-                // A failed handshake, or a timed-out one, ends this connection the same way.
-                Ok(Err(_)) | Err(_) => return,
+                Ok(Err(e)) => {
+                    tracing::warn!(%peer, error = %e, "tls handshake failed");
+                    return;
+                }
+                Err(_) => {
+                    tracing::warn!(%peer, "tls handshake timed out");
+                    return;
+                }
             };
-            handle_connection(tls_socket, engine, aof, replication, client_id).await;
+            handle_connection(tls_socket, peer, true, engine, aof, replication, client_id).await;
         });
     }
 }
 
 async fn handle_connection<S>(
     socket: S,
+    peer: std::net::SocketAddr,
+    tls: bool,
     engine: Arc<Engine>,
     aof: Arc<AofWriter>,
     replication: Arc<ReplicationHandle>,
@@ -94,6 +104,7 @@ async fn handle_connection<S>(
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    tracing::info!(%peer, protocol = "rmp", tls, "connection accepted");
     replication.connection_opened();
     let _client_guard = ClientGuard(Arc::clone(&replication));
     let framed = Framed::new(socket, RmpCodec);
@@ -125,7 +136,7 @@ async fn handle_connection<S>(
             Ok(msg) if msg.msg_type == MsgType::Request => msg,
             Ok(_) => break, // a stray Response from a misbehaving client
             Err(e) => {
-                tracing::warn!(error = %e, "rmp decode error");
+                tracing::warn!(%peer, error = %e, "rmp decode error");
                 break;
             }
         };
