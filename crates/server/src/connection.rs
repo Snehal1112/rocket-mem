@@ -68,7 +68,7 @@ async fn periodic_fsync_loop(aof: Arc<AofWriter>) {
     loop {
         interval.tick().await;
         if let Err(e) = aof.fsync() {
-            eprintln!("aof fsync failed: {e}");
+            tracing::error!(error = %e, "aof fsync failed");
         }
     }
 }
