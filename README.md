@@ -113,24 +113,28 @@ its own lock, so any task can reach any key by taking that key's shard lock. See
 
 ## Performance
 
-Measured against `redis-server` 8.10.1 on the same host with matching durability settings
-(`appendonly yes`, `appendfsync everysec`), via `redis-benchmark -t set,get -n 100000 -c 50`:
+Measured against `redis-server` 8.10.1 on the same host with matching durability settings on
+**both** servers (`appendonly yes`, `appendfsync everysec`), via
+`redis-benchmark -t set,get -n 100000 -c 50`:
 
 | Workload | redis-server | rocket-mem | Ratio |
 |---|---:|---:|---:|
-| GET, 3B, no pipeline | 109,290 | 105,708 | 1.03x |
-| GET, 1KB, no pipeline | 103,093 | 98,619 | 1.05x |
-| SET, 1KB, no pipeline | 103,734 | 92,764 | 1.12x |
-| SET, 3B, no pipeline | 112,740 | 99,800 | 1.13x |
-| GET, 3B, `-P 16` | 1,639,344 | 1,428,571 | 1.15x |
-| SET, 1KB, `-P 16` | 450,450 | 245,700 | 1.83x |
-| SET, 3B, `-P 16` | 934,579 | 390,625 | 2.39x |
-| GET, 1KB, `-P 16` | 1,136,364 | 19,493 | **58.30x** |
+| SET, 3B, no pipeline | 77,882 | 87,719 | **0.89x (rocket faster)** |
+| GET, 3B, no pipeline | 103,520 | 99,206 | 1.04x |
+| GET, 1KB, no pipeline | 94,787 | 86,655 | 1.09x |
+| GET, 3B, `-P 16` | 1,587,302 | 1,351,351 | 1.17x |
+| SET, 1KB, no pipeline | 98,717 | 72,464 | 1.36x |
+| SET, 1KB, `-P 16` | 454,545 | 264,550 | 1.72x |
+| SET, 3B, `-P 16` | 943,396 | 332,226 | 2.84x |
+| GET, 1KB, `-P 16` | 840,336 | 19,497 | **43.10x** |
 
-Seven of eight cases land within 1.03x–2.39x of real Redis. The eighth does not: pipelined 1KB
-`GET` collapses to ~19,500 req/s, an unexplained cliff that no candidate explanation accounts
-for and that remains open. Full methodology, the raw traces, and the profiling that followed are
-in [`docs/benchmarks/`](docs/benchmarks/).
+Seven of eight cases land within 0.89x–2.84x of real Redis (one of them, unpipelined 3B `SET`,
+rocket-mem is actually faster). The eighth does not: pipelined 1KB `GET` collapses to ~19,500
+req/s, an unexplained cliff that no candidate explanation accounts for and that remains open
+(down from 58.30x in the prior run, but still an order of magnitude worse than every other row).
+Full methodology, the raw traces, and the profiling that followed are in
+[`docs/benchmarks/`](docs/benchmarks/), most recently
+[`2026-09-07-redis-benchmark.md`](docs/benchmarks/2026-09-07-redis-benchmark.md).
 
 ## Command coverage
 
