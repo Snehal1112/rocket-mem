@@ -457,7 +457,8 @@ mod tests {
 
     #[test]
     fn resolve_log_filter_directive_falls_back_to_config_value_when_unset() {
-        figment::Jail::expect_with(|_jail| {
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
             assert_eq!(resolve_log_filter_directive("warn"), "warn");
             Ok(())
         });
