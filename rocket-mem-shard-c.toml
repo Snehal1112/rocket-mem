@@ -13,6 +13,13 @@ slowlog_threshold_micros = 0
 cluster_config = "/home/numericlabs/data/rocket/rocket-mem/cluster.conf"
 cluster_node_id = "shard-c"
 
+# PEM certificate chain, shared by both TLS listeners. Resolved relative to the
+# server's working directory, not to this file — prefer an absolute path.
+tls_cert_path = "/home/numericlabs/data/tls/server.crt"
+
+# PEM private key, shared by both TLS listeners. Same relative-path caveat as above.
+tls_key_path = "/home/numericlabs/data/tls/server.key"
+
 # Must match shard-a's ACL users: a client redirected here by MOVED re-authenticates
 # against this node, not shard-a.
 [[acl.users]]
