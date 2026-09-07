@@ -124,38 +124,56 @@ Two constraints follow, and breaking either produces the classic unreadable page
 
 ## Typography
 
-**Two families, split along who is speaking.** JetBrains Mono — drawn for reading code on screen —
-carries everything the *machine* says: commands, output, case IDs, counts, chips, tags, keycaps.
-IBM Plex carries everything the *page* says: prose, headings, labels, buttons. On a page this
-mono-heavy that split does real work; it is not decoration.
+**One face, set throughout: JetBrains Mono.** Headings, prose, labels, buttons, commands, output,
+case IDs, counts, chips and keycaps are all the same typeface. The page is a terminal transcript
+with an index attached — nearly every noun in it is a literal string the tester will type or
+compare — so the usual prose/code split had little left to separate. Setting the whole page in
+the face drawn for reading code is a decision about what this document *is*, not a shortcut.
 
-Each has a real fallback stack, so the page degrades to system faces offline.
+The cost is real and worth naming: mono prose is slower to read at length, and there are 135
+cases of it. It buys uniform character metrics everywhere, which is what makes a case title, a
+command and its expected reply line up as the same kind of object.
 
 | Role | Stack | Used for |
 |---|---|---|
-| `--sans` | IBM Plex Sans → `ui-sans-serif`, `system-ui`, … | All UI and prose |
-| `--mono` | JetBrains Mono → `ui-monospace`, `SFMono-Regular`, … | Every command, output, case ID, count, chip, keycap |
-| `--serif` | IBM Plex Serif *italic* → Georgia, … | The masthead lede only |
+| `--mono` | JetBrains Mono → `ui-monospace`, `SFMono-Regular`, … | Everything the machine says |
+| `--sans` | `var(--mono)` | Nothing of its own — see below |
+| `--serif` | IBM Plex Serif → Georgia, … | Everything a person says: the masthead lede, and case notes |
 
-The serif appears exactly once, in the sub-headline. It is a deliberate single note of contrast
-against an otherwise sans/mono page — using it anywhere else dilutes it to decoration.
+`--sans` is deliberately kept as a live token aliased to `--mono` rather than deleted. Some sixty
+rules reference it, and the two roles were separate until recently; giving `--sans` its own stack
+re-splits the page in one line, where a find-and-replace would have to be reasoned about again.
+This is the one token on the page allowed to have no distinct value of its own.
+
+**The serif is the author's voice, and that is the whole rule.** It had a weaker one — "it
+appears exactly once, in the lede, and using it anywhere else dilutes it" — which was a rule
+about scarcity rather than about meaning, and it did not survive contact with the notes field.
+The lede ("Every expected output below was captured from a real run, not predicted.") and a case
+note are the same speech act: the person who wrote the playbook telling the tester how to judge
+what they are looking at. Everything else on the page is a literal string a machine produced or
+will consume. So the serif marks the human voice, appears in exactly those two places, and stays
+out of everything else — which is a stricter constraint than "once", not a looser one.
+
+The lede keeps the italic; notes are roman, because four lines of italic is a chore to read.
 
 **Code ligatures are switched off**, and this is not a stylistic preference:
 
 ```
-pre,code{font-variant-ligatures:none;font-feature-settings:"liga" 0,"calt" 0}
+body{font-variant-ligatures:none;font-feature-settings:"liga" 0,"calt" 0}
 ```
 
 JetBrains Mono ligates by default, and the case data contains 330 occurrences of `--`, 29 of
 `->`, 37 of `//` and 35 of `::`. With ligatures on, `redis-cli --version` renders the double
 hyphen as one long dash — a tester could reasonably retype it as a single hyphen or an em dash.
 The whole page exists so that expected output can be compared against actual character by
-character, so every glyph stays literal. Any new element that shows a command or a reply must
-inherit this rule or restate it.
+character, so every glyph stays literal. The rule sits on `body`, not on `pre,code`, precisely
+because case titles and prose are mono too now; both properties inherit, so it covers everything.
 
-Swapping the mono face was safe because **JetBrains Mono and IBM Plex Mono share a 0.6em advance
-width** — measured, not assumed — so nothing reflowed. Check that before changing it again; a
-mono face with different metrics would resize every `<pre>`, chip, tag and count on the page.
+Two notes for whoever changes the face next. **JetBrains Mono and IBM Plex Mono share a 0.6em
+advance width** — measured, not assumed — which is why the earlier mono swap reflowed nothing; a
+face with different metrics resizes every `<pre>`, chip, tag and count. And the prose measures are
+set in `ch`, which under a monospaced face means exactly that many characters per line, so
+`max-width:76ch` is now a literal 76-character measure rather than an approximation.
 
 **Scale**, in px: `10.5 · 11 · 11.5 · 12 · 12.5 · 13 · 13.5 · 14.5 · 15 · 18 · 22`. Body is 15px
 at `line-height:1.5`; code is 12.5px at `1.62`, which keeps dense terminal output readable.
@@ -168,6 +186,33 @@ particular the masthead has no eyebrow, and a case's verdict (`Passed` / `Failed
 sentence case, not tracked caps: it is data, not a label, and 135 rows of tracked caps shout.
 
 Numbers that stack in columns use `font-variant-numeric: tabular-nums` so digits align.
+
+**Notes are a gloss, not a fourth field** — and they are the one part of a case with no micro-label
+above them. `PRECONDITION`, `STEPS` and `EXPECTED OUTPUT` are inputs to running the test; a note is
+commentary on judging it, usually talking the tester out of a wrong verdict ("exact version will
+differ per machine; what matters is that the command resolves at all"). Its treatment says so:
+
+| | |
+|---|---|
+| Face | `--serif` roman, 14.5px / 1.62, `--ink-2` |
+| Measure | `max-width:62ch` — about 64 characters, narrower than any mono field on purpose |
+| Mark | a 1px `--line` rule on the leading edge, 13px inset. The marginal-gloss device |
+| Label | none visible; a `.vh` span still names it for screen readers |
+| Inline code | `--mono` 13px, `--ink`, **no chip background** |
+
+Two of those are easy to get wrong. The inline code carries no `--surface-2` chip the way
+`.ftext code` does: against serif the face change alone is a strong enough signal, and the pills
+made every line bumpy where notes are dense with command names. And the leading-edge rule is
+deliberately 1px and neutral so it never competes with the known-defect callout's 3px `--gap`
+rule — same device, different weight, different voice.
+
+Notes are also the only field authored with **block structure**, so they get their own renderer
+(`notesHtml`) rather than `inline()`: a blank line starts a paragraph (19 of 95 notes), `- `
+starts a list item with two-space continuation lines folded into it (3 notes), and anything else
+is hard-wrapped prose where newline-to-space is right. Every other field is hard-wrapped prose
+throughout — no precondition in the current data contains a blank line or a bullet — which is why
+`inline()` is still correct for them. Ligatures come back *on* inside a note, because that text is
+read rather than retyped; the `code` spans inside it switch them off again.
 
 ## Layout
 
@@ -225,6 +270,7 @@ unaffected — the rail still pins at `top:16px` and the control bar at `top:0`.
 | `.cid` | mono 11.5px, 600, radius 3px, `--surface-3` | Tinted `--pass-soft` / `--fail-soft` once judged. |
 | `.sec-head` | `border-bottom:2px solid var(--ink)` | The only 2px ink rule on the page — it is what separates suites. |
 | `pre` | mono 12.5px/1.62, `--surface-2`, radius 5px, `tab-size:2` | Expected output overrides to `--accent-soft` + `--accent-line`, so steps and expected never blur together. |
+| `.fnote` | serif 14.5px/1.62, 62ch, 1px `--line` leading rule, 13px inset | Case notes. No label and no chip on its inline code — see "Notes are a gloss". |
 | `.chip` | mono 12px, radius 5px, `aria-pressed` | Filters. Active state fills with `--accent`. |
 | `.vb` | mono 12px, 600, radius 5px | Pass / Fail / Clear. Fills with its semantic colour when pressed. |
 | `.copy` | absolute, `opacity:0` until `.codewrap:hover` or `:focus-visible` | Hidden affordance that must stay keyboard-reachable — hence the focus condition. |
@@ -285,6 +331,9 @@ actually needs to paste, rather than a disclaimer. It reuses the case components
   `aria-label`.
 - Verdicts are never colour-only — gutter, chip tint, tick height and a text label change
   together, and the default "Untested" survives in a `.vh` span for screen readers.
+- The notes field carries a `.vh` "Notes" span for the same reason. Dropping its visible label was
+  a typographic decision; a screen reader still hears the field named, in step with the other
+  three. Anything else that loses a label for visual reasons owes the same span.
 
 ## Extending it
 
@@ -321,15 +370,18 @@ actually needs to paste, rather than a disclaimer. It reuses the case components
 
 ## Constraints worth knowing
 
-- **Webfonts are fetched from Google Fonts** — IBM Plex Sans, IBM Plex Serif and JetBrains Mono,
-  in one request. Offline, the page falls back to the system stacks and still works.
-  `docs/manual.html` deliberately takes the opposite position and ships no webfont at all, so the
-  two documents are inconsistent on this point by choice, not accident.
-- **There is no JetBrains sans on Google Fonts.** JetBrains Mono is the only family of theirs the
-  CDN serves; JetBrains Sans is distributed from jetbrains.com and would have to be self-hosted,
-  which is why the sans and serif roles are still IBM Plex. If someone asks for "JetBrains fonts"
-  across the whole page, that is the trade to put to them — self-hosting font files in the repo
-  versus one CDN request.
+- **Webfonts are fetched from Google Fonts** — JetBrains Mono and IBM Plex Serif, in one request.
+  Offline, the page falls back to the system stacks and still works. `docs/manual.html`
+  deliberately takes the opposite position and ships no webfont at all, so the two documents are
+  inconsistent on this point by choice, not accident.
+- **JetBrains Sans cannot be used here, and the reason is licensing, not availability.** It is not
+  an open-source release the way JetBrains Mono is (OFL-1.1); JetBrains have stated on their own
+  tracker that it is not publicly released, is served exclusively from JetBrains domains, and is
+  licensed only for use with Writerside. There is no repo, no download and no grant, and pulling
+  the `woff2` off their CDN would be an unlicensed copy rather than a workaround. So "use the
+  JetBrains fonts everywhere" resolves to JetBrains Mono everywhere, which is what the page now
+  does. If a proportional face is ever wanted back, JetBrains themselves point to **Inter** as the
+  stand-in; it is OFL and on Google Fonts.
 - **The page is generated, not hand-edited.** Cases are parsed out of `docs/qa-playbook.md` into
   an embedded JSON block on a single long line. Editing case text in the HTML will be overwritten
   on the next regeneration — edit the markdown. There is no generator script in the repo; when

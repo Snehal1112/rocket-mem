@@ -1,0 +1,22 @@
+# Cluster node shard-b — see cluster.conf and rocket-mem.toml (shard-a) for context.
+# TLS omitted here for simplicity; only shard-a exposes TLS ports for this benchmark setup.
+
+addr = "numericlabs.lxd:6380"
+rmp_addr = "numericlabs.lxd:7380"
+metrics_addr = "numericlabs.lxd:9122"
+
+aof_path = "./appendonly-shard-b.aof"
+snapshot_path = "./dump-shard-b.snapshot"
+
+slowlog_threshold_micros = 0
+
+cluster_config = "/home/numericlabs/data/rocket/rocket-mem/cluster.conf"
+cluster_node_id = "shard-b"
+
+# Must match shard-a's ACL users: a client redirected here by MOVED re-authenticates
+# against this node, not shard-a.
+[[acl.users]]
+username = "app"
+password = "changeme"
+enabled = true
+rules = ["allcommands", "allkeys"]

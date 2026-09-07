@@ -1,0 +1,18 @@
+# Replica of cluster node shard-c. Not a cluster member itself -- no cluster_config/
+# cluster_node_id here. Becomes read-only once `REPLICAOF 127.0.0.1 6381` is sent to it.
+
+addr = "numericlabs.lxd:6481"
+rmp_addr = "numericlabs.lxd:7481"
+metrics_addr = "numericlabs.lxd:9223"
+
+aof_path = "./appendonly-shard-c-replica.aof"
+snapshot_path = "./dump-shard-c-replica.snapshot"
+
+slowlog_threshold_micros = 0
+
+# Must match shard-c's ACL users to authenticate the replication connection.
+[[acl.users]]
+username = "app"
+password = "changeme"
+enabled = true
+rules = ["allcommands", "allkeys"]

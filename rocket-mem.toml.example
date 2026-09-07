@@ -1,0 +1,93 @@
+# Example rocket-mem.toml — every field the server understands, with its default value
+# noted in a comment. Copy to rocket-mem.toml (auto-picked up from the current directory)
+# or pass --config <path>, then uncomment and edit only what you need to change.
+#
+# Layering: built-in defaults < this file < ROCKET_MEM_* env vars < CLI flags.
+# A field left unset here simply falls through to the next layer down, so there's no
+# need to fully specify this file — set only what you want to change from the default.
+# See docs/config-reference.md for the full reference this file mirrors.
+
+# TCP address the RESP listener binds to. Any Redis client (redis-cli, redis-py,
+# ioredis, go-redis, ...) connects here.
+# addr = "127.0.0.1:6379"
+
+# TCP address the RMP (rocket-mem's own binary protocol) listener binds to.
+# Reachable only via the rmp-client crate, not redis-cli.
+# rmp_addr = "127.0.0.1:6380"
+
+# TCP address the Prometheus /metrics HTTP endpoint binds to. Loopback by default
+# because it has no authentication of its own, ACL or not.
+# metrics_addr = "127.0.0.1:9121"
+
+# Path to the append-only file used for write-durability and crash recovery.
+# aof_path = "./appendonly.aof"
+
+# Path to the point-in-time snapshot file written by SAVE and loaded on startup.
+# snapshot_path = "./dump.snapshot"
+
+# Minimum command duration, in microseconds, that gets recorded to the slow log.
+# 0 disables the slow log entirely.
+# slowlog_threshold_micros = 10000
+
+# --- Cluster mode -----------------------------------------------------------
+# Both fields are unset by default (standalone mode). Setting one requires the other.
+
+# Path to the cluster topology file: one "<node-id> <host:port> <first-slot> <last-slot>"
+# line per node, covering all 16384 slots exactly once.
+# cluster_config = "/etc/rocket-mem/cluster.conf"
+
+# This node's id, matched against a line in cluster_config's topology file.
+# cluster_node_id = "shard-a"
+
+# --- TLS ---------------------------------------------------------------------
+# TLS listeners run *alongside* the plaintext ones — they never replace addr/rmp_addr.
+# Setting either tls_resp_addr or tls_rmp_addr requires both tls_cert_path and
+# tls_key_path to also be set; startup fails hard otherwise, before binding anything.
+# Server-auth only — no mutual TLS, no client certificate is ever requested.
+
+# TLS-wrapped RESP listener, run alongside the plaintext one at `addr`.
+# tls_resp_addr = "0.0.0.0:16379"
+
+# TLS-wrapped RMP listener, run alongside the plaintext one at `rmp_addr`.
+# tls_rmp_addr = "0.0.0.0:16380"
+
+# PEM certificate chain, shared by both TLS listeners. Resolved relative to the
+# server's working directory, not to this file — prefer an absolute path.
+# tls_cert_path = "/etc/rocket-mem/tls/server.crt"
+
+# PEM private key, shared by both TLS listeners. Same relative-path caveat as above.
+# tls_key_path = "/etc/rocket-mem/tls/server.key"
+
+# --- ACL / authentication -----------------------------------------------------
+# File-only: there is no flat ROCKET_MEM_* env var that can express an array of
+# tables. Defining even one user here turns authentication ON for the whole server —
+# there is no requirepass-style switch, and there is no recovery command short of
+# restarting with an edited file if every user gets locked out.
+#
+# Bootstrap users here live only in memory at runtime: a user added later via the
+# ACL SETUSER command is NOT persisted and is lost on restart unless it's also added
+# to this array.
+#
+# Fields per entry:
+#   username  string             required. Name passed to AUTH.
+#   password  string, optional   default: unset (nopass — any password, or none, is
+#                                 accepted). Plaintext here is argon2-hashed once at
+#                                 startup and never written back out in plaintext —
+#                                 not to the AOF, the snapshot, the slow log, or any
+#                                 error message.
+#   enabled   bool                default: true. false = loaded but AUTH rejects it.
+#   rules     array of strings   default: [] (denies every command and key until
+#                                 rules are added). Same token vocabulary as the
+#                                 ACL SETUSER command: allcommands/nocommands, allkeys,
+#                                 +CMD/-CMD, ~pattern. Applied left to right — a later
+#                                 rule overrides an earlier one where they overlap.
+
+# [[acl.users]]
+# username = "admin"
+# password = "change-me"
+# enabled = true
+# rules = ["allcommands", "allkeys"]
+
+# [[acl.users]]
+# username = "readonly"
+# rules = ["~app:*", "+get"]

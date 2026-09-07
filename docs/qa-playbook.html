@@ -11,7 +11,7 @@ if(m==='light'||m==='dark')document.documentElement.setAttribute('data-theme',m)
 </script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Serif:ital@1&family=JetBrains+Mono:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Serif:ital,wght@0,400;0,600;1,400&family=JetBrains+Mono:wght@400;500;600;700&display=swap">
 <style>
 :root{
   --ground:#F6F8F9; --surface:#FFFFFF; --surface-2:#EDF1F3; --surface-3:#E3EAED;
@@ -22,8 +22,10 @@ if(m==='light'||m==='dark')document.documentElement.setAttribute('data-theme',m)
   --fail:#B02128; --fail-soft:#FAE6E7;
   --gap:#9A5A08;
   --tick:#CAD7DC;
-  --sans:"IBM Plex Sans",ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
   --mono:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  /* The page is set in one face. --sans stays a distinct token so the two roles
+     can be split again by giving it its own stack, without touching 60-odd rules. */
+  --sans:var(--mono);
   --serif:"IBM Plex Serif",Georgia,"Times New Roman",serif;
 }
 @media (prefers-color-scheme:dark){
@@ -51,9 +53,13 @@ if(m==='light'||m==='dark')document.documentElement.setAttribute('data-theme',m)
 *{box-sizing:border-box}
 /* A class-level display rule outranks the UA [hidden] rule, so restate it. */
 [hidden]{display:none!important}
-/* Column flex keeps the footer at the viewport bottom when a filter empties the list. */
+/* JetBrains Mono ligates -- -> :: and //, which the case text is full of. A tester compares
+   expected against actual character by character, so keep every glyph literal. Set here rather
+   than on pre/code because the whole page is mono now, case titles and prose included.
+   Column flex keeps the footer at the viewport bottom when a filter empties the list. */
 body{margin:0;background:var(--ground);color:var(--ink);font-family:var(--sans);line-height:1.5;
   -webkit-font-smoothing:antialiased;font-size:15px;
+  font-variant-ligatures:none;font-feature-settings:"liga" 0,"calt" 0;
   min-height:100vh;display:flex;flex-direction:column}
 .shell{flex:1 0 auto;width:100%}
 a{color:var(--accent)}
@@ -214,9 +220,24 @@ h1{font-size:clamp(25px,3.4vw,33px);font-weight:700;letter-spacing:-.022em}
 .ftext{font-size:13.5px;color:var(--ink-2);max-width:76ch;margin:0}
 .ftext code{font-family:var(--mono);font-size:12.5px;background:var(--surface-2);
   padding:1px 4px;border-radius:3px;color:var(--ink)}
-/* JetBrains Mono ligates -- -> :: and //, which the commands and output here are full of.
-   A tester compares expected against actual character by character, so keep every glyph literal. */
-pre,code{font-variant-ligatures:none;font-feature-settings:"liga" 0,"calt" 0}
+/* A note is the only field where a person talks to the tester rather than the machine stating a
+   literal, so it carries the page's only proportional face and takes no visible label — the voice
+   is the signal. The hairline on its leading edge is the old marginal-gloss device, marking it as
+   commentary on the fields above rather than a fourth field of its own; 1px and neutral so it
+   never competes with the known-defect callout's 3px amber rule. Ligatures come back on: this is
+   prose to read, not a string to retype. */
+.fnote{font-family:var(--serif);font-size:14.5px;line-height:1.62;color:var(--ink-2);
+  max-width:62ch;margin:2px 0 0;padding-left:13px;border-left:1px solid var(--line);
+  font-variant-ligatures:normal;font-feature-settings:normal}
+.fnote p{margin:0 0 10px}
+.fnote p:last-child,.fnote ul:last-child{margin-bottom:0}
+.fnote ul{margin:0 0 10px;padding-left:19px;display:flex;flex-direction:column;gap:8px}
+.fnote strong{font-weight:600;color:var(--ink)}
+/* Mono inside serif is what keeps a command name reading as a literal string. It needs no chip
+   behind it the way mono-inside-mono did — against serif the face alone carries it, and the
+   pills made every line bumpy. Ligatures off again, for the reason they are off page-wide. */
+.fnote code{font-family:var(--mono);font-size:13px;color:var(--ink);
+  font-variant-ligatures:none;font-feature-settings:"liga" 0,"calt" 0}
 pre{margin:0;font-family:var(--mono);font-size:12.5px;line-height:1.62;background:var(--surface-2);
   border:1px solid var(--line);border-radius:5px;padding:11px 12px;overflow-x:auto;
   color:var(--ink);white-space:pre;tab-size:2}
@@ -437,6 +458,24 @@ export ROCKET_MEM_BIN="$ROCKET_MEM_REPO/target/release/rocket-mem"</pre>
                  .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
                  .replace(/\n/g, ' ');
   }
+  // Notes are the only field authored with block structure: a blank line starts a new paragraph,
+  // "- " starts a list item, and a two-space-indented line continues the item above it. Every
+  // other field is hard-wrapped prose, where inline()'s newline-to-space is the right answer.
+  function notesHtml(t){
+    var out = '';
+    String(t == null ? '' : t).split(/\n[ \t]*\n/).forEach(function(block){
+      var items = [], para = [];
+      block.split('\n').forEach(function(ln){
+        var bullet = /^-[ \t]+(.*)$/.exec(ln);
+        if (bullet) items.push(bullet[1]);
+        else if (items.length) items[items.length - 1] += ' ' + ln.trim();
+        else para.push(ln.trim());
+      });
+      if (para.join(' ').trim()) out += '<p>' + inline(para.join(' ')) + '</p>';
+      if (items.length) out += '<ul><li>' + items.map(inline).join('</li><li>') + '</li></ul>';
+    });
+    return out;
+  }
   // Same subset, stripped rather than rendered, for tooltips and labels.
   function plain(t){ return String(t == null ? '' : t).replace(/[`*]/g,'').replace(/\n/g,' '); }
   function slug(t){ return t.toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,''); }
@@ -489,8 +528,10 @@ export ROCKET_MEM_BIN="$ROCKET_MEM_REPO/target/release/rocket-mem"</pre>
         if (c.expected) html += '<div class="field"><span class="flabel">Expected output</span>'
           + '<div class="codewrap"><pre class="expected">'+esc(c.expected)+'</pre>'
           + '<button class="copy" data-copy="expected">Copy</button></div></div>';
-        if (c.notes) html += '<div class="field"><span class="flabel">Notes</span>'
-          + '<p class="ftext">'+inline(c.notes)+'</p></div>';
+        // The label is dropped visually — the serif says "note" on sight — but assistive tech
+        // still needs the field named, the same trick the untested verdict uses.
+        if (c.notes) html += '<div class="field"><span class="vh">Notes</span>'
+          + '<div class="fnote">'+notesHtml(c.notes)+'</div></div>';
         html += '<div class="verdict">'
           + '<button class="vb p" data-v="pass" aria-pressed="'+(st==='pass')+'">Pass</button>'
           + '<button class="vb f" data-v="fail" aria-pressed="'+(st==='fail')+'">Fail</button>'

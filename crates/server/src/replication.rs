@@ -525,8 +525,35 @@ where
     // `send()`, so nothing has been read from the socket yet on the codec side.
     let mut parts = framed.into_parts();
     use tokio::io::AsyncReadExt;
+
+    // The leader can reject PSYNC outright (e.g. NOAUTH, when it has ACL users configured and
+    // this connection never authenticated) with a plain RESP error line instead of the raw
+    // length prefix expected next. A `-` first byte is never a valid length-prefix byte in
+    // practice (it would require an implausible ~2^56-magnitude blob), so it reliably
+    // distinguishes the two cases. Without this check, the error line's bytes get read as a
+    // little-endian u64 length and the following `vec![0u8; len]` aborts the process.
+    let mut first_byte = [0u8; 1];
+    parts.io.read_exact(&mut first_byte).await?;
+    if first_byte[0] == b'-' {
+        let mut line = Vec::new();
+        loop {
+            let mut b = [0u8; 1];
+            parts.io.read_exact(&mut b).await?;
+            if b[0] == b'\n' {
+                break;
+            }
+            if b[0] != b'\r' {
+                line.push(b[0]);
+            }
+        }
+        return Err(std::io::Error::other(format!(
+            "leader rejected PSYNC: {}",
+            String::from_utf8_lossy(&line)
+        )));
+    }
     let mut len_buf = [0u8; 8];
-    parts.io.read_exact(&mut len_buf).await?;
+    len_buf[0] = first_byte[0];
+    parts.io.read_exact(&mut len_buf[1..]).await?;
     let len = u64::from_le_bytes(len_buf) as usize;
     let mut blob = vec![0u8; len];
     parts.io.read_exact(&mut blob).await?;
@@ -799,6 +826,51 @@ mod tests {
         fake_leader.await.unwrap();
 
         assert_eq!(engine.get(b"from-snapshot"), None); // stale task must not load its snapshot
+    }
+
+    #[tokio::test]
+    async fn sync_once_returns_an_error_instead_of_crashing_on_a_resp_error_reply() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Simulates an ACL-protected leader rejecting the follower's unauthenticated PSYNC:
+        // a plain RESP error frame, not the raw 8-byte length prefix `sync_once` otherwise
+        // expects next. Before this fix, the first 8 bytes of that error text were read as a
+        // little-endian u64 length ("-NOAUTH " -> 2326201932681530925) and the subsequent
+        // `vec![0u8; len]` aborted the whole process with an allocation failure.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let fake_leader = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut psync_bytes = [0u8; 15];
+            socket.read_exact(&mut psync_bytes).await.unwrap();
+            socket
+                .write_all(b"-NOAUTH Authentication required.\r\n")
+                .await
+                .unwrap();
+        });
+
+        let engine = engine::Engine::new();
+        let host_port = addr.to_string();
+        let generation = Arc::new(AtomicU64::new(0));
+        let stream = tokio::net::TcpStream::connect(&host_port).await.unwrap();
+
+        let result = sync_once(
+            stream,
+            &engine,
+            &generation,
+            0,
+            None,
+            &AtomicI64::new(0),
+            &AtomicBool::new(false),
+        )
+        .await;
+
+        fake_leader.await.unwrap();
+        assert!(
+            result.is_err(),
+            "sync_once must reject a non-length-prefixed reply instead of misreading it as a blob length"
+        );
     }
 
     /// Proves the apply loop's `lock_for_ordering()` guard is load-bearing, not decorative.
