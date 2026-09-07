@@ -206,6 +206,36 @@ impl ClusterConfig {
         me.first_slot <= slot && slot <= me.last_slot
     }
 
+    /// Full multi-line topology listing, one line per node in `first_slot` order with this
+    /// process's own entry flagged `(this node)`. `main.rs`'s startup banner previously printed
+    /// only this node's own slot range plus a bare node count, hiding where the other nodes
+    /// actually are -- this is what it prints instead. Id/addr/slot-range columns are padded to
+    /// the widest entry so the listing lines up instead of ragged-wrapping around whichever
+    /// node happens to have the longest hostname.
+    pub fn topology_summary(&self) -> String {
+        let id_width = self.nodes.iter().map(|n| n.id.len()).max().unwrap_or(0);
+        let addr_width = self.nodes.iter().map(|n| n.addr.len()).max().unwrap_or(0);
+        let slots = self
+            .nodes
+            .iter()
+            .map(|n| format!("slots {}-{}", n.first_slot, n.last_slot))
+            .collect::<Vec<_>>();
+        let slots_width = slots.iter().map(String::len).max().unwrap_or(0);
+        self.nodes
+            .iter()
+            .zip(&slots)
+            .enumerate()
+            .map(|(i, (n, slots))| {
+                let marker = if i == self.myself { " (this node)" } else { "" };
+                format!(
+                    "{:id_width$}  {:addr_width$}  {slots:slots_width$}{marker}",
+                    n.id, n.addr
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// Reads the topology file at `path` and delegates to `parse`. A missing file surfaces as
     /// the underlying `NotFound` io::Error rather than being treated as "cluster mode off":
     /// `ROCKET_MEM_CLUSTER_CONFIG` being *set* to a path that doesn't exist is an operator
@@ -289,6 +319,17 @@ shard-c 127.0.0.1:7003 10923 16383
         let config = ClusterConfig::parse(THREE_SHARDS, "shard-b").unwrap();
         assert_eq!(config.myself().id, "shard-b");
         assert_eq!(config.myself().addr, "127.0.0.1:7002");
+    }
+
+    #[test]
+    fn topology_summary_lists_every_node_and_flags_this_one() {
+        let config = ClusterConfig::parse(THREE_SHARDS, "shard-b").unwrap();
+        assert_eq!(
+            config.topology_summary(),
+            "shard-a  127.0.0.1:7001  slots 0-5460     \n\
+             shard-b  127.0.0.1:7002  slots 5461-10922  (this node)\n\
+             shard-c  127.0.0.1:7003  slots 10923-16383"
+        );
     }
 
     #[test]

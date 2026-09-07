@@ -10,7 +10,8 @@ use std::process::{Child, Command, Stdio};
 /// Parses the startup banner's `RESP <addr>` listener row rather than matching a fixed
 /// string: the banner pads/colors labels for a human reader, so only the first
 /// whitespace-separated token is a stable contract. Matching the exact token `"RESP"` (not a
-/// prefix) also skips the `RESP+TLS` row when TLS happens to be configured.
+/// prefix) also skips the `RESP+TLS` row when TLS happens to be configured. The banner draws
+/// each row inside a box border, so the frame characters are stripped before splitting.
 fn spawn_server(aof_path: &std::path::Path) -> (Child, String) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_rocket-mem"))
         .env("ROCKET_MEM_ADDR", "127.0.0.1:0")
@@ -29,7 +30,7 @@ fn spawn_server(aof_path: &std::path::Path) -> (Child, String) {
         match reader.read_line(&mut line) {
             Ok(0) => break, // EOF — the process exited before printing anything useful
             Ok(_) => {
-                let trimmed = line.trim();
+                let trimmed = line.trim().trim_matches(|c| c == '│' || c == ' ');
                 let mut parts = trimmed.split_whitespace();
                 if parts.next() == Some("RESP") {
                     if let Some(addr_str) = parts.next() {

@@ -182,7 +182,8 @@ async fn handle_connection<S>(
                 }
                 continue; // let the client retry after AUTH/HELLO ... AUTH, or give up
             }
-            serve_replica(framed, &aof, &replication).await;
+            let advertised_addr = psync_advertised_addr(&frame);
+            serve_replica(framed, &aof, &replication, advertised_addr).await;
             return; // serve_replica never returns until the replica connection dies
         }
         let response =
@@ -219,6 +220,20 @@ fn is_psync_command(frame: &protocol::Frame) -> bool {
     name.eq_ignore_ascii_case(b"PSYNC")
 }
 
+/// Pulls the follower's advertised RESP listen address from its `PSYNC` frame, when present --
+/// `PSYNC <addr>`, the second array element. `None` for a bare `PSYNC` (an old client, or any
+/// test that doesn't send one), which is exactly what pre-this-feature behavior was. Feeds
+/// `ReplicaRegistry::register`, which in turn feeds `INFO REPLICATION`'s `slaveN:` lines.
+fn psync_advertised_addr(frame: &protocol::Frame) -> Option<String> {
+    let protocol::Frame::Array(items) = frame else {
+        return None;
+    };
+    let protocol::Frame::Bulk(bytes) = items.get(1)? else {
+        return None;
+    };
+    Some(String::from_utf8_lossy(bytes).into_owned())
+}
+
 /// Takes ownership of `framed`'s underlying socket and never returns until the replica
 /// connection dies. `PSYNC` has no reply frame of its own — the length-prefixed snapshot blob
 /// (not a RESP value) stands in for one.
@@ -226,6 +241,7 @@ async fn serve_replica<S>(
     framed: Framed<S, RespCodec>,
     aof: &AofWriter,
     replication: &crate::replication::ReplicationHandle,
+    advertised_addr: Option<String>,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -242,7 +258,7 @@ async fn serve_replica<S>(
         let _order_guard = aof.lock_for_ordering();
         let bytes = replication.engine().snapshot(0); // 0: a follower keeps no AOF, so the header is moot
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<bytes::Bytes>();
-        replication.registry.register(tx);
+        replication.registry.register(advertised_addr, tx);
         (bytes, rx)
     };
 
@@ -635,6 +651,40 @@ mod tests {
         let mut streamed = vec![0u8; b"*3\r\n$3\r\nSET\r\n$3\r\nnew\r\n$5\r\nvalue\r\n".len()];
         parts.io.read_exact(&mut streamed).await.unwrap();
         assert_eq!(streamed, b"*3\r\n$3\r\nSET\r\n$3\r\nnew\r\n$5\r\nvalue\r\n");
+    }
+
+    #[tokio::test]
+    async fn psync_with_an_advertised_address_registers_it_on_the_leader() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let engine = Arc::new(Engine::new());
+        let (_dir, aof) = test_aof();
+        let replication = Arc::new(crate::replication::ReplicationHandle::new(
+            Arc::clone(&engine),
+            std::env::temp_dir().join("psync-test-unused-3.snapshot"),
+        ));
+        tokio::spawn(serve(
+            listener,
+            Arc::clone(&engine),
+            Arc::clone(&aof),
+            Arc::clone(&replication),
+        ));
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let mut framed = Framed::new(stream, RespCodec::default());
+        framed
+            .send(Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"PSYNC")),
+                Frame::Bulk(Bytes::from_static(b"127.0.0.1:6480")),
+            ]))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await; // let serve_replica register
+
+        assert_eq!(
+            replication.registry.addrs(),
+            vec![Some("127.0.0.1:6480".to_string())]
+        );
     }
 
     #[tokio::test]

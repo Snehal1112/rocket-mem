@@ -15,25 +15,37 @@ fn unix_now_secs() -> i64 {
         .unwrap_or(0)
 }
 
-/// Holds one outbound channel per connected replica. `senders` is a plain `std::sync::Mutex`,
-/// not `tokio::sync::Mutex`: every access is a quick, synchronous push/retain, never held
-/// across an `.await`, so the lighter std lock is the right tool — matching `AofWriter::order`'s
-/// existing choice for the same reason.
+/// Holds one outbound channel per connected replica, paired with the address (if any) that
+/// replica advertised in its `PSYNC` -- see `ReplicationHandle::own_addr`'s doc comment. The
+/// `Mutex` is a plain `std::sync::Mutex`, not `tokio::sync::Mutex`: every access is a quick,
+/// synchronous push/retain, never held across an `.await`, so the lighter std lock is the right
+/// tool — matching `AofWriter::order`'s existing choice for the same reason.
 #[derive(Default)]
 pub struct ReplicaRegistry {
-    senders: std::sync::Mutex<Vec<tokio::sync::mpsc::UnboundedSender<bytes::Bytes>>>,
+    replicas: std::sync::Mutex<
+        Vec<(
+            Option<String>,
+            tokio::sync::mpsc::UnboundedSender<bytes::Bytes>,
+        )>,
+    >,
 }
 
 impl ReplicaRegistry {
-    /// Registers a newly-synced replica's outbound channel. Called only from `serve_replica`
-    /// (Task 4), while it still holds `AofWriter::lock_for_ordering()` — see this plan's
-    /// Global Constraints for why registration must happen inside that same critical section
-    /// as the snapshot walk, not after it.
-    pub fn register(&self, sender: tokio::sync::mpsc::UnboundedSender<bytes::Bytes>) {
-        self.senders
+    /// Registers a newly-synced replica's outbound channel, alongside the address (if any) it
+    /// advertised in its `PSYNC` frame -- `None` for a bare `PSYNC` (an old client, or a test).
+    /// Called only from `serve_replica` (Task 4), while it still holds
+    /// `AofWriter::lock_for_ordering()` — see this plan's Global Constraints for why
+    /// registration must happen inside that same critical section as the snapshot walk, not
+    /// after it.
+    pub fn register(
+        &self,
+        addr: Option<String>,
+        sender: tokio::sync::mpsc::UnboundedSender<bytes::Bytes>,
+    ) {
+        self.replicas
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push(sender);
+            .push((addr, sender));
     }
 
     /// Fans `bytes` out to every registered replica, pruning any whose receiver has been
@@ -41,15 +53,30 @@ impl ReplicaRegistry {
     /// failure to one dead replica must not affect delivery to the others, and must never
     /// roll back the write that already committed on the leader.
     pub fn broadcast(&self, bytes: bytes::Bytes) {
-        let mut senders = self.senders.lock().unwrap_or_else(|e| e.into_inner());
-        senders.retain(|tx| tx.send(bytes.clone()).is_ok());
+        let mut replicas = self.replicas.lock().unwrap_or_else(|e| e.into_inner());
+        replicas.retain(|(_, tx)| tx.send(bytes.clone()).is_ok());
     }
 
     /// How many replicas are currently registered. Note this counts senders, which are pruned
     /// lazily by `broadcast`, so a replica that died since the last write may still be counted
     /// until the next one -- an acceptable lag for a gauge, and cheaper than probing sockets.
     pub fn len(&self) -> usize {
-        self.senders.lock().unwrap_or_else(|e| e.into_inner()).len()
+        self.replicas
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
+    }
+
+    /// Every currently-registered replica's advertised address, in registration order -- `None`
+    /// for a replica whose `PSYNC` carried no address. Feeds `INFO REPLICATION`'s `slaveN:`
+    /// lines on the leader side; subject to the same lazy-pruning lag as `len`.
+    pub fn addrs(&self) -> Vec<Option<String>> {
+        self.replicas
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(addr, _)| addr.clone())
+            .collect()
     }
 
     /// Required by `clippy::len_without_is_empty`, which `-D warnings` makes a hard error.
@@ -168,6 +195,12 @@ pub struct ReplicationHandle {
     /// `[[acl.users]]`) and at runtime via `ACL SETUSER` (plan 08). Never persisted; see
     /// ../../../docs/superpowers/plans/2026-08-31-sprint-8-plans/04-acl-store-and-bootstrap-wiring.md.
     pub acl: crate::acl::AclStore,
+    /// This node's own RESP listen address, advertised to a leader via `PSYNC <addr>` once this
+    /// node is a follower -- lets the leader's `INFO REPLICATION` report which address to reach
+    /// this replica at (`slaveN:ip=...,port=...`), the same purpose real Redis's `REPLCONF
+    /// listening-port` serves. `None` -- the default -- sends a bare `PSYNC`, matching every
+    /// pre-this-feature test and any deployment that never calls `with_own_addr`.
+    own_addr: Option<String>,
 }
 
 impl ReplicationHandle {
@@ -193,6 +226,7 @@ impl ReplicationHandle {
             link_up: Arc::new(AtomicBool::new(false)),
             slowlog: crate::slowlog::SlowLog::default(),
             acl: crate::acl::AclStore::default(),
+            own_addr: None,
         }
     }
 
@@ -206,6 +240,14 @@ impl ReplicationHandle {
     /// behavior for those.
     pub fn with_aof(mut self, aof: Arc<AofWriter>) -> Self {
         self.aof = Some(aof);
+        self
+    }
+
+    /// Sets this node's own RESP listen address, advertised on every `PSYNC` this node's
+    /// follower loop sends -- see the `own_addr` field's doc comment. Only `main.rs` calls this,
+    /// with `config.addr`.
+    pub fn with_own_addr(mut self, addr: String) -> Self {
+        self.own_addr = Some(addr);
         self
     }
 
@@ -269,6 +311,15 @@ impl ReplicationHandle {
     /// what stops a stale task's already-in-flight poll from mutating state after this call
     /// returns — see the `generation` field's doc comment.
     pub fn start_replicating(&self, host_port: String) {
+        self.start_replicating_with_auth(host_port, None);
+    }
+
+    /// Same as `start_replicating`, but also authenticates against the leader with `AUTH
+    /// <username> <password>` before `PSYNC` -- required when the leader has ACL users
+    /// configured, since an unauthenticated `PSYNC` is otherwise rejected with `NOAUTH` and
+    /// replication can never complete. See `handle_replicaof`'s `REPLICAOF ... AUTH user pass`
+    /// clause, the only production caller of this with `Some`.
+    pub fn start_replicating_with_auth(&self, host_port: String, auth: Option<(String, String)>) {
         let mut task = self.follower_task.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(old) = task.take() {
             old.abort();
@@ -281,6 +332,10 @@ impl ReplicationHandle {
         let last_apply = self.last_apply_slot();
         *self.master_addr.lock().unwrap_or_else(|e| e.into_inner()) = Some(host_port.clone());
         let link_up = self.link_up_slot();
+        let identity = FollowerIdentity {
+            own_addr: self.own_addr.clone(),
+            auth,
+        };
         *task = Some(tokio::spawn(replication_client_loop(
             host_port,
             engine,
@@ -289,9 +344,12 @@ impl ReplicationHandle {
                 mine: my_generation,
             },
             aof,
-            last_apply,
-            link_up,
+            FollowerHandles {
+                last_apply,
+                link_up,
+            },
             tls_client_config,
+            identity,
         )));
         self.is_replica.store(true, Ordering::Relaxed);
     }
@@ -400,6 +458,35 @@ impl Generation {
     }
 }
 
+/// Bundles the two follower-status slots `sync_once`'s apply loop keeps live -- every caller
+/// down this call chain needs both together, and bundling them here is what keeps
+/// `replication_client_loop`/`connect_and_sync`/`sync_once` under clippy's argument-count limit,
+/// the same reasoning as `Generation` above.
+struct FollowerStatus<'a> {
+    last_apply: &'a AtomicI64,
+    link_up: &'a AtomicBool,
+}
+
+/// Owned counterpart of `FollowerStatus`, held across the whole `replication_client_loop`
+/// (which needs its own `Arc`s, being `'static`) -- bundled for the same argument-count reason.
+struct FollowerHandles {
+    last_apply: Arc<AtomicI64>,
+    link_up: Arc<AtomicBool>,
+}
+
+/// What this follower tells the leader about itself when it `PSYNC`s: the address it
+/// advertises (see `ReplicationHandle::own_addr`'s doc comment) and, when the leader has ACL
+/// users configured, `AUTH` credentials -- `(username, password)`. Without this, `PSYNC` against
+/// an ACL-protected leader is rejected with `NOAUTH` and replication can never complete (see
+/// `sync_once`'s handling of a RESP error reply). Bundled into one struct, rather than two more
+/// parameters, so `replication_client_loop`/`connect_and_sync`/`sync_once` stay under clippy's
+/// argument-count limit -- the same reasoning as `Generation`/`FollowerStatus` above.
+#[derive(Clone, Default)]
+struct FollowerIdentity {
+    own_addr: Option<String>,
+    auth: Option<(String, String)>,
+}
+
 /// Connects to `host_port`, syncs, applies the leader's stream forever, and reconnects (after
 /// a fixed ~1s backoff) on any failure — including the leader simply closing the connection.
 /// There is no distinction between "first sync" and "resync after disconnect": both run this
@@ -411,22 +498,26 @@ async fn replication_client_loop(
     engine: Arc<Engine>,
     generation: Generation,
     aof: Option<Arc<AofWriter>>,
-    last_apply: Arc<AtomicI64>,
-    link_up: Arc<AtomicBool>,
+    handles: FollowerHandles,
     tls_client_config: Option<Arc<rustls::ClientConfig>>,
+    identity: FollowerIdentity,
 ) {
     loop {
         if generation.is_stale() {
             return; // superseded before even starting this iteration's sync
         }
+        let status = FollowerStatus {
+            last_apply: &handles.last_apply,
+            link_up: &handles.link_up,
+        };
         match connect_and_sync(
             &host_port,
             &engine,
             &generation,
             aof.as_deref(),
-            &last_apply,
-            &link_up,
+            status,
             tls_client_config.as_ref(),
+            &identity,
         )
         .await
         {
@@ -435,7 +526,7 @@ async fn replication_client_loop(
                 tracing::warn!(%host_port, error = %e, "replication connection lost, reconnecting")
             }
         }
-        link_up.store(false, Ordering::Relaxed);
+        handles.link_up.store(false, Ordering::Relaxed);
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
 }
@@ -450,9 +541,9 @@ async fn connect_and_sync(
     engine: &Engine,
     generation: &Generation,
     aof: Option<&AofWriter>,
-    last_apply: &AtomicI64,
-    link_up: &AtomicBool,
+    status: FollowerStatus<'_>,
     tls_client_config: Option<&Arc<rustls::ClientConfig>>,
+    identity: &FollowerIdentity,
 ) -> std::io::Result<()> {
     let tcp = tokio::net::TcpStream::connect(host_port).await?;
     match tls_client_config {
@@ -471,8 +562,8 @@ async fn connect_and_sync(
                 &generation.counter,
                 generation.mine,
                 aof,
-                last_apply,
-                link_up,
+                status,
+                identity,
             )
             .await
         }
@@ -483,8 +574,8 @@ async fn connect_and_sync(
                 &generation.counter,
                 generation.mine,
                 aof,
-                last_apply,
-                link_up,
+                status,
+                identity,
             )
             .await
         }
@@ -506,18 +597,57 @@ async fn sync_once<S>(
     generation: &AtomicU64,
     my_generation: u64,
     aof: Option<&AofWriter>,
-    last_apply: &AtomicI64,
-    link_up: &AtomicBool,
+    status: FollowerStatus<'_>,
+    identity: &FollowerIdentity,
 ) -> std::io::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let mut framed = tokio_util::codec::Framed::new(stream, protocol::codec::RespCodec::default());
-    framed
-        .send(protocol::Frame::Array(vec![protocol::Frame::Bulk(
-            bytes::Bytes::from_static(b"PSYNC"),
-        )]))
-        .await?;
+
+    // Authenticate first, when configured -- an ACL-protected leader rejects an unauthenticated
+    // PSYNC with NOAUTH (handled below as a RESP error reply), so replication can never
+    // otherwise complete against one. AUTH's reply is a normal RESP frame (unlike PSYNC's, which
+    // is a raw length-prefixed blob), so it round-trips through the codec's ordinary
+    // send/next -- no need for the raw-socket handling PSYNC's reply requires.
+    if let Some((username, password)) = &identity.auth {
+        framed
+            .send(protocol::Frame::Array(vec![
+                protocol::Frame::Bulk(bytes::Bytes::from_static(b"AUTH")),
+                protocol::Frame::Bulk(bytes::Bytes::copy_from_slice(username.as_bytes())),
+                protocol::Frame::Bulk(bytes::Bytes::copy_from_slice(password.as_bytes())),
+            ]))
+            .await?;
+        match framed.next().await {
+            Some(Ok(protocol::Frame::Error(e))) => {
+                return Err(std::io::Error::other(format!("leader rejected AUTH: {e}")))
+            }
+            Some(Ok(_)) => {} // +OK -- proceed to PSYNC
+            Some(Err(e)) => return Err(e),
+            None => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "leader closed the connection during AUTH",
+                ))
+            }
+        }
+    }
+
+    // Advertising `own_addr` (when configured) is what lets the leader's `INFO REPLICATION`
+    // report a `slaveN:ip=...,port=...` line naming an address an operator can actually
+    // reconnect to -- the connection's own peer address is an ephemeral source port, not this
+    // node's listening port, so the leader has no way to learn it otherwise. A bare `PSYNC`
+    // (`own_addr: None`) matches every pre-this-feature test and deployment.
+    let psync_frame = match &identity.own_addr {
+        Some(addr) => protocol::Frame::Array(vec![
+            protocol::Frame::Bulk(bytes::Bytes::from_static(b"PSYNC")),
+            protocol::Frame::Bulk(bytes::Bytes::copy_from_slice(addr.as_bytes())),
+        ]),
+        None => protocol::Frame::Array(vec![protocol::Frame::Bulk(bytes::Bytes::from_static(
+            b"PSYNC",
+        ))]),
+    };
+    framed.send(psync_frame).await?;
 
     // Reclaim the raw socket to read the length-prefixed snapshot blob, which is NOT a RESP
     // frame — decoding it through RespCodec would desync the stream entirely. `read_buf` is
@@ -564,7 +694,7 @@ where
     engine
         .load_snapshot(&blob)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-    link_up.store(true, Ordering::Relaxed);
+    status.link_up.store(true, Ordering::Relaxed);
 
     // From here on the leader sends plain RESP frames, byte-for-byte what its own AOF
     // received — rebuild a Framed over the same socket (whose read position is exactly past
@@ -593,7 +723,7 @@ where
         if let protocol::Frame::Error(e) = reply {
             tracing::error!(error = %e, "failed to apply replicated command");
         }
-        last_apply.store(unix_now_secs(), Ordering::Relaxed);
+        status.last_apply.store(unix_now_secs(), Ordering::Relaxed);
     }
     Ok(())
 }
@@ -639,8 +769,8 @@ mod tests {
         let registry = ReplicaRegistry::default();
         let (tx1, mut rx1) = tokio::sync::mpsc::unbounded_channel();
         let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
-        registry.register(tx1);
-        registry.register(tx2);
+        registry.register(None, tx1);
+        registry.register(None, tx2);
 
         registry.broadcast(bytes::Bytes::from_static(b"hello"));
 
@@ -654,8 +784,8 @@ mod tests {
         let (tx1, rx1) = tokio::sync::mpsc::unbounded_channel();
         drop(rx1); // simulate a dead replica connection
         let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
-        registry.register(tx1);
-        registry.register(tx2);
+        registry.register(None, tx1);
+        registry.register(None, tx2);
 
         registry.broadcast(bytes::Bytes::from_static(b"a"));
         registry.broadcast(bytes::Bytes::from_static(b"b")); // the dead sender must be pruned by now
@@ -669,6 +799,20 @@ mod tests {
     fn broadcast_with_no_registered_replicas_does_nothing() {
         let registry = ReplicaRegistry::default();
         registry.broadcast(bytes::Bytes::from_static(b"hello")); // must not panic
+    }
+
+    #[test]
+    fn addrs_returns_registered_addresses_in_registration_order() {
+        let registry = ReplicaRegistry::default();
+        let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
+        let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel();
+        registry.register(Some("127.0.0.1:6480".to_string()), tx1);
+        registry.register(None, tx2); // a bare PSYNC advertised no address
+
+        assert_eq!(
+            registry.addrs(),
+            vec![Some("127.0.0.1:6480".to_string()), None]
+        );
     }
 
     #[test]
@@ -756,8 +900,11 @@ mod tests {
                     &generation,
                     0,
                     None,
-                    &AtomicI64::new(0),
-                    &AtomicBool::new(false),
+                    FollowerStatus {
+                        last_apply: &AtomicI64::new(0),
+                        link_up: &AtomicBool::new(false),
+                    },
+                    &FollowerIdentity::default(),
                 )
                 .await
             })
@@ -818,8 +965,11 @@ mod tests {
             &generation,
             0,
             None,
-            &AtomicI64::new(0),
-            &AtomicBool::new(false),
+            FollowerStatus {
+                last_apply: &AtomicI64::new(0),
+                link_up: &AtomicBool::new(false),
+            },
+            &FollowerIdentity::default(),
         )
         .await
         .unwrap();
@@ -861,8 +1011,11 @@ mod tests {
             &generation,
             0,
             None,
-            &AtomicI64::new(0),
-            &AtomicBool::new(false),
+            FollowerStatus {
+                last_apply: &AtomicI64::new(0),
+                link_up: &AtomicBool::new(false),
+            },
+            &FollowerIdentity::default(),
         )
         .await;
 
@@ -870,6 +1023,168 @@ mod tests {
         assert!(
             result.is_err(),
             "sync_once must reject a non-length-prefixed reply instead of misreading it as a blob length"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_once_advertises_its_own_address_in_the_psync_frame_when_configured() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let fake_leader = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut framed =
+                tokio_util::codec::Framed::new(socket, protocol::codec::RespCodec::default());
+            let frame = framed.next().await.unwrap().unwrap();
+            assert_eq!(
+                frame,
+                protocol::Frame::Array(vec![
+                    protocol::Frame::Bulk(bytes::Bytes::from_static(b"PSYNC")),
+                    protocol::Frame::Bulk(bytes::Bytes::from_static(b"127.0.0.1:6479")),
+                ])
+            );
+            // Reject it so `sync_once` returns quickly instead of hanging on a length prefix
+            // that will never come -- this test only cares about the outgoing PSYNC frame.
+            framed
+                .send(protocol::Frame::Error("ERR test stub".into()))
+                .await
+                .unwrap();
+        });
+
+        let engine = engine::Engine::new();
+        let host_port = addr.to_string();
+        let generation = Arc::new(AtomicU64::new(0));
+        let stream = tokio::net::TcpStream::connect(&host_port).await.unwrap();
+
+        let _ = sync_once(
+            stream,
+            &engine,
+            &generation,
+            0,
+            None,
+            FollowerStatus {
+                last_apply: &AtomicI64::new(0),
+                link_up: &AtomicBool::new(false),
+            },
+            &FollowerIdentity {
+                own_addr: Some("127.0.0.1:6479".to_string()),
+                auth: None,
+            },
+        )
+        .await;
+
+        fake_leader.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sync_once_authenticates_before_psync_when_credentials_are_configured() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let fake_leader = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut framed =
+                tokio_util::codec::Framed::new(socket, protocol::codec::RespCodec::default());
+            let auth_frame = framed.next().await.unwrap().unwrap();
+            assert_eq!(
+                auth_frame,
+                protocol::Frame::Array(vec![
+                    protocol::Frame::Bulk(bytes::Bytes::from_static(b"AUTH")),
+                    protocol::Frame::Bulk(bytes::Bytes::from_static(b"app")),
+                    protocol::Frame::Bulk(bytes::Bytes::from_static(b"changeme")),
+                ]),
+                "AUTH must be sent, with the configured credentials, before PSYNC"
+            );
+            framed
+                .send(protocol::Frame::Simple("OK".into()))
+                .await
+                .unwrap();
+
+            let psync_frame = framed.next().await.unwrap().unwrap();
+            assert_eq!(
+                psync_frame,
+                protocol::Frame::Array(vec![protocol::Frame::Bulk(bytes::Bytes::from_static(
+                    b"PSYNC"
+                ))]),
+                "PSYNC must follow a successful AUTH"
+            );
+            // Reject it so sync_once returns quickly -- this test only cares about the AUTH and
+            // PSYNC frames sent, not a full snapshot handshake.
+            framed
+                .send(protocol::Frame::Error("ERR test stub".into()))
+                .await
+                .unwrap();
+        });
+
+        let engine = engine::Engine::new();
+        let host_port = addr.to_string();
+        let generation = Arc::new(AtomicU64::new(0));
+        let stream = tokio::net::TcpStream::connect(&host_port).await.unwrap();
+
+        let _ = sync_once(
+            stream,
+            &engine,
+            &generation,
+            0,
+            None,
+            FollowerStatus {
+                last_apply: &AtomicI64::new(0),
+                link_up: &AtomicBool::new(false),
+            },
+            &FollowerIdentity {
+                own_addr: None,
+                auth: Some(("app".to_string(), "changeme".to_string())),
+            },
+        )
+        .await;
+
+        fake_leader.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sync_once_fails_without_sending_psync_when_auth_is_rejected() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let fake_leader = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut framed =
+                tokio_util::codec::Framed::new(socket, protocol::codec::RespCodec::default());
+            let _auth_frame = framed.next().await.unwrap().unwrap();
+            framed
+                .send(protocol::Frame::Error(
+                    "WRONGPASS invalid username-password pair or user is disabled.".into(),
+                ))
+                .await
+                .unwrap();
+        });
+
+        let engine = engine::Engine::new();
+        let host_port = addr.to_string();
+        let generation = Arc::new(AtomicU64::new(0));
+        let stream = tokio::net::TcpStream::connect(&host_port).await.unwrap();
+
+        let result = sync_once(
+            stream,
+            &engine,
+            &generation,
+            0,
+            None,
+            FollowerStatus {
+                last_apply: &AtomicI64::new(0),
+                link_up: &AtomicBool::new(false),
+            },
+            &FollowerIdentity {
+                own_addr: None,
+                auth: Some(("app".to_string(), "wrong".to_string())),
+            },
+        )
+        .await;
+
+        fake_leader.await.unwrap();
+        assert!(
+            result.is_err(),
+            "sync_once must fail when the leader rejects AUTH, not proceed to PSYNC anyway"
         );
     }
 
@@ -967,8 +1282,11 @@ mod tests {
                     &generation,
                     0,
                     Some(&aof),
-                    &AtomicI64::new(0),
-                    &AtomicBool::new(false),
+                    FollowerStatus {
+                        last_apply: &AtomicI64::new(0),
+                        link_up: &AtomicBool::new(false),
+                    },
+                    &FollowerIdentity::default(),
                 )
                 .await
             })
@@ -1074,7 +1392,7 @@ mod tests {
         let registry = ReplicaRegistry::default();
         assert!(registry.is_empty());
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        registry.register(tx);
+        registry.register(None, tx);
         assert_eq!(registry.len(), 1);
     }
 

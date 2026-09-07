@@ -1,5 +1,7 @@
 # Replica of cluster node shard-a. Not a cluster member itself -- no cluster_config/
-# cluster_node_id here. Becomes read-only once `REPLICAOF 127.0.0.1 6379` is sent to it.
+# cluster_node_id here. Becomes read-only once `REPLICAOF numericlabs.lxd 6379 AUTH app
+# changeme` is sent to it -- the AUTH clause is required because shard-a has ACL users
+# configured; a bare REPLICAOF fails with NOAUTH.
 
 addr = "numericlabs.lxd:6479"
 rmp_addr = "numericlabs.lxd:7479"

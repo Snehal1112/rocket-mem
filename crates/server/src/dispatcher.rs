@@ -1393,7 +1393,11 @@ fn handle_replicaof(
     if !name.eq_ignore_ascii_case(b"REPLICAOF") {
         return None;
     }
-    if items.len() != 3 {
+    // 3: `REPLICAOF <host> <port>` / `REPLICAOF NO ONE`. 6: `REPLICAOF <host> <port> AUTH
+    // <username> <password>` -- needed to sync against a leader with ACL users configured,
+    // since an unauthenticated PSYNC is otherwise rejected with NOAUTH (see
+    // `ReplicationHandle::start_replicating_with_auth`'s doc comment).
+    if items.len() != 3 && items.len() != 6 {
         return Some(Frame::Error(
             "ERR wrong number of arguments for 'replicaof' command".into(),
         ));
@@ -1403,13 +1407,32 @@ fn handle_replicaof(
             "ERR wrong number of arguments for 'replicaof' command".into(),
         ));
     };
+    let auth = if items.len() == 6 {
+        let (Frame::Bulk(auth_kw), Frame::Bulk(username), Frame::Bulk(password)) =
+            (&items[3], &items[4], &items[5])
+        else {
+            return Some(Frame::Error("ERR syntax error".into()));
+        };
+        if !auth_kw.eq_ignore_ascii_case(b"AUTH") {
+            return Some(Frame::Error("ERR syntax error".into()));
+        }
+        Some((
+            String::from_utf8_lossy(username).into_owned(),
+            String::from_utf8_lossy(password).into_owned(),
+        ))
+    } else {
+        None
+    };
 
     if a.eq_ignore_ascii_case(b"NO") && b.eq_ignore_ascii_case(b"ONE") {
+        if auth.is_some() {
+            return Some(Frame::Error("ERR syntax error".into()));
+        }
         replication.stop_replicating();
     } else {
         let host = String::from_utf8_lossy(a);
         let port = String::from_utf8_lossy(b);
-        replication.start_replicating(format!("{host}:{port}"));
+        replication.start_replicating_with_auth(format!("{host}:{port}"), auth);
     }
     Some(Frame::Simple("OK".into()))
 }
@@ -1704,10 +1727,20 @@ fn info_text(
             ));
         } else {
             out.push_str("role:master\r\n");
-            out.push_str(&format!(
-                "connected_slaves:{}\r\n",
-                replication.registry.len()
-            ));
+            let addrs = replication.registry.addrs();
+            out.push_str(&format!("connected_slaves:{}\r\n", addrs.len()));
+            // One `slaveN:` line per connected replica, real Redis's format -- `ip`/`port` come
+            // from the address the replica advertised in its own `PSYNC` (see
+            // `ReplicationHandle::own_addr`'s doc comment), not this connection's ephemeral
+            // source port. `ip=?,port=0` for a replica that advertised none (a bare `PSYNC`,
+            // from an old client or a test) rather than silently omitting the line.
+            for (i, addr) in addrs.iter().enumerate() {
+                let (ip, port) = match addr {
+                    Some(a) => split_addr(a),
+                    None => ("?", 0),
+                };
+                out.push_str(&format!("slave{i}:ip={ip},port={port},state=online\r\n"));
+            }
         }
         out.push_str("\r\n");
     }
@@ -4310,11 +4343,35 @@ mod tests {
         let engine = Engine::new();
         let replication = ReplicationHandle::default();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        replication.registry.register(tx);
+        replication.registry.register(None, tx);
         let text = info_text_for(&replication, &engine, &[b"replication"]);
         assert!(text.contains("role:master\r\n"), "{text}");
         assert!(text.contains("connected_slaves:1\r\n"), "{text}");
         assert!(!text.contains("master_host:"), "{text}");
+    }
+
+    #[test]
+    fn info_lists_each_connected_slaves_advertised_address() {
+        let engine = Engine::new();
+        let replication = ReplicationHandle::default();
+        let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
+        let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel();
+        replication
+            .registry
+            .register(Some("127.0.0.1:6480".to_string()), tx1);
+        replication.registry.register(None, tx2); // a bare PSYNC advertised no address
+
+        let text = info_text_for(&replication, &engine, &[b"replication"]);
+
+        assert!(text.contains("connected_slaves:2\r\n"), "{text}");
+        assert!(
+            text.contains("slave0:ip=127.0.0.1,port=6480,state=online\r\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("slave1:ip=?,port=0,state=online\r\n"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -6671,7 +6728,7 @@ mod tests {
             dir.path().join("unused.snapshot"),
         );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        replication.registry.register(tx);
+        replication.registry.register(None, tx);
 
         dispatch_and_log(
             &engine,
@@ -6704,7 +6761,7 @@ mod tests {
             dir.path().join("unused.snapshot"),
         );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        replication.registry.register(tx);
+        replication.registry.register(None, tx);
 
         dispatch_and_log(
             &engine,
@@ -6752,7 +6809,7 @@ mod tests {
             dir.path().join("unused.snapshot"),
         );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        replication.registry.register(tx);
+        replication.registry.register(None, tx);
 
         dispatch_and_log(
             &engine,
@@ -6894,7 +6951,7 @@ mod tests {
             std::path::PathBuf::from("unused.snapshot"),
         );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        replication.registry.register(tx);
+        replication.registry.register(None, tx);
 
         let reply = dispatch_and_log(
             &engine,
@@ -8000,6 +8057,87 @@ mod tests {
             reply,
             Frame::Error("ERR wrong number of arguments for 'replicaof' command".into())
         );
+    }
+
+    #[test]
+    fn replicaof_with_a_partial_auth_clause_is_a_resp_error() {
+        let engine = std::sync::Arc::new(Engine::new());
+        let (_dir, aof) = test_aof();
+        let replication = ReplicationHandle::new(
+            std::sync::Arc::clone(&engine),
+            "/tmp/unused.snapshot".into(),
+        );
+        // 4 total args (host, port, AUTH, username) -- missing the password, and not the plain
+        // 3-arg form either.
+        let reply = dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"REPLICAOF", b"127.0.0.1", b"1", b"AUTH", b"user"]),
+            &Session::new(),
+            1,
+        );
+        assert_eq!(
+            reply,
+            Frame::Error("ERR wrong number of arguments for 'replicaof' command".into())
+        );
+    }
+
+    #[test]
+    fn replicaof_with_a_misspelled_auth_keyword_is_a_syntax_error() {
+        let engine = std::sync::Arc::new(Engine::new());
+        let (_dir, aof) = test_aof();
+        let replication = ReplicationHandle::new(
+            std::sync::Arc::clone(&engine),
+            "/tmp/unused.snapshot".into(),
+        );
+        let reply = dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[
+                b"REPLICAOF",
+                b"127.0.0.1",
+                b"1",
+                b"AUHT", // typo, not AUTH
+                b"user",
+                b"pass",
+            ]),
+            &Session::new(),
+            1,
+        );
+        assert_eq!(reply, Frame::Error("ERR syntax error".into()));
+    }
+
+    #[tokio::test]
+    async fn replicaof_with_an_auth_clause_returns_ok_and_marks_the_node_a_replica() {
+        let engine = std::sync::Arc::new(Engine::new());
+        let (_dir, aof) = test_aof();
+        let replication = ReplicationHandle::new(
+            std::sync::Arc::clone(&engine),
+            "/tmp/unused.snapshot".into(),
+        );
+
+        let reply = dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[
+                b"REPLICAOF",
+                b"127.0.0.1",
+                b"1", // nothing listens there; connection attempt fails harmlessly in the background
+                b"AUTH",
+                b"app",
+                b"changeme",
+            ]),
+            &Session::new(),
+            1,
+        );
+        assert_eq!(reply, Frame::Simple("OK".into()));
+        assert!(replication
+            .is_replica
+            .load(std::sync::atomic::Ordering::Relaxed));
+        replication.stop_replicating(); // clean up the background task this test started
     }
 
     #[test]

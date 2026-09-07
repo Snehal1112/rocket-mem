@@ -127,6 +127,50 @@ async fn one_leader_two_followers_propagates_writes_within_a_bounded_time_window
     wait_for(&f2_engine, b"k", b"v").await;
 }
 
+/// Reproduces the real-world scenario `REPLICAOF ... AUTH` exists to fix: before it, a follower
+/// could never sync from a leader with ACL users configured at all -- an unauthenticated PSYNC
+/// is rejected with NOAUTH, and (before a separate earlier fix) that rejection actually crashed
+/// the follower outright. This proves both the follower actually links up against the
+/// ACL-protected leader, and that writes still replicate afterward.
+#[tokio::test]
+async fn a_follower_syncs_from_an_acl_protected_leader_when_replicaof_auth_is_used() {
+    let (_leader_dir, _leader_engine, _leader_aof, leader_replication, leader_addr) =
+        spawn_node().await;
+    leader_replication
+        .acl
+        .set_user(
+            "app",
+            &[
+                bytes::Bytes::from_static(b"on"),
+                bytes::Bytes::from_static(b">changeme"),
+                bytes::Bytes::from_static(b"allcommands"),
+                bytes::Bytes::from_static(b"allkeys"),
+            ],
+        )
+        .unwrap();
+
+    let (_f_dir, f_engine, _f_aof, f_replication, _f_addr) = spawn_node().await;
+    f_replication.start_replicating_with_auth(
+        leader_addr.clone(),
+        Some(("app".to_string(), "changeme".to_string())),
+    );
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !f_replication.link_up() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "follower never linked up against the ACL-protected leader"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let client = redis::Client::open(format!("redis://app:changeme@{leader_addr}")).unwrap();
+    let mut con = client.get_multiplexed_async_connection().await.unwrap();
+    let _: () = con.set("k", "v").await.unwrap();
+
+    wait_for(&f_engine, b"k", b"v").await;
+}
+
 // multi_thread, not the default current_thread flavor: serve_replica's snapshot-walk and
 // registry-register have no `.await` between them, so on a single-threaded runtime they'd be
 // atomic with respect to every other task on that same thread regardless of whether the lock

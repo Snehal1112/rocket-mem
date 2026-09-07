@@ -11,6 +11,74 @@ fn paint(code: &str, text: &str, color: bool) -> String {
     }
 }
 
+/// Column width the label ("storage", "cluster", ...) is padded to before the value starts, so
+/// every top-level banner line's value lines up in the same column and sub-items (cluster nodes,
+/// listeners) can indent to that same column underneath.
+const BANNER_LABEL_WIDTH: usize = 10;
+
+/// A banner line's length once `paint`'s ANSI SGR codes are stripped back out -- the box border
+/// has to size itself and pad each line to the *visible* width, not the byte length of a string
+/// that may have escape codes spliced into the middle of it (e.g. `cluster_summary`, which
+/// colors just the node id).
+fn visible_width(s: &str) -> usize {
+    let mut width = 0;
+    let mut in_escape = false;
+    for c in s.chars() {
+        if in_escape {
+            if c == 'm' {
+                in_escape = false;
+            }
+        } else if c == '\x1b' {
+            in_escape = true;
+        } else {
+            width += 1;
+        }
+    }
+    width
+}
+
+/// A padded, dimmed banner label (`"storage   "`, `"cluster   "`, ...), padded to
+/// `BANNER_LABEL_WIDTH` before coloring so the ANSI codes don't throw off later width padding.
+fn banner_label(text: &str, color: bool) -> String {
+    paint("2", &format!("{text:<BANNER_LABEL_WIDTH$}"), color)
+}
+
+/// Prints `title` and `body` lines inside a box border sized to the widest line, so the startup
+/// banner reads as one deliberate block instead of a loose stack of println!s.
+fn print_banner(title: &str, body: &[String], color: bool) {
+    let inner_width = body
+        .iter()
+        .map(|l| visible_width(l))
+        .chain(std::iter::once(visible_width(title)))
+        .max()
+        .unwrap_or(0);
+
+    let border = |left: &str, right: &str| {
+        paint(
+            "36",
+            &format!("{left}{}{right}", "─".repeat(inner_width + 2)),
+            color,
+        )
+    };
+    let row = |content: &str, pad_to: usize| {
+        let pad = " ".repeat(pad_to.saturating_sub(visible_width(content)));
+        format!(
+            "{} {content}{pad} {}",
+            paint("36", "│", color),
+            paint("36", "│", color)
+        )
+    };
+
+    println!("\n{}", border("┌", "┐"));
+    println!("{}", row(title, inner_width));
+    println!("{}", border("├", "┤"));
+    for line in body {
+        println!("{}", row(line, inner_width));
+    }
+    println!("{}", border("└", "┘"));
+    println!();
+}
+
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     let config = rocket_mem::config::load().map_err(|e| {
@@ -55,6 +123,7 @@ async fn main() -> std::io::Result<()> {
     // node in standalone mode while its neighbours redirect keys to it.
     let mut listeners: Vec<(&str, String)> = Vec::new();
     let mut cluster_summary = paint("2", "standalone (no cluster_config set)", color);
+    let mut cluster_topology_lines: Vec<String> = Vec::new();
 
     let cluster = match (&config.cluster_config, &config.cluster_node_id) {
         (Some(path), Some(node_id)) => {
@@ -72,6 +141,15 @@ async fn main() -> std::io::Result<()> {
                     "s"
                 }
             );
+            // The one-line summary above only ever names this node; the full topology (every
+            // other node's id/addr/slot range) previously wasn't shown anywhere at startup --
+            // an operator had to already know cluster.conf's contents or query a running node
+            // with `CLUSTER NODES` to find out where the other shards are.
+            cluster_topology_lines = cluster_config
+                .topology_summary()
+                .lines()
+                .map(str::to_string)
+                .collect();
             Some(Arc::new(cluster_config))
         }
         (Some(_), None) => {
@@ -165,6 +243,7 @@ async fn main() -> std::io::Result<()> {
         snapshot_path.to_path_buf(),
     )
     .with_aof(Arc::clone(&aof))
+    .with_own_addr(config.addr.clone())
     .with_slowlog_threshold(slowlog_threshold)
     .with_acl_bootstrap(acl_users);
     if let Some(cluster) = cluster {
@@ -248,15 +327,53 @@ async fn main() -> std::io::Result<()> {
         &format!("rocket-mem v{}", env!("CARGO_PKG_VERSION")),
         color,
     );
-    println!("\n{title}");
-    println!("  {}  {storage_summary}", paint("2", "storage ", color));
-    println!("  {}  {acl_summary}", paint("2", "acl     ", color));
-    println!("  {}  {cluster_summary}", paint("2", "cluster ", color));
-    println!("  {}", paint("2", "listeners", color));
-    for (label, addr) in &listeners {
-        println!("    {}  {addr}", paint("1", &format!("{label:<9}"), color));
+    let mut body = Vec::new();
+    body.push(format!(
+        "{}{storage_summary}",
+        banner_label("storage", color)
+    ));
+    body.push(format!("{}{acl_summary}", banner_label("acl", color)));
+    body.push(format!(
+        "{}{cluster_summary}",
+        banner_label("cluster", color)
+    ));
+    for line in &cluster_topology_lines {
+        body.push(format!("{:BANNER_LABEL_WIDTH$}{line}", ""));
     }
-    println!();
+    // A live count, not a hardcoded message: `REPLICAOF` has no config-file equivalent (see
+    // .claude/manual-testing.md's "Replication" section), so this node is never itself a
+    // replica of anything yet at the moment this banner prints. A replica CAN already be
+    // registered here, though -- a TLS RESP listener (spawned above, before this point) starts
+    // accepting connections immediately, so a fast-connecting replica's PSYNC can land before
+    // this banner prints, even though the plaintext RESP listener (served only after the
+    // banner, at the bottom of this function) cannot.
+    let replica_addrs = replication.registry.addrs();
+    if replica_addrs.is_empty() {
+        body.push(format!(
+            "{}none connected yet -- REPLICAOF is a live command; INFO REPLICATION shows current state",
+            banner_label("replicas", color)
+        ));
+    } else {
+        body.push(format!(
+            "{}{} connected",
+            banner_label("replicas", color),
+            replica_addrs.len()
+        ));
+        for (i, addr) in replica_addrs.iter().enumerate() {
+            let shown = addr.as_deref().unwrap_or("?");
+            body.push(format!("{:BANNER_LABEL_WIDTH$}slave{i} {shown}", ""));
+        }
+    }
+    body.push(paint("2", "listeners", color));
+    let listener_label_width = listeners.iter().map(|(l, _)| l.len()).max().unwrap_or(0);
+    for (label, addr) in &listeners {
+        body.push(format!(
+            "{:BANNER_LABEL_WIDTH$}{}  {addr}",
+            "",
+            paint("1", &format!("{label:<listener_label_width$}"), color)
+        ));
+    }
+    print_banner(&title, &body, color);
 
     rocket_mem::serve(listener, engine, aof, replication).await;
     Ok(())

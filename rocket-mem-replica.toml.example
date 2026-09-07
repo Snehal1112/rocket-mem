@@ -1,0 +1,80 @@
+# Example rocket-mem-replica.toml — a template for a node whose only job is to replicate from
+# some other rocket-mem node (the "leader"). Copy this to a real file (e.g. my-replica.toml),
+# fill in the fields below with values distinct from every other node on the machine, start it,
+# then point it at the leader with REPLICAOF (a live command, not a config-file field -- see
+# "Wiring it up" at the bottom).
+#
+# Layering: built-in defaults < this file < ROCKET_MEM_* env vars < CLI flags. A field left
+# unset here simply falls through to the next layer down.
+#
+# A replica is NOT a cluster node: leave cluster_config/cluster_node_id unset here even when the
+# leader it replicates from is a cluster member. Cluster mode (hash-slot sharding across
+# multiple masters) and replication (a read-only copy of one master) are independent features --
+# setting cluster_config/cluster_node_id here would make this node a cluster member owning its
+# own slot range, which is not what a replica is for. See docs/config-reference.md for the full
+# field list this file mirrors.
+
+# TCP address this replica's own RESP listener binds to. Must be distinct from the leader's --
+# and every other node's -- addr. Clients can read from it directly for a read-only copy of the
+# leader's data; they cannot write to it (REPLICAOF gates client writes while replicating).
+# addr = "127.0.0.1:6479"
+
+# TCP address the RMP listener binds to. Same distinctness requirement as addr.
+# rmp_addr = "127.0.0.1:7479"
+
+# TCP address the Prometheus /metrics endpoint binds to. Same distinctness requirement --
+# every node on one machine needs its own value for rmp_addr AND metrics_addr, or the
+# second/third node crashes with AddrInUse even though its RESP port is free. This is a real,
+# documented gotcha -- see .claude/manual-testing.md.
+# metrics_addr = "127.0.0.1:9221"
+
+# This replica's own AOF/snapshot files. Must not be shared with the leader's or any other
+# node's -- each node's recovery reads only its own files, and paths are resolved relative to
+# whatever directory the process is started from, not to this config file.
+# aof_path = "./appendonly-replica.aof"
+# snapshot_path = "./dump-replica.snapshot"
+
+# Minimum command duration, in microseconds, that gets recorded to the slow log.
+# 0 disables the slow log entirely.
+# slowlog_threshold_micros = 0
+
+# --- ACL / authentication -----------------------------------------------------
+# Must match the LEADER's [[acl.users]] username/password exactly: REPLICAOF's AUTH clause
+# (see "Wiring it up" below) authenticates this replica's connection to the leader with these
+# same credentials -- they are not this replica's own separate account.
+#
+# Defining even one user here also turns authentication ON for this node's own client
+# connections, exactly like any other rocket-mem.toml -- there is no way to require replication
+# auth without also gating this node's plain client traffic behind the same ACL.
+#
+# [[acl.users]]
+# username = "app"
+# password = "changeme"
+# enabled = true
+# rules = ["allcommands", "allkeys"]
+
+# --- Wiring it up --------------------------------------------------------------
+# REPLICAOF has no config-file equivalent -- it is always sent as a live command to an
+# already-running node. Once this replica is up:
+#
+#   redis-cli -p <this replica's addr port> replicaof <leader-host> <leader-port>
+#
+# If the leader has ACL users configured (as above), add AUTH with the SAME username/password
+# the LEADER defines -- without it, PSYNC is rejected with NOAUTH and this node retries forever,
+# once a second, without ever actually syncing:
+#
+#   redis-cli -p <this replica's addr port> replicaof <leader-host> <leader-port> auth app changeme
+#
+# Confirm it actually linked up. Do not trust the startup banner's "replicas" line for this --
+# it is a one-time snapshot printed at boot, before REPLICAOF could ever have run, so it always
+# reads "none connected yet" regardless of live state:
+#
+#   redis-cli -p <this replica's addr port> info replication
+#   # -> role:slave / master_host:<leader-host> / master_link_status:up
+#
+# And on the leader side, to see every currently-connected replica:
+#
+#   redis-cli -p <leader's addr port> info replication
+#   # -> role:master / connected_slaves:1 / slave0:ip=<this replica's addr host>,port=<...>,state=online
+#
+# REPLICAOF NO ONE promotes this node back to normal, writable standalone operation.
