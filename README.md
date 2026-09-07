@@ -130,11 +130,16 @@ Measured against `redis-server` 8.10.1 on the same host with matching durability
 
 Seven of eight cases land within 0.89x–2.84x of real Redis (one of them, unpipelined 3B `SET`,
 rocket-mem is actually faster). The eighth does not: pipelined 1KB `GET` collapses to ~19,500
-req/s, an unexplained cliff that no candidate explanation accounts for and that remains open
-(down from 58.30x in the prior run, but still an order of magnitude worse than every other row).
+req/s, a cliff whose leading candidate — off-CPU wait on the reply-write path, consistent with
+`TCP_NODELAY` being set nowhere in the server — has been profiled but is neither proven nor fixed.
+The prior run put this row at 58.30x rather than 43.10x, but that is not a rocket-mem-side
+improvement: rocket-mem's own figure is flat at ~19,400–19,500 req/s across all three measurement
+sessions, and the ratio moved only because redis-server's own reference number dropped 26%
+between them. Either way it stays an order of magnitude worse than every other row.
 Full methodology, the raw traces, and the profiling that followed are in
 [`docs/benchmarks/`](docs/benchmarks/), most recently
-[`2026-09-07-redis-benchmark.md`](docs/benchmarks/2026-09-07-redis-benchmark.md).
+[`2026-09-07-redis-benchmark.md`](docs/benchmarks/2026-09-07-redis-benchmark.md) and
+[`2026-09-07-flamegraph-notes.md`](docs/benchmarks/2026-09-07-flamegraph-notes.md).
 
 ## Command coverage
 
