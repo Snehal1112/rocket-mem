@@ -6,6 +6,11 @@ use std::process::{Child, Command, Stdio};
 /// Spawns the real compiled binary bound to an OS-assigned port, reading its own stdout to
 /// discover which port it actually got. Returns the child (so the caller can kill it) and a
 /// `redis://` URL ready to connect to.
+///
+/// Parses the startup banner's `RESP <addr>` listener row rather than matching a fixed
+/// string: the banner pads/colors labels for a human reader, so only the first
+/// whitespace-separated token is a stable contract. Matching the exact token `"RESP"` (not a
+/// prefix) also skips the `RESP+TLS` row when TLS happens to be configured.
 fn spawn_server(aof_path: &std::path::Path) -> (Child, String) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_rocket-mem"))
         .env("ROCKET_MEM_ADDR", "127.0.0.1:0")
@@ -24,9 +29,13 @@ fn spawn_server(aof_path: &std::path::Path) -> (Child, String) {
         match reader.read_line(&mut line) {
             Ok(0) => break, // EOF — the process exited before printing anything useful
             Ok(_) => {
-                if let Some(rest) = line.trim().strip_prefix("Listening on ") {
-                    addr = Some(rest.to_string());
-                    break;
+                let trimmed = line.trim();
+                let mut parts = trimmed.split_whitespace();
+                if parts.next() == Some("RESP") {
+                    if let Some(addr_str) = parts.next() {
+                        addr = Some(addr_str.to_string());
+                        break;
+                    }
                 }
             }
             Err(_) => break,

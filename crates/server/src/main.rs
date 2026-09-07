@@ -1,6 +1,16 @@
 use std::io::IsTerminal;
 use std::sync::Arc;
 
+/// Wraps `text` in an ANSI SGR code, or returns it unchanged when `color` is
+/// false (no tty, or `NO_COLOR` set) -- see the startup-banner code below.
+fn paint(code: &str, text: &str, color: bool) -> String {
+    if color {
+        format!("\x1b[{code}m{text}\x1b[0m")
+    } else {
+        text.to_string()
+    }
+}
+
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     let config = rocket_mem::config::load().map_err(|e| {
@@ -37,17 +47,24 @@ async fn main() -> std::io::Result<()> {
     // range, and cluster_node_id says which line is this process. Both must be set
     // together -- one without the other is an operator mistake that would otherwise start a
     // node in standalone mode while its neighbours redirect keys to it.
+    let mut listeners: Vec<(&str, String)> = Vec::new();
+    let mut cluster_summary = paint("2", "standalone (no cluster_config set)", color);
+
     let cluster = match (&config.cluster_config, &config.cluster_node_id) {
         (Some(path), Some(node_id)) => {
             let cluster_config =
                 rocket_mem::cluster::ClusterConfig::load(std::path::Path::new(path), node_id)?;
-            println!(
-                "Cluster mode enabled: node '{}' at {} owns slots {}-{} of {} nodes",
-                cluster_config.myself().id,
-                cluster_config.myself().addr,
+            cluster_summary = format!(
+                "node '{}' owns slots {}-{} ({} node{} total)",
+                paint("1", &cluster_config.myself().id, color),
                 cluster_config.myself().first_slot,
                 cluster_config.myself().last_slot,
-                cluster_config.nodes().len()
+                cluster_config.nodes().len(),
+                if cluster_config.nodes().len() == 1 {
+                    ""
+                } else {
+                    "s"
+                }
             );
             Some(Arc::new(cluster_config))
         }
@@ -100,10 +117,24 @@ async fn main() -> std::io::Result<()> {
     // startup: `recover` resolves it internally, and the writer must be opened at the very same
     // generation, or every write this process makes would land in a file the manifest does not
     // name and be lost at the next restart.
+    let acl_summary = if acl_users.is_empty() {
+        paint(
+            "33",
+            "no users configured -- auth disabled, every client is trusted",
+            color,
+        )
+    } else {
+        format!(
+            "{} user{} configured, auth required",
+            acl_users.len(),
+            if acl_users.len() == 1 { "" } else { "s" }
+        )
+    };
+
     let generation = rocket_mem::aof::read_generation(snapshot_path)?;
     let engine = Arc::new(rocket_mem::aof::recover(aof_path, snapshot_path)?);
-    println!(
-        "Recovered state from {} and {} (generation {generation})",
+    let storage_summary = format!(
+        "recovered {} + {} (generation {generation})",
         snapshot_path.display(),
         aof_path.display()
     );
@@ -141,10 +172,10 @@ async fn main() -> std::io::Result<()> {
     let replication = Arc::new(handle);
 
     let metrics_listener = tokio::net::TcpListener::bind(&config.metrics_addr).await?;
-    println!(
-        "Metrics on http://{}/metrics",
-        metrics_listener.local_addr()?
-    );
+    listeners.push((
+        "metrics",
+        format!("http://{}/metrics", metrics_listener.local_addr()?),
+    ));
     tokio::spawn(rocket_mem::metrics::serve_metrics(
         metrics_listener,
         metrics_handle,
@@ -153,7 +184,7 @@ async fn main() -> std::io::Result<()> {
     ));
 
     let rmp_listener = tokio::net::TcpListener::bind(&config.rmp_addr).await?;
-    println!("RMP listening on {}", rmp_listener.local_addr()?);
+    listeners.push(("RMP", rmp_listener.local_addr()?.to_string()));
     tokio::spawn(rocket_mem::rmp_connection::serve(
         rmp_listener,
         Arc::clone(&engine),
@@ -173,7 +204,7 @@ async fn main() -> std::io::Result<()> {
             std::path::Path::new(key),
         )?;
         let tls_listener = tokio::net::TcpListener::bind(tls_addr).await?;
-        println!("TLS listening on {}", tls_listener.local_addr()?);
+        listeners.push(("RESP+TLS", tls_listener.local_addr()?.to_string()));
         tokio::spawn(rocket_mem::serve_tls(
             tls_listener,
             tls_config,
@@ -193,7 +224,7 @@ async fn main() -> std::io::Result<()> {
             std::path::Path::new(key),
         )?;
         let tls_rmp_listener = tokio::net::TcpListener::bind(tls_rmp_addr).await?;
-        println!("RMP TLS listening on {}", tls_rmp_listener.local_addr()?);
+        listeners.push(("RMP+TLS", tls_rmp_listener.local_addr()?.to_string()));
         tokio::spawn(rocket_mem::rmp_connection::serve_tls(
             tls_rmp_listener,
             tls_config,
@@ -204,7 +235,23 @@ async fn main() -> std::io::Result<()> {
     }
 
     let listener = tokio::net::TcpListener::bind(&config.addr).await?;
-    println!("Listening on {}", listener.local_addr()?);
+    listeners.push(("RESP", listener.local_addr()?.to_string()));
+
+    let title = paint(
+        "1;36",
+        &format!("rocket-mem v{}", env!("CARGO_PKG_VERSION")),
+        color,
+    );
+    println!("\n{title}");
+    println!("  {}  {storage_summary}", paint("2", "storage ", color));
+    println!("  {}  {acl_summary}", paint("2", "acl     ", color));
+    println!("  {}  {cluster_summary}", paint("2", "cluster ", color));
+    println!("  {}", paint("2", "listeners", color));
+    for (label, addr) in &listeners {
+        println!("    {}  {addr}", paint("1", &format!("{label:<9}"), color));
+    }
+    println!();
+
     rocket_mem::serve(listener, engine, aof, replication).await;
     Ok(())
 }
