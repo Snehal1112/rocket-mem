@@ -22,7 +22,7 @@ pub async fn serve(
 
     let mut next_client_id: u64 = 1;
     loop {
-        let (socket, _addr) = match listener.accept().await {
+        let (socket, peer) = match listener.accept().await {
             Ok(pair) => pair,
             Err(_) => continue, // a failed accept shouldn't take the whole listener down
         };
@@ -33,6 +33,8 @@ pub async fn serve(
         let replication = Arc::clone(&replication);
         tokio::spawn(handle_connection(
             socket,
+            peer,
+            false, // plaintext listener
             engine,
             aof,
             replication,
@@ -89,7 +91,7 @@ pub async fn serve_tls(
     let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
     let mut next_client_id: u64 = 1;
     loop {
-        let (socket, _addr) = match listener.accept().await {
+        let (socket, peer) = match listener.accept().await {
             Ok(pair) => pair,
             Err(_) => continue,
         };
@@ -111,13 +113,16 @@ pub async fn serve_tls(
             .await
             {
                 Ok(Ok(s)) => s,
-                // A failed handshake -- including a plaintext client whose raw bytes don't parse
-                // as a TLS ClientHello -- simply ends this connection, exactly like any other
-                // malformed-input path elsewhere in this codebase. A timed-out handshake ends
-                // the connection the same way.
-                Ok(Err(_)) | Err(_) => return,
+                Ok(Err(e)) => {
+                    tracing::warn!(%peer, error = %e, "tls handshake failed");
+                    return;
+                }
+                Err(_) => {
+                    tracing::warn!(%peer, "tls handshake timed out");
+                    return;
+                }
             };
-            handle_connection(tls_socket, engine, aof, replication, client_id).await;
+            handle_connection(tls_socket, peer, true, engine, aof, replication, client_id).await;
         });
     }
 }
@@ -135,6 +140,8 @@ impl Drop for ClientGuard {
 
 async fn handle_connection<S>(
     socket: S,
+    peer: std::net::SocketAddr,
+    tls: bool,
     engine: Arc<Engine>,
     aof: Arc<AofWriter>,
     replication: Arc<ReplicationHandle>,
@@ -142,6 +149,7 @@ async fn handle_connection<S>(
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    tracing::info!(%peer, protocol = "resp", tls, "connection accepted");
     replication.connection_opened();
     let _client_guard = ClientGuard(Arc::clone(&replication));
     let mut framed = Framed::new(socket, RespCodec::default());
@@ -155,7 +163,11 @@ async fn handle_connection<S>(
         };
         let frame = match next {
             Some(Ok(frame)) => frame,
-            Some(Err(_)) | None => return, // malformed input or a dropped connection — end this task quietly
+            Some(Err(e)) => {
+                tracing::warn!(%peer, error = %e, "connection closed: decode error");
+                return;
+            }
+            None => return, // client disconnected cleanly — not worth logging
         };
         if is_psync_command(&frame) {
             // PSYNC never reaches `dispatch_and_log` (it's intercepted here, before the frame
