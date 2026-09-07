@@ -20,13 +20,19 @@ async fn main() -> std::io::Result<()> {
         )
     })?;
 
+    // Two separate tty checks, not one shared `color`: the tracing subscriber writes to
+    // stderr while the startup banner below writes to stdout, and the two file descriptors
+    // can have different tty-ness under asymmetric redirection (e.g. `rocket-mem 2>app.log`
+    // with stdout still a terminal) -- sharing one check would leak ANSI codes into
+    // whichever stream the wrong check was based on.
+    let log_color = std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none();
     let color = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
 
     let filter = tracing_subscriber::EnvFilter::new(
         rocket_mem::config::resolve_log_filter_directive(&config.log_level),
     );
     tracing_subscriber::fmt()
-        .with_ansi(color)
+        .with_ansi(log_color)
         .with_writer(std::io::stderr)
         .with_env_filter(filter)
         .init();
