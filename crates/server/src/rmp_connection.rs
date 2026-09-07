@@ -125,7 +125,7 @@ async fn handle_connection<S>(
             Ok(msg) if msg.msg_type == MsgType::Request => msg,
             Ok(_) => break, // a stray Response from a misbehaving client
             Err(e) => {
-                eprintln!("rmp decode error: {e}");
+                tracing::warn!(error = %e, "rmp decode error");
                 break;
             }
         };
