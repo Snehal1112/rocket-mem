@@ -195,54 +195,78 @@ This rules out "one new expensive function" as the explanation, same conclusion 
 reached — but now from clean, isolated data instead of a blended, unresolved one.
 
 **The strongest evidence: within the single pipelined-1KB capture, SET and GET are cleanly
-time-separable, and GET does markedly less sampled CPU work per request than SET while taking
-markedly longer per request in wall-clock time — the opposite of what proportional CPU cost would
-predict.** `redis-benchmark -t set,get` runs SET to completion, then GET, inside one recording;
-`perf script -i perf-pipelined-1kb.data -F time,comm` (bucketed at 0.05–0.2s resolution, not
-guessed) shows a sharp density cliff at the transition — SET's sample rate holds in the
-hundreds-per-100ms range through absolute timestamp `525494.49`, then drops from 167 samples in a
-50ms bucket to 5 in the next. That boundary, cross-checked against each phase's own known request
-count and measured throughput (200,000 ÷ 96,665.05 req/s ≈ 2.07s expected for SET; 200,000 ÷
-19,417.47 req/s ≈ 10.30s expected for GET — both within ~3% of the timestamp-derived durations
-below), is reliable enough to filter on directly:
+time-separable, and GET does markedly less on-CPU work per request than SET while taking markedly
+longer per request in wall-clock time — the opposite of what proportional on-CPU cost would
+predict.** `redis-benchmark -t set,get` runs SET to completion, then GET, inside one recording.
+**The phase boundary is pinned by a throughput cross-check, not by sample density alone** — density
+by itself is not reliable here: a `perf script -i perf-pipelined-1kb.data -F time` bucketing at
+50ms resolution does show a sharp cliff (167 samples in the bucket at absolute timestamp
+`525494.10`, down to 5 at `525494.15`), but there is also a genuine ~0.80s trough mid-SET-phase
+(`--time 525492.85,525493.65` → only 59 samples, ~74 samples/s — actually *lower* density than the
+entire GET phase's own average of ~108.6 samples/s, plausibly AOF writeback of the 213MB AOF file
+mid-burst, not chased further here) that a density-cliff heuristic applied on its own would
+misplace the boundary at. What actually confirms `525494.15` as the real SET/GET boundary is that
+it matches each phase's own known request count and independently measured throughput: 200,000 ÷
+96,665.05 req/s ≈ 2.069s expected for SET (measured window: 2.09s, <1% off); 200,000 ÷ 19,417.47
+req/s ≈ 10.300s expected for GET (measured window: 10.30s, <0.1% off):
 
 ```
-$ perf script -i perf-pipelined-1kb.data --time 525492.358,525494.49 | grep -c 'cpu/cycles/P:'
-3972   # SET phase: 200,000 commands, 2.132s (525492.358 -> 525494.49)
-$ perf script -i perf-pipelined-1kb.data --time 525494.49,525504.5 | grep -c 'cpu/cycles/P:'
-1064   # GET phase: 200,000 commands, 9.956s (525494.49 -> 525504.446, last sample)
+$ perf script -i perf-pipelined-1kb.data --time 525492.06,525494.15 | grep -c 'cpu/cycles/P:'
+5617   # SET phase: 200,000 commands, 2.09s (525492.06 -> 525494.15)
+$ perf script -i perf-pipelined-1kb.data --time 525494.15,525504.45 | grep -c 'cpu/cycles/P:'
+1119   # GET phase: 200,000 commands, 10.30s (525494.15 -> 525504.45, last sample ~525504.446)
 ```
 
 Per request, that's:
 
 | Phase | Samples | Requests | Wall time | Samples/request | Wall-clock/request |
 |---|---|---|---|---|---|
-| SET | 3,972 | 200,000 | 2.132s | 0.0199 | 10.66µs |
-| GET | 1,064 | 200,000 | 9.956s | 0.0053 | 49.78µs |
+| SET | 5,617 | 200,000 | 2.09s | 0.0281 | 10.45µs |
+| GET | 1,119 | 200,000 | 10.30s | 0.0056 | 51.50µs |
 
-GET does **~3.7x fewer** sampled CPU cycles per request than SET (0.0199 → 0.0053) — cheaper work,
-as expected for a read-only lookup-and-reply versus a write that also touches the AOF/order-lock
-path — yet each GET request takes **~4.7x longer** in wall-clock time (10.66µs → 49.78µs). Less
-work, more time: that inversion (a combined ~17.4x gap between the two ratios) is a direct,
-non-circular statement that GET-phase wall-clock time here is not proportional to GET-phase CPU
-work, measured entirely within one capture, same server process, same client, same connections —
-nothing is being normalized across two different recordings, which directly closes the
-phase-blending gap noted below for the secondary evidence. Since `perf record -e cpu/cycles/P`
-(what `cargo flamegraph` uses) only samples active, running cycles, it is structurally blind to
-time a thread spends genuinely blocked/descheduled (e.g. backpressure from a full socket send
-buffer, or Nagle-driven batching delaying a small final segment behind an unacked one) — exactly
-the kind of gap this per-request inversion points at.
+GET does **~5.0x fewer** on-CPU time samples per request than SET (0.0281 → 0.0056) — cheaper
+work, as expected for a read-only lookup-and-reply versus a write that also touches the
+AOF/order-lock path — yet each GET request takes **~4.9x longer** in wall-clock time (10.45µs →
+51.50µs). Less work, more time: that inversion (a combined ~24.7x gap between the two ratios) is a
+direct, non-circular statement that GET-phase wall-clock time here is not proportional to
+GET-phase on-CPU work, measured entirely within one capture, same server process, same client,
+same connections — nothing is being normalized across two different recordings, which directly
+closes the phase-blending gap noted below for the secondary evidence. `perf record -e cpu/cycles/P
+-F 997` (what `cargo flamegraph` uses) is frequency-mode sampling of on-CPU time, not a direct
+retired-cycle count — each sample requires the profiled thread to actually be running on a CPU at
+that instant — so it is structurally blind to time a thread spends genuinely blocked/descheduled
+(e.g. backpressure from a full socket send buffer, or Nagle-driven batching delaying a small final
+segment behind an unacked one) — exactly the kind of gap this per-request inversion points at.
 
-This also lets the payload-size claim be checked directly rather than by throughput ratio alone:
-pipelined-3B's own GET phase, at its measured 1,092,896.12 req/s, computes to an estimated 0.183s
-for the same 200,000 requests — far too short a window to cleanly time-slice apart from SET the
-way pipelined-1KB's was (its whole SET+GET burst is compressed into ~1.2s with no visible density
-transition at any bucket resolution tried down to 50ms, unlike pipelined-1KB's sharp cliff), so
-this number is computed from measured throughput, not isolated by timestamp the way the numbers
-above are. Still, 9.956s (pipelined-1KB's real, isolated GET-phase duration) against 0.183s
-(pipelined-3B's computed one) for the identical 200,000-request GET workload is a ~54.4x wall-clock
-gap — consistent with, and an independent cross-check on, the 56.28x throughput ratio already
-reported (19,417.47 vs 1,092,896.12 req/s) from a different angle.
+This also lets the payload-size claim be checked with a second, genuinely independent
+timestamp-based measurement, not by relying on throughput math for one side of the comparison the
+way an earlier version of this section did: `perf script -i perf-pipelined-3b.data -F time`,
+bucketed the same way, shows a real SET→GET transition too — at absolute timestamp `525858.85`,
+matching its own throughput-predicted boundary (the SET burst itself starts at `525857.90`;
+200,000 ÷ 209,863.59 req/s ≈ 0.953s after that closely matches the measured 0.95s window):
+
+```
+$ perf script -i perf-pipelined-3b.data --time 525857.90,525858.85 | grep -c 'cpu/cycles/P:'
+4445   # SET-dominated window, 0.95s
+$ perf script -i perf-pipelined-3b.data --time 525858.85,525859.08 | grep -c 'cpu/cycles/P:'
+631    # GET phase, 0.23s (525858.85 -> 525859.08, last sample ~525859.078)
+```
+
+(An earlier version of this section claimed pipelined-3B's SET+GET burst showed "no visible
+density transition at any bucket resolution" — that was wrong. The transition is real and lines up
+with the throughput-predicted boundary; it is just far gentler than pipelined-1KB's sharp cliff —
+density drops from ~4,680 samples/s pre-transition to ~2,744 samples/s post, roughly 1.7x, not
+pipelined-1KB's ~24.7x — consistent with pipelined-3B's GET phase not being anomalously slow the
+way pipelined-1KB's is.)
+
+That gives a genuine, fully independent cross-check (both sides now timestamp-measured, not one
+side computed from throughput): 10.30s (pipelined-1KB's measured GET-phase span) against 0.23s
+(pipelined-3B's measured GET-phase span) is a ~44.8x wall-clock gap for the identical
+200,000-request GET workload. That is broadly consistent with — though not identical to — the
+56.28x throughput ratio already reported (19,417.47 vs 1,092,896.12 req/s); the ~21% gap between
+44.8x and 56.28x is plausibly boundary-placement noise in the 3B side's brief ~230ms, 631-sample
+window (a shift of even a few tens of milliseconds swings the ratio substantially at that
+timescale), not a real inconsistency between the two measurements.
 
 **Secondary, corroborating color: the resolved call-graph's active-work composition looks nearly
 identical between the two runs.** Following `entry_SYSCALL_64_after_hwframe` down with `perf
