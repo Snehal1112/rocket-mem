@@ -9,6 +9,12 @@ async fn main() -> std::io::Result<()> {
         )
     })?;
 
+    let filter = tracing_subscriber::EnvFilter::new(
+        rocket_mem::config::resolve_log_filter_directive(&config.log_level),
+    );
+    tracing_subscriber::fmt().with_env_filter(filter).init();
+    tracing::info!(version = env!("CARGO_PKG_VERSION"), "rocket-mem starting");
+
     let metrics_handle = rocket_mem::metrics::recorder_handle();
 
     let aof_path = std::path::PathBuf::from(&config.aof_path);
