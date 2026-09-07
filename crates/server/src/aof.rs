@@ -107,7 +107,7 @@ impl AofWriter {
                         // place an error can go.
                         AofMsg::Append(bytes) => {
                             if let Err(e) = writer.write_all(&bytes) {
-                                eprintln!("aof append failed: {e}");
+                                tracing::error!(error = %e, "aof append failed");
                             }
                         }
                         // The acked variants hand the real I/O result back to the waiting
@@ -475,11 +475,11 @@ pub fn recover(aof_path: &Path, snapshot_path: &Path) -> std::io::Result<engine:
                 match aof_len {
                     None => return Ok(engine),
                     Some(len) if offset > len => {
-                        eprintln!(
-                            "snapshot at {} names an AOF offset ({offset}) past the AOF's \
-                             actual length ({len}) -- discarding the snapshot and replaying \
-                             the full AOF from byte 0 instead",
-                            snapshot_path.display()
+                        tracing::warn!(
+                            snapshot_path = %snapshot_path.display(),
+                            offset,
+                            aof_len = len,
+                            "snapshot offset past end of AOF; discarding snapshot and replaying full AOF"
                         );
                         let fresh = engine::Engine::new();
                         replay(aof_path, &fresh, 0)?;
@@ -489,9 +489,10 @@ pub fn recover(aof_path: &Path, snapshot_path: &Path) -> std::io::Result<engine:
                 }
             }
             Err(e) => {
-                eprintln!(
-                    "snapshot at {} is unreadable ({e}); falling back to full AOF replay",
-                    snapshot_path.display()
+                tracing::warn!(
+                    snapshot_path = %snapshot_path.display(),
+                    error = %e,
+                    "snapshot unreadable; falling back to full AOF replay"
                 );
                 0
             }
