@@ -24,6 +24,11 @@ pub struct Config {
     /// before this field existed.
     pub tls_ca_path: Option<String>,
     pub acl: AclBootstrapConfig,
+    /// Log level filter, e.g. "info", "debug", "rocket_mem=debug,warn" -- same syntax as
+    /// `RUST_LOG`. Overridden by the `RUST_LOG` env var when it's set (see
+    /// `resolve_log_filter_directive` below); this field is the *default* for a deployment
+    /// that doesn't set RUST_LOG, not a competing source of truth.
+    pub log_level: String,
 }
 
 impl Default for Config {
@@ -45,6 +50,7 @@ impl Default for Config {
             tls_key_path: None,
             tls_ca_path: None,
             acl: AclBootstrapConfig::default(),
+            log_level: "info".to_string(),
         }
     }
 }
@@ -153,6 +159,9 @@ pub struct Cli {
     /// to over TLS [default: unset, replication stays plaintext]
     #[arg(long)]
     pub tls_ca_path: Option<String>,
+    /// Log level filter, e.g. "info", "debug", "rocket_mem=debug,warn" [default: info]
+    #[arg(long)]
+    pub log_level: Option<String>,
 }
 
 /// `Serialized::defaults` embeds every field including the unset `None`s, which would make an
@@ -194,6 +203,7 @@ fn cli_overrides(
     set!(tls_cert_path);
     set!(tls_key_path);
     set!(tls_ca_path);
+    set!(log_level);
     if let Some(v) = cli.slowlog_threshold_micros {
         map.insert("slowlog_threshold_micros", Value::from(v));
     }
@@ -270,6 +280,7 @@ mod tests {
         assert_eq!(cfg.tls_cert_path, None);
         assert_eq!(cfg.tls_key_path, None);
         assert_eq!(cfg.tls_ca_path, None);
+        assert_eq!(cfg.log_level, "info");
         assert!(cfg.acl.users.is_empty());
     }
 
@@ -401,6 +412,27 @@ mod tests {
                 Some("/x"),
                 "CLI flag must be able to override an Option<String> field"
             );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn log_level_is_layered_like_every_other_string_field() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("rocket-mem.toml", "log_level = \"debug\"\n")?;
+            jail.set_env("ROCKET_MEM_LOG_LEVEL", "warn"); // env beats file
+            let cfg = load_layered(Some(std::path::Path::new("rocket-mem.toml"))).unwrap();
+            assert_eq!(cfg.log_level, "warn");
+
+            let cli = Cli::parse_from([
+                "rocket-mem",
+                "--config",
+                "rocket-mem.toml",
+                "--log-level",
+                "error", // CLI beats env
+            ]);
+            let cfg = load_with_cli(cli).unwrap();
+            assert_eq!(cfg.log_level, "error");
             Ok(())
         });
     }
