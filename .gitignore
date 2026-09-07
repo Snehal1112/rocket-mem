@@ -36,3 +36,8 @@ tools/*/.yarn/install-state.gz
 
 *.aof
 tools
+
+# Local TLS material (self-signed dev certs/keys generated for manual testing)
+certs/
+*.pem
+*.key
