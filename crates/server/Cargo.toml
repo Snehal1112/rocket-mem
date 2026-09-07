@@ -28,6 +28,8 @@ metrics-exporter-prometheus.workspace = true
 rustls.workspace = true
 rustls-pemfile.workspace = true
 tokio-rustls.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [dev-dependencies]
 redis = { version = "0.27", features = ["tokio-comp"] }

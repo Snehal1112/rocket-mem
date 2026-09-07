@@ -258,6 +258,15 @@ pub fn validate_tls(config: &Config) -> Result<(), std::io::Error> {
     Ok(())
 }
 
+/// Resolves the log filter directive: `RUST_LOG`, when set, wins over `log_level` -- the
+/// standard `tracing` convention of letting an operator's env var override any code- or
+/// config-file-supplied default. Returns a plain `String` (not an `EnvFilter`) so this stays
+/// unit-testable without constructing a filter or a subscriber. `main.rs` passes the result
+/// straight to `tracing_subscriber::EnvFilter::new`.
+pub fn resolve_log_filter_directive(log_level: &str) -> String {
+    std::env::var("RUST_LOG").unwrap_or_else(|_| log_level.to_string())
+}
+
 #[cfg(test)]
 #[allow(clippy::result_large_err)]
 mod tests {
@@ -433,6 +442,23 @@ mod tests {
             ]);
             let cfg = load_with_cli(cli).unwrap();
             assert_eq!(cfg.log_level, "error");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn resolve_log_filter_directive_prefers_rust_log_env_over_config_value() {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("RUST_LOG", "debug");
+            assert_eq!(resolve_log_filter_directive("info"), "debug");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn resolve_log_filter_directive_falls_back_to_config_value_when_unset() {
+        figment::Jail::expect_with(|_jail| {
+            assert_eq!(resolve_log_filter_directive("warn"), "warn");
             Ok(())
         });
     }

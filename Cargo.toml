@@ -15,6 +15,7 @@ serde = { version = "1", features = ["derive"] }
 bincode = "1"
 thiserror = "1"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 parking_lot = "0.12"
 rand = "0.8"
 ordered-float = "4"
