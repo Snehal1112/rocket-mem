@@ -65,8 +65,16 @@ pub fn encode_frame(frame: &Frame) -> std::io::Result<Vec<u8>> {
 /// present, and several `#[tokio::test]` tests elsewhere in the crate (which are current-thread
 /// by default) drive real AOF writes. So the flavor, not just the presence, of a runtime gates
 /// the call: anything but a multi-threaded runtime runs `f` directly, exactly as before this fix.
-/// The server's own runtimes (`#[tokio::main]` in `main.rs`, `rmp_connection`'s builder) are all
-/// multi-threaded, so production always takes the `block_in_place` path.
+/// The only production runtime is `#[tokio::main]` in `main.rs`, which is multi-threaded, so
+/// production always takes the `block_in_place` path. (`rmp_connection`'s
+/// `spawn_isolated_test_server` builds a multi-threaded runtime too, but it is a `#[cfg(test)]`
+/// helper, not a server runtime.)
+///
+/// One panicking case this gate cannot detect: inside a `LocalSet` on a multi-threaded runtime,
+/// `runtime_flavor()` still reports `MultiThread`, yet `block_in_place` panics anyway because it
+/// is not allowed within a `LocalSet`. No `LocalSet` exists anywhere in this codebase today, so
+/// this is a latent gap rather than a live one -- but adding one near an AOF write path would
+/// slip past this check.
 fn run_blocking<F, R>(f: F) -> R
 where
     F: FnOnce() -> R,
