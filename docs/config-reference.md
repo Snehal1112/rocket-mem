@@ -21,6 +21,7 @@ want to change from the default.
 | `aof_path` | `ROCKET_MEM_AOF_PATH` | `--aof-path` | `./appendonly.aof` | Path to the append-only file used for write-durability and crash recovery. |
 | `snapshot_path` | `ROCKET_MEM_SNAPSHOT_PATH` | `--snapshot-path` | `./dump.snapshot` | Path to the point-in-time snapshot file written by `SAVE` and loaded on startup. |
 | `slowlog_threshold_micros` | `ROCKET_MEM_SLOWLOG_THRESHOLD_MICROS` | `--slowlog-threshold-micros` | `10000` | Minimum command duration, in microseconds, that gets logged to the slow log. `0` disables the slow log entirely. |
+| `log_level` | `ROCKET_MEM_LOG_LEVEL` | `--log-level` | `info` | Log level filter passed to `tracing`'s `EnvFilter`, e.g. `info`, `debug`, `rocket_mem=debug,warn`. Same syntax as `RUST_LOG`, which — when set — always overrides this field. |
 | `cluster_config` | `ROCKET_MEM_CLUSTER_CONFIG` | `--cluster-config` | unset | Path to the cluster topology file. Requires `cluster_node_id` to also be set; unset means standalone (non-cluster) mode. |
 | `cluster_node_id` | `ROCKET_MEM_CLUSTER_NODE_ID` | `--cluster-node-id` | unset | This node's id within `cluster_config`'s topology. Requires `cluster_config` to also be set. |
 | `tls_resp_addr` | `ROCKET_MEM_TLS_RESP_ADDR` | `--tls-resp-addr` | unset | TCP address for a TLS-wrapped RESP listener, run alongside the plaintext one at `addr`. Unset means no TLS RESP listener. Setting this requires `tls_cert_path` and `tls_key_path` — see the TLS note below. |

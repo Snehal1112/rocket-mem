@@ -164,6 +164,7 @@ Configuration is layered, each level overriding the one before: built-in default
 | `tls_cert_path` / `tls_key_path` | unset | PEM cert and key; required if either TLS address is set |
 | `cluster_config` / `cluster_node_id` | unset | Cluster topology file and this node's entry |
 | `slowlog_threshold_micros` | `10000` | Commands at or over this are recorded; `0` disables |
+| `log_level` | `info` | Log level filter for `tracing`; `RUST_LOG` env var always overrides it |
 
 Every field, with its TOML key, environment variable, CLI flag, and ACL bootstrap format, is in
 [`docs/config-reference.md`](docs/config-reference.md).
