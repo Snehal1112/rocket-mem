@@ -46,6 +46,49 @@ pub fn encode_frame(frame: &Frame) -> std::io::Result<Vec<u8>> {
     Ok(buf.to_vec())
 }
 
+/// Runs `f`, freeing the current worker thread for other tasks while it blocks, if called from
+/// inside a multi-threaded Tokio runtime. `AofWriter`'s ack-channel `recv()` and `send()` calls
+/// block the calling OS thread for real I/O (a disk fsync, or backpressure from a full writer
+/// queue) -- called directly from an async task, that freezes the whole worker thread, starving
+/// every other task queued on it for the wait's duration. `tokio::task::block_in_place` is the
+/// fix: it hands the runtime a replacement worker so other tasks keep running.
+///
+/// Wrap only the sections that genuinely block, never a whole method: the handoff costs real
+/// time (measured at roughly half a microsecond a call), so it pays for itself against a disk
+/// fsync but not against a queue push that almost always succeeds outright. That is why `send`
+/// tries first and only wraps the full-queue fallback, while the ack-channel `recv()`s -- an
+/// unavoidable wait on the writer thread -- are wrapped at each call site.
+///
+/// `block_in_place` requires an actual multi-threaded Tokio runtime and panics anywhere else --
+/// both with no runtime at all and on a current-thread one. Both cases are real here: every
+/// synchronous unit test in this file calls `fsync`/`append_encoded`/`rotate_to` with no runtime
+/// present, and several `#[tokio::test]` tests elsewhere in the crate (which are current-thread
+/// by default) drive real AOF writes. So the flavor, not just the presence, of a runtime gates
+/// the call: anything but a multi-threaded runtime runs `f` directly, exactly as before this fix.
+/// The only production runtime is `#[tokio::main]` in `main.rs`, which is multi-threaded, so
+/// production always takes the `block_in_place` path. (`rmp_connection`'s
+/// `spawn_isolated_test_server` builds a multi-threaded runtime too, but it is a `#[cfg(test)]`
+/// helper, not a server runtime.)
+///
+/// One panicking case this gate cannot detect: inside a `LocalSet` on a multi-threaded runtime,
+/// `runtime_flavor()` still reports `MultiThread`, yet `block_in_place` panics anyway because it
+/// is not allowed within a `LocalSet`. No `LocalSet` exists anywhere in this codebase today, so
+/// this is a latent gap rather than a live one -- but adding one near an AOF write path would
+/// slip past this check.
+fn run_blocking<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    let on_multi_thread = tokio::runtime::Handle::try_current().is_ok_and(|handle| {
+        handle.runtime_flavor() != tokio::runtime::RuntimeFlavor::CurrentThread
+    });
+    if on_multi_thread {
+        tokio::task::block_in_place(f)
+    } else {
+        f()
+    }
+}
+
 pub struct AofWriter {
     /// Bounded at `AOF_QUEUE_CAPACITY`; see that constant for why.
     tx: mpsc::SyncSender<AofMsg>,
@@ -169,7 +212,7 @@ impl AofWriter {
             self.send(AofMsg::AppendAndFsync(bytes, ack_tx))?;
             // Two failure modes, flattened into one: the writer thread vanished (recv error),
             // or it ran and the write itself failed (the inner result).
-            ack_rx.recv().map_err(writer_gone)?
+            run_blocking(|| ack_rx.recv().map_err(writer_gone))?
         } else {
             self.send(AofMsg::Append(bytes))
         }
@@ -189,7 +232,7 @@ impl AofWriter {
     pub fn fsync(&self) -> std::io::Result<()> {
         let (ack_tx, ack_rx) = mpsc::sync_channel(1);
         self.send(AofMsg::Flush(ack_tx))?;
-        ack_rx.recv().map_err(writer_gone)?
+        run_blocking(|| ack_rx.recv().map_err(writer_gone))?
     }
 
     /// Flushes and fsyncs (via the existing `Flush` message the writer thread already handles),
@@ -229,7 +272,7 @@ impl AofWriter {
     pub fn rotate_to(&self, new_path: &Path) -> std::io::Result<()> {
         let (ack_tx, ack_rx) = mpsc::sync_channel(1);
         self.send(AofMsg::Rotate(new_path.to_path_buf(), ack_tx))?;
-        ack_rx.recv().map_err(writer_gone)??;
+        run_blocking(|| ack_rx.recv().map_err(writer_gone))??;
         *self.path.lock().unwrap_or_else(|e| e.into_inner()) = new_path.to_path_buf();
         Ok(())
     }
@@ -263,8 +306,20 @@ impl AofWriter {
         self.rewrite.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Enqueues `msg` for the writer thread, blocking only if the bounded queue is actually
+    /// full. The try-first shape matters: `block_in_place` is not free (it hands the worker's
+    /// core to another thread and steals it back), and every write command funnels through
+    /// here, so paying that on each one to guard against a queue that has room would tax the
+    /// hot path for nothing. A full queue is the rare case, and only there does the send
+    /// genuinely block -- the intended backpressure, now taken without freezing a worker.
     fn send(&self, msg: AofMsg) -> std::io::Result<()> {
-        self.tx.send(msg).map_err(|_| writer_gone_err())
+        match self.tx.try_send(msg) {
+            Ok(()) => Ok(()),
+            Err(mpsc::TrySendError::Disconnected(_)) => Err(writer_gone_err()),
+            Err(mpsc::TrySendError::Full(msg)) => {
+                run_blocking(|| self.tx.send(msg).map_err(|_| writer_gone_err()))
+            }
+        }
     }
 }
 
@@ -511,6 +566,59 @@ mod tests {
     use engine::{Engine, Value};
     use protocol::Frame;
     use std::io::Read;
+
+    /// How long the blocking task waits for the other task's ping before giving up. Only ever
+    /// waited out in full when the fix is absent, so it trades a slow failure for a fast pass.
+    const STARVATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn run_blocking_does_not_starve_other_tasks_while_it_blocks() {
+        // A single-worker-thread runtime, deliberately: with exactly one worker thread, a
+        // blocking call that doesn't free that thread makes every other task provably unable
+        // to run until it returns -- no timing luck needed to observe the difference. Note the
+        // blocking call has to happen inside a *spawned* task: this test body runs on
+        // `block_on`'s own thread, which is not a worker thread, so blocking here would starve
+        // nothing and prove nothing.
+        let (ping_tx, ping_rx) = mpsc::channel::<()>();
+        let (blocking_started_tx, blocking_started_rx) = mpsc::channel::<()>();
+
+        // Occupies the one worker thread, then blocks until the other task pings it.
+        let blocker = tokio::spawn(async move {
+            blocking_started_tx.send(()).unwrap();
+            run_blocking(|| ping_rx.recv_timeout(STARVATION_TIMEOUT).is_ok())
+        });
+
+        // Blocking this thread is safe -- it is not a worker thread. Waiting here first means
+        // the other task is only spawned once the worker thread is genuinely taken.
+        blocking_started_rx.recv().unwrap();
+
+        let other_task = tokio::spawn(async move {
+            ping_tx.send(()).ok();
+        });
+
+        // The ping can only arrive if the other task ran *during* the blocking call, which can
+        // only happen if run_blocking handed the runtime a replacement worker thread.
+        assert!(
+            blocker.await.unwrap(),
+            "other_task never ran while run_blocking was blocking the only worker thread; \
+             run_blocking starved the runtime instead of freeing it via block_in_place"
+        );
+        other_task.await.unwrap();
+    }
+
+    #[test]
+    fn run_blocking_falls_back_to_a_direct_call_with_no_runtime() {
+        // `block_in_place` panics outside a multi-threaded runtime, and every other test in
+        // this module calls the AOF's blocking methods with no runtime at all.
+        assert_eq!(run_blocking(|| 7), 7);
+    }
+
+    #[tokio::test]
+    async fn run_blocking_falls_back_to_a_direct_call_on_a_current_thread_runtime() {
+        // `#[tokio::test]` is current-thread by default, and several such tests elsewhere in
+        // the crate drive real AOF writes -- `block_in_place` would panic for all of them.
+        assert_eq!(run_blocking(|| 7), 7);
+    }
 
     fn frame(parts: &[&[u8]]) -> Frame {
         Frame::Array(
