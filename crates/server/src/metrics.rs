@@ -30,8 +30,8 @@ pub fn recorder_handle() -> PrometheusHandle {
             // recorder, and the alternative -- panicking -- would take down a server over an
             // observability detail.
             if ::metrics::set_global_recorder(recorder).is_err() {
-                eprintln!(
-                    "metrics: a global recorder was already installed; metrics may be incomplete"
+                tracing::warn!(
+                    "global metrics recorder already installed; metrics may be incomplete"
                 );
             }
             handle
