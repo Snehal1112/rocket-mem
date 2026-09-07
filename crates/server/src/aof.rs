@@ -53,6 +53,12 @@ pub fn encode_frame(frame: &Frame) -> std::io::Result<Vec<u8>> {
 /// every other task queued on it for the wait's duration. `tokio::task::block_in_place` is the
 /// fix: it hands the runtime a replacement worker so other tasks keep running.
 ///
+/// Wrap only the sections that genuinely block, never a whole method: the handoff costs real
+/// time (measured at roughly half a microsecond a call), so it pays for itself against a disk
+/// fsync but not against a queue push that almost always succeeds outright. That is why `send`
+/// tries first and only wraps the full-queue fallback, while the ack-channel `recv()`s -- an
+/// unavoidable wait on the writer thread -- are wrapped at each call site.
+///
 /// `block_in_place` requires an actual multi-threaded Tokio runtime and panics anywhere else --
 /// both with no runtime at all and on a current-thread one. Both cases are real here: every
 /// synchronous unit test in this file calls `fsync`/`append_encoded`/`rotate_to` with no runtime
@@ -193,17 +199,15 @@ impl AofWriter {
     /// itself can block if the writer thread is far enough behind to fill the bounded queue --
     /// that is the intended backpressure, not a stall to avoid.
     pub fn append_encoded(&self, bytes: Vec<u8>) -> std::io::Result<()> {
-        run_blocking(|| {
-            if self.policy == FsyncPolicy::Always {
-                let (ack_tx, ack_rx) = mpsc::sync_channel(1);
-                self.send(AofMsg::AppendAndFsync(bytes, ack_tx))?;
-                // Two failure modes, flattened into one: the writer thread vanished (recv error),
-                // or it ran and the write itself failed (the inner result).
-                ack_rx.recv().map_err(writer_gone)?
-            } else {
-                self.send(AofMsg::Append(bytes))
-            }
-        })
+        if self.policy == FsyncPolicy::Always {
+            let (ack_tx, ack_rx) = mpsc::sync_channel(1);
+            self.send(AofMsg::AppendAndFsync(bytes, ack_tx))?;
+            // Two failure modes, flattened into one: the writer thread vanished (recv error),
+            // or it ran and the write itself failed (the inner result).
+            run_blocking(|| ack_rx.recv().map_err(writer_gone))?
+        } else {
+            self.send(AofMsg::Append(bytes))
+        }
     }
 
     /// Encodes `frame` and sends it to the dedicated writer thread -- a thin wrapper over
@@ -218,11 +222,9 @@ impl AofWriter {
     /// confirms it's done and returning that thread's actual I/O result. Called directly by
     /// tests, and on a timer by `FsyncPolicy::EverySecond`'s periodic loop in `connection.rs`.
     pub fn fsync(&self) -> std::io::Result<()> {
-        run_blocking(|| {
-            let (ack_tx, ack_rx) = mpsc::sync_channel(1);
-            self.send(AofMsg::Flush(ack_tx))?;
-            ack_rx.recv().map_err(writer_gone)?
-        })
+        let (ack_tx, ack_rx) = mpsc::sync_channel(1);
+        self.send(AofMsg::Flush(ack_tx))?;
+        run_blocking(|| ack_rx.recv().map_err(writer_gone))?
     }
 
     /// Flushes and fsyncs (via the existing `Flush` message the writer thread already handles),
@@ -260,13 +262,11 @@ impl AofWriter {
     /// lock is needed here. Acked like `fsync()`, so the caller knows the rotation completed
     /// (and `path()`/`current_offset()` reflect the new file) before proceeding.
     pub fn rotate_to(&self, new_path: &Path) -> std::io::Result<()> {
-        run_blocking(|| {
-            let (ack_tx, ack_rx) = mpsc::sync_channel(1);
-            self.send(AofMsg::Rotate(new_path.to_path_buf(), ack_tx))?;
-            ack_rx.recv().map_err(writer_gone)??;
-            *self.path.lock().unwrap_or_else(|e| e.into_inner()) = new_path.to_path_buf();
-            Ok(())
-        })
+        let (ack_tx, ack_rx) = mpsc::sync_channel(1);
+        self.send(AofMsg::Rotate(new_path.to_path_buf(), ack_tx))?;
+        run_blocking(|| ack_rx.recv().map_err(writer_gone))??;
+        *self.path.lock().unwrap_or_else(|e| e.into_inner()) = new_path.to_path_buf();
+        Ok(())
     }
 
     /// Acquired by `dispatcher::dispatch_and_log` around "mutate, then log" for write
@@ -298,8 +298,20 @@ impl AofWriter {
         self.rewrite.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Enqueues `msg` for the writer thread, blocking only if the bounded queue is actually
+    /// full. The try-first shape matters: `block_in_place` is not free (it hands the worker's
+    /// core to another thread and steals it back), and every write command funnels through
+    /// here, so paying that on each one to guard against a queue that has room would tax the
+    /// hot path for nothing. A full queue is the rare case, and only there does the send
+    /// genuinely block -- the intended backpressure, now taken without freezing a worker.
     fn send(&self, msg: AofMsg) -> std::io::Result<()> {
-        self.tx.send(msg).map_err(|_| writer_gone_err())
+        match self.tx.try_send(msg) {
+            Ok(()) => Ok(()),
+            Err(mpsc::TrySendError::Disconnected(_)) => Err(writer_gone_err()),
+            Err(mpsc::TrySendError::Full(msg)) => {
+                run_blocking(|| self.tx.send(msg).map_err(|_| writer_gone_err()))
+            }
+        }
     }
 }
 
