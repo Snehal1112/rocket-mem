@@ -62,12 +62,15 @@ and is not something this task attempted.
 | GET, 1KB, `-P 16` | 840,336.12 | 19,496.98 | 43.10x |
 
 Full raw `redis-benchmark` trace (including the interim `rps=...` progress lines) is preserved at
-`/tmp/rocket-mem-baseline-2026-09-07.txt` on the machine this run was executed on, and quoted in
-full in `.superpowers/sdd/2026-09-07-perf-baseline-and-profiling-plan/task-1-report.md`.
+`/tmp/rocket-mem-baseline-2026-09-07.txt` on the machine this run was executed on. It is also
+quoted in full in the local task report at
+`.superpowers/sdd/2026-09-07-perf-baseline-and-profiling-plan/task-1-report.md` — note that path
+is gitignored (`.superpowers/sdd/.gitignore`) and won't exist in a fresh clone; both this and the
+`/tmp` path are ephemeral, machine-local artifacts, not committed references.
 
 ## Where we are slower, and why
 
-Six of eight rows are still slower than redis-server, from a small 1.04x (unpipelined 3B GET) up
+Seven of eight rows are still slower than redis-server, from a small 1.04x (unpipelined 3B GET) up
 to the still-enormous 43.10x on pipelined 1KB GET. Compared to the 2026-08-30 report's numbers,
 the picture is mixed rather than uniformly better or worse:
 
