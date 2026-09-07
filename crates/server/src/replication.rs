@@ -430,8 +430,10 @@ async fn replication_client_loop(
         )
         .await
         {
-            Ok(()) => eprintln!("replication: connection to {host_port} closed; reconnecting"),
-            Err(e) => eprintln!("replication: lost connection to {host_port}: {e}; reconnecting"),
+            Ok(()) => tracing::warn!(%host_port, "replication connection closed, reconnecting"),
+            Err(e) => {
+                tracing::warn!(%host_port, error = %e, "replication connection lost, reconnecting")
+            }
         }
         link_up.store(false, Ordering::Relaxed);
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -562,7 +564,7 @@ where
         // version skew) — logged and skipped, not a reason to tear down and resync, which
         // would just reproduce the same error against the same divergence.
         if let protocol::Frame::Error(e) = reply {
-            eprintln!("replication: applying a replicated command failed: {e}");
+            tracing::error!(error = %e, "failed to apply replicated command");
         }
         last_apply.store(unix_now_secs(), Ordering::Relaxed);
     }
