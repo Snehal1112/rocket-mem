@@ -1,3 +1,4 @@
+use std::io::IsTerminal;
 use std::sync::Arc;
 
 #[tokio::main]
@@ -9,10 +10,16 @@ async fn main() -> std::io::Result<()> {
         )
     })?;
 
+    let color = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+
     let filter = tracing_subscriber::EnvFilter::new(
         rocket_mem::config::resolve_log_filter_directive(&config.log_level),
     );
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    tracing_subscriber::fmt()
+        .with_ansi(color)
+        .with_writer(std::io::stderr)
+        .with_env_filter(filter)
+        .init();
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "rocket-mem starting");
 
     let metrics_handle = rocket_mem::metrics::recorder_handle();
