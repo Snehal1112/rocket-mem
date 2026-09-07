@@ -2603,7 +2603,7 @@ fn dispatch_and_log_inner(
         let encoded = match crate::aof::encode_frame(&frame_to_log) {
             Ok(bytes) => bytes,
             Err(e) => {
-                eprintln!("aof encode failed: {e}");
+                tracing::error!(error = %e, "aof encode failed");
                 aof_failed = true;
                 continue; // nothing to append or broadcast without a successful encode
             }
@@ -2613,7 +2613,7 @@ fn dispatch_and_log_inner(
         // `Bytes` handle. A small, accepted per-write-command cost rather than widening AofMsg's
         // channel type just for this sprint.
         if let Err(e) = aof.append_encoded(encoded.clone()) {
-            eprintln!("aof append failed: {e}");
+            tracing::error!(error = %e, "aof append failed");
             aof_failed = true;
         }
         // Broadcast regardless of the append's result: the engine mutation already committed, so
