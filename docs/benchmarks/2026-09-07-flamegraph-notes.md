@@ -25,7 +25,25 @@ only the rendered SVGs are checked in.
 baseline (`2026-09-07-redis-benchmark.md`: 19,496.98 req/s, 43.10x slower than Redis) and the
 2026-08-30 profile's in-band reproduction (19,440 req/s) almost exactly. The anomaly is real,
 reproduces reliably across three separate measurement sessions, and confirming it live (not just
-trusting the benchmark doc) was step 1 of this task's own analysis.
+trusting the benchmark doc) was step 1 of this task's own analysis. This also rebuts a "maybe
+`redis-benchmark` itself is the bottleneck" reading: the same client, on the identical `-d 1024 -P
+16` GET workload, drives real Redis to 840,336.12 req/s in the same benchmark doc — the client is
+plainly not what's capping this run at ~19,400.
+
+**Three different ratios appear below; they measure different things, not the same anomaly three
+ways.** 43.10x is today's `2026-09-07-redis-benchmark.md` figure — real Redis vs. rocket-mem,
+unprofiled, same day. 58.30x is the older `2026-08-30-redis-benchmark.md` figure for the same
+comparison, cited only for trend context. 56x (below, in the anomaly section) is a different
+denominator entirely — it never involves Redis; it's this task's own pipelined-3B-GET vs.
+pipelined-1KB-GET ratio, both rocket-mem, both from these profiled captures.
+
+**A note on structure:** this file's section headings deliberately diverge from
+`2026-08-30-flamegraph-notes.md`'s — that profile was one continuous recording analyzed as a
+single artifact, so its headings ("What the profile shows," "The bottleneck this sprint fixes")
+fit a single-profile narrative. This task produced three isolated recordings answering two
+specific standing questions (the Mutex, the anomaly), so the structure here follows those
+questions instead. Only "Recorded, not acted on" is carried over verbatim, since that heading's
+purpose (this doc feeds Phase 3's fix selection, not fixes anything itself) is unchanged.
 
 ## Kernel symbols: confirmed resolved this time
 
@@ -64,7 +82,11 @@ $ perf report -i perf-pipelined-3b.data --stdio -g graph,0,caller \
 ```
 
 Only 0.08 of the 3.51% self-time resolves to *any* caller, and that caller is the kernel syscall
-entry point, not a rocket-mem frame. This happens because `perf record --call-graph dwarf` samples
+entry point, not a rocket-mem frame. (This run's `--symbol-filter` self-time, 3.51%, differs
+trivially from the 3.54% the flat `--sort=overhead,symbol -g none` report gives for the same
+symbol on the same `perf.data` in the table below — the two `perf report` modes recompute
+percentages against slightly different internal event-count bases; both are the same underlying
+data, not a discrepancy worth chasing further.) This happens because `perf record --call-graph dwarf` samples
 and unwinds from the interrupted context; a thread that's actually asleep in the kernel (as
 opposed to running user code that gets NMI-sampled) doesn't have a live register/stack snapshot at
 the point `perf` can walk DWARF CFI from — the unwind has nothing above the syscall to walk. This
@@ -74,14 +96,61 @@ frame to one specific caller is **not possible from this kind of profile**, inde
 `kptr_restrict` fix — a different tool (e.g. an eBPF-based off-CPU profiler, or `perf record -e
 sched:sched_switch`) would be needed to see the sleeping side of a contended lock's call stack.
 
-## The Mutex-contention question: attributed by strong structural + correlational evidence, not by direct call-graph
+## The Mutex-contention question: decided by source-level elimination, not by call-graph or by self-time scaling
 
-**Direct answer: still not attributable by call-graph** (see above), but the isolated,
-per-phase captures this task's methodology change was specifically for make an indirect
-attribution solid enough to act on.
+**Direct call-graph attribution: still not possible** (see above — the futex-unwind limitation
+means no sample resolves a caller). But the source code itself eliminates two of the three named
+candidates outright, which is a stronger and simpler argument than anything a scaling comparison
+could give:
 
-Flat self-time for `std::sync::mutex::futex::Mutex::lock_contended`, isolated per phase (this is
-the number the 2026-08-30 profile could only report as one blended 1.96% across all three phases):
+**`SlowLog` is eliminated: its mutex is structurally almost never even reached on this benchmark.**
+`SlowLog::maybe_record` (`crates/server/src/slowlog.rs:69`) returns *before* touching
+`self.state.lock()` unless `elapsed >= self.threshold`:
+
+```rust
+if self.threshold.is_zero() || elapsed < self.threshold {
+    return;
+}
+```
+
+The default threshold is 10,000µs / 10ms (`crates/server/src/config.rs:44`,
+`slowlog_threshold_micros: 10_000`), and nothing in this benchmark run overrides it. Every `p50`
+this task measured is sub-millisecond (0.167–4.687ms across all three captures, both commands),
+comfortably under the 10ms bar — so for the overwhelming majority of commands the function returns
+on the first line, before the mutex is ever locked. This isn't "less contended than the others";
+it's structurally unreachable as *the* contended lock at these latencies, full stop.
+
+**`ReplicaRegistry` is eliminated: its lock is nested under the order lock, never independently
+raced.** `crates/server/src/dispatcher.rs:2537` binds `_order_guard = aof.lock_for_ordering()` at
+the top of `dispatch_and_log`; the function's only calls into `ReplicaRegistry` —
+`registry.broadcast(...)` at `:2622` — happen inside that same function body, and `_order_guard`
+isn't dropped until the function returns at `:2634`. `replication.rs`'s `register()` (the other
+write path into `senders`) documents the identical constraint in its own doc comment: "Called only
+from `serve_replica`... while it still holds `AofWriter::lock_for_ordering()`." So every writer
+that could possibly reach `senders.lock()` on a write path has *already* serialized on
+`_order_guard` first — two concurrent writers can never race each other for `senders`, because
+whichever one is inside `dispatch_and_log` already holds the order lock alone. Any
+`lock_contended` sample attributed to `senders` would be a symptom *downstream of* the order lock's
+own serialization, not an independent source of contention.
+
+(An earlier version of this section argued from each candidate's own self-time scaling with
+pipelining — e.g. that `SlowLog::maybe_record`'s self-time staying flat across captures proved it
+wasn't contended. That argument doesn't hold: `lock_contended` is its own, separate,
+not-inlined profiler symbol — blocked/waiting time inside a `.lock()` call is counted there, in
+the callee, not folded into the caller's self-time. This is consistent with, not in tension with,
+the futex-unwind finding above: those samples don't unwind to *any* caller, which is exactly why a
+caller's self-time can't be used as a proxy for how much it contends its own locks. The source-level
+elimination above replaces that argument rather than supplementing it.)
+
+By elimination, `AofWriter::lock_for_ordering()` (`crates/server/src/aof.rs:277`, backed by
+`self.order: Mutex<()>`) is the only one of the three candidates a second concurrent writer can
+actually race on this benchmark's write path — it's acquired at the very top of
+`dispatch_and_log`, before either of the other two locks comes into play, so multiple worker
+threads dispatching write commands concurrently genuinely contend on this one acquisition.
+
+For reference, isolating `lock_contended`'s flat self-time per phase (impossible from the 2026-08-30
+blended profile, which could only report one number, 1.96%, across all three phases at once) does
+show it rising sharply under pipelining:
 
 | Capture | `lock_contended` self % | `AofWriter::append_encoded` | `AofWriter::send` | `SlowLog::maybe_record` | `ReplicaRegistry::broadcast` |
 |---|---|---|---|---|---|
@@ -89,48 +158,24 @@ the number the 2026-08-30 profile could only report as one blended 1.96% across 
 | pipelined 3B (`-P 16`) | **3.54%** | 0.10% | 0.17% | 0.20% | 0.09% |
 | pipelined 1KB (`-P 16 -d 1024`) | **2.96%** | 0.06% | 0.04% | 0.07% | 0.09% |
 
-Two things this table shows cleanly, that the blended prior profile couldn't:
+This is included for completeness, not as the basis of the attribution above, and it does not
+hold up cleanly as a scaling argument on its own: SET throughput only rises 2.9x from unpipelined
+to pipelined-3B (71,556 → 209,864 req/s) while `lock_contended` rises ~25x (0.14% → 3.54%) —
+non-linear — and SET throughput *drops* from pipelined-3B to pipelined-1KB (209,864 → 96,665
+req/s) while `lock_contended` barely moves (3.54% → 2.96%). Per the correction above, none of the
+other columns (including `broadcast`'s own 9x jump, 0.01% → 0.09%, the largest relative move of
+the three) can be read as evidence of relative contention-proneness either way, since self-time in
+a lock's caller doesn't capture that lock's blocked time. The table is left here as raw data for
+anyone following up, not re-interpreted into a proof this document doesn't need — the elimination
+argument above is the decisive one.
 
-1. **The Mutex is overwhelmingly a pipelining/throughput-rate effect, not a payload-size effect.**
-   It jumps ~25x between unpipelined and pipelined at the *same* 3-byte payload (0.14% → 3.54%),
-   but stays roughly the same order of magnitude between the two pipelined runs regardless of
-   payload (3.54% at 3B vs 2.96% at 1KB). Whatever this Mutex guards, contention on it scales with
-   *how fast commands arrive back-to-back*, not with how big they are.
-2. **None of the three named candidates' own self-time scales anywhere near proportionally with
-   `lock_contended`.** `SlowLog::maybe_record` and `ReplicaRegistry::broadcast` stay under 0.2%
-   in every capture (and this benchmark has zero registered replicas, so `broadcast`'s lock is
-   held only to iterate an empty `Vec` and return — a few nanoseconds). If either of those were
-   the contended lock, their own self-time (the fast path *and* the contended path both run
-   inside the same function) would need to scale similarly. It doesn't.
+**Verdict:** `AofWriter::lock_for_ordering` (the `order: Mutex<()>` field) is the contended Mutex,
+established by eliminating the other two candidates at the source level — a decisive argument, not
+a correlational one — though still not confirmed by direct call-graph evidence, which remains
+blocked by the futex-unwind limitation documented above. Phase 3 can treat this as settled enough
+to act on.
 
-Cross-referencing the source settles which of the three candidates this has to be.
-`crates/server/src/dispatcher.rs:2537`:
-
-```rust
-let _order_guard = write_name.as_ref().map(|_| aof.lock_for_ordering());
-```
-
-`AofWriter::lock_for_ordering()` (`crates/server/src/aof.rs:277`, backed by `self.order:
-Mutex<()>`) is held across the *entire* "mutate the engine, then log it" section of
-`dispatch_and_log` for every write command — not a quick push like `SlowLog`'s or
-`ReplicaRegistry`'s, but a single global mutex serializing all concurrent writers across the
-whole server for the encode-then-enqueue duration. `-P 16` doesn't change payload size; it changes
-how many write commands per connection are in flight and get dispatched back-to-back with no
-network round-trip between them, directly multiplying the *rate* at which 50 concurrent
-connections' commands hit this one lock. That is exactly the variable the data above says drives
-the contention. `SlowLog`'s and `ReplicaRegistry`'s locks are architecturally quick,
-independently-scoped, per-call critical sections with no reason to scale with pipeline depth the
-way a single serializing ordering-lock does.
-
-**Verdict:** `AofWriter::lock_for_ordering` (the `order: Mutex<()>` field) is the far more likely
-source of the contended `std::sync::Mutex`, on structural grounds (it is the only one of the three
-candidates architected to serialize *all* concurrent writers into one critical section) and on
-correlational grounds (contention tracks pipelining exactly as this lock's design predicts, while
-none of the alternative candidates' own measured self-time scales similarly). This is not a
-call-graph-confirmed attribution — that remains blocked by the futex-unwind limitation above — so
-treat it as a strong, actionable lead for Phase 3, not a certainty proven by this profile alone.
-
-## The 43x/58x pipelined-1KB GET anomaly
+## The 43x/58x-vs-Redis, 56x-internal pipelined-1KB GET anomaly
 
 **Reproduced:** 19,417 req/s GET in this capture, consistent with both the 43.10x figure in
 today's `2026-09-07-redis-benchmark.md` and the 08-30 profile's in-band 19,440 req/s.
@@ -146,10 +191,27 @@ alone is nowhere near large enough to explain a 43–58x slowdown, and the mallo
 This rules out "one new expensive function" as the explanation, same conclusion the 08-30 profile
 reached — but now from clean, isolated data instead of a blended, unresolved one.
 
-**The real finding is in the resolved call-graph, and it points at the socket write path — but
-not the way "a distinct hot path" implies.** Following `entry_SYSCALL_64_after_hwframe` down with
-`perf report -g graph,0.5,caller`, in **both** pipelined captures essentially the same two
-syscalls dominate, at essentially the same *proportions*:
+**The strongest evidence: the same 400,000 commands (200,000 SET + 200,000 GET, both captures)
+cost ~1.34x more CPU cycles but took ~3.4x longer in wall-clock terms at 1KB than at 3B.**
+`perf report --header-only`'s sample-bounded span (the interval between each capture's first and
+last recorded sample — not the total time the recording process was open, which also includes the
+script's `sleep 5` startup pause before any traffic starts; that pause emits few or no cycle
+samples and does not materially inflate this figure) was 4.68s for pipelined-3B and 16.09s for
+pipelined-1KB — a ~3.4x difference. Over that span, pipelined-3B recorded ~5,540 samples and
+pipelined-1KB ~7,399 — only ~1.34x more, not 3.4x more and nowhere near the 56x throughput gap.
+Same total command count, similar-order CPU cycles spent, but 3.4x the wall-clock time to do it.
+That is a clean, direct statement that most of the extra wall-clock time in the 1KB run is *not*
+being spent computing — whatever it's doing with the other ~2x of elapsed time it isn't retiring
+proportionally more CPU cycles to show for it. Since `perf record -e cpu/cycles/P` (what `cargo
+flamegraph` uses) only samples active, running cycles, it is structurally blind to that missing
+time by construction — a thread genuinely blocked/descheduled (e.g. backpressure from a full
+socket send buffer, or Nagle-driven batching delaying a small final segment behind an unacked
+one) emits no samples for however long it's parked.
+
+**Secondary, corroborating color: the resolved call-graph's active-work composition looks nearly
+identical between the two runs.** Following `entry_SYSCALL_64_after_hwframe` down with `perf
+report -g graph,0.5,caller`, in **both** pipelined captures the same two syscalls dominate, at
+close to the same *proportions*:
 
 | | pipelined 3B | pipelined 1KB |
 |---|---|---|
@@ -164,31 +226,60 @@ tcp_write_xmit → __tcp_transmit_skb → ip_queue_xmit → ip_local_out → ip_
 ip_finish_output2 → neigh_hh_output → __dev_queue_xmit → do_softirq → net_rx_action →
 __napi_poll → process_backlog → __netif_receive_skb → ip_rcv → ip_local_deliver →
 tcp_v4_rcv → tcp_v4_do_rcv → tcp_rcv_established` — a genuine loopback round trip through the
-*entire* TCP/IP stack and back into the kernel's own receive path for every pipelined write,
-costing double-digit percent of all CPU cycles sampled. This is real, resolved, and exactly the
-"socket write path under large pipelined responses" the 08-30 notes hypothesized — but it is
-**not distinctively larger for the 1KB run**. The proportion is nearly identical (11.07% vs
-11.39%) between a workload running at 1.09M req/s and one running at 19.4K req/s — a 56x
-difference in throughput with essentially no difference in *where the active CPU cycles go*.
+*entire* TCP/IP stack and back into the kernel's own receive path for every pipelined write. This
+is real and resolved, and it is exactly the "socket write path under large pipelined responses"
+the 08-30 notes hypothesized. But treat "11.07% vs 11.39%, nearly identical" as weak, corroborating
+color, not as the headline finding — it's close to tautological under the off-CPU-wait hypothesis
+above: if the extra time genuinely is idle/blocked and idle/blocked time emits no cycle samples at
+all, then of course the *proportions among the samples that do exist* look similar between the two
+runs — that's what "the missing time doesn't show up as CPU work" predicts, not an independent
+confirmation of it. The sample-count/wall-time comparison above is the non-circular version of
+this same observation and should be weighted accordingly.
 
-That is the actual anomaly, restated precisely: **the bottleneck is not what the CPU is doing, it
-is how much wall-clock time elapses per unit of that (roughly fixed-proportion) work.** A
-CPU-cycle sampling profiler (`perf record -e cpu/cycles/P`, what `cargo flamegraph` uses by
-default) only samples active, running cycles — it is structurally blind to time a thread spends
-genuinely blocked/descheduled (e.g. backpressure from a full socket send buffer, or Nagle-driven
-batching delaying a small final segment behind an unacked one). Weak but consistent supporting
-evidence for this reading: sample *density* (samples per wall-clock second) is markedly lower in
-the 1KB capture (~5,540 samples / 4.68s ≈ 1,180/s for pipelined-3b vs ~7,399 samples / 16.09s ≈
-460/s for pipelined-1kb) — roughly 2.6x fewer active-CPU samples per second of wall time, in a
-recording where 50 connections × 16 pipeline depth should be keeping every worker thread
-maximally busy if the server weren't stalling. That drop is consistent with — not proof of —
-threads spending real wall-clock time off-CPU (blocked) rather than computing.
+**A real limitation in this comparison, not glossed over:** each capture's percentages (in both
+tables above) are computed over its *whole* recording — SET phase and GET phase blended together —
+because `redis-benchmark -t set,get` runs both in one invocation and each capture is one
+`perf.data`. But the order lock is SET-only (`dispatch_and_log`'s `_order_guard` only binds for
+write commands) and this anomaly is GET-only (SET throughput is comparatively unaffected — see
+below). Comparing a whole-capture aggregate (11.07% vs 11.39% writev proportion, blending both
+phases) against a GET-phase-only 56x throughput ratio is a normalization mismatch: the two numbers
+aren't measuring matched slices of the same work. A fourth, GET-only capture (`redis-benchmark -t
+get` alone, both payload sizes) would isolate this cleanly and is a real gap in this task's
+methodology — flagged here for whoever picks this up next, not attempted now per this task's
+scope (no new captures once the analysis was underway).
 
-One more data point narrows this further: the SET phase (client → server, 1KB *request* payload,
-still `-P 16`) is only ~2.2x slower at 1KB than at 3B (96,665 vs 209,864 req/s) — nothing like the
-56x GET gap. **The anomaly is specific to the server's write path for large pipelined *replies*,
-not to large payloads in general** — ruling out a generic "big buffers are slow" explanation and
-narrowing it specifically to the direction rocket-mem writes to the socket.
+**The SET-phase comparison, corrected.** The profiled captures' own SET numbers (96,665 req/s at
+1KB vs 209,864 req/s at 3B, both `-P 16`) look like a ~2.2x gap, but those numbers are themselves
+distorted by profiling overhead, and — as the next paragraph shows — that distortion is *not*
+uniform across workloads, so it's not safe to compare two profiled numbers against each other
+directly here. Against the same-day **unprofiled** baseline in `2026-09-07-redis-benchmark.md`
+(SET 1KB `-P 16`: 264,550.28 req/s; SET 3B `-P 16`: 332,225.91 req/s), the real gap is **~1.26x**
+— a modest, unremarkable difference, nothing like the 56x GET gap. This still supports the same
+conclusion (the anomaly is specific to the server's large-pipelined-*reply* write path, not to
+large payloads generally — SET pushes the 1KB payload the *other* direction, client→server, and
+barely slows down) but the corrected number is the one to cite, not the profiled one.
+
+**Profiling overhead itself is heterogeneous across workloads, which is worth flagging on its own.**
+Computing unprofiled-baseline ÷ profiled-capture per workload this task profiled:
+
+| Workload | Unprofiled (req/s) | Profiled (req/s) | Overhead ratio |
+|---|---|---|---|
+| SET, 3B, no pipeline | 87,719.30 | 71,556.35 | 1.23x |
+| GET, 3B, no pipeline | 99,206.34 | 83,437.62 | 1.19x |
+| SET, 3B, `-P 16` | 332,225.91 | 209,863.59 | 1.58x |
+| GET, 3B, `-P 16` | 1,351,351.38 | 1,092,896.12 | 1.24x |
+| SET, 1KB, `-P 16` | 264,550.28 | 96,665.05 | **2.74x** |
+| GET, 1KB, `-P 16` | 19,496.98 | 19,417.47 | **1.00x** |
+
+Five of six workloads cluster in a 1.19x–1.58x "profiling tax" band — unsurprising, `perf record
+-F 997 --call-graph dwarf` isn't free. Two don't: SET-1KB-`P16` is far more distorted than
+anything else (2.74x, likely `lock_for_ordering` contention itself becoming worse under
+profiling's added overhead per critical section), while GET-1KB-`P16` — the anomaly itself — shows
+**no measurable profiling distortion at all** (1.00x). That absence of distortion is itself a
+minor data point for the off-CPU-wait reading: if the bottleneck were CPU-bound rocket-mem work,
+adding a sampling profiler's overhead to that work should slow it down like it does everywhere
+else; a bottleneck that's already dominated by kernel-side blocking/backpressure has little
+additional CPU work for the profiler to tax.
 
 **This profile corroborates, rather than contradicts, both candidate causes raised for
 cross-validation:**
@@ -203,10 +294,12 @@ signals the wrong process and the capture never stops on its own. Worked around 
 a log file instead of piping (`... > log 2>&1 &`) and locating the actual `perf record` process
 via `pgrep -x perf` before signaling it. The first attempts at the unpipelined-3b and pipelined-3b
 captures hit this bug and sat idle for several minutes before being manually recovered mid-task;
-both were **discarded and re-captured cleanly** once the fix was in place (final sample durations:
-8.8s, 4.7s, and 16.1s — all consistent with their actual `redis-benchmark` run times, confirmed via
-`perf report --header-only`). All percentages and call-graphs in this document are from the clean,
-tightly-scoped re-captures, not the diluted first attempts.
+both were **discarded and re-captured cleanly** once the fix was in place (final sample-bounded
+spans — the interval between each capture's first and last recorded sample, not total process
+runtime — were 8.8s, 4.7s, and 16.1s respectively, confirmed via `perf report --header-only`, and
+each is in the right order of magnitude for its `redis-benchmark` run's actual duration). All
+percentages and call-graphs in this document are from the clean, tightly-scoped re-captures, not
+the diluted first attempts.
 
 ## Recorded, not acted on
 
@@ -215,7 +308,7 @@ this task's brief and the sprint's own sequencing (a TDD plan can't be written f
 target this task is the one establishing). Specifically queued for that follow-up work:
 
 - Narrowing `AofWriter::lock_for_ordering`'s scope, or replacing the `Mutex<()>` ordering
-  mechanism, informed by the correlational (not call-graph-direct) attribution above.
+  mechanism, informed by the source-level-elimination (not call-graph-direct) attribution above.
 - Setting `TCP_NODELAY` on the RESP/RMP accept paths, informed by the source-confirmed absence
   and the profile's consistent (not proving, but non-contradicting) symptom shape.
 - If pursued further, an off-CPU/wallclock profiling pass (not a CPU-cycle one) is the correct
