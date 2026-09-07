@@ -115,21 +115,24 @@ if self.threshold.is_zero() || elapsed < self.threshold {
 
 The default threshold is 10,000µs / 10ms (`crates/server/src/config.rs:44`,
 `slowlog_threshold_micros: 10_000`), and nothing in this benchmark run overrides it. Every `p50`
-this task measured is sub-millisecond (0.167–4.687ms across all three captures, both commands),
-comfortably under the 10ms bar — so for the overwhelming majority of commands the function returns
-on the first line, before the mutex is ever locked. This isn't "less contended than the others";
-it's structurally unreachable as *the* contended lock at these latencies, full stop.
+this task measured, across all three captures and both commands, is 0.167–4.687ms — all comfortably
+under the 10ms bar (none even reaches half of it) — so for the overwhelming majority of commands
+the function returns on the first line, before the mutex is ever locked. This isn't "less contended
+than the others"; it's structurally unreachable as *the* contended lock at these latencies, full
+stop.
 
 **`ReplicaRegistry` is eliminated: its lock is nested under the order lock, never independently
-raced.** `crates/server/src/dispatcher.rs:2537` binds `_order_guard = aof.lock_for_ordering()` at
-the top of `dispatch_and_log`; the function's only calls into `ReplicaRegistry` —
-`registry.broadcast(...)` at `:2622` — happen inside that same function body, and `_order_guard`
-isn't dropped until the function returns at `:2634`. `replication.rs`'s `register()` (the other
+raced.** `crates/server/src/dispatcher.rs:2537` binds `_order_guard = aof.lock_for_ordering()` near
+the top of `dispatch_and_log_inner` (the function `dispatch_and_log`, `:2433`, wraps for metrics/
+timing — the guard itself lives in the inner function, not the outer wrapper); the function's only
+calls into `ReplicaRegistry` — `registry.broadcast(...)` at `:2622` — happen inside that same
+function body, and `_order_guard` isn't dropped until the function returns at `:2634`.
+`replication.rs`'s `register()` (the other
 write path into `senders`) documents the identical constraint in its own doc comment: "Called only
 from `serve_replica`... while it still holds `AofWriter::lock_for_ordering()`." So every writer
 that could possibly reach `senders.lock()` on a write path has *already* serialized on
 `_order_guard` first — two concurrent writers can never race each other for `senders`, because
-whichever one is inside `dispatch_and_log` already holds the order lock alone. Any
+whichever one is inside `dispatch_and_log_inner` already holds the order lock alone. Any
 `lock_contended` sample attributed to `senders` would be a symptom *downstream of* the order lock's
 own serialization, not an independent source of contention.
 
@@ -144,8 +147,8 @@ elimination above replaces that argument rather than supplementing it.)
 
 By elimination, `AofWriter::lock_for_ordering()` (`crates/server/src/aof.rs:277`, backed by
 `self.order: Mutex<()>`) is the only one of the three candidates a second concurrent writer can
-actually race on this benchmark's write path — it's acquired at the very top of
-`dispatch_and_log`, before either of the other two locks comes into play, so multiple worker
+actually race on this benchmark's write path — it's acquired near the top of
+`dispatch_and_log_inner`, before either of the other two locks comes into play, so multiple worker
 threads dispatching write commands concurrently genuinely contend on this one acquisition.
 
 For reference, isolating `lock_contended`'s flat self-time per phase (impossible from the 2026-08-30
@@ -191,22 +194,55 @@ alone is nowhere near large enough to explain a 43–58x slowdown, and the mallo
 This rules out "one new expensive function" as the explanation, same conclusion the 08-30 profile
 reached — but now from clean, isolated data instead of a blended, unresolved one.
 
-**The strongest evidence: the same 400,000 commands (200,000 SET + 200,000 GET, both captures)
-cost ~1.34x more CPU cycles but took ~3.4x longer in wall-clock terms at 1KB than at 3B.**
-`perf report --header-only`'s sample-bounded span (the interval between each capture's first and
-last recorded sample — not the total time the recording process was open, which also includes the
-script's `sleep 5` startup pause before any traffic starts; that pause emits few or no cycle
-samples and does not materially inflate this figure) was 4.68s for pipelined-3B and 16.09s for
-pipelined-1KB — a ~3.4x difference. Over that span, pipelined-3B recorded ~5,540 samples and
-pipelined-1KB ~7,399 — only ~1.34x more, not 3.4x more and nowhere near the 56x throughput gap.
-Same total command count, similar-order CPU cycles spent, but 3.4x the wall-clock time to do it.
-That is a clean, direct statement that most of the extra wall-clock time in the 1KB run is *not*
-being spent computing — whatever it's doing with the other ~2x of elapsed time it isn't retiring
-proportionally more CPU cycles to show for it. Since `perf record -e cpu/cycles/P` (what `cargo
-flamegraph` uses) only samples active, running cycles, it is structurally blind to that missing
-time by construction — a thread genuinely blocked/descheduled (e.g. backpressure from a full
-socket send buffer, or Nagle-driven batching delaying a small final segment behind an unacked
-one) emits no samples for however long it's parked.
+**The strongest evidence: within the single pipelined-1KB capture, SET and GET are cleanly
+time-separable, and GET does markedly less sampled CPU work per request than SET while taking
+markedly longer per request in wall-clock time — the opposite of what proportional CPU cost would
+predict.** `redis-benchmark -t set,get` runs SET to completion, then GET, inside one recording;
+`perf script -i perf-pipelined-1kb.data -F time,comm` (bucketed at 0.05–0.2s resolution, not
+guessed) shows a sharp density cliff at the transition — SET's sample rate holds in the
+hundreds-per-100ms range through absolute timestamp `525494.49`, then drops from 167 samples in a
+50ms bucket to 5 in the next. That boundary, cross-checked against each phase's own known request
+count and measured throughput (200,000 ÷ 96,665.05 req/s ≈ 2.07s expected for SET; 200,000 ÷
+19,417.47 req/s ≈ 10.30s expected for GET — both within ~3% of the timestamp-derived durations
+below), is reliable enough to filter on directly:
+
+```
+$ perf script -i perf-pipelined-1kb.data --time 525492.358,525494.49 | grep -c 'cpu/cycles/P:'
+3972   # SET phase: 200,000 commands, 2.132s (525492.358 -> 525494.49)
+$ perf script -i perf-pipelined-1kb.data --time 525494.49,525504.5 | grep -c 'cpu/cycles/P:'
+1064   # GET phase: 200,000 commands, 9.956s (525494.49 -> 525504.446, last sample)
+```
+
+Per request, that's:
+
+| Phase | Samples | Requests | Wall time | Samples/request | Wall-clock/request |
+|---|---|---|---|---|---|
+| SET | 3,972 | 200,000 | 2.132s | 0.0199 | 10.66µs |
+| GET | 1,064 | 200,000 | 9.956s | 0.0053 | 49.78µs |
+
+GET does **~3.7x fewer** sampled CPU cycles per request than SET (0.0199 → 0.0053) — cheaper work,
+as expected for a read-only lookup-and-reply versus a write that also touches the AOF/order-lock
+path — yet each GET request takes **~4.7x longer** in wall-clock time (10.66µs → 49.78µs). Less
+work, more time: that inversion (a combined ~17.4x gap between the two ratios) is a direct,
+non-circular statement that GET-phase wall-clock time here is not proportional to GET-phase CPU
+work, measured entirely within one capture, same server process, same client, same connections —
+nothing is being normalized across two different recordings, which directly closes the
+phase-blending gap noted below for the secondary evidence. Since `perf record -e cpu/cycles/P`
+(what `cargo flamegraph` uses) only samples active, running cycles, it is structurally blind to
+time a thread spends genuinely blocked/descheduled (e.g. backpressure from a full socket send
+buffer, or Nagle-driven batching delaying a small final segment behind an unacked one) — exactly
+the kind of gap this per-request inversion points at.
+
+This also lets the payload-size claim be checked directly rather than by throughput ratio alone:
+pipelined-3B's own GET phase, at its measured 1,092,896.12 req/s, computes to an estimated 0.183s
+for the same 200,000 requests — far too short a window to cleanly time-slice apart from SET the
+way pipelined-1KB's was (its whole SET+GET burst is compressed into ~1.2s with no visible density
+transition at any bucket resolution tried down to 50ms, unlike pipelined-1KB's sharp cliff), so
+this number is computed from measured throughput, not isolated by timestamp the way the numbers
+above are. Still, 9.956s (pipelined-1KB's real, isolated GET-phase duration) against 0.183s
+(pipelined-3B's computed one) for the identical 200,000-request GET workload is a ~54.4x wall-clock
+gap — consistent with, and an independent cross-check on, the 56.28x throughput ratio already
+reported (19,417.47 vs 1,092,896.12 req/s) from a different angle.
 
 **Secondary, corroborating color: the resolved call-graph's active-work composition looks nearly
 identical between the two runs.** Following `entry_SYSCALL_64_after_hwframe` down with `perf
@@ -236,17 +272,17 @@ runs — that's what "the missing time doesn't show up as CPU work" predicts, no
 confirmation of it. The sample-count/wall-time comparison above is the non-circular version of
 this same observation and should be weighted accordingly.
 
-**A real limitation in this comparison, not glossed over:** each capture's percentages (in both
-tables above) are computed over its *whole* recording — SET phase and GET phase blended together —
-because `redis-benchmark -t set,get` runs both in one invocation and each capture is one
-`perf.data`. But the order lock is SET-only (`dispatch_and_log`'s `_order_guard` only binds for
-write commands) and this anomaly is GET-only (SET throughput is comparatively unaffected — see
-below). Comparing a whole-capture aggregate (11.07% vs 11.39% writev proportion, blending both
-phases) against a GET-phase-only 56x throughput ratio is a normalization mismatch: the two numbers
-aren't measuring matched slices of the same work. A fourth, GET-only capture (`redis-benchmark -t
-get` alone, both payload sizes) would isolate this cleanly and is a real gap in this task's
-methodology — flagged here for whoever picks this up next, not attempted now per this task's
-scope (no new captures once the analysis was underway).
+**A real limitation, still present in the secondary evidence above (not in the primary evidence
+this time):** the `writev`/futex proportion table's two columns are each computed over their
+capture's *whole* recording — SET phase and GET phase blended together — because that specific
+`perf report -g graph,0.5,caller` pass wasn't time-sliced the way the primary SET-vs-GET comparison
+above was. The order lock is SET-only (`dispatch_and_log_inner`'s `_order_guard` only binds for
+write commands) and this anomaly is GET-only, so comparing that whole-capture aggregate (11.07% vs
+11.39% writev proportion, blending both phases) against a GET-phase-only throughput ratio is still
+a normalization mismatch for that specific table — the two numbers aren't measuring matched slices
+of the same work. Re-running that `-g graph,0.5,caller` pass with the same `--time` boundaries used
+above would close this the same way; not done here since the table was always secondary,
+corroborating color (see above) and the primary evidence no longer depends on it.
 
 **The SET-phase comparison, corrected.** The profiled captures' own SET numbers (96,665 req/s at
 1KB vs 209,864 req/s at 3B, both `-P 16`) look like a ~2.2x gap, but those numbers are themselves
@@ -273,13 +309,18 @@ Computing unprofiled-baseline ÷ profiled-capture per workload this task profile
 
 Five of six workloads cluster in a 1.19x–1.58x "profiling tax" band — unsurprising, `perf record
 -F 997 --call-graph dwarf` isn't free. Two don't: SET-1KB-`P16` is far more distorted than
-anything else (2.74x, likely `lock_for_ordering` contention itself becoming worse under
-profiling's added overhead per critical section), while GET-1KB-`P16` — the anomaly itself — shows
-**no measurable profiling distortion at all** (1.00x). That absence of distortion is itself a
-minor data point for the off-CPU-wait reading: if the bottleneck were CPU-bound rocket-mem work,
-adding a sampling profiler's overhead to that work should slow it down like it does everywhere
-else; a bottleneck that's already dominated by kernel-side blocking/backpressure has little
-additional CPU work for the profiler to tax.
+anything else (2.74x), while GET-1KB-`P16` — the anomaly itself — shows **no measurable profiling
+distortion at all** (1.00x). What specifically drives SET-1KB-`P16`'s outsized distortion is not
+established by this data, and it is *not* simply "more concurrent writers hitting
+`lock_for_ordering`": SET-3B-`P16` puts more SET commands/sec through that exact same lock than
+SET-1KB-`P16` does (209,863.59 vs 96,665.05 req/s profiled; 332,225.91 vs 264,550.28 req/s
+unprofiled — SET-3B-`P16` is the higher-rate case either way) yet shows *less* profiling distortion
+(1.58x vs 2.74x) — the opposite of what a "more lock traffic → more distortion" story predicts.
+Recorded as an open, contradicted-by-its-own-neighbor question, not a claimed cause. GET-1KB-`P16`'s
+1.00x is more straightforward: if the bottleneck were CPU-bound rocket-mem work, adding a sampling
+profiler's overhead to that work should slow it down like it does everywhere else; a bottleneck
+that's already dominated by kernel-side blocking/backpressure has little additional CPU work for
+the profiler to tax — a minor data point for the off-CPU-wait reading.
 
 **This profile corroborates, rather than contradicts, both candidate causes raised for
 cross-validation:**
