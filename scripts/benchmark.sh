@@ -39,7 +39,8 @@ ROCKET_MEM_ADDR="127.0.0.1:$ROCKET_PORT" \
 ROCKET_MEM_AOF_PATH="$WORK/rocket.aof" \
 ROCKET_MEM_SNAPSHOT_PATH="$WORK/rocket.snapshot" \
 ROCKET_MEM_METRICS_ADDR="127.0.0.1:9178" \
-  "$ROOT/target/release/rocket-mem" >"$WORK/rocket.log" 2>&1 &
+ROCKET_MEM_RMP_ADDR="127.0.0.1:9179" \
+  "$ROOT/target/release/rocket-mem" --config "$WORK/unused.toml" >"$WORK/rocket.log" 2>&1 &
 ROCKET_PID=$!
 
 sleep 1
@@ -55,8 +56,17 @@ echo
 # -q prints one "COMMAND: N requests per second" line per tested command.
 run_case() { # $1=label $2=port $3=payload-bytes $4=pipeline-depth
   echo "--- $1 (payload=${3}B, pipeline=${4}) ---"
-  redis-benchmark -h 127.0.0.1 -p "$2" -t set,get -n 100000 -c 50 -d "$3" -P "$4" -q
-  redis-cli -p "$2" flushall >/dev/null 2>&1 || true
+  # -r spreads writes over a keyspace instead of hammering one key. Without it every command
+  # targeted a single key, which is a degenerate case: no shard parallelism on rocket-mem's side,
+  # one permanently hot cache line, and a keyspace small enough to sit entirely in L1. 100k is
+  # matched to -n so GET has a realistic hit rate rather than measuring mostly-misses.
+  redis-benchmark -h 127.0.0.1 -p "$2" -t set,get -n 100000 -c 50 -r 100000 -d "$3" -P "$4" -q
+  # Deliberately no `flushall` between cases. rocket-mem implements no FLUSHALL, so the call
+  # only ever succeeded against redis-server -- harmless while both sides used one key, but with
+  # -r it would leave redis-server serving GET against an emptied keyspace (all misses, no value
+  # copy) while rocket-mem served hits. Letting both keyspaces persist keeps the two comparable.
+  # Bounded: every case draws from the same `key:__rand_int__` namespace, so this tops out at
+  # ~100k keys at the largest payload rather than growing per case.
 }
 
 for payload in 3 1024; do

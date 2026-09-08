@@ -1,9 +1,18 @@
 # Cluster node shard-b — see cluster.conf and rocket-mem.toml (shard-a) for context.
-# TLS omitted here for simplicity; only shard-a exposes TLS ports for this benchmark setup.
+#
+# cluster.conf advertises this node as numericlabs.lxd:16380, which must therefore be the
+# TLS RESP listener: a client following a MOVED redirect here has to reach the same kind of
+# port on every node, and shard-a advertises its TLS listener. The plaintext ports below stay
+# available for local use, but nothing in the cluster topology points at them.
 
 addr = "numericlabs.lxd:6380"
 rmp_addr = "numericlabs.lxd:7380"
 metrics_addr = "numericlabs.lxd:9122"
+
+tls_resp_addr = "numericlabs.lxd:16380"
+tls_rmp_addr = "numericlabs.lxd:17380"
+tls_cert_path = "/home/numericlabs/data/tls/server.crt"
+tls_key_path = "/home/numericlabs/data/tls/server.key"
 
 aof_path = "./appendonly-shard-b.aof"
 snapshot_path = "./dump-shard-b.snapshot"
@@ -12,13 +21,6 @@ slowlog_threshold_micros = 0
 
 cluster_config = "/home/numericlabs/data/rocket/rocket-mem/cluster.conf"
 cluster_node_id = "shard-b"
-
-# PEM certificate chain, shared by both TLS listeners. Resolved relative to the
-# server's working directory, not to this file — prefer an absolute path.
-tls_cert_path = "/home/numericlabs/data/tls/server.crt"
-
-# PEM private key, shared by both TLS listeners. Same relative-path caveat as above.
-tls_key_path = "/home/numericlabs/data/tls/server.key"
 
 # Must match shard-a's ACL users: a client redirected here by MOVED re-authenticates
 # against this node, not shard-a.

@@ -23,7 +23,7 @@ replication, clustering, and access control apply identically whichever one a cl
 > different cores at the same instant. Real Redis is deliberately single-threaded for command
 > execution; rocket-mem chose sharded locks over that model instead.
 
-> **Project status.** rocket-mem is complete and tested — 773 tests, durability verified under a
+> **Project status.** rocket-mem is complete and tested — 791 tests, durability verified under a
 > `kill -9` chaos loop — but it is not yet production-hardened: there is no failover and no live
 > resharding. Read [Limitations](#limitations) before deploying it.
 
@@ -40,7 +40,7 @@ docker run --rm -p 6379:6379 -p 6380:6380 ghcr.io/snehal1112/rocket-mem:latest
 checksum and a minisign `.sig`:
 
 ```bash
-VERSION=v0.1.3
+VERSION=v0.1.4
 curl -LO https://github.com/Snehal1112/rocket-mem/releases/download/$VERSION/rocket-mem-$VERSION-linux-amd64.tar.gz
 curl -LO https://github.com/Snehal1112/rocket-mem/releases/download/$VERSION/rocket-mem-$VERSION-linux-amd64.tar.gz.sha256
 sha256sum -c rocket-mem-$VERSION-linux-amd64.tar.gz.sha256
@@ -122,33 +122,122 @@ its own lock, so any task can reach any key by taking that key's shard lock. See
 
 ## Performance
 
-Measured against `redis-server` 8.10.1 on the same host with matching durability settings on
-**both** servers (`appendonly yes`, `appendfsync everysec`), via
-`redis-benchmark -t set,get -n 100000 -c 50`:
+Measured against `redis-server` 8.10.1 on the same host via `scripts/benchmark.sh`, which pins
+matching durability on **both** servers (`appendonly yes`, `appendfsync everysec`), runs both on
+loopback, and spreads commands over a 100,000-key keyspace (`-r`) so writes reach all 16 shards.
+`redis-benchmark -t set,get -n 100000 -c 50 -r 100000`, median of three sweeps (2026-09-08):
 
 | Workload | redis-server | rocket-mem | Ratio |
 |---|---:|---:|---:|
-| SET, 3B, no pipeline | 77,882 | 87,719 | **0.89x (rocket faster)** |
-| GET, 3B, no pipeline | 103,520 | 99,206 | 1.04x |
-| GET, 1KB, no pipeline | 94,787 | 86,655 | 1.09x |
-| GET, 3B, `-P 16` | 1,587,302 | 1,351,351 | 1.17x |
-| SET, 1KB, no pipeline | 98,717 | 72,464 | 1.36x |
-| SET, 1KB, `-P 16` | 454,545 | 264,550 | 1.72x |
-| SET, 3B, `-P 16` | 943,396 | 332,226 | 2.84x |
-| GET, 1KB, `-P 16` | 840,336 | 19,497 | **43.10x** |
+| SET, 3B, no pipeline | 78,247 | 90,662 | **0.86x (rocket faster)** |
+| SET, 1KB, `-P 16` | 438,596 | 500,000 | **0.88x (rocket faster)** |
+| GET, 1KB, `-P 16` | 746,269 | 763,359 | **0.98x (rocket faster)** |
+| GET, 1KB, no pipeline | 99,010 | 97,943 | 1.01x |
+| SET, 3B, `-P 16` | 763,359 | 729,927 | 1.05x |
+| GET, 3B, no pipeline | 105,597 | 98,039 | 1.08x |
+| SET, 1KB, no pipeline | 96,339 | 86,655 | 1.11x |
+| GET, 3B, `-P 16` | 1,449,275 | 1,176,471 | 1.23x |
 
-Seven of eight cases land within 0.89x–2.84x of real Redis (one of them, unpipelined 3B `SET`,
-rocket-mem is actually faster). The eighth does not: pipelined 1KB `GET` collapses to ~19,500
-req/s, a cliff whose leading candidate — off-CPU wait on the reply-write path, consistent with
-`TCP_NODELAY` being set nowhere in the server — has been profiled but is neither proven nor fixed.
-The prior run put this row at 58.30x rather than 43.10x, but that is not a rocket-mem-side
-improvement: rocket-mem's own figure is flat at ~19,400–19,500 req/s across all three measurement
-sessions, and the ratio moved only because redis-server's own reference number dropped 26%
-between them. Either way it stays an order of magnitude worse than every other row.
-Full methodology, the raw traces, and the profiling that followed are in
-[`docs/benchmarks/`](docs/benchmarks/), most recently
-[`2026-09-07-redis-benchmark.md`](docs/benchmarks/2026-09-07-redis-benchmark.md) and
-[`2026-09-07-flamegraph-notes.md`](docs/benchmarks/2026-09-07-flamegraph-notes.md).
+Every workload lands between **0.86x and 1.23x** of real Redis, and rocket-mem is faster on three
+of the eight. The two pipelined `SET` rows were 2.78x and 2.18x until the AOF ordering lock was
+made per-shard (below); they are now 1.05x and 0.88x.
+
+**Two notes on reading these.** They are medians of a noisy host; run-to-run spread is wide,
+especially on the `redis-server` side, so no ratio should be read to two significant figures.
+And they are not comparable to figures published here before 2026-09-08, which came from a
+single-key benchmark (no `-r`) — a degenerate case with no shard parallelism and a keyspace small
+enough to sit in cache. That setup flattered `redis-server` on reads: its pipelined 1KB `GET` fell
+from 1,052,632 to 813,008 req/s once keys were spread, while rocket-mem's barely moved.
+
+Latency on the same setup, 3B payload, no pipelining, two runs quoted `run 1 / run 2`:
+
+| Metric | redis-server | rocket-mem |
+|---|---:|---:|
+| SET `p50` | 0.303 / 0.255 ms | 0.295 / 0.287 ms |
+| SET `p99` | 1.023 / 0.735 ms | 1.143 / 0.519 ms |
+| GET `p50` | 0.247 / 0.255 ms | 0.263 / 0.279 ms |
+| GET `p99` | 0.631 / 0.719 ms | 0.463 / 0.623 ms |
+
+The two are comparable, within a few tens of microseconds either way, with no consistent winner at
+either percentile. Worst-case `max` is spiky on both sides — `redis-server` recorded a 9.191ms
+`SET` outlier and rocket-mem a 4.735ms one — and nothing anywhere approaches the hundreds of
+milliseconds that an earlier AOF-blocking bug used to produce.
+
+### What fixed pipelined `SET`: per-shard AOF ordering guards
+
+Until 2026-09-08 the AOF ordering guard was a single process-wide mutex, acquired *before* the
+engine mutation rather than merely around the AOF append. Every write command in the server
+serialised on it, so the 16 independently-locked shards bought nothing at all for writes — the
+worst of both models, paying multi-threading's coordination costs while executing writes one at a
+time. Pipelined 3B `SET` sat at 2.78x of `redis-server`, and pipelined 1KB `SET` at 2.18x.
+
+It is now one guard per shard. A write locks only the shards its own keys live in, so writes to
+unrelated keys no longer block each other. Measured over six interleaved rounds, old binary against
+new, alternating which ran first:
+
+| Workload | global guard | per-shard | change |
+|---|---:|---:|---:|
+| SET, 3B, `-P 16` | 261,460 | 662,281 | **+143%** (6/6 rounds) |
+| SET, 1KB, `-P 16` | 129,670 | 341,440 | **+160%** (6/6 rounds) |
+
+The correctness argument is that replay only needs ordering *per key* — two commands touching
+disjoint keys may be appended in either order and replay identically — and a key lives in exactly
+one shard. Guards are acquired in ascending shard index, always, which is what makes deadlock
+between overlapping multi-key commands impossible; `AofWriter::lock_shards` sorts and deduplicates
+so no call site can get that wrong.
+
+Three paths still take every guard, because they need a view of the whole keyspace rather than of
+particular keys: `SAVE` and `BGREWRITEAOF` (which hold it across "read AOF offset, then walk the
+keyspace", so `(snapshot, offset)` is a consistent cut), `serve_replica`'s snapshot-then-register,
+and the follower apply loop (which must stop a concurrent `SAVE` seeing a multi-key command
+half-applied across shards).
+
+Design and testing strategy:
+[`2026-09-08-per-shard-aof-ordering-spec.md`](docs/superpowers/specs/2026-09-08-per-shard-aof-ordering-spec.md).
+
+### What fixed the pipelined 1KB `GET` cliff
+
+Until 2026-09-08 that row read **19,448 req/s**, a 52.91x loss and an order of magnitude worse than
+anything else in the table. (Every figure in this subsection was measured on the single-key harness
+in use at the time, so they compare to each other but not to the multi-key table above.) It was not
+slow code. It was a kernel timer, once per pipeline batch:
+
+1. Replies are buffered with `feed()` and flushed only when no more pipelined input is ready
+   (`crates/server/src/connection.rs`) — deliberate, and correct.
+2. But `Framed` force-flushes inside `feed()` once its write buffer crosses `backpressure_boundary`,
+   which defaults to 8 KiB.
+3. Sixteen pipelined 1KB `GET` replies are ~1,033 bytes each ≈ 16.5 KiB, so each batch left the
+   socket as **two** writes rather than one.
+4. On loopback the MSS is ~64 KiB, so that second ~8 KiB write was a sub-MSS segment issued while
+   the first was still unacknowledged — exactly what Nagle's algorithm holds back.
+5. `redis-benchmark` sends nothing until all 16 replies arrive, so the only thing releasing it was
+   Linux's 40ms delayed-ACK timer.
+
+The arithmetic confirms the diagnosis: 16 requests ÷ 0.040s × 50 clients = **20,000 req/s**,
+against measured values of 19,429 / 19,444 / 19,451 / 19,486 — a 0.3% spread across four sweeps,
+as a fixed timer does not vary. Every other cell stayed under 8 KiB per flush and was unaffected:
+`SET` replies are five bytes at any payload size, and sixteen 3B `GET` replies total ~144 bytes.
+
+The fix is `TCP_NODELAY` on every accepted socket, set at all four accept sites (plaintext and TLS,
+for both RESP and RMP). That row went from 19,448 to 775,194 req/s — a 40x improvement — and the
+matrix lost its cliff entirely. Under the current multi-key harness the same row sits at 793,651
+req/s, within 2% of `redis-server`.
+
+**Everything on this page postdates the v0.1.4 release.** A binary downloaded from the releases
+page still has the pipelined-`GET` stall and the global write guard; build from source to get
+either fix.
+
+All four causes identified in
+[`2026-09-07-throughput-parity-design.md`](docs/superpowers/specs/2026-09-07-throughput-parity-design.md)
+have now been addressed: `TCP_NODELAY`, the AOF ordering guard, the recency clock (a shared
+`AtomicU64` every shard `fetch_add`ed on every access, now written once per 100ms expiry tick and
+only read on the hot path), and per-command dispatcher allocations (`metric_label` returns a
+`&'static str` instead of allocating, and read commands no longer clone a frame they discard).
+
+The largest remaining per-command cost is not on that list: the `metrics` crate performs a registry
+lookup keyed by (name, labels) on **every** command, which a `GET` profile puts at roughly 4.7% of
+CPU. Caching the counter and histogram handles would remove far more than eliminating the label
+allocation did.
 
 ## Command coverage
 
