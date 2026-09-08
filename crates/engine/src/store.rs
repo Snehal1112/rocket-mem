@@ -17,11 +17,36 @@ impl Store {
         }
     }
 
-    fn shard_for(&self, key: &[u8]) -> &Shard {
+    /// Advances the shared recency clock by one tick.
+    ///
+    /// Every `get`/`set` *reads* this clock to stamp an entry's `last_touched`; nothing but this
+    /// method writes it. Incrementing per operation instead -- as this did until the clock became
+    /// coarse -- meant every shard on every core issued a read-modify-write against one cache
+    /// line, so all 16 shards serialised on it and the sharding bought nothing for that part of
+    /// the work. Redis takes the same approach with `server.lruclock`.
+    ///
+    /// The cost is resolution: entries touched inside one tick share a timestamp and tie. That is
+    /// acceptable because the only consumer is `sample_for_eviction`, which wants an approximately
+    /// -least-recently-used candidate, not an exact ordering.
+    pub fn advance_clock(&self) {
+        self.clock
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Which shard a key routes to. Public so the AOF ordering guards can be taken for exactly
+    /// the shards a command touches -- they must agree with this mapping or a write could be
+    /// ordered against the wrong guard.
+    /// `#[inline]` because extracting this out of `shard_for` put a call on the hot path of every
+    /// single read as well as every write; it was folded into `shard_for` before.
+    #[inline]
+    pub fn shard_index(&self, key: &[u8]) -> usize {
         let mut hasher = DefaultHasher::new();
         key.hash(&mut hasher);
-        let idx = (hasher.finish() as usize) % self.shards.len();
-        &self.shards[idx]
+        (hasher.finish() as usize) % self.shards.len()
+    }
+
+    fn shard_for(&self, key: &[u8]) -> &Shard {
+        &self.shards[self.shard_index(key)]
     }
 
     pub fn get(&self, key: &[u8]) -> Option<Value> {

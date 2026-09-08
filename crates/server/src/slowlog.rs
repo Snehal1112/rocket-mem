@@ -55,6 +55,11 @@ impl SlowLog {
         }
     }
 
+    /// The configured threshold, as `CONFIG GET slowlog-log-slower-than` reports it.
+    pub fn threshold(&self) -> Duration {
+        self.threshold
+    }
+
     /// Records `command` if it took at least the configured threshold. A no-op otherwise, which
     /// is the overwhelmingly common case -- this is the only slow-log work on the hot path.
     /// `Duration::ZERO` means disabled, not "record everything"; see this plan's Global

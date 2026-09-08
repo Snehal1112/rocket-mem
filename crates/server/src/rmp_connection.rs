@@ -32,6 +32,7 @@ pub async fn serve(
             Ok(pair) => pair,
             Err(_) => continue, // a failed accept shouldn't take the whole listener down
         };
+        crate::connection::disable_nagle(&socket, peer);
         let client_id = next_client_id;
         next_client_id += 1;
         tokio::spawn(handle_connection(
@@ -61,6 +62,8 @@ pub async fn serve_tls(
             Ok(pair) => pair,
             Err(_) => continue,
         };
+        // Set on the underlying TcpStream before the handshake, as in `connection::serve_tls`.
+        crate::connection::disable_nagle(&socket, peer);
         let acceptor = acceptor.clone();
         let client_id = next_client_id;
         next_client_id += 1;

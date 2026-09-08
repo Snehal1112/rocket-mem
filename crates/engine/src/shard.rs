@@ -42,7 +42,7 @@ impl Shard {
                 Some(entry) if !entry.is_expired() => {
                     entry
                         .last_touched
-                        .store(clock.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
+                        .store(clock.load(Ordering::Relaxed), Ordering::Relaxed);
                     return Some(entry.value.clone());
                 }
                 Some(_) => {} // expired — fall through to remove it under a write lock
@@ -68,7 +68,7 @@ impl Shard {
             Entry {
                 value,
                 expires_at: None,
-                last_touched: AtomicU64::new(clock.fetch_add(1, Ordering::Relaxed)),
+                last_touched: AtomicU64::new(clock.load(Ordering::Relaxed)),
             },
         );
         drop(guard);
@@ -227,7 +227,7 @@ impl Shard {
             Some(entry) if !entry.is_expired() => {
                 entry
                     .last_touched
-                    .store(clock.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
+                    .store(clock.load(Ordering::Relaxed), Ordering::Relaxed);
                 f(Some(&entry.value))
             }
             _ => f(None),
@@ -255,7 +255,7 @@ impl Shard {
             Some(entry) => {
                 entry
                     .last_touched
-                    .store(clock.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
+                    .store(clock.load(Ordering::Relaxed), Ordering::Relaxed);
                 let old_size = entry.value.approx_size();
                 let result = f(Some(&mut entry.value));
                 let new_size = entry.value.approx_size();
@@ -300,7 +300,7 @@ impl Shard {
             Some(entry) => {
                 entry
                     .last_touched
-                    .store(clock.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
+                    .store(clock.load(Ordering::Relaxed), Ordering::Relaxed);
                 let (result, delta) = f(Some(&mut entry.value));
                 match delta.cmp(&0) {
                     std::cmp::Ordering::Greater => {
@@ -627,6 +627,10 @@ mod tests {
             &clock,
         );
         let before = shard.sample_recency(10)[0].1;
+        // The clock is externally driven now (one tick per 100ms expiry cycle in the server), so
+        // the test advances it where that cycle would. Without this the set and the get land in
+        // the same tick and tie -- which is the intended coarse behaviour, not a regression.
+        clock.fetch_add(1, Ordering::Relaxed);
         shard.get(b"k", &clock);
         let after = shard.sample_recency(10)[0].1;
         assert!(after > before);
@@ -657,6 +661,7 @@ mod tests {
             &clock,
         );
         let before = shard.sample_recency(10)[0].1;
+        clock.fetch_add(1, Ordering::Relaxed); // as above: the externally-driven tick
         shard.with_ref(b"k", |v| v.is_some(), &clock);
         let after = shard.sample_recency(10)[0].1;
         assert!(after > before);

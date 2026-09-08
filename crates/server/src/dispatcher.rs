@@ -24,6 +24,12 @@ use protocol::Frame;
 pub struct Session {
     protocol: std::sync::Mutex<Protocol>,
     authenticated_user: std::sync::Mutex<Option<std::sync::Arc<crate::acl::AclUser>>>,
+    /// This connection's `CLIENT SETNAME` label, if it set one. Purely descriptive -- nothing
+    /// routes or authorizes on it; `CLIENT GETNAME` and `CLIENT INFO` are its only readers.
+    name: std::sync::Mutex<Option<Bytes>>,
+    /// The peer address, for `CLIENT INFO`'s `addr=` field. `None` for sessions built outside an
+    /// accepted TCP connection (RMP's shared session, and tests), which render an empty `addr=`.
+    peer_addr: Option<std::net::SocketAddr>,
 }
 
 impl Session {
@@ -31,7 +37,29 @@ impl Session {
         Self {
             protocol: std::sync::Mutex::new(Protocol::default()),
             authenticated_user: std::sync::Mutex::new(None),
+            name: std::sync::Mutex::new(None),
+            peer_addr: None,
         }
+    }
+
+    /// A `Session` that knows which peer it belongs to, so `CLIENT INFO` can report it.
+    pub fn with_peer_addr(peer_addr: std::net::SocketAddr) -> Self {
+        Self {
+            peer_addr: Some(peer_addr),
+            ..Self::new()
+        }
+    }
+
+    pub fn name(&self) -> Option<Bytes> {
+        self.name.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub fn set_name(&self, name: Option<Bytes>) {
+        *self.name.lock().unwrap_or_else(|e| e.into_inner()) = name;
+    }
+
+    pub fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        self.peer_addr
     }
 
     pub fn protocol(&self) -> Protocol {
@@ -371,10 +399,10 @@ pub fn dispatch(engine: &Engine, frame: Frame, _protocol: &mut Protocol, _client
         }
         "HSCAN" => {
             require_args!(rest, 2, "hscan");
-            // No MATCH/COUNT/NOVALUES support yet, matching the keyspace SCAN's current scope.
-            // A hash already lives fully in memory (HGETALL reads it all in one shot), so unlike
-            // keyspace SCAN there's no chunking to design here -- one call always returns
-            // everything and reports cursor "0" (done), which is a legitimate SCAN-family reply.
+            // No NOVALUES support yet. A hash already lives fully in memory (HGETALL reads it all
+            // in one shot), so unlike keyspace SCAN there's no chunking to design here -- one call
+            // always returns everything and reports cursor "0" (done), which is a legitimate
+            // SCAN-family reply. MATCH filters the fields, as real Redis does.
             if std::str::from_utf8(&rest[1])
                 .ok()
                 .and_then(|s| s.parse::<u64>().ok())
@@ -382,11 +410,16 @@ pub fn dispatch(engine: &Engine, frame: Frame, _protocol: &mut Protocol, _client
             {
                 return Frame::Error("ERR invalid cursor".into());
             }
+            let opts = match ScanOptions::parse(&rest[2..], false) {
+                Ok(o) => o,
+                Err(e) => return e,
+            };
             match commands::hash::hgetall(engine, &rest[0]) {
                 Ok(map) => Frame::Array(vec![
                     Frame::Bulk(Bytes::from_static(b"0")),
                     Frame::Array(
                         map.into_iter()
+                            .filter(|(f, _)| opts.matches(f))
                             .flat_map(|(f, v)| [Frame::Bulk(f), Frame::Bulk(v)])
                             .collect(),
                     ),
@@ -621,10 +654,10 @@ pub fn dispatch(engine: &Engine, frame: Frame, _protocol: &mut Protocol, _client
         }
         "SSCAN" => {
             require_args!(rest, 2, "sscan");
-            // No MATCH/COUNT support yet, matching HSCAN's current scope. A set already lives
-            // fully in memory (SMEMBERS reads it all in one shot), so like HSCAN there's no
-            // chunking to design here -- one call always returns everything and reports cursor
-            // "0" (done), which is a legitimate SCAN-family reply.
+            // A set already lives fully in memory (SMEMBERS reads it all in one shot), so like
+            // HSCAN there's no chunking to design here -- one call always returns everything and
+            // reports cursor "0" (done), which is a legitimate SCAN-family reply. MATCH filters
+            // the members, as real Redis does.
             if std::str::from_utf8(&rest[1])
                 .ok()
                 .and_then(|s| s.parse::<u64>().ok())
@@ -632,10 +665,20 @@ pub fn dispatch(engine: &Engine, frame: Frame, _protocol: &mut Protocol, _client
             {
                 return Frame::Error("ERR invalid cursor".into());
             }
+            let opts = match ScanOptions::parse(&rest[2..], false) {
+                Ok(o) => o,
+                Err(e) => return e,
+            };
             match commands::set::smembers(engine, &rest[0]) {
                 Ok(members) => Frame::Array(vec![
                     Frame::Bulk(Bytes::from_static(b"0")),
-                    Frame::Array(members.into_iter().map(Frame::Bulk).collect()),
+                    Frame::Array(
+                        members
+                            .into_iter()
+                            .filter(|m| opts.matches(m))
+                            .map(Frame::Bulk)
+                            .collect(),
+                    ),
                 ]),
                 Err(e) => engine_error_to_frame(e),
             }
@@ -871,16 +914,32 @@ pub fn dispatch(engine: &Engine, frame: Frame, _protocol: &mut Protocol, _client
                 Some(n) => n,
                 None => return Frame::Error("ERR invalid cursor".into()),
             };
+            let opts = match ScanOptions::parse(&rest[1..], true) {
+                Ok(o) => o,
+                Err(e) => return e,
+            };
             let (next, keys) = engine.scan(cursor);
+            let keys = keys
+                .into_iter()
+                .filter(|k| opts.matches(k))
+                .filter(|k| match &opts.type_filter {
+                    None => true,
+                    Some(t) => commands::keys::key_type(engine, k) == t,
+                })
+                .map(Frame::Bulk)
+                .collect();
             Frame::Array(vec![
                 Frame::Bulk(Bytes::from(next.to_string())),
-                Frame::Array(keys.into_iter().map(Frame::Bulk).collect()),
+                Frame::Array(keys),
             ])
         }
         "RANDOMKEY" => match commands::keys::randomkey(engine) {
             Some(k) => Frame::Bulk(k),
             None => Frame::Null,
         },
+        // In cluster mode this counts only the keys on this node, matching real Redis: a
+        // cluster-wide total would have to poll the other nodes, which no client expects here.
+        "DBSIZE" => Frame::Integer(engine.key_counts().0 as i64),
         "EXPIRE" | "PEXPIRE" => {
             require_args!(rest, 2, name.as_str().to_ascii_lowercase());
             let n: i64 = match std::str::from_utf8(&rest[1])
@@ -1170,8 +1229,11 @@ pub(crate) const KNOWN_COMMANDS: &[&str] = &[
     "APPEND",
     "AUTH",
     "BGREWRITEAOF",
+    "CLIENT",
     "CLUSTER",
     "COMMAND",
+    "CONFIG",
+    "DBSIZE",
     "DEBUG",
     "DECR",
     "DEL",
@@ -1277,7 +1339,7 @@ fn key_spec(name: &str) -> KeySpec {
     match name {
         "PING" | "ECHO" | "SELECT" | "COMMAND" | "INFO" | "HELLO" | "KEYS" | "SCAN"
         | "RANDOMKEY" | "CLUSTER" | "SAVE" | "BGREWRITEAOF" | "REPLICAOF" | "PSYNC" | "SLOWLOG"
-        | "DEBUG" | "AUTH" | "ACL" => {
+        | "DEBUG" | "AUTH" | "ACL" | "DBSIZE" | "CONFIG" | "CLIENT" => {
             // AUTH has no keys -- its arguments are a username/password, never a routable key.
             // ACL likewise -- its arguments are a subcommand/username/rule tokens, never a
             // routable key. Without this exception either would fall through to the
@@ -1452,6 +1514,15 @@ fn split_addr(addr: &str) -> (&str, i64) {
 /// unconditionally `0` because a static config has no way to know otherwise -- there is no
 /// gossip to learn a peer is down, and no epoch bumping without resharding or failover. Pinning
 /// the fields we cannot compute to the value that is true by construction beats fabricating one.
+///
+/// The full field set real Redis always emits is present, because clients render it directly:
+/// RedisInsight's cluster panel reads each one and shows `0` for anything missing, which made a
+/// healthy cluster look like it had no slots. `slots_ok` mirrors `slots_assigned` and both fail
+/// counters are `0` for the same reason `cluster_state` is `ok` -- nothing here can observe a
+/// slot failing. The two `stats_messages_*` counters are honestly `0`: there is no cluster bus,
+/// so no gossip message has ever been sent or received. `cluster_enabled` is a deliberate extra;
+/// real Redis reports it in `INFO`'s Cluster section rather than here, but clients read it from
+/// both and an additional key breaks no parser.
 fn cluster_info_text(cluster: Option<&std::sync::Arc<crate::cluster::ClusterConfig>>) -> String {
     let (enabled, assigned, count) = match cluster {
         Some(c) => (1, crate::cluster::SLOT_COUNT as u32, c.nodes().len()),
@@ -1461,10 +1532,16 @@ fn cluster_info_text(cluster: Option<&std::sync::Arc<crate::cluster::ClusterConf
         "cluster_enabled:{enabled}\r\n\
          cluster_state:ok\r\n\
          cluster_slots_assigned:{assigned}\r\n\
+         cluster_slots_ok:{assigned}\r\n\
+         cluster_slots_pfail:0\r\n\
+         cluster_slots_fail:0\r\n\
          cluster_known_nodes:{count}\r\n\
          cluster_size:{count}\r\n\
          cluster_my_epoch:0\r\n\
-         cluster_current_epoch:0\r\n"
+         cluster_current_epoch:0\r\n\
+         cluster_stats_messages_sent:0\r\n\
+         cluster_stats_messages_received:0\r\n\
+         total_cluster_links_buffer_limit_exceeded:0\r\n"
     )
 }
 
@@ -1548,6 +1625,36 @@ fn cluster_shards_reply(cluster: Option<&std::sync::Arc<crate::cluster::ClusterC
     )
 }
 
+/// `CLUSTER SLOTS`'s reply: the older, wider-compatible sibling of `CLUSTER SHARDS` that most
+/// cluster-aware client libraries still use for topology discovery and slot routing -- some
+/// clients (this project's own testing surfaced RedisInsight) never call `SHARDS` at all, so a
+/// server that only answers `SHARDS` looks like a single, un-routable node to them. Real Redis's
+/// shape per range is `[start_slot, end_slot, [ip, port, node_id], ...replicas]`; this project
+/// has no shard-level replicas, so each entry stops after the one master node.
+fn cluster_slots_reply(cluster: Option<&std::sync::Arc<crate::cluster::ClusterConfig>>) -> Frame {
+    let Some(cluster) = cluster else {
+        return Frame::Array(vec![]);
+    };
+    Frame::Array(
+        cluster
+            .nodes()
+            .iter()
+            .map(|n| {
+                let (host, port) = split_addr(&n.addr);
+                Frame::Array(vec![
+                    Frame::Integer(n.first_slot as i64),
+                    Frame::Integer(n.last_slot as i64),
+                    Frame::Array(vec![
+                        Frame::Bulk(Bytes::from(host.to_string())),
+                        Frame::Integer(port),
+                        Frame::Bulk(Bytes::from(n.id.clone())),
+                    ]),
+                ])
+            })
+            .collect(),
+    )
+}
+
 /// Returns `Some(reply)` if `frame` was a `CLUSTER` command -- handled entirely here, never
 /// reaching `dispatch` -- or `None` if it was some other command. Same interception shape as
 /// `handle_replicaof` above, and for the same reason: this needs `ReplicationHandle`, which
@@ -1590,6 +1697,7 @@ fn handle_cluster(
         }),
         "INFO" => Frame::Bulk(Bytes::from(cluster_info_text(cluster))),
         "SHARDS" => cluster_shards_reply(cluster),
+        "SLOTS" => cluster_slots_reply(cluster),
         "NODES" => Frame::Bulk(Bytes::from(cluster_nodes_text(cluster))),
         _ => Frame::Error(format!("ERR unknown CLUSTER subcommand '{sub}'")),
     })
@@ -1687,9 +1795,13 @@ fn info_text(
             "# Persistence\r\n\
              aof_enabled:1\r\n\
              aof_fsync_policy:{}\r\n\
+             aof_file_intact:{}\r\n\
              rdb_last_save_time:{}\r\n\
              rdb_bgsave_in_progress:0\r\n\r\n",
             fsync_policy_name(aof.policy()),
+            // A failed check reports the same as a confirmed problem: this field exists to be
+            // trusted at a glance, and "unknown" reading as healthy would defeat that.
+            aof.is_file_intact().unwrap_or(false) as u8,
             replication.last_save_unix(),
         ));
     }
@@ -1944,11 +2056,270 @@ fn slowlog_args_frame(entry: &crate::slowlog::SlowLogEntry) -> Frame {
     Frame::Array(args)
 }
 
+/// Returns `Some(reply)` if `frame` was `CLIENT`. Intercepted here rather than in `dispatch`
+/// because every subcommand describes the *connection*, and only `dispatch_and_log` is handed the
+/// `Session` and `client_id` that identify it.
+///
+/// `SETNAME`/`GETNAME` exist because ioredis -- and so RedisInsight, which is built on it --
+/// sends `CLIENT SETNAME` on every connection it opens; a server that errors there makes the
+/// client log a failure on connect. `LIST` is deliberately refused: see its arm below.
+fn handle_client(frame: &Frame, session: &Session, client_id: u64) -> Option<Frame> {
+    let Frame::Array(items) = frame else {
+        return None;
+    };
+    let Some(Frame::Bulk(name)) = items.first() else {
+        return None;
+    };
+    if !name.eq_ignore_ascii_case(b"CLIENT") {
+        return None;
+    }
+    let Some(Frame::Bulk(sub_bytes)) = items.get(1) else {
+        return Some(Frame::Error(
+            "ERR wrong number of arguments for 'client' command".into(),
+        ));
+    };
+    let sub = String::from_utf8_lossy(sub_bytes).to_ascii_uppercase();
+    Some(match sub.as_str() {
+        "ID" => Frame::Integer(client_id as i64),
+        "GETNAME" => Frame::Bulk(session.name().unwrap_or_default()),
+        "SETNAME" => {
+            let Some(Frame::Bulk(new_name)) = items.get(2) else {
+                return Some(Frame::Error(
+                    "ERR wrong number of arguments for 'client|setname' command".into(),
+                ));
+            };
+            // Real Redis's own rule. The name is echoed back inside CLIENT INFO's
+            // space-separated field list, so a name with a space or newline in it would corrupt
+            // that reply's shape for anything parsing it.
+            if new_name
+                .iter()
+                .any(|b| *b < b'!' || *b > b'~' || *b == b' ')
+            {
+                return Some(Frame::Error(
+                    "ERR Client names cannot contain spaces, newlines or special characters."
+                        .into(),
+                ));
+            }
+            session.set_name(if new_name.is_empty() {
+                None
+            } else {
+                Some(new_name.clone())
+            });
+            Frame::Simple("OK".into())
+        }
+        "INFO" => Frame::Bulk(Bytes::from(client_info_text(session, client_id))),
+        // Answering this needs a registry of every live connection, which does not exist -- the
+        // `connected_clients` gauge is a bare counter. Replying with only the asking connection
+        // would read as "exactly one client is connected", which is worse than refusing.
+        "LIST" => Frame::Error(
+            "ERR CLIENT LIST is not supported by rocket-mem: no live connection registry exists"
+                .into(),
+        ),
+        _ => Frame::Error(format!("ERR unknown CLIENT subcommand '{sub}'")),
+    })
+}
+
+/// `CLIENT INFO`'s single-line body, in real Redis's `field=value` space-separated form. Only the
+/// fields this server can answer honestly are present; the rest of real Redis's line describes
+/// buffers, watches, and pubsub state that have no counterpart here.
+fn client_info_text(session: &Session, client_id: u64) -> String {
+    format!(
+        "id={client_id} addr={addr} name={name} resp={resp} db=0 cmd=client|info user={user}",
+        addr = session
+            .peer_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_default(),
+        name = session
+            .name()
+            .map(|n| String::from_utf8_lossy(&n).into_owned())
+            .unwrap_or_default(),
+        resp = match session.protocol() {
+            Protocol::Resp2 => 2,
+            Protocol::Resp3 => 3,
+        },
+        // "default" when nothing is authenticated, matching real Redis: with no ACL users
+        // configured this server has auth off entirely, which is exactly Redis's default user.
+        user = session
+            .authenticated_user()
+            .map(|u| u.username.clone())
+            .unwrap_or_else(|| "default".to_string()),
+    )
+}
+
+/// The `MATCH`/`COUNT`/`TYPE` options shared by `SCAN` and (minus `TYPE`) `HSCAN`/`SSCAN`.
+///
+/// These used to be accepted and silently ignored, which is the worst of both worlds: a client
+/// filtering with `MATCH` got back the unfiltered keyspace and had no way to tell. RedisInsight
+/// leans on this directly -- it sends `TYPE` unconditionally and watches for a `syntax error`
+/// reply to decide whether to show its "filtering per key type is not supported" notice, so
+/// silence made its filter UI claim to work while returning everything.
+struct ScanOptions {
+    pattern: Option<Bytes>,
+    /// `None` for `HSCAN`/`SSCAN`, which have no `TYPE` option in real Redis either.
+    type_filter: Option<String>,
+}
+
+impl ScanOptions {
+    /// Parses trailing `OPTION value` pairs. `allow_type` gates `TYPE`, which only `SCAN` accepts.
+    ///
+    /// `COUNT` is validated as an integer and then deliberately dropped. Redis documents it as a
+    /// hint the server may ignore, and honoring it here would be actively wrong: this cursor
+    /// advances one whole shard per call, so truncating a page to `COUNT` without a finer cursor
+    /// would silently skip every key past the cut.
+    fn parse(args: &[Bytes], allow_type: bool) -> Result<Self, Frame> {
+        let syntax = || Frame::Error("ERR syntax error".into());
+        let mut opts = ScanOptions {
+            pattern: None,
+            type_filter: None,
+        };
+        let mut i = 0;
+        while i < args.len() {
+            let value = args.get(i + 1).ok_or_else(syntax)?;
+            match String::from_utf8_lossy(&args[i])
+                .to_ascii_uppercase()
+                .as_str()
+            {
+                "MATCH" => opts.pattern = Some(value.clone()),
+                "COUNT" => {
+                    let ok = std::str::from_utf8(value)
+                        .ok()
+                        .and_then(|s| s.parse::<i64>().ok())
+                        .is_some_and(|n| n > 0);
+                    if !ok {
+                        return Err(Frame::Error(
+                            "ERR value is not an integer or out of range".into(),
+                        ));
+                    }
+                }
+                "TYPE" if allow_type => {
+                    opts.type_filter = Some(String::from_utf8_lossy(value).to_ascii_lowercase())
+                }
+                _ => return Err(syntax()),
+            }
+            i += 2;
+        }
+        Ok(opts)
+    }
+
+    /// Whether `candidate` survives the `MATCH` glob. No pattern means everything survives.
+    fn matches(&self, candidate: &[u8]) -> bool {
+        match &self.pattern {
+            None => true,
+            Some(p) => engine::glob::glob_match(p, candidate),
+        }
+    }
+}
+
+/// Every parameter `CONFIG GET` can answer, as `(name, rendered value)`. Deliberately a fixed
+/// table rather than a general configuration surface: these are the fields client tooling asks
+/// for on connect (RedisInsight reads `maxmemory`, `databases`, and `notify-keyspace-events`
+/// before it will render its overview), and each is derived from state this server genuinely
+/// has. A parameter absent from this table answers empty, exactly as real Redis does for one it
+/// does not recognize.
+fn config_parameters(
+    engine: &Engine,
+    aof: &crate::aof::AofWriter,
+    replication: &crate::replication::ReplicationHandle,
+) -> Vec<(&'static str, String)> {
+    vec![
+        ("maxmemory", engine.maxmemory().unwrap_or(0).to_string()),
+        // Mirrors INFO's memory section, which hardcodes the same policy name.
+        ("maxmemory-policy", "allkeys-lru".to_string()),
+        // The AOF cannot be turned off, so this is honestly constant, not configurable.
+        ("appendonly", "yes".to_string()),
+        ("appendfsync", fsync_policy_name(aof.policy()).to_string()),
+        // There is no SELECT-able database beyond 0, so exactly one.
+        ("databases", "1".to_string()),
+        // Keyspace notifications are not implemented. Empty means "nothing enabled", which is
+        // what a client deciding whether it can subscribe needs to see.
+        ("notify-keyspace-events", String::new()),
+        (
+            "slowlog-log-slower-than",
+            replication.slowlog.threshold().as_micros().to_string(),
+        ),
+        // No automatic background snapshotting -- SAVE is explicit only.
+        ("save", String::new()),
+        ("timeout", "0".to_string()),
+    ]
+}
+
+/// Returns `Some(reply)` if `frame` was `CONFIG`. Intercepted here, like `CLUSTER` and `INFO`,
+/// because the values it reports come from `AofWriter` and `ReplicationHandle`, which plain
+/// `dispatch` cannot see.
+///
+/// The reply is a flat name/value array in both RESP2 and RESP3. Real Redis promotes it to a map
+/// under RESP3; every client this serves reads the flat form correctly, and matching `INFO`'s
+/// protocol-independent shape keeps the interception simple.
+fn handle_config(
+    frame: &Frame,
+    engine: &Engine,
+    aof: &crate::aof::AofWriter,
+    replication: &crate::replication::ReplicationHandle,
+) -> Option<Frame> {
+    let Frame::Array(items) = frame else {
+        return None;
+    };
+    let Some(Frame::Bulk(name)) = items.first() else {
+        return None;
+    };
+    if !name.eq_ignore_ascii_case(b"CONFIG") {
+        return None;
+    }
+    let Some(Frame::Bulk(sub_bytes)) = items.get(1) else {
+        return Some(Frame::Error(
+            "ERR wrong number of arguments for 'config' command".into(),
+        ));
+    };
+    let sub = String::from_utf8_lossy(sub_bytes).to_ascii_uppercase();
+    Some(match sub.as_str() {
+        "GET" => {
+            let patterns: Vec<&Bytes> = items[2..]
+                .iter()
+                .filter_map(|f| match f {
+                    Frame::Bulk(raw) => Some(raw),
+                    _ => None,
+                })
+                .collect();
+            if patterns.is_empty() {
+                return Some(Frame::Error(
+                    "ERR wrong number of arguments for 'config|get' command".into(),
+                ));
+            }
+            let mut out = Vec::new();
+            for (param, value) in config_parameters(engine, aof, replication) {
+                if patterns
+                    .iter()
+                    .any(|p| engine::glob::glob_match(p, param.as_bytes()))
+                {
+                    out.push(Frame::Bulk(Bytes::from(param)));
+                    out.push(Frame::Bulk(Bytes::from(value)));
+                }
+            }
+            Frame::Array(out)
+        }
+        "SET" => {
+            let Some(Frame::Bulk(param)) = items.get(2) else {
+                return Some(Frame::Error(
+                    "ERR wrong number of arguments for 'config|set' command".into(),
+                ));
+            };
+            // Nothing in `config_parameters` is settable at runtime -- each value is derived from
+            // startup configuration or from state with no runtime setter. Rejecting is the honest
+            // answer: an `OK` that changed nothing would leave the client believing otherwise.
+            Frame::Error(format!(
+                "ERR Unknown option or number of arguments for CONFIG SET - '{}'",
+                String::from_utf8_lossy(param)
+            ))
+        }
+        _ => Frame::Error(format!("ERR unknown CONFIG subcommand '{sub}'")),
+    })
+}
+
 /// Returns `Some(reply)` if `frame` was `SLOWLOG`. Intercepted here, like `CLUSTER` and `INFO`,
 /// because the ring buffer lives on `ReplicationHandle`, which plain `dispatch` cannot see.
 ///
-/// Three subcommands only: `GET [count]`, `LEN`, `RESET`. `SLOWLOG HELP` is out of scope for the
-/// same reason `CLUSTER SLOTS` is -- nothing in this repo consumes it.
+/// Three subcommands only: `GET [count]`, `LEN`, `RESET`. `SLOWLOG HELP` is out of scope --
+/// nothing in this repo consumes it.
 fn handle_slowlog(
     frame: &Frame,
     replication: &crate::replication::ReplicationHandle,
@@ -2207,7 +2578,7 @@ fn start_rewrite(
     aof: &crate::aof::AofWriter,
     replication: &crate::replication::ReplicationHandle,
 ) -> std::io::Result<(u64, Vec<u8>)> {
-    let _order_guard = aof.lock_for_ordering();
+    let _order_guard = aof.lock_all_shards();
     let current_gen = crate::aof::read_generation(replication.snapshot_path())?;
     let next_gen = current_gen + 1;
     let bytes = replication.engine().snapshot(0);
@@ -2293,7 +2664,7 @@ fn handle_save(
     let path = crate::aof::generation_path(replication.snapshot_path(), gen);
 
     let bytes = {
-        let _order_guard = aof.lock_for_ordering();
+        let _order_guard = aof.lock_all_shards();
         let offset = match aof.current_offset() {
             Ok(o) => o,
             Err(e) => return Frame::Error(format!("ERR failed to read AOF offset: {e}")),
@@ -2440,13 +2811,110 @@ fn command_key_and_arity(frame: &Frame) -> (Option<Bytes>, usize) {
 /// The `cmd` label value for a command name: its lowercase form if we know the command, the
 /// literal `other` otherwise. The `other` fallback is what bounds Prometheus label cardinality --
 /// without it, a client sending random command names could create unbounded series.
-fn metric_label(name: &str) -> String {
-    if KNOWN_COMMANDS.binary_search(&name).is_ok() {
-        name.to_ascii_lowercase()
-    } else {
-        "other".to_string()
+fn metric_label(name: &str) -> &'static str {
+    match KNOWN_COMMANDS.binary_search(&name) {
+        Ok(i) => KNOWN_COMMANDS_LOWER[i],
+        Err(_) => "other",
     }
 }
+
+/// The lowercase form of every `KNOWN_COMMANDS` entry, at the same index. Kept as a table so
+/// `metric_label` can hand out a `&'static str` instead of allocating a `String` per command --
+/// the metrics labels are on the hot path of every single request. `metric_label_table_matches_
+/// known_commands` guards the two arrays against drifting apart.
+pub(crate) const KNOWN_COMMANDS_LOWER: &[&str] = &[
+    "acl",
+    "append",
+    "auth",
+    "bgrewriteaof",
+    "client",
+    "cluster",
+    "command",
+    "config",
+    "dbsize",
+    "debug",
+    "decr",
+    "del",
+    "echo",
+    "exists",
+    "expire",
+    "expireat",
+    "get",
+    "getrange",
+    "getset",
+    "hdel",
+    "hello",
+    "hexists",
+    "hget",
+    "hgetall",
+    "hincrby",
+    "hkeys",
+    "hlen",
+    "hmget",
+    "hscan",
+    "hset",
+    "hsetnx",
+    "hvals",
+    "incr",
+    "incrby",
+    "info",
+    "keys",
+    "lindex",
+    "linsert",
+    "llen",
+    "lpop",
+    "lpush",
+    "lrange",
+    "lrem",
+    "lset",
+    "ltrim",
+    "memory",
+    "mget",
+    "mset",
+    "msetnx",
+    "object",
+    "persist",
+    "pexpire",
+    "pexpireat",
+    "ping",
+    "psync",
+    "pttl",
+    "randomkey",
+    "rename",
+    "renamenx",
+    "replicaof",
+    "rpop",
+    "rpush",
+    "sadd",
+    "save",
+    "scan",
+    "scard",
+    "sdiff",
+    "sdiffstore",
+    "select",
+    "set",
+    "setrange",
+    "sinter",
+    "sinterstore",
+    "sismember",
+    "slowlog",
+    "smembers",
+    "spop",
+    "srandmember",
+    "srem",
+    "strlen",
+    "sunion",
+    "sunionstore",
+    "ttl",
+    "type",
+    "zadd",
+    "zcard",
+    "zincrby",
+    "zrange",
+    "zrank",
+    "zrem",
+    "zscore",
+];
 
 /// Times and counts every client command, then delegates to `dispatch_and_log_inner`, which
 /// holds all the actual behavior. The split exists because the inner function has seven early
@@ -2481,8 +2949,8 @@ pub fn dispatch_and_log(
 
     let elapsed = started.elapsed();
     replication.command_executed();
-    ::metrics::counter!("rocket_mem_commands_total", "cmd" => label.clone()).increment(1);
-    ::metrics::histogram!("rocket_mem_command_duration_seconds", "cmd" => label.clone())
+    ::metrics::counter!("rocket_mem_commands_total", "cmd" => label).increment(1);
+    ::metrics::histogram!("rocket_mem_command_duration_seconds", "cmd" => label)
         .record(elapsed.as_secs_f64());
     if matches!(reply, Frame::Error(_)) {
         ::metrics::counter!("rocket_mem_command_errors_total", "cmd" => label).increment(1);
@@ -2559,15 +3027,42 @@ fn dispatch_and_log_inner(
     if let Some(reply) = handle_slowlog(&frame, replication) {
         return reply;
     }
+    if let Some(reply) = handle_config(&frame, engine, aof, replication) {
+        return reply;
+    }
+    if let Some(reply) = handle_client(&frame, session, client_id) {
+        return reply;
+    }
 
-    let original_frame = frame.clone();
-    let write_name = extract_write_command_name(&original_frame);
+    let write_name = extract_write_command_name(&frame);
+    // Cloned only for writes. Every read of `original_frame` below sits inside the
+    // `write_name.is_some()` branch, so cloning unconditionally made every read command pay to
+    // duplicate a frame it then discarded -- and reads are the majority of most workloads.
+    let original_frame = write_name.as_ref().map(|_| frame.clone());
 
-    // Held across "mutate the engine, then log it" for write commands only, so two
-    // concurrent connections' AOF appends always land in the order their mutations
-    // committed in. Reads take no lock and stay fully concurrent. See
+    // Held across "mutate the engine, then log it" for write commands only, so two concurrent
+    // connections' AOF appends always land in the order their mutations committed in. Reads take
+    // no guard and stay fully concurrent. See
     // ../../docs/superpowers/specs/2026-08-30-tech-debt-cleanup-spec.md Item 2.
-    let _order_guard = write_name.as_ref().map(|_| aof.lock_for_ordering());
+    //
+    // Only the shards this command's keys live in, so two writes to unrelated keys no longer
+    // block each other -- that is the whole point of the keyspace being sharded. `command_keys`
+    // is the same enumeration cluster mode uses for CROSSSLOT, so the two cannot disagree about
+    // which keys a command touches. Empty means we could not enumerate them (the write-command
+    // table and `key_spec` derive their answers independently, so nothing structurally forces
+    // them to agree); falling back to every shard degrades to the old global-guard behaviour,
+    // which is the safe direction.
+    let _order_guard = write_name.as_ref().map(|_| {
+        let shards: Vec<usize> = command_keys(&frame)
+            .iter()
+            .map(|k| engine.shard_index(k))
+            .collect();
+        if shards.is_empty() {
+            aof.lock_all_shards()
+        } else {
+            aof.lock_shards(&shards)
+        }
+    });
 
     // `dispatch`'s `_protocol` parameter is frozen for this sprint (see Global Constraints in
     // ../../docs/superpowers/plans/2026-08-31-sprint-8-plans/05-session-type-and-resp-wiring.md)
@@ -2580,6 +3075,10 @@ fn dispatch_and_log_inner(
         return reply;
     }
     let Some(name) = write_name else {
+        return reply;
+    };
+    // Some whenever `write_name` was, by construction above.
+    let Some(original_frame) = original_frame else {
         return reply;
     };
     let Frame::Array(items) = &original_frame else {
@@ -2625,6 +3124,12 @@ fn dispatch_and_log_inner(
     // Every frame still gets attempted even after a failure, so whatever can land on disk
     // does -- see the multi-frame note above about SET EX/PX's [SET, PEXPIREAT] pair.
     let mut aof_failed = false;
+    // Collected under the ordering guard, sent after it is released. The guard exists to keep
+    // AOF append order equal to mutation-commit order; replica fan-out was never part of that
+    // invariant (replicas apply what they receive, in receipt order), and holding a lock every
+    // concurrent writer contends for across the broadcast made it the top contention site in a
+    // pipelined-SET profile.
+    let mut to_broadcast: Vec<Bytes> = Vec::new();
     for frame_to_log in to_log {
         // A logging failure must not fail the client's reply outright, but it must not be
         // silently swallowed either -- surface it so an operator watching stderr/logs can
@@ -2649,13 +3154,20 @@ fn dispatch_and_log_inner(
             tracing::error!(error = %e, "aof append failed");
             aof_failed = true;
         }
-        // Broadcast regardless of the append's result: the engine mutation already committed, so
+        // Queued regardless of the append's result: the engine mutation already committed, so
         // a leader that fails to log a write locally must not also withhold it from its
         // replicas -- that would diverge them permanently over a purely local disk problem.
-        replication.registry.broadcast(Bytes::from(encoded));
+        to_broadcast.push(Bytes::from(encoded));
         // fsync timing for Always lives inside AofWriter::append itself; EverySecond's
         // periodic fsync loop lives in connection.rs (periodic_fsync_loop); Never does
         // nothing here.
+    }
+    // Every AOF append for this command has landed, so the ordering invariant is satisfied and
+    // the guard's work is done. Dropping it here rather than at end-of-scope keeps the replica
+    // fan-out -- which walks the registry and pushes into per-replica queues -- off the lock.
+    drop(_order_guard);
+    for encoded in to_broadcast {
+        replication.registry.broadcast(encoded);
     }
     // Only Always promises the client's reply won't precede durability -- EverySecond/Never
     // are fire-and-forget by design, so a write that hasn't landed yet is expected, not an
@@ -4274,10 +4786,19 @@ mod tests {
 
     fn info_text_for(replication: &ReplicationHandle, engine: &Engine, args: &[&[u8]]) -> String {
         let (_dir, aof) = test_aof();
+        info_text_for_writer(replication, engine, &aof, args)
+    }
+
+    fn info_text_for_writer(
+        replication: &ReplicationHandle,
+        engine: &Engine,
+        aof: &AofWriter,
+        args: &[&[u8]],
+    ) -> String {
         let mut command = vec![&b"INFO"[..]];
         command.extend_from_slice(args);
         let Frame::Bulk(text) =
-            dispatch_and_log(engine, &aof, replication, cmd(&command), &Session::new(), 1)
+            dispatch_and_log(engine, aof, replication, cmd(&command), &Session::new(), 1)
         else {
             panic!("INFO should reply with a Bulk string")
         };
@@ -4305,6 +4826,16 @@ mod tests {
         assert!(text.contains("aof_enabled:1\r\n"), "{text}");
         assert!(text.contains("rdb_bgsave_in_progress:0\r\n"), "{text}");
         assert!(text.contains("aof_fsync_policy:no\r\n"), "{text}"); // test_aof uses Never
+        assert!(text.contains("aof_file_intact:1\r\n"), "{text}");
+    }
+
+    #[test]
+    fn info_reports_the_aof_as_not_intact_once_its_file_is_deleted() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        std::fs::remove_file(aof.path()).unwrap();
+        let text = info_text_for_writer(&ReplicationHandle::default(), &engine, &aof, &[]);
+        assert!(text.contains("aof_file_intact:0\r\n"), "{text}");
     }
 
     #[test]
@@ -5230,6 +5761,411 @@ mod tests {
         assert_eq!(
             dispatch(&engine, cmd(&[b"RANDOMKEY"]), &mut Protocol::default(), 1),
             Frame::Null
+        );
+    }
+
+    fn client_reply_for(session: &Session, args: &[&[u8]]) -> Frame {
+        let (_dir, aof) = test_aof();
+        let mut command = vec![&b"CLIENT"[..]];
+        command.extend_from_slice(args);
+        dispatch_and_log(
+            &Engine::new(),
+            &aof,
+            &ReplicationHandle::default(),
+            cmd(&command),
+            session,
+            7,
+        )
+    }
+
+    fn client_reply(args: &[&[u8]]) -> Frame {
+        client_reply_for(&Session::new(), args)
+    }
+
+    #[test]
+    fn client_id_reports_the_connections_own_id() {
+        assert_eq!(client_reply(&[b"ID"]), Frame::Integer(7));
+    }
+
+    #[test]
+    fn client_getname_is_empty_until_setname_names_the_connection() {
+        let session = Session::new();
+        assert_eq!(
+            client_reply_for(&session, &[b"GETNAME"]),
+            Frame::Bulk(Bytes::new())
+        );
+        assert_eq!(
+            client_reply_for(&session, &[b"SETNAME", b"redisinsight"]),
+            Frame::Simple("OK".into())
+        );
+        assert_eq!(
+            client_reply_for(&session, &[b"GETNAME"]),
+            bulk("redisinsight")
+        );
+    }
+
+    #[test]
+    fn client_setname_rejects_a_name_containing_a_space_or_newline() {
+        for bad in [&b"two words"[..], b"line\nbreak"] {
+            let Frame::Error(msg) = client_reply(&[b"SETNAME", bad]) else {
+                panic!(
+                    "CLIENT SETNAME should reject {:?}",
+                    String::from_utf8_lossy(bad)
+                )
+            };
+            assert!(msg.contains("Client names cannot contain"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn client_setname_with_an_empty_name_clears_it() {
+        let session = Session::new();
+        client_reply_for(&session, &[b"SETNAME", b"named"]);
+        assert_eq!(
+            client_reply_for(&session, &[b"SETNAME", b""]),
+            Frame::Simple("OK".into())
+        );
+        assert_eq!(
+            client_reply_for(&session, &[b"GETNAME"]),
+            Frame::Bulk(Bytes::new())
+        );
+    }
+
+    #[test]
+    fn client_info_describes_this_connection_including_its_peer_address() {
+        let session = Session::with_peer_addr("192.0.2.7:51000".parse().unwrap());
+        client_reply_for(&session, &[b"SETNAME", b"tooling"]);
+        let Frame::Bulk(raw) = client_reply_for(&session, &[b"INFO"]) else {
+            panic!("CLIENT INFO should reply with a Bulk string")
+        };
+        let text = String::from_utf8(raw.to_vec()).unwrap();
+        assert!(text.contains("id=7"), "{text}");
+        assert!(text.contains("addr=192.0.2.7:51000"), "{text}");
+        assert!(text.contains("name=tooling"), "{text}");
+        assert!(text.contains("resp=2"), "{text}");
+        assert!(text.contains("cmd=client|info"), "{text}");
+        assert!(text.contains("user=default"), "{text}");
+    }
+
+    #[test]
+    fn client_list_says_it_is_unsupported_rather_than_reporting_one_connection() {
+        // A registry of live connections does not exist yet, and answering with just this
+        // connection would read as "one client is connected" -- worse than an honest refusal.
+        let Frame::Error(msg) = client_reply(&[b"LIST"]) else {
+            panic!("CLIENT LIST should reply with an error")
+        };
+        assert!(msg.contains("LIST"), "{msg}");
+    }
+
+    #[test]
+    fn client_rejects_a_missing_or_unknown_subcommand() {
+        assert_eq!(
+            client_reply(&[]),
+            Frame::Error("ERR wrong number of arguments for 'client' command".into())
+        );
+        assert_eq!(
+            client_reply(&[b"KILL"]),
+            Frame::Error("ERR unknown CLIENT subcommand 'KILL'".into())
+        );
+        assert_eq!(
+            client_reply(&[b"SETNAME"]),
+            Frame::Error("ERR wrong number of arguments for 'client|setname' command".into())
+        );
+    }
+
+    fn config_reply(engine: &Engine, args: &[&[u8]]) -> Frame {
+        let (_dir, aof) = test_aof();
+        let mut command = vec![&b"CONFIG"[..]];
+        command.extend_from_slice(args);
+        dispatch_and_log(
+            engine,
+            &aof,
+            &ReplicationHandle::default(),
+            cmd(&command),
+            &Session::new(),
+            1,
+        )
+    }
+
+    fn bulk(s: &str) -> Frame {
+        Frame::Bulk(Bytes::from(s.to_string()))
+    }
+
+    #[test]
+    fn config_get_returns_a_known_parameter_as_a_name_value_pair() {
+        let engine = Engine::new();
+        assert_eq!(
+            config_reply(&engine, &[b"GET", b"maxmemory"]),
+            Frame::Array(vec![bulk("maxmemory"), bulk("0")])
+        );
+        assert_eq!(
+            config_reply(&engine, &[b"GET", b"appendonly"]),
+            Frame::Array(vec![bulk("appendonly"), bulk("yes")])
+        );
+    }
+
+    #[test]
+    fn config_get_reports_the_configured_maxmemory_ceiling() {
+        let engine = Engine::with_maxmemory(1024);
+        assert_eq!(
+            config_reply(&engine, &[b"GET", b"maxmemory"]),
+            Frame::Array(vec![bulk("maxmemory"), bulk("1024")])
+        );
+    }
+
+    #[test]
+    fn config_get_expands_a_glob_pattern_over_every_matching_parameter() {
+        let engine = Engine::new();
+        let Frame::Array(items) = config_reply(&engine, &[b"GET", b"maxmemory*"]) else {
+            panic!("CONFIG GET should reply with an array")
+        };
+        // Flat name/value pairs, so both parameters together are four entries.
+        assert_eq!(items.len(), 4, "{items:?}");
+        assert!(items.contains(&bulk("maxmemory")), "{items:?}");
+        assert!(items.contains(&bulk("maxmemory-policy")), "{items:?}");
+        assert!(items.contains(&bulk("allkeys-lru")), "{items:?}");
+    }
+
+    #[test]
+    fn config_get_accepts_several_patterns_at_once() {
+        let engine = Engine::new();
+        let Frame::Array(items) = config_reply(&engine, &[b"GET", b"appendonly", b"databases"])
+        else {
+            panic!("CONFIG GET should reply with an array")
+        };
+        assert_eq!(items.len(), 4, "{items:?}");
+        assert!(items.contains(&bulk("appendonly")), "{items:?}");
+        assert!(items.contains(&bulk("databases")), "{items:?}");
+    }
+
+    #[test]
+    fn config_get_on_an_unknown_parameter_is_empty_not_an_error() {
+        let engine = Engine::new();
+        assert_eq!(
+            config_reply(&engine, &[b"GET", b"no-such-parameter"]),
+            Frame::Array(vec![])
+        );
+    }
+
+    #[test]
+    fn config_set_rejects_every_parameter_rather_than_pretending_to_apply_it() {
+        let engine = Engine::new();
+        let Frame::Error(msg) = config_reply(&engine, &[b"SET", b"maxmemory", b"100"]) else {
+            panic!("CONFIG SET should reply with an error")
+        };
+        assert!(msg.starts_with("ERR "), "{msg}");
+        assert!(msg.contains("maxmemory"), "{msg}");
+    }
+
+    #[test]
+    fn config_rejects_a_missing_or_unknown_subcommand() {
+        let engine = Engine::new();
+        assert_eq!(
+            config_reply(&engine, &[]),
+            Frame::Error("ERR wrong number of arguments for 'config' command".into())
+        );
+        assert_eq!(
+            config_reply(&engine, &[b"REWRITE"]),
+            Frame::Error("ERR unknown CONFIG subcommand 'REWRITE'".into())
+        );
+        assert_eq!(
+            config_reply(&engine, &[b"GET"]),
+            Frame::Error("ERR wrong number of arguments for 'config|get' command".into())
+        );
+    }
+
+    /// Drains every cursor page of a SCAN, so a test asserts on the whole keyspace rather than
+    /// on whichever shard the first page happened to land on.
+    fn scan_all(engine: &Engine, opts: &[&[u8]]) -> Vec<String> {
+        let mut cursor = b"0".to_vec();
+        let mut out = Vec::new();
+        loop {
+            let mut command: Vec<&[u8]> = vec![b"SCAN", &cursor];
+            command.extend_from_slice(opts);
+            let reply = dispatch(engine, cmd(&command), &mut Protocol::default(), 1);
+            let Frame::Array(parts) = reply else {
+                panic!("SCAN should reply with an array, got {reply:?}")
+            };
+            let (Frame::Bulk(next), Frame::Array(keys)) = (&parts[0], &parts[1]) else {
+                panic!("SCAN reply shape wrong: {parts:?}")
+            };
+            for k in keys {
+                let Frame::Bulk(k) = k else {
+                    panic!("key not bulk")
+                };
+                out.push(String::from_utf8(k.to_vec()).unwrap());
+            }
+            if next.as_ref() == b"0" {
+                out.sort();
+                return out;
+            }
+            cursor = next.to_vec();
+        }
+    }
+
+    fn seed_scan_keys(engine: &Engine) {
+        for k in [&b"apple"[..], b"avocado", b"banana"] {
+            dispatch(engine, cmd(&[b"SET", k, b"v"]), &mut Protocol::default(), 1);
+        }
+        dispatch(
+            engine,
+            cmd(&[b"LPUSH", b"alist", b"x"]),
+            &mut Protocol::default(),
+            1,
+        );
+    }
+
+    #[test]
+    fn scan_match_filters_keys_by_glob() {
+        let engine = Engine::new();
+        seed_scan_keys(&engine);
+        assert_eq!(
+            scan_all(&engine, &[b"MATCH", b"a*"]),
+            vec!["alist", "apple", "avocado"]
+        );
+        assert_eq!(scan_all(&engine, &[b"MATCH", b"b*"]), vec!["banana"]);
+        assert!(scan_all(&engine, &[b"MATCH", b"zzz*"]).is_empty());
+    }
+
+    #[test]
+    fn scan_type_filters_keys_by_value_type() {
+        let engine = Engine::new();
+        seed_scan_keys(&engine);
+        assert_eq!(scan_all(&engine, &[b"TYPE", b"list"]), vec!["alist"]);
+        assert_eq!(
+            scan_all(&engine, &[b"TYPE", b"string"]),
+            vec!["apple", "avocado", "banana"]
+        );
+    }
+
+    #[test]
+    fn scan_combines_match_and_type() {
+        let engine = Engine::new();
+        seed_scan_keys(&engine);
+        assert_eq!(
+            scan_all(&engine, &[b"MATCH", b"a*", b"TYPE", b"string"]),
+            vec!["apple", "avocado"]
+        );
+    }
+
+    #[test]
+    fn scan_accepts_count_as_a_hint_without_dropping_keys() {
+        let engine = Engine::new();
+        seed_scan_keys(&engine);
+        // COUNT is explicitly a hint in Redis: the server may return more or fewer. Truncating
+        // to it here would silently lose keys, because this cursor advances a whole shard at a
+        // time -- so it is validated and then deliberately not applied.
+        assert_eq!(
+            scan_all(&engine, &[b"COUNT", b"1"]),
+            vec!["alist", "apple", "avocado", "banana"]
+        );
+    }
+
+    #[test]
+    fn scan_rejects_a_malformed_option_instead_of_ignoring_it() {
+        let engine = Engine::new();
+        let syntax_error = Frame::Error("ERR syntax error".into());
+        for bad in [
+            &[&b"SCAN"[..], b"0", b"MATCH"][..],
+            &[&b"SCAN"[..], b"0", b"BOGUS", b"x"][..],
+            &[&b"SCAN"[..], b"0", b"TYPE"][..],
+        ] {
+            assert_eq!(
+                dispatch(&engine, cmd(bad), &mut Protocol::default(), 1),
+                syntax_error,
+                "{bad:?}"
+            );
+        }
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"SCAN", b"0", b"COUNT", b"notanumber"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Error("ERR value is not an integer or out of range".into())
+        );
+    }
+
+    #[test]
+    fn hscan_and_sscan_filter_with_match() {
+        let engine = Engine::new();
+        dispatch(
+            &engine,
+            cmd(&[b"HSET", b"h", b"alpha", b"1"]),
+            &mut Protocol::default(),
+            1,
+        );
+        dispatch(
+            &engine,
+            cmd(&[b"HSET", b"h", b"beta", b"2"]),
+            &mut Protocol::default(),
+            1,
+        );
+        let Frame::Array(parts) = dispatch(
+            &engine,
+            cmd(&[b"HSCAN", b"h", b"0", b"MATCH", b"a*"]),
+            &mut Protocol::default(),
+            1,
+        ) else {
+            panic!("HSCAN should reply with an array")
+        };
+        let Frame::Array(pairs) = &parts[1] else {
+            panic!("HSCAN payload should be an array")
+        };
+        // Field/value pairs, so one surviving field is two entries.
+        assert_eq!(pairs.len(), 2, "{pairs:?}");
+        assert_eq!(pairs[0], Frame::Bulk(Bytes::from_static(b"alpha")));
+
+        dispatch(
+            &engine,
+            cmd(&[b"SADD", b"s", b"apple"]),
+            &mut Protocol::default(),
+            1,
+        );
+        dispatch(
+            &engine,
+            cmd(&[b"SADD", b"s", b"pear"]),
+            &mut Protocol::default(),
+            1,
+        );
+        let Frame::Array(parts) = dispatch(
+            &engine,
+            cmd(&[b"SSCAN", b"s", b"0", b"MATCH", b"a*"]),
+            &mut Protocol::default(),
+            1,
+        ) else {
+            panic!("SSCAN should reply with an array")
+        };
+        assert_eq!(
+            parts[1],
+            Frame::Array(vec![Frame::Bulk(Bytes::from_static(b"apple"))])
+        );
+    }
+
+    #[test]
+    fn dbsize_counts_live_keys() {
+        let engine = Engine::new();
+        assert_eq!(
+            dispatch(&engine, cmd(&[b"DBSIZE"]), &mut Protocol::default(), 1),
+            Frame::Integer(0)
+        );
+        for key in [&b"a"[..], b"b", b"c"] {
+            dispatch(
+                &engine,
+                cmd(&[b"SET", key, b"v"]),
+                &mut Protocol::default(),
+                1,
+            );
+        }
+        assert_eq!(
+            dispatch(&engine, cmd(&[b"DBSIZE"]), &mut Protocol::default(), 1),
+            Frame::Integer(3)
+        );
+        dispatch(&engine, cmd(&[b"DEL", b"b"]), &mut Protocol::default(), 1);
+        assert_eq!(
+            dispatch(&engine, cmd(&[b"DBSIZE"]), &mut Protocol::default(), 1),
+            Frame::Integer(2)
         );
     }
 
@@ -8247,6 +9183,17 @@ mod tests {
         assert!(KNOWN_COMMANDS.binary_search(&"NOSUCHCOMMAND").is_err());
     }
 
+    /// `metric_label` indexes `KNOWN_COMMANDS_LOWER` with a position found in `KNOWN_COMMANDS`,
+    /// so the two must stay the same length and the same order. Adding a command to one and not
+    /// the other would otherwise mislabel every metric from that index onward, or panic.
+    #[test]
+    fn metric_label_table_matches_known_commands() {
+        assert_eq!(KNOWN_COMMANDS.len(), KNOWN_COMMANDS_LOWER.len());
+        for (upper, lower) in KNOWN_COMMANDS.iter().zip(KNOWN_COMMANDS_LOWER) {
+            assert_eq!(&upper.to_ascii_lowercase(), lower);
+        }
+    }
+
     #[test]
     fn command_keys_finds_the_single_key_of_an_ordinary_command() {
         assert_eq!(
@@ -8464,6 +9411,56 @@ mod tests {
     }
 
     #[test]
+    fn cluster_info_emits_every_field_real_redis_always_includes() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let Frame::Bulk(text) = dispatch_and_log(
+            &engine,
+            &aof,
+            &cluster_handle("shard-a"),
+            cmd(&[b"CLUSTER", b"INFO"]),
+            &Session::new(),
+            1,
+        ) else {
+            panic!("expected Bulk")
+        };
+        let text = String::from_utf8(text.to_vec()).unwrap();
+        // Every slot is assigned and none can be failing: there is no failure detection here,
+        // so ok mirrors assigned and both fail counters are honestly zero.
+        assert!(text.contains("cluster_slots_ok:16384\r\n"), "{text}");
+        assert!(text.contains("cluster_slots_pfail:0\r\n"), "{text}");
+        assert!(text.contains("cluster_slots_fail:0\r\n"), "{text}");
+        // No cluster bus exists, so no gossip message has ever been sent or received.
+        assert!(text.contains("cluster_stats_messages_sent:0\r\n"), "{text}");
+        assert!(
+            text.contains("cluster_stats_messages_received:0\r\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("total_cluster_links_buffer_limit_exceeded:0\r\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn cluster_info_reports_zero_slots_ok_when_no_config_was_loaded() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let Frame::Bulk(text) = dispatch_and_log(
+            &engine,
+            &aof,
+            &ReplicationHandle::default(),
+            cmd(&[b"CLUSTER", b"INFO"]),
+            &Session::new(),
+            1,
+        ) else {
+            panic!("expected Bulk")
+        };
+        let text = String::from_utf8(text.to_vec()).unwrap();
+        assert!(text.contains("cluster_slots_ok:0\r\n"), "{text}");
+    }
+
+    #[test]
     fn cluster_info_reports_disabled_when_no_config_was_loaded() {
         let engine = Engine::new();
         let (_dir, aof) = test_aof();
@@ -8590,6 +9587,51 @@ mod tests {
                 &aof,
                 &ReplicationHandle::default(),
                 cmd(&[b"CLUSTER", b"SHARDS"]),
+                &Session::new(),
+                1
+            ),
+            Frame::Array(vec![])
+        );
+    }
+
+    #[test]
+    fn cluster_slots_describes_every_shards_slot_range_and_its_one_node() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let Frame::Array(ranges) = dispatch_and_log(
+            &engine,
+            &aof,
+            &cluster_handle("shard-a"),
+            cmd(&[b"CLUSTER", b"SLOTS"]),
+            &Session::new(),
+            1,
+        ) else {
+            panic!("expected Array")
+        };
+        assert_eq!(ranges.len(), 3);
+        let Frame::Array(first) = &ranges[0] else {
+            panic!("expected each range to be an Array")
+        };
+        assert_eq!(first[0], Frame::Integer(0));
+        assert_eq!(first[1], Frame::Integer(5460));
+        let Frame::Array(node) = &first[2] else {
+            panic!("expected the third element to be the master node's Array")
+        };
+        assert_eq!(node[0], Frame::Bulk(Bytes::from_static(b"127.0.0.1")));
+        assert_eq!(node[1], Frame::Integer(7001));
+        assert_eq!(node[2], Frame::Bulk(Bytes::from_static(b"shard-a")));
+    }
+
+    #[test]
+    fn cluster_slots_is_empty_when_cluster_mode_is_off() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        assert_eq!(
+            dispatch_and_log(
+                &engine,
+                &aof,
+                &ReplicationHandle::default(),
+                cmd(&[b"CLUSTER", b"SLOTS"]),
                 &Session::new(),
                 1
             ),
