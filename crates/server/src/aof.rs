@@ -1105,6 +1105,80 @@ mod tests {
         }
     }
 
+    /// Job 1 of the ordering guard, end to end: the AOF's append order must match the order
+    /// mutations committed in, so a replay reproduces the value that was actually committed.
+    /// One key means one shard, so every writer here contends -- that is the point.
+    ///
+    /// Uses APPEND, not SET, on purpose. SET replaces the value, so only a reordering that
+    /// lands on the very last write of a round is visible -- every earlier reordering gets
+    /// silently overwritten by a later, correctly-ordered write and leaves no trace. APPEND
+    /// accumulates instead, so every write's position in the final string is observable: any
+    /// reordering, anywhere in the round, changes the accumulated result. That turns roughly one
+    /// observable event per round into roughly one per write, which is what makes this test
+    /// actually able to catch the defect it guards against.
+    #[test]
+    fn concurrent_writes_to_one_key_replay_to_the_committed_value() {
+        use std::sync::Arc;
+
+        // A reordering only shows up in this assertion if it lands on the very last write of a
+        // burst -- roughly one chance per burst, no matter how many writes the burst contains.
+        // Many short rounds, each with their own log, turn the same total work into one
+        // independent chance per round instead of one chance per run.
+        const ROUNDS: usize = 200;
+        const WRITERS: usize = 4;
+        const WRITES_PER_WRITER: usize = 25;
+
+        for round in 0..ROUNDS {
+            let dir = tempfile::tempdir().unwrap();
+            let aof_path = dir.path().join("ordering.aof");
+            let aof = Arc::new(AofWriter::open(&aof_path, FsyncPolicy::Never).unwrap());
+            let engine = Arc::new(engine::Engine::new());
+            let replication = Arc::new(crate::replication::ReplicationHandle::new(
+                Arc::clone(&engine),
+                dir.path().join("ordering.snapshot"),
+            ));
+
+            let mut writers = Vec::new();
+            for w in 0..WRITERS {
+                let engine = Arc::clone(&engine);
+                let aof = Arc::clone(&aof);
+                let replication = Arc::clone(&replication);
+                writers.push(std::thread::spawn(move || {
+                    for i in 0..WRITES_PER_WRITER {
+                        let value = format!("w{w}-{i}.");
+                        let frame = protocol::Frame::Array(vec![
+                            protocol::Frame::Bulk(bytes::Bytes::from_static(b"APPEND")),
+                            protocol::Frame::Bulk(bytes::Bytes::from_static(b"hot")),
+                            protocol::Frame::Bulk(bytes::Bytes::from(value)),
+                        ]);
+                        crate::dispatcher::dispatch_and_log(
+                            &engine,
+                            &aof,
+                            &replication,
+                            frame,
+                            &crate::dispatcher::Session::new(),
+                            1,
+                        );
+                    }
+                }));
+            }
+            for w in writers {
+                w.join().unwrap();
+            }
+            aof.fsync().unwrap();
+
+            // Replaying the log must land on whatever the engine actually holds. Because APPEND
+            // accumulates, any AOF line that ever overtook the mutation it logged changes the
+            // accumulated string's order, so replay and the engine would diverge.
+            let replayed = recover(&aof_path, &dir.path().join("absent.snapshot")).unwrap();
+            assert_eq!(
+                replayed.get(b"hot"),
+                engine.get(b"hot"),
+                "AOF replay diverged from committed state in round {round}"
+            );
+        }
+    }
+
     /// Duplicate indices must not self-deadlock: `MSET k1 v1 k1 v2` and any command whose keys
     /// collide onto one shard reach `lock_shards` with repeats.
     #[test]
