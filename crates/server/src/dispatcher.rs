@@ -9298,6 +9298,22 @@ mod tests {
         );
     }
 
+    /// Every write command must enumerate at least one key, or `dispatch_and_log_inner` silently
+    /// falls back to locking all sixteen shards for it -- correct, but it throws away the entire
+    /// point of per-shard ordering. `WRITE_COMMANDS` and `key_spec` derive their answers
+    /// independently, so nothing but this test keeps them in step.
+    #[test]
+    fn every_write_command_enumerates_at_least_one_key() {
+        for name in crate::aof::WRITE_COMMANDS {
+            assert!(
+                !matches!(key_spec(name), KeySpec::None),
+                "{name} is in WRITE_COMMANDS but key_spec reports no keys, so every write of it \
+                 would lock all shards. Either give it a KeySpec, or add it to this test's \
+                 deliberate-all-shards list with a comment explaining why."
+            );
+        }
+    }
+
     /// A three-shard topology whose ranges are the even thirds of the slot space, with this
     /// process being `node_id`. Uses `ReplicationHandle::default()` (its own throwaway Engine
     /// and the `./dump.snapshot` path) because none of these tests issue a SAVE.
