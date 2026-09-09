@@ -363,44 +363,92 @@ impl ReplicationHandle {
         self.start_replicating_with_auth(host_port, None);
     }
 
+    /// What triggered a role transition, for the `source` field on the `info` events below. An
+    /// operator reading a log during an incident has to be able to tell "a client told this node
+    /// to follow" from "this node started up already following" -- the two have completely
+    /// different causes and completely different fixes, and without this field they render
+    /// identically.
+    const SOURCE_COMMAND: &'static str = "command";
+    const SOURCE_CONFIG: &'static str = "config";
+
     /// Same as `start_replicating`, but also authenticates against the leader with `AUTH
     /// <username> <password>` before `PSYNC` -- required when the leader has ACL users
     /// configured, since an unauthenticated `PSYNC` is otherwise rejected with `NOAUTH` and
     /// replication can never complete. See `handle_replicaof`'s `REPLICAOF ... AUTH user pass`
     /// clause, the only production caller of this with `Some`.
     pub fn start_replicating_with_auth(&self, host_port: String, auth: Option<(String, String)>) {
-        let mut task = self.follower_task.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(old) = task.take() {
-            old.abort();
+        self.start_replicating_inner(host_port, auth, Self::SOURCE_COMMAND);
+    }
+
+    /// The one place this node actually becomes a follower, and therefore the one place the
+    /// `info`-level transition event belongs. Both public entry points funnel through here, so no
+    /// present or future caller can flip the role silently -- the alternative, an event at each
+    /// entry point, is call-site discipline again, which is exactly what this series keeps
+    /// replacing with structure. `source` is the only thing the entry points know that this
+    /// function cannot derive, so it is the only thing they pass down.
+    fn start_replicating_inner(
+        &self,
+        host_port: String,
+        auth: Option<(String, String)>,
+        source: &'static str,
+    ) {
+        // Deliberately scoped: the `info!` below must not run while `follower_task`'s mutex is
+        // held. Writing a log line is I/O, and a subscriber is free to block on it.
+        let auth_configured = auth.is_some();
+        {
+            let mut task = self.follower_task.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(old) = task.take() {
+                old.abort();
+            }
+            let my_generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+            let engine = Arc::clone(&self.engine);
+            let generation = Arc::clone(&self.generation);
+            let aof = self.aof.clone();
+            let tls_client_config = self.replication_tls_client_config.clone();
+            let last_apply = self.last_apply_slot();
+            *self.master_addr.lock().unwrap_or_else(|e| e.into_inner()) = Some(host_port.clone());
+            let link_up = self.link_up_slot();
+            let identity = FollowerIdentity {
+                own_addr: self.own_addr.clone(),
+                auth,
+            };
+            *task = Some(tokio::spawn(replication_client_loop(
+                host_port.clone(),
+                engine,
+                Generation {
+                    counter: generation,
+                    mine: my_generation,
+                },
+                aof,
+                FollowerHandles {
+                    last_apply,
+                    link_up,
+                },
+                tls_client_config,
+                identity,
+            )));
+            self.is_replica.store(true, Ordering::Relaxed);
         }
-        let my_generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        let engine = Arc::clone(&self.engine);
-        let generation = Arc::clone(&self.generation);
-        let aof = self.aof.clone();
-        let tls_client_config = self.replication_tls_client_config.clone();
-        let last_apply = self.last_apply_slot();
-        *self.master_addr.lock().unwrap_or_else(|e| e.into_inner()) = Some(host_port.clone());
-        let link_up = self.link_up_slot();
-        let identity = FollowerIdentity {
-            own_addr: self.own_addr.clone(),
-            auth,
-        };
-        *task = Some(tokio::spawn(replication_client_loop(
-            host_port,
-            engine,
-            Generation {
-                counter: generation,
-                mine: my_generation,
-            },
-            aof,
-            FollowerHandles {
-                last_apply,
-                link_up,
-            },
-            tls_client_config,
-            identity,
-        )));
-        self.is_replica.store(true, Ordering::Relaxed);
+
+        // `auth = <bool>`, never the credential: the AUTH tuple carries the leader's plaintext
+        // password, from `REPLICAOF <host> <port> AUTH <user> <pass>` or from
+        // `Config::replicaof_auth_password`. Whether auth is configured at all is the
+        // operationally useful half and is not a secret; the username is omitted too, since it
+        // adds nothing an operator cannot read out of the config. `host_port` is
+        // client-controlled on the command path, so it goes through `escape_ident` like every
+        // other client-supplied field in this crate.
+        //
+        // `source` is rendered with `%`, not recorded bare: a bare `&str` field is
+        // Debug-formatted by `tracing-subscriber` and comes out as `source="command"`, while
+        // every other fixed-vocabulary field in this project (`protocol`, `cmd`, `key`) renders
+        // unquoted. One grep should match them all -- see the spec's note on `protocol` being
+        // unified the same way in plan 22.
+        tracing::info!(
+            host_port = %crate::logging::escape_ident(&host_port),
+            auth = auth_configured,
+            source = %source,
+            "replication started, node is now a follower"
+        );
     }
 
     /// Config-driven equivalent of the "if `replicaof` is set, auto-connect" startup wiring
@@ -413,7 +461,10 @@ impl ReplicationHandle {
     pub fn start_replicating_from_config(&self, config: &crate::config::Config) {
         if let Some(target) = &config.replicaof {
             let auth = crate::config::replicaof_auth(config);
-            self.start_replicating_with_auth(target.clone(), auth);
+            // `SOURCE_CONFIG`, not the `start_replicating_with_auth` route: this is the startup
+            // auto-connect, and its transition event must be distinguishable from a client's live
+            // `REPLICAOF`. Same event, same fields, different `source`.
+            self.start_replicating_inner(target.clone(), auth, Self::SOURCE_CONFIG);
         }
     }
 
@@ -421,14 +472,38 @@ impl ReplicationHandle {
     /// writable operation. Also bumps the generation so a stale task's in-flight poll can no
     /// longer apply state even when nothing new replaces it.
     pub fn stop_replicating(&self) {
-        let mut task = self.follower_task.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(old) = task.take() {
-            old.abort();
+        // Scoped for the same reason `start_replicating_inner`'s body is: no logging under the
+        // mutex. `master_addr.take()` doubles as the "was this node actually a follower?" test --
+        // it is `Some` exactly while a follower task is live, set in `start_replicating_inner` and
+        // cleared only here.
+        let previous_leader = {
+            let mut task = self.follower_task.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(old) = task.take() {
+                old.abort();
+            }
+            self.generation.fetch_add(1, Ordering::SeqCst);
+            self.is_replica.store(false, Ordering::Relaxed);
+            let previous_leader = self
+                .master_addr
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            self.link_up.store(false, Ordering::Relaxed);
+            previous_leader
+        };
+
+        // `REPLICAOF NO ONE` against a node that was never a follower is a no-op, not a
+        // milestone, so it must not claim a promotion that did not happen -- an operator reading
+        // "promoted to leader" during a failover has to be able to trust it. Still logged, at
+        // `debug`, because "the command arrived and did nothing" is itself worth being able to
+        // see when a failover script appears to have run and nothing changed.
+        match previous_leader {
+            Some(host_port) => tracing::info!(
+                host_port = %crate::logging::escape_ident(&host_port),
+                "replication stopped, node promoted to leader"
+            ),
+            None => tracing::debug!("replication stop requested, but node was not a follower"),
         }
-        self.generation.fetch_add(1, Ordering::SeqCst);
-        self.is_replica.store(false, Ordering::Relaxed);
-        *self.master_addr.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        self.link_up.store(false, Ordering::Relaxed);
     }
 
     /// Called once per accepted client connection. Bumps both the live gauge and the lifetime
@@ -814,7 +889,18 @@ where
     engine
         .load_snapshot(&blob)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-    tracing::debug!("snapshot loaded");
+    // `info`, not `debug`: the next line is `link_up.store(true)`, so this is the exact moment
+    // the follower becomes in-sync. At `debug` a synced follower and one still stuck in the
+    // reconnect loop emitted identical output -- nothing -- which is the single question an
+    // operator asks about a follower.
+    //
+    // The message deliberately does not reuse `aof.rs`'s `snapshot loaded`, which is the
+    // *recovery* path reading this node's own snapshot file off disk at startup. Both are `info`
+    // and both would otherwise match one grep while meaning opposite things: one says "this node
+    // restored its own state", the other says "this node took a leader's state". `host_port`
+    // comes free from the enclosing `repl` span, which is `info`-level and therefore entered at
+    // the production default -- see the spec's span-field-duplication rule.
+    tracing::info!(bytes = len, "follower in sync with leader");
     status.link_up.store(true, Ordering::Relaxed);
 
     // From here on the leader sends plain RESP frames, byte-for-byte what its own AOF
@@ -1765,7 +1851,10 @@ mod tests {
             text.contains("received snapshot blob from leader"),
             "{text}"
         );
-        assert!(text.contains("snapshot loaded"), "{text}");
+        // Not `snapshot loaded` -- that message belongs to `aof.rs`'s recovery path, and this
+        // event was deliberately renamed so one grep cannot conflate "restored my own state" with
+        // "took the leader's state". It is `info` now, so a `DEBUG` subscriber still sees it.
+        assert!(text.contains("follower in sync with leader"), "{text}");
     }
 
     // `sync_once_logs_stream_offset_and_the_applied_command_name` used to live here, asserting

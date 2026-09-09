@@ -109,11 +109,14 @@ The list above is the planning-time vocabulary and stopped being exhaustive almo
 | Engine | `reason`, `evicted`, `evicted_total`, `removed` | eviction (per key, per cycle, and the rate-limited pressure roll-up), active-expire cycle |
 | Protocol | `kind`, `len`, `buffered`, `needed` | frame decoded, split-read reassembly |
 | AOF / snapshot | `aof_path`, `snapshot_path` (the same two names the Startup row uses), `generation`, `commands`, `aof_len` | snapshot save/load, rewrite, recovery replay summary and its failure paths |
+| Replication | `source`, `auth` | the `REPLICAOF` role-transition events (`replication.rs`'s `start_replicating_inner`) |
 
 Three notes on names the reports got wrong or left out:
 
 - **`log_filter`, not `log_level`.** The field renders the resolved filter *directive* (`RUST_LOG` wins, `log_level` is the fallback — `config::resolve_log_filter_directive`), which is not the same thing as the configured level, and was renamed to say so. The *config key* is still `log_level`.
 - **`protocol` and `host_port` are both span fields *and* event fields**, not span-only as the Spans row above may suggest. `main.rs`'s "listener bound" events and both connection spans emit `protocol`, and since plan 22 all of them render it through `%` as unquoted uppercase (`RESP`, `RMP`, `RESP+TLS`, `RMP+TLS`) so one grep matches every site; the single exception is `metrics`, lowercase, which names an HTTP endpoint rather than one of the two wire protocols. `host_port` is on the `repl` span (`replication.rs`'s `#[instrument]`) and also on its own reconnect events. Of the three names in the Spans row, only `tls` is genuinely span-only.
+- **`source` and `auth` are the two names added on 2026-09-10**, both on the `REPLICAOF` transition event. `source` is a fixed two-value vocabulary — `command` (a client sent `REPLICAOF`) or `config` (the startup auto-connect from `Config::replicaof`) — and renders unquoted through `%`, matching `protocol` and every other fixed-vocabulary field rather than the Debug-quoted `reply="ok"` shape a bare `&str` field would produce. `auth` is a **boolean**, never the credential: it reports only whether an AUTH clause is configured, which is operationally useful and not a secret. No `user` field is emitted there — the username adds nothing an operator cannot read out of the config, and omitting it keeps the event's credential surface at zero.
+
 - **`path` is gone — collapsed onto `aof_path`/`snapshot_path` on 2026-09-10.** It had been a genuine inconsistency against *two* other names rather than a distinction, and this entry recorded it as an open split for a future sweep to close. That sweep is this one; the entry now records the resolution, so nothing here still describes an unresolved problem.
 
   Four call sites were renamed. Three named the snapshot file and became `snapshot_path`: `aof.rs`'s "snapshot loaded", and `dispatcher.rs`'s "snapshot save starting"/"snapshot save finished" (whose local `path` binding was renamed too, so the field and the variable read alike). One named the AOF file and became `aof_path`: `connection.rs`'s "AOF file has no directory entry" warning. No other call site in the workspace used a bare `path` field.
@@ -155,7 +158,7 @@ Every existing call site keeps its current level and trigger condition; this tab
 | Protocol | `protocol/codec.rs`, `protocol/rmp.rs` | frame decoded, kind + length (trace); split-read reassembly (trace); protocol error (warn) |
 | AOF | `server/aof.rs` | append `offset`/`bytes` (trace); fsync (debug); rewrite start/finish with generation + size (info); recovery replay summary — commands, bytes, duration (info); recovery failure with the failing path + `error` (error — it aborts startup); discarded AOF tail with `offset` + `aof_len`, never the bytes (warn — recovery survives it) |
 | Snapshot | `engine/snapshot.rs`, `server/aof.rs` | save start/finish with path + bytes + duration (info); load (info) |
-| Replication | `server/replication.rs` | PSYNC handshake steps (debug); replica register/prune with addr (info); offset progress (trace); per-command apply (debug) |
+| Replication | `server/replication.rs` | PSYNC handshake steps (debug); replica register/prune with addr (info); offset progress (trace); per-command apply (debug); `REPLICAOF` role transitions with `host_port`/`auth`/`source` (info); follower reaching in-sync (info) |
 | Cluster | `server/cluster.rs`, `server/dispatcher.rs` | topology loaded (info); MOVED redirect with `key`/slot/target node (debug) |
 | Slowlog | `server/slowlog.rs` | entry recorded, `cmd`/`key`/`elapsed_us` (warn — the threshold is operator-set, so crossing it is by definition notable) |
 | Metrics | `server/metrics.rs` | scrape served (trace) |
@@ -258,6 +261,24 @@ The alternative considered and rejected was a `SecretString` newtype with a reda
 `config::Cli` **lost its derived `Debug` entirely** in the same change. It holds the same plaintext password, earlier than `Config` sees it, so fixing only `Config` would have left the CLI layer leaking. Nothing in the workspace formats a `Cli`; removing the impl is the stronger guard, because `?cli` then fails to compile rather than merely being discouraged.
 
 Residue, recorded honestly rather than papered over: a `?config` still renders the ACL **usernames**, `replicaof_auth_username`, and the TLS cert/key/CA **paths**. That is deliberate — a filename is not key material, and hiding it would only make a TLS or auth misconfiguration harder to diagnose. What is no longer residue is any password. The standing call-site rule survives unchanged for that reason — enumerate the fields explicitly, never `?config` — and `main.rs`'s config-summary event still carries a comment saying so directly above it.
+
+### `REPLICAOF` transitions log at the handle, not at the command
+
+The `info` row's "`REPLICAOF` transitions" was promised from the first draft of this spec and **was never built** — `handle_replicaof`, `start_replicating_with_auth` and `stop_replicating` carried no `tracing::` call at any level until 2026-09-10, so promotion and demotion, the state change most asked about during an incident, were silent. The `replicaof` config-file work then added a third way to become a follower (the startup auto-connect), which was silent too.
+
+All three now emit **one** event, and it lives at the `ReplicationHandle` choke points — a private `start_replicating_inner` that both public start methods funnel through, and `stop_replicating` — rather than at each call site. The reason is the same one that motivated the redacting `Debug` impls: a call-site rule can be lost by whoever adds a fourth entry point, while a choke point cannot. `dispatcher.rs`'s `handle_replicaof` therefore has no `tracing::` call of its own and carries a comment saying where the event lives and why, so its absence reads as a decision rather than an omission.
+
+The one thing the entry points know that the handle cannot derive is what triggered the transition, so that — and only that — is passed down, as `source`. An operator has to be able to tell "a client told this node to follow" from "this node started up already following"; the two have different causes and different fixes, and without the field they render identically.
+
+Two events, not one, on the stop path: `REPLICAOF NO ONE` against a node that was never a follower is a no-op, so it logs at `debug` ("stop requested, but node was not a follower") instead of claiming a promotion that did not happen. An operator reading "promoted to leader" during a failover has to be able to trust it.
+
+### `snapshot loaded` was two different events sharing one message
+
+`replication.rs`'s `debug!("snapshot loaded")` sits immediately before `link_up.store(true)` — it *is* the moment a follower becomes in-sync. At `info` that made a synced follower and one still stuck in the reconnect loop emit identical output: nothing. It is now `info!(bytes, "follower in sync with leader")`.
+
+The rename is not cosmetic. `aof.rs` already had an `info`-level `snapshot loaded` on the **recovery** path, so both events would have been visible at the production default under one message meaning opposite things — "this node restored its own state" versus "this node took the leader's state". This is the same defect the `path` → `aof_path`/`snapshot_path` entry above records, one level up: there the *field* name conflated two files, here the *message* conflated two events. The message is the primary grep key, so a collision there is the worse of the two.
+
+`host_port` is not repeated on the event: the enclosing `repl` span is `#[instrument]`'s default `info` level and is therefore entered at the production default, so the field is inherited. That is the span-field-duplication rule above applied in the direction that *permits* omission — the rule only forbids relying on a span whose level is below the event's.
 
 ### Redaction tests must be mutation-checked
 

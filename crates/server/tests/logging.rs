@@ -460,6 +460,214 @@ async fn sync_once_logs_stream_offset_and_the_applied_command_name() {
     );
 }
 
+/// A `ReplicationHandle` pointed at a snapshot path inside `dir`, for the role-transition tests
+/// below. They never reach a leader -- the transition and its log line happen synchronously,
+/// before the spawned client loop's first connect attempt -- so the address they follow is
+/// deliberately one nothing listens on.
+fn transition_handle(dir: &std::path::Path) -> rocket_mem::replication::ReplicationHandle {
+    rocket_mem::replication::ReplicationHandle::new(
+        Arc::new(engine::Engine::new()),
+        dir.join("replicaof-transition-test.snapshot"),
+    )
+}
+
+/// An address nothing listens on. Port 1 needs root to bind, so the spawned reconnect loop fails
+/// fast and forever rather than ever finding a real leader.
+const DEAD_LEADER: &str = "127.0.0.1:1";
+
+/// Promotion and demotion driven by a client's `REPLICAOF` command, at the production default
+/// level -- the state change an operator asks about first during an incident, and which was
+/// silent at every level before this.
+///
+/// **The password in the fixture is load-bearing.** An absence assertion against a fixture with no
+/// secret in it passes forever and proves nothing; the spec records that as a real defect already
+/// found once in this series. `zzcommandpassword` is genuinely parsed by `handle_replicaof` into
+/// the AUTH tuple this transition carries, and mutation-checked: replacing `auth = auth_configured`
+/// in `start_replicating_inner` with the credential itself makes this test fail on that assertion.
+#[tokio::test]
+async fn replicaof_command_transition_is_logged_at_info_without_the_password() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = engine::Engine::new();
+    let aof = rocket_mem::aof::AofWriter::open(
+        &dir.path().join("replicaof-command.aof"),
+        rocket_mem::aof::FsyncPolicy::Never,
+    )
+    .expect("open aof");
+    let replication = transition_handle(dir.path());
+    let session = rocket_mem::dispatcher::Session::new();
+
+    let (_, text) = capture_during("info", || {
+        // The full six-token credential-carrying form, straight through the real dispatcher.
+        rocket_mem::dispatcher::dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[
+                b"REPLICAOF",
+                b"127.0.0.1",
+                b"1",
+                b"AUTH",
+                b"app",
+                b"zzcommandpassword",
+            ]),
+            &session,
+            1,
+        );
+        replication.stop_replicating();
+    });
+
+    assert!(
+        text.contains("replication started, node is now a follower"),
+        "a client REPLICAOF must log the promotion at `info`; output was:\n{text}"
+    );
+    assert!(
+        text.contains("source=command"),
+        "the transition must say a client command caused it; output was:\n{text}"
+    );
+    assert!(
+        text.contains(&format!("host_port={DEAD_LEADER}")),
+        "the transition must name the leader; output was:\n{text}"
+    );
+    assert!(
+        text.contains("auth=true"),
+        "the transition must report that auth is configured; output was:\n{text}"
+    );
+    assert!(
+        text.contains("replication stopped, node promoted to leader"),
+        "REPLICAOF NO ONE's demotion must log at `info`; output was:\n{text}"
+    );
+    // The whole point of the fixture above.
+    assert!(
+        !text.contains("zzcommandpassword"),
+        "the leader password reached the log; output was:\n{text}"
+    );
+}
+
+/// The same transition reached from the config file instead of from a client, which is the path
+/// the `replicaof` startup auto-connect takes (`main.rs` calls
+/// `ReplicationHandle::start_replicating_from_config`). It must be distinguishable from the
+/// command-driven one: "this node was told to follow" and "this node started up already
+/// following" have different causes and different fixes.
+///
+/// Same mutation check, same reason: `zzconfigpassword` really is in the `Config` this drives,
+/// reaching `start_replicating_inner` through `config::replicaof_auth`.
+#[tokio::test]
+async fn replicaof_config_transition_is_logged_at_info_without_the_password() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let replication = transition_handle(dir.path());
+    let config = rocket_mem::config::Config {
+        replicaof: Some(DEAD_LEADER.to_string()),
+        replicaof_auth_username: Some("app".to_string()),
+        replicaof_auth_password: Some("zzconfigpassword".to_string()),
+        ..rocket_mem::config::Config::default()
+    };
+
+    let (_, text) = capture_during("info", || {
+        replication.start_replicating_from_config(&config);
+        replication.stop_replicating();
+    });
+
+    assert!(
+        text.contains("replication started, node is now a follower"),
+        "the startup auto-connect must log the same transition; output was:\n{text}"
+    );
+    assert!(
+        text.contains("source=config"),
+        "the config-driven transition must be distinguishable from the command-driven one; \
+         output was:\n{text}"
+    );
+    assert!(
+        !text.contains("source=command"),
+        "the config path must not claim a client command caused it; output was:\n{text}"
+    );
+    assert!(
+        text.contains(&format!("host_port={DEAD_LEADER}")) && text.contains("auth=true"),
+        "the transition lost its leader or auth field; output was:\n{text}"
+    );
+    assert!(
+        !text.contains("zzconfigpassword"),
+        "the configured leader password reached the log; output was:\n{text}"
+    );
+}
+
+/// `REPLICAOF NO ONE` against a node that was never a follower is a no-op, and must not claim a
+/// promotion that did not happen -- an operator reading "promoted to leader" during a failover
+/// has to be able to trust it.
+#[tokio::test]
+async fn stopping_replication_on_a_node_that_was_never_a_follower_claims_no_promotion() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let replication = transition_handle(dir.path());
+
+    let (_, text) = capture_during("info", || replication.stop_replicating());
+    assert!(
+        !text.contains("promoted to leader"),
+        "a no-op stop must not report a promotion; output was:\n{text}"
+    );
+
+    let (_, debug_text) = capture_during("debug", || replication.stop_replicating());
+    assert!(
+        debug_text.contains("replication stop requested, but node was not a follower"),
+        "the no-op is still worth seeing at `debug`; output was:\n{debug_text}"
+    );
+}
+
+/// The moment a follower becomes in-sync (`link_up` goes true), at the production default level.
+/// It used to be `debug!("snapshot loaded")`, which meant that at `info` a synced follower and one
+/// still stuck in the reconnect loop emitted exactly the same output: nothing.
+///
+/// The message must also not collide with `aof.rs`'s own `info`-level `snapshot loaded`, which is
+/// the *recovery* path reading this node's own snapshot off disk. Both are `info`, so a shared
+/// string would make one grep return two events meaning opposite things -- hence the last
+/// assertion, which is about the vocabulary, not about this code path.
+#[tokio::test]
+async fn a_follower_reaching_sync_is_logged_at_info() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let fake_leader = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut psync_bytes = [0u8; 15];
+        socket.read_exact(&mut psync_bytes).await.unwrap();
+        let blob = engine::Engine::new().snapshot(0);
+        socket
+            .write_all(&(blob.len() as u64).to_le_bytes())
+            .await
+            .unwrap();
+        socket.write_all(&blob).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    });
+
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(BufferWriter(Arc::clone(&buffer)))
+        .with_env_filter(EnvFilter::new("info"))
+        .finish();
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let replication = Arc::new(transition_handle(dir.path()));
+
+    let _guard = tracing::subscriber::set_default(subscriber);
+    replication.start_replicating(addr.to_string());
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    replication.stop_replicating();
+    drop(_guard);
+    fake_leader.abort();
+
+    let bytes_out = buffer.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let text = String::from_utf8(bytes_out).expect("subscriber output is utf-8");
+    assert!(
+        text.contains("follower in sync with leader"),
+        "the sync-complete milestone is missing at `info`; output was:\n{text}"
+    );
+    assert!(
+        !text.contains("snapshot loaded"),
+        "this event must not reuse aof.rs's recovery-path message; output was:\n{text}"
+    );
+}
+
 /// Cluster mode's startup event: `ClusterConfig::load` logs this node's own id, slot range, and
 /// the topology's node count once, on the success path, at `info`.
 ///

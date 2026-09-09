@@ -1653,6 +1653,15 @@ fn handle_replicaof(
         None
     };
 
+    // No `tracing::` call here, deliberately. Both transitions are logged at `info` by
+    // `ReplicationHandle::start_replicating_inner` and `stop_replicating`, which are the choke
+    // points every path -- this command, the startup auto-connect, and any future caller --
+    // funnels through, so the event cannot be lost by someone adding a fourth entry point. A
+    // second event here would only duplicate it, and this site knows nothing the handle does not:
+    // `start_replicating_with_auth` already tags its event `source=command`, which is exactly
+    // what distinguishes this path from `start_replicating_from_config`'s `source=config`.
+    // The credential in `auth` must never be logged and is not; see `logging::is_sensitive`'s
+    // `REPLICAOF` arm for the `trace`-level argument line, which redacts the whole list.
     if a.eq_ignore_ascii_case(b"NO") && b.eq_ignore_ascii_case(b"ONE") {
         if auth.is_some() {
             return Some(Frame::Error("ERR syntax error".into()));
