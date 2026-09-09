@@ -91,8 +91,11 @@ fn check_aof_intact(aof: &AofWriter) {
         Ok(true) => ::metrics::gauge!("rocket_mem_aof_file_intact").set(1.0),
         Ok(false) => {
             ::metrics::gauge!("rocket_mem_aof_file_intact").set(0.0);
+            // `aof_path`, not `path`: this names the same file every event in `aof.rs` calls
+            // `aof_path`, and the same file the `aof_path` config key configures. A lone `path`
+            // here made `grep aof_path` miss the one event that says the file is gone.
             tracing::error!(
-                path = %aof.path().display(),
+                aof_path = %aof.path().display(),
                 "AOF file has no directory entry at its configured path -- it was deleted or \
                  replaced while this process is still writing to it; every byte written since \
                  will be lost on the next restart unless this is fixed now"

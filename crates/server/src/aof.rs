@@ -728,8 +728,12 @@ pub fn recover(aof_path: &Path, snapshot_path: &Path) -> std::io::Result<engine:
             let load_started = std::time::Instant::now();
             match engine.load_snapshot(&bytes) {
                 Ok(offset) => {
+                    // `snapshot_path`, matching the four other events in this same function and
+                    // the config key of the same name. It used to be `path` alone, which meant
+                    // `grep snapshot_path` missed the single most important snapshot event on
+                    // the recovery path -- the one saying the snapshot was actually loaded.
                     tracing::info!(
-                        path = %snapshot_path.display(),
+                        snapshot_path = %snapshot_path.display(),
                         bytes = bytes.len(),
                         elapsed_us = load_started.elapsed().as_micros() as u64,
                         "snapshot loaded"

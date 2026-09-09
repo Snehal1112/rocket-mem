@@ -106,15 +106,21 @@ The list above is the planning-time vocabulary and stopped being exhaustive almo
 | Startup | `version`, `addr`, `rmp_addr`, `metrics_addr`, `aof_path`, `snapshot_path`, `log_filter`, `log_value_max_bytes`, `slowlog_threshold_micros`, `cluster_mode`, `acl_enabled`, `acl_user_count`, `tls_enabled`, `tls_replication_enabled` | `main.rs`'s "rocket-mem starting", "resolved config summary" and "listener bound" |
 | Cluster | `node_id`, `first_slot`, `last_slot`, `node_count`; `slot`, `target` | `cluster.rs`'s topology-loaded; `dispatcher.rs`'s MOVED redirect |
 | Dispatch | `args`, `reply`, `want`, `got`, `resp_version` | argument trace, per-command line, arity error, `HELLO` upgrade |
-| Engine | `reason`, `evicted`, `removed` | eviction (per key and per cycle), active-expire cycle |
+| Engine | `reason`, `evicted`, `evicted_total`, `removed` | eviction (per key, per cycle, and the rate-limited pressure roll-up), active-expire cycle |
 | Protocol | `kind`, `len`, `buffered`, `needed` | frame decoded, split-read reassembly |
-| AOF / snapshot | `path`, `generation`, `commands`, `aof_len` | snapshot save/load, rewrite, recovery replay summary and its failure paths |
+| AOF / snapshot | `aof_path`, `snapshot_path` (the same two names the Startup row uses), `generation`, `commands`, `aof_len` | snapshot save/load, rewrite, recovery replay summary and its failure paths |
 
 Three notes on names the reports got wrong or left out:
 
 - **`log_filter`, not `log_level`.** The field renders the resolved filter *directive* (`RUST_LOG` wins, `log_level` is the fallback — `config::resolve_log_filter_directive`), which is not the same thing as the configured level, and was renamed to say so. The *config key* is still `log_level`.
 - **`protocol` and `host_port` are both span fields *and* event fields**, not span-only as the Spans row above may suggest. `main.rs`'s "listener bound" events and both connection spans emit `protocol`, and since plan 22 all of them render it through `%` as unquoted uppercase (`RESP`, `RMP`, `RESP+TLS`, `RMP+TLS`) so one grep matches every site; the single exception is `metrics`, lowercase, which names an HTTP endpoint rather than one of the two wire protocols. `host_port` is on the `repl` span (`replication.rs`'s `#[instrument]`) and also on its own reconnect events. Of the three names in the Spans row, only `tls` is genuinely span-only.
-- **`path` is a genuine inconsistency against *two* other names, not a distinction.** It collides with `snapshot_path`: the snapshot save/load events name their file `path` while recovery's failure events name theirs `snapshot_path` — and note `aof.rs`'s own "snapshot loaded" event, which lives inside `recover`, uses `path` too, so the split is not cleanly "save/load versus recovery". It *also* collides with `aof_path`: `connection.rs`'s "AOF file has no directory entry" warning names the AOF file `path`, where every event in `aof.rs` calls the same thing `aof_path`. All are recorded here as they stand rather than quietly unified, because renaming a shipped field breaks any runbook grepping for it — but a future sweep should collapse them onto `aof_path`/`snapshot_path`, and no new call site should copy `path`.
+- **`path` is gone — collapsed onto `aof_path`/`snapshot_path` on 2026-09-10.** It had been a genuine inconsistency against *two* other names rather than a distinction, and this entry recorded it as an open split for a future sweep to close. That sweep is this one; the entry now records the resolution, so nothing here still describes an unresolved problem.
+
+  Four call sites were renamed. Three named the snapshot file and became `snapshot_path`: `aof.rs`'s "snapshot loaded", and `dispatcher.rs`'s "snapshot save starting"/"snapshot save finished" (whose local `path` binding was renamed too, so the field and the variable read alike). One named the AOF file and became `aof_path`: `connection.rs`'s "AOF file has no directory entry" warning. No other call site in the workspace used a bare `path` field.
+
+  The worst of the split was inside a single function: four events in `recover` said `snapshot_path` while the fifth — "snapshot loaded", the single most important snapshot event on the recovery path — said `path`, so `grep snapshot_path` returned every failure and never the success. Two names rather than one shared `path` because the two files are different files and an operator chasing a recovery problem needs to know which one an event is about; and these two specifically because they are already the names of the config keys that set them (`docs/config-reference.md`), so a reader needs no second vocabulary.
+
+  The counter-argument this entry originally rested on — that renaming a shipped field breaks a runbook grepping for it — is why the rename happened *now*: none of these events has ever appeared in a tagged release, no operator doc names a log field, and no test asserted on `path=`. The cost only grows from here.
 
 ## Decision: log content — values at `trace`, secrets never
 
@@ -145,7 +151,7 @@ Every existing call site keeps its current level and trigger condition; this tab
 | Connection | `server/connection.rs`, `server/rmp_connection.rs` | `HELLO`/RESP3 protocol upgrade (debug); clean close and EOF with duration + command count (info) |
 | Dispatch | `server/dispatcher.rs` | per-command `cmd`/`key`/`argc`/`elapsed_us`/reply kind (debug); full arguments, capped and redacted (trace); unknown command, WRONGTYPE, and arity errors (debug) |
 | ACL | `server/acl.rs` | auth success with `user` (info); auth failure with `user` + `peer`, never the secret (warn); permission denied with `user`/`cmd`/`key` (warn); `SETUSER`/`DELUSER` (info) |
-| Engine | `engine/engine.rs`, `engine/shard.rs`, `engine/store.rs` | shard routing, `key` → `shard` (trace); mutation byte delta (trace); per-key TTL expiry (trace); active-expire cycle key count (debug); eviction with `key` + bytes freed + reason (warn) |
+| Engine | `engine/engine.rs`, `engine/shard.rs`, `engine/store.rs` | shard routing, `key` → `shard` (trace); mutation byte delta (trace); per-key TTL expiry (trace); active-expire cycle key count (debug); eviction, as three events — per evicted `key` with `bytes` + `reason` (debug), per-cycle summary with `evicted` + `bytes` + `reason` (debug), and a rate-limited pressure roll-up with `evicted_total` (warn) |
 | Protocol | `protocol/codec.rs`, `protocol/rmp.rs` | frame decoded, kind + length (trace); split-read reassembly (trace); protocol error (warn) |
 | AOF | `server/aof.rs` | append `offset`/`bytes` (trace); fsync (debug); rewrite start/finish with generation + size (info); recovery replay summary — commands, bytes, duration (info); recovery failure with the failing path + `error` (error — it aborts startup); discarded AOF tail with `offset` + `aof_len`, never the bytes (warn — recovery survives it) |
 | Snapshot | `engine/snapshot.rs`, `server/aof.rs` | save start/finish with path + bytes + duration (info); load (info) |
@@ -173,16 +179,17 @@ the only place it could fire is `Shard::get`/`with_ref`/`with_mut` discovering
 than `Store::shard_index` — the placement plan 12 identified as the riskiest in the series and
 deliberately avoided by instrumenting the `Engine` facade instead. It needs its own plan with
 its own benchmark gate, not a line folded into a plan that changes other things at the same
-time. Everything else in the Engine row shipped: shard routing, mutation byte delta, the
-*active*-expire cycle count, and eviction — which shipped as three events, not the row's one:
-a per-key `debug`, a per-cycle `debug`, and a rate-limited `warn` roll-up. Both demotions from
-the row's `warn` are volume, on two different axes. Within a cycle, `MAX_EVICTION_ATTEMPTS` is
-1000, so a `warn` per key could be 1000 lines from one call. Across cycles, `maybe_evict` runs
-after *every* mutation, so at `maxmemory` every write evicts and even a per-cycle `warn` is a
-per-write `warn` — the loudest line in such a deployment's log. What an operator actually needs
-at the default level is "this node is evicting", so that is what the `warn` roll-up says
-(`maxmemory eviction active`), immediately on the first eviction and at most once a minute
-after: its volume is a function of wall time, never of the write rate.
+time. Everything else in the Engine row shipped, including eviction — whose row above now
+describes the three events as built, so only the *reasoning* for the shape remains here.
+
+The row originally promised a single `warn!` per eviction. That survives neither of the two
+volume axes. Within one cycle, `MAX_EVICTION_ATTEMPTS` is 1000, so a `warn` per key could be
+1000 lines from one call. Across cycles, `maybe_evict` runs after *every* mutation, so at
+`maxmemory` every write evicts and even a per-cycle `warn` is a per-write `warn` — the loudest
+line in such a deployment's log. Hence both per-eviction events at `debug`. What an operator
+actually needs at the default level is "this node is evicting", so that is what the `warn`
+roll-up says (`maxmemory eviction active`), immediately on the first eviction and at most once
+a minute after: its volume is a function of wall time, never of the write rate.
 
 **The File column names the subsystem, not always the file the event landed in.** The audit
 found five rows whose event exists but lives elsewhere, in every case because the value the

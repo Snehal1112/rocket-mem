@@ -2858,8 +2858,11 @@ fn handle_save(
         Ok(g) => g,
         Err(e) => return Frame::Error(format!("ERR failed to read AOF generation: {e}")),
     };
-    let path = crate::aof::generation_path(replication.snapshot_path(), gen);
-    tracing::info!(path = %path.display(), "snapshot save starting");
+    let snapshot_path = crate::aof::generation_path(replication.snapshot_path(), gen);
+    // `snapshot_path`, not `path`: one name for the snapshot file across every event that names
+    // it -- `aof.rs`'s recovery events, this pair, and `main.rs`'s config summary -- and the same
+    // name as the config key an operator already knows it by. See the spec's field vocabulary.
+    tracing::info!(snapshot_path = %snapshot_path.display(), "snapshot save starting");
 
     let bytes = {
         let _order_guard = aof.lock_all_shards();
@@ -2870,11 +2873,11 @@ fn handle_save(
         replication.engine().snapshot(offset)
     };
 
-    match write_snapshot_atomically(&path, &bytes) {
+    match write_snapshot_atomically(&snapshot_path, &bytes) {
         Ok(()) => {
             replication.record_save();
             tracing::info!(
-                path = %path.display(),
+                snapshot_path = %snapshot_path.display(),
                 bytes = bytes.len(),
                 elapsed_us = started.elapsed().as_micros() as u64,
                 "snapshot save finished"
