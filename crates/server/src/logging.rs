@@ -68,6 +68,29 @@ pub fn fmt_value(bytes: &[u8], cap: usize) -> String {
     out
 }
 
+/// The text that replaces a sensitive command's entire argument list.
+const REDACTED: &str = "<redacted>";
+
+/// Renders a command's argument list for a `trace`-level log line, or `<redacted>` when the
+/// command carries credential material.
+///
+/// The whole list is replaced, never just the argument believed to hold the secret: AUTH's
+/// one-argument and two-argument forms put the password in different positions, so any
+/// positional rule would leak one form while guarding the other.
+///
+/// Allocates, which is acceptable because every caller sits behind a `trace`-level check --
+/// `tracing`'s macros only evaluate field expressions when the callsite is enabled, so this
+/// never runs at the default `info` level.
+pub fn redact_args(cmd: &str, args: &[Bytes], cap: usize) -> String {
+    if is_sensitive(cmd, args) {
+        return REDACTED.to_string();
+    }
+    args.iter()
+        .map(|a| fmt_value(a, cap))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,5 +205,71 @@ mod tests {
         // string ends up -- escaping expands bytes, and a cap that drifted with it would make
         // the truncation count meaningless.
         assert_eq!(fmt_value(b"\n\n\n\n\n\n", 2), "\\x0a\\x0a…(4 more)");
+    }
+
+    #[test]
+    fn redact_args_renders_ordinary_arguments_space_separated() {
+        assert_eq!(redact_args("SET", &args(&[b"k", b"v"]), 128), "k v");
+    }
+
+    #[test]
+    fn redact_args_renders_no_arguments_as_an_empty_string() {
+        assert_eq!(redact_args("PING", &args(&[]), 128), "");
+    }
+
+    #[test]
+    fn redact_args_applies_the_cap_to_each_argument_independently() {
+        assert_eq!(
+            redact_args("SET", &args(&[b"k", b"abcdefghij"]), 4),
+            "k abcd…(6 more)"
+        );
+    }
+
+    #[test]
+    fn redact_args_escapes_control_bytes_in_arguments() {
+        assert_eq!(
+            redact_args("SET", &args(&[b"k", b"a\nb"]), 128),
+            "k a\\x0ab"
+        );
+    }
+
+    #[test]
+    fn redact_args_never_renders_an_auth_password() {
+        let rendered = redact_args("AUTH", &args(&[b"alice", b"hunter2"]), 128);
+        assert_eq!(rendered, "<redacted>");
+        assert!(!rendered.contains("hunter2"));
+        assert!(!rendered.contains("alice"));
+    }
+
+    #[test]
+    fn redact_args_never_renders_a_hello_auth_password() {
+        let rendered = redact_args("HELLO", &args(&[b"3", b"AUTH", b"alice", b"hunter2"]), 128);
+        assert_eq!(rendered, "<redacted>");
+        assert!(!rendered.contains("hunter2"));
+    }
+
+    #[test]
+    fn redact_args_never_renders_an_acl_setuser_rule_token() {
+        let rendered = redact_args("ACL", &args(&[b"SETUSER", b"alice", b">hunter2"]), 128);
+        assert_eq!(rendered, "<redacted>");
+        assert!(!rendered.contains("hunter2"));
+    }
+
+    #[test]
+    fn redact_args_redacts_the_whole_list_not_just_the_secret_argument() {
+        // Partial redaction is a trap: the argument layout differs between AUTH's one- and
+        // two-argument forms, so "redact the last one" would leak the password of the other.
+        assert_eq!(redact_args("AUTH", &args(&[b"hunter2"]), 128), "<redacted>");
+    }
+
+    #[test]
+    fn redact_args_still_renders_a_bare_hello() {
+        assert_eq!(redact_args("HELLO", &args(&[b"3"]), 128), "3");
+    }
+
+    #[test]
+    fn redact_args_ignores_the_cap_when_redacting() {
+        // A tiny cap must not truncate the marker into something that looks like data.
+        assert_eq!(redact_args("AUTH", &args(&[b"hunter2"]), 1), "<redacted>");
     }
 }
