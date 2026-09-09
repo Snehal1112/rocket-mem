@@ -96,6 +96,7 @@ pub async fn serve_tls(
     }
 }
 
+#[tracing::instrument(skip_all, fields(conn_id = client_id, %peer, protocol = "rmp", %tls))]
 async fn handle_connection<S>(
     socket: S,
     peer: std::net::SocketAddr,
@@ -107,7 +108,7 @@ async fn handle_connection<S>(
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    tracing::info!(%peer, protocol = "rmp", tls, "connection accepted");
+    tracing::info!("connection accepted");
     replication.connection_opened();
     let _client_guard = ClientGuard(Arc::clone(&replication));
     let framed = Framed::new(socket, RmpCodec);
