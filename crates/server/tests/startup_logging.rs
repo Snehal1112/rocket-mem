@@ -156,11 +156,12 @@ fn resolved_config_summary_reports_the_effective_log_filter_not_the_configured_o
 /// still pass.
 ///
 /// Verified by mutation: adding `full = ?config` to the event makes this test fail on the
-/// `zzuser` assertion, and only this test. The `zzsecret` and `zzkeypattern` assertions survive
-/// that mutation now that `config::AclUserConfig` has a hand-written `Debug` -- this test and
-/// that impl are complementary, not redundant: the impl makes the *credential* leak impossible
-/// from any call site, while this test still guards the fields the summary must enumerate by
-/// hand.
+/// `zzuser` assertion, and only this test. The `zzsecret`, `zzkeypattern` and
+/// `zzleaderpassword` assertions all survive that mutation, because `config::AclUserConfig` and
+/// `config::Config` both have hand-written redacting `Debug` impls -- this test and those impls
+/// are complementary, not redundant: the impls make the *credential* leak impossible from any
+/// call site, while this test still guards the residue the summary must enumerate by hand (the
+/// ACL usernames and the TLS paths, which those impls deliberately still render).
 #[test]
 fn secret_bearing_config_is_never_rendered_into_the_summary() {
     let dir = tempfile::tempdir().unwrap();
@@ -176,12 +177,19 @@ fn secret_bearing_config_is_never_rendered_into_the_summary() {
     // Written into the tempdir, never the repo-root `rocket-mem.toml` -- that file is a live
     // deployment's credential-bearing config and no test may load it.
     let config_path = dir.path().join("redaction-test.toml");
+    // `replicaof_auth_password` without `replicaof`: `validate_replicaof` only requires the
+    // username and password to be set together, and `start_replicating_from_config` is a no-op
+    // with no target -- so the plaintext leader credential is genuinely present in the `Config`
+    // this process logs a summary of, without the child spawning a doomed reconnect loop that
+    // would fill this capture with unrelated warnings.
     let config_toml = format!(
         r#"
 tls_resp_addr = "127.0.0.1:0"
 tls_rmp_addr = "127.0.0.1:0"
 tls_cert_path = "{}"
 tls_key_path = "{}"
+replicaof_auth_username = "zzleaderuser"
+replicaof_auth_password = "zzleaderpassword"
 
 [[acl.users]]
 username = "zzuser"
@@ -210,6 +218,10 @@ rules = ["allcommands", "~zzkeypattern*"]
         "zzuser",
         "zzsecret",
         "zzkeypattern",
+        // The plaintext leader credential. `Config`'s hand-written `Debug` now redacts it, so
+        // even a `full = ?config` mutation cannot put it here -- but the summary must not
+        // enumerate it by hand either, and only this assertion says so.
+        "zzleaderpassword",
         cert.to_str().unwrap(),
         key.to_str().unwrap(),
     ] {

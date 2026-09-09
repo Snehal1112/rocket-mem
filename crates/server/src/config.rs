@@ -4,7 +4,8 @@
 ///
 /// `#[serde(default)]` on the struct means a partial TOML file (or one missing entirely) still
 /// deserializes -- any field it doesn't mention falls back to `Config::default()`'s value for it.
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+/// `Debug` is hand-written below, not derived -- this struct holds a plaintext leader password.
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct Config {
     pub addr: String,
@@ -73,6 +74,80 @@ impl Default for Config {
             log_level: "info".to_string(),
             log_value_max_bytes: 128,
         }
+    }
+}
+
+impl std::fmt::Debug for Config {
+    /// Hand-written rather than derived, because `replicaof_auth_password` is a plaintext leader
+    /// credential (see its own doc comment) and a derived `Debug` would render it in full from any
+    /// `?config` call site. The decision recorded in the verbose-logging spec used to be the
+    /// opposite -- leave it derived -- on the reasoning that the only residue was ACL *usernames*
+    /// and TLS *paths*, which are not key material. That reasoning stopped holding the moment
+    /// `replicaof_auth_password` landed.
+    ///
+    /// **The destructuring is the point, not decoration.** `let Config { .. } = self` with no
+    /// `..` rest pattern is exhaustive: adding a field to `Config` makes this function fail to
+    /// compile with "pattern does not mention field `x`", forcing whoever adds it to decide here
+    /// whether it renders or is redacted. That compile-time check is exactly what the earlier
+    /// decision assumed a hand-written impl could not have -- "no compile-time check for a field
+    /// someone forgets to add, so it would silently start omitting new configuration while looking
+    /// exhaustive". It is available, and it also covers the failure mode that decision did not
+    /// consider: a future field that is itself a secret. Never add a `..` to the pattern below.
+    ///
+    /// What still renders, deliberately: the ACL usernames (via `AclUserConfig`'s own redacting
+    /// `Debug`), `replicaof_auth_username`, and the TLS cert/key/CA *paths*. A filename is not key
+    /// material, and hiding it would only make a TLS misconfiguration harder to diagnose. That is
+    /// the residue, and it is the same residue the spec has always named -- minus the password.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Config {
+            addr,
+            rmp_addr,
+            metrics_addr,
+            aof_path,
+            snapshot_path,
+            slowlog_threshold_micros,
+            cluster_config,
+            cluster_node_id,
+            tls_resp_addr,
+            tls_rmp_addr,
+            tls_cert_path,
+            tls_key_path,
+            tls_ca_path,
+            replicaof,
+            replicaof_auth_username,
+            replicaof_auth_password,
+            acl,
+            log_level,
+            log_value_max_bytes,
+        } = self;
+
+        // `Option<&str>`, not a bare marker string, so the field keeps its `Some`/`None` shape:
+        // "a leader password is configured" is a routine, non-secret operational fact, and
+        // collapsing it with "none configured" would only make an auth misconfiguration harder to
+        // spot -- the same reasoning `AclUserConfig`'s `<nopass>` rests on.
+        let replicaof_auth_password = replicaof_auth_password.as_ref().map(|_| "<redacted>");
+
+        f.debug_struct("Config")
+            .field("addr", addr)
+            .field("rmp_addr", rmp_addr)
+            .field("metrics_addr", metrics_addr)
+            .field("aof_path", aof_path)
+            .field("snapshot_path", snapshot_path)
+            .field("slowlog_threshold_micros", slowlog_threshold_micros)
+            .field("cluster_config", cluster_config)
+            .field("cluster_node_id", cluster_node_id)
+            .field("tls_resp_addr", tls_resp_addr)
+            .field("tls_rmp_addr", tls_rmp_addr)
+            .field("tls_cert_path", tls_cert_path)
+            .field("tls_key_path", tls_key_path)
+            .field("tls_ca_path", tls_ca_path)
+            .field("replicaof", replicaof)
+            .field("replicaof_auth_username", replicaof_auth_username)
+            .field("replicaof_auth_password", &replicaof_auth_password)
+            .field("acl", acl)
+            .field("log_level", log_level)
+            .field("log_value_max_bytes", log_value_max_bytes)
+            .finish()
     }
 }
 
@@ -163,7 +238,16 @@ pub fn load_layered(toml_path: Option<&std::path::Path>) -> Result<Config, figme
 // Adding a new field to `Config` also requires adding it here and to `cli_overrides`'s `set!`
 // calls -- there's no compile-time check that catches a forgotten one.
 /// A RESP-compatible in-memory data store.
-#[derive(clap::Parser, Debug)]
+//
+// **No `Debug`, deliberately.** `--replicaof-auth-password` puts a plaintext leader credential in
+// this struct, *earlier* than `Config` sees it, so a derived `Debug` here is the same hazard
+// `Config`'s hand-written impl above exists to close -- and closing only `Config`'s half would
+// leave the CLI layer leaking. Nothing in the workspace formats a `Cli`, and nothing should: it is
+// a transient parse artifact whose every value ends up in `Config`, which *is* debuggable. Not
+// having the impl at all is the stronger guard, because a `?cli` does not compile rather than
+// merely being discouraged. `clap::Parser` does not require `Debug`; if a future need for one is
+// real, hand-write it exhaustively the way `Config`'s is, never derive it.
+#[derive(clap::Parser)]
 #[command(name = "rocket-mem", version)]
 pub struct Cli {
     /// Path to a TOML config file. Not read via env/CLI layering itself -- it names which file
@@ -553,6 +637,100 @@ mod tests {
             "got: {rendered}"
         );
         assert!(rendered.contains("<redacted>"), "got: {rendered}");
+    }
+
+    /// The hazard `Config`'s hand-written `Debug` closes: `replicaof_auth_password` is a plaintext
+    /// leader credential, and until this impl existed the derived `Debug` rendered it in full.
+    ///
+    /// Mutation-checked, per the spec's "Redaction tests must be mutation-checked" rule: the
+    /// fixture below genuinely carries `zzleaderpassword`, and replacing the `map(|_| ...)` in the
+    /// impl with `.map(|p| p.as_str())` makes this test -- and only this test plus
+    /// `config_debug_still_renders_every_non_secret_field` -- fail on the first assertion.
+    #[test]
+    fn config_debug_redacts_the_replicaof_auth_password() {
+        let cfg = Config {
+            replicaof: Some("127.0.0.1:6400".to_string()),
+            replicaof_auth_username: Some("app".to_string()),
+            replicaof_auth_password: Some("zzleaderpassword".to_string()),
+            ..Config::default()
+        };
+        let rendered = format!("{cfg:?}");
+
+        assert!(
+            !rendered.contains("zzleaderpassword"),
+            "the plaintext leader password must never render, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("replicaof_auth_password: Some(\"<redacted>\")"),
+            "got: {rendered}"
+        );
+        // "a password is configured" is a non-secret operational fact and must stay
+        // distinguishable from "none configured", so the `Option` shape survives redaction.
+        let none = format!("{:?}", Config::default());
+        assert!(
+            none.contains("replicaof_auth_password: None"),
+            "got: {none}"
+        );
+    }
+
+    /// The other half of a hand-written `Debug`'s risk: silently *dropping* a field while looking
+    /// exhaustive. The destructuring in the impl makes a forgotten field a compile error, but
+    /// nothing stops a field being destructured and then not passed to `debug_struct`, so this
+    /// pins the rendered output too. It also fixes the residue the spec records as still visible.
+    #[test]
+    fn config_debug_still_renders_every_non_secret_field() {
+        let cfg = Config {
+            addr: "1.1.1.1:1".to_string(),
+            rmp_addr: "1.1.1.1:2".to_string(),
+            metrics_addr: "1.1.1.1:3".to_string(),
+            aof_path: "/zz/a.aof".to_string(),
+            snapshot_path: "/zz/s.snap".to_string(),
+            slowlog_threshold_micros: 4321,
+            cluster_config: Some("/zz/cluster.conf".to_string()),
+            cluster_node_id: Some("zznode".to_string()),
+            tls_resp_addr: Some("1.1.1.1:4".to_string()),
+            tls_rmp_addr: Some("1.1.1.1:5".to_string()),
+            tls_cert_path: Some("/zz/cert.pem".to_string()),
+            tls_key_path: Some("/zz/key.pem".to_string()),
+            tls_ca_path: Some("/zz/ca.pem".to_string()),
+            replicaof: Some("1.1.1.1:6".to_string()),
+            replicaof_auth_username: Some("zzuser".to_string()),
+            replicaof_auth_password: Some("zzleaderpassword".to_string()),
+            acl: AclBootstrapConfig::default(),
+            log_level: "zzlevel".to_string(),
+            log_value_max_bytes: 4322,
+        };
+        let rendered = format!("{cfg:?}");
+
+        for expected in [
+            "1.1.1.1:1",
+            "1.1.1.1:2",
+            "1.1.1.1:3",
+            "/zz/a.aof",
+            "/zz/s.snap",
+            "4321",
+            "/zz/cluster.conf",
+            "zznode",
+            "1.1.1.1:4",
+            "1.1.1.1:5",
+            // The TLS paths and the replication username are the residue this impl deliberately
+            // keeps: a filename is not key material, and hiding it makes a TLS or auth
+            // misconfiguration harder to diagnose, not safer.
+            "/zz/cert.pem",
+            "/zz/key.pem",
+            "/zz/ca.pem",
+            "1.1.1.1:6",
+            "zzuser",
+            "acl",
+            "zzlevel",
+            "4322",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "a hand-written Debug must not silently drop {expected:?}, got: {rendered}"
+            );
+        }
+        assert!(!rendered.contains("zzleaderpassword"), "got: {rendered}");
     }
 
     #[test]

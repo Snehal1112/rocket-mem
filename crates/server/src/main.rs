@@ -115,21 +115,25 @@ async fn main() -> std::io::Result<()> {
     //
     // This lands at `info`, so it reaches every operator's log file and every log aggregator.
     // `Config` transitively holds credential material -- `acl.users` carries plaintext
-    // passwords and rule tokens, and the TLS cert/key/CA paths name private key material on
-    // disk -- so every field below is enumerated by hand and each is either a bind address, a
-    // non-credential path, a level string, or a plain boolean derived from a secret-bearing
-    // field's *presence*. Never render `config` (or `config.acl`) via `Debug`/`{:?}` here: a
-    // derived `Debug` on a struct that transitively holds credentials is exactly the hazard
-    // `acl::AclUser`'s and `config::AclUserConfig`'s hand-written `Debug`s exist to prevent.
-    // Those two impls make the *credential* half of this rule structural -- a `{:?}` of the
-    // whole `Config` can no longer print a plaintext password or a raw rule token -- but
-    // `Config` itself still derives `Debug`, so the ACL usernames and the TLS cert/key/CA paths
-    // would still render in full. Enumerating fields by hand remains the rule. Deliberately absent:
-    // `tls_cert_path`, `tls_key_path`, `tls_ca_path` (summarised only as the two `tls_*_enabled`
-    // booleans) and every `acl.users` field (summarised only as `acl_enabled`/`acl_user_count`).
+    // passwords and rule tokens, `replicaof_auth_password` is the leader's plaintext password,
+    // and the TLS cert/key/CA paths name private key material on disk -- so every field below is
+    // enumerated by hand and each is either a bind address, a non-credential path, a level
+    // string, or a plain boolean derived from a secret-bearing field's *presence*.
+    //
+    // The *credential* half of that rule is now structural rather than a call-site convention:
+    // `acl::AclUser`, `config::AclUserConfig` and `config::Config` all have hand-written
+    // redacting `Debug` impls, so a `{:?}` of the whole `Config` anywhere in the crate can no
+    // longer print a plaintext password or a raw rule token. `Config`'s impl is destructuring and
+    // therefore exhaustive at compile time -- a new field cannot slip past it unconsidered.
+    // What those impls still render, deliberately, is the residue: the ACL usernames,
+    // `replicaof_auth_username`, and the TLS cert/key/CA paths. So enumerating fields by hand
+    // remains the rule here even though a `?config` would no longer leak a secret. Deliberately
+    // absent: `tls_cert_path`, `tls_key_path`, `tls_ca_path` (summarised only as the two
+    // `tls_*_enabled` booleans) and every `acl.users` field (summarised only as
+    // `acl_enabled`/`acl_user_count`).
     // `startup_logging.rs`'s `secret_bearing_config_is_never_rendered_into_the_summary` is the
-    // regression guard for all of that -- it starts the binary with a real-shaped ACL user and
-    // TLS material and fails if any of it reaches stderr.
+    // regression guard for all of that -- it starts the binary with a real-shaped ACL user, a
+    // real `replicaof_auth_password` and TLS material, and fails if any of it reaches stderr.
     //
     // `tls_enabled` means "this process is serving TLS listeners", derived from the addresses
     // rather than from cert/key presence: cert and key set with no `tls_*_addr` binds no TLS
