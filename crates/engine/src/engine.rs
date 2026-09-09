@@ -90,8 +90,12 @@ impl Engine {
             observed_delta = delta;
             (r, delta)
         });
+        // `escape_key`, not a bare `from_utf8_lossy`: a key is arbitrary client bytes, and an
+        // unescaped `\n` in one forges a second log record. `common::log_escape` is the shared
+        // escaper -- see its header for why it lives in `common` and not in `server`'s
+        // `logging.rs`. It still borrows for an ordinary key, so this costs no allocation.
         tracing::trace!(
-            key = %String::from_utf8_lossy(key),
+            key = %common::log_escape::escape_key(key),
             bytes = observed_delta,
             "mutation byte delta"
         );
@@ -133,7 +137,7 @@ impl Engine {
     /// per-key read/write path inside `Store`.
     pub fn shard_index(&self, key: &[u8]) -> usize {
         let shard = self.store.shard_index(key);
-        tracing::trace!(key = %String::from_utf8_lossy(key), shard, "shard routing");
+        tracing::trace!(key = %common::log_escape::escape_key(key), shard, "shard routing");
         shard
     }
     /// Ticks the recency clock `get`/`set` stamp entries with. The server calls this from its
@@ -227,7 +231,7 @@ impl Engine {
             self.store.del(&key);
             total_freed += freed;
             tracing::debug!(
-                key = %String::from_utf8_lossy(&key),
+                key = %common::log_escape::escape_key(&key),
                 bytes = freed,
                 reason = REASON,
                 "evicted key"

@@ -105,8 +105,12 @@ impl SlowLog {
         // command and no key at all. `key` goes through `key_field` -- the same lossy-UTF-8
         // rendering the `cmd` span already uses -- never `?` on the raw `Bytes`, which renders
         // byte-by-byte. It renders `log_key`, not the stored `key`: see this fn's doc comment.
+        // Both `cmd` and `key` are escaped and capped -- see `logging::key_field`. This event is
+        // the one that made the missing escaping a production problem rather than a `debug`-only
+        // one: the slow log is on by default, this fires at `warn`, and both fields are raw
+        // client bytes.
         tracing::warn!(
-            cmd = %command,
+            cmd = %crate::logging::escape_ident(command),
             key = %crate::logging::key_field(log_key),
             elapsed_us = duration_micros,
             "slow command recorded"

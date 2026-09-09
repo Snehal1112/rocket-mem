@@ -358,10 +358,17 @@ fn psync_advertised_addr(frame: &protocol::Frame) -> Option<String> {
 /// carries `conn_id`/`peer`/`protocol`/`tls`), so it deliberately does not re-log any of those --
 /// only the one field neither ancestor span already has. See
 /// ../../../docs/superpowers/specs/2026-09-09-verbose-logging-design.md's span table.
+///
+/// `host_port` goes through `logging::escape_ident`. It is a raw client bulk, and `PSYNC` clears
+/// `auth_gate` even on a server with no ACLs configured, which makes this the one field an
+/// *unauthenticated* remote party can put arbitrary bytes into at `info` -- the level every
+/// production node runs at. Unescaped it forges log records; uncapped it forges long ones.
 #[tracing::instrument(
     name = "repl",
     skip_all,
-    fields(host_port = %advertised_addr.clone().unwrap_or_else(|| "unknown".to_string()))
+    fields(host_port = %crate::logging::escape_ident(
+        advertised_addr.as_deref().unwrap_or("unknown")
+    ))
 )]
 async fn serve_replica<S>(
     framed: Framed<S, RespCodec>,
@@ -390,7 +397,7 @@ async fn serve_replica<S>(
             .clone()
             .unwrap_or_else(|| "unknown".to_string());
         replication.registry.register(advertised_addr, tx);
-        tracing::info!(host_port = %host_port, "replica registered");
+        tracing::info!(host_port = %crate::logging::escape_ident(&host_port), "replica registered");
         (bytes, rx)
     };
 

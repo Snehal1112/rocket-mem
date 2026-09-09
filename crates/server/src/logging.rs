@@ -7,6 +7,15 @@
 
 use bytes::Bytes;
 
+/// The escaper every client-controlled log field in this crate goes through, re-exported from
+/// `common::log_escape` so that this module stays the one file a reviewer opens.
+///
+/// The implementation is in `common` rather than here for a reason spelled out in that
+/// module's own header: `engine` logs key names too and cannot depend on `server`. No policy
+/// moved with it -- `is_sensitive` and `redact_args`, the parts that decide what is a secret,
+/// are still below and still only here.
+pub(crate) use common::log_escape::escape_ident;
+
 /// Renders `dispatcher::logged_key`'s key for a log field -- the `cmd` span's `key`, and
 /// `SlowLog::maybe_record`'s `warn!` (see that fn's doc comment for why that event needs its own
 /// copy of the key rather than leaning on the span).
@@ -21,6 +30,13 @@ use bytes::Bytes;
 /// key, which is essentially all of them, `from_utf8_lossy` returns a `Cow::Borrowed` and
 /// copies nothing.
 ///
+/// It is not lossy UTF-8 *alone*, though. A key is arbitrary client bytes, so it goes through
+/// `common::log_escape::escape_key`: unescaped, a key containing `\n` forges a second log
+/// record and one containing an ANSI escape repaints the operator's terminal, and both would
+/// reach a `warn`-level slow-log line at the production default. The escaper still borrows for
+/// an ordinary key, so the no-copy property above survives -- pinned by
+/// `key_field_borrows_a_valid_utf8_key_instead_of_allocating` below.
+///
 /// `None` -- a keyless command such as `PING`, `ECHO` or `AUTH`, all of which
 /// `dispatcher::logged_key` deliberately reports as keyless -- renders as the empty string
 /// rather than a literal `"None"`, so a `key=` field is either a real key or visibly absent.
@@ -28,7 +44,7 @@ use bytes::Bytes;
 /// `dispatcher.rs` and moving a function must not widen the crate's public surface.
 pub(crate) fn key_field(key: Option<&Bytes>) -> std::borrow::Cow<'_, str> {
     match key {
-        Some(k) => String::from_utf8_lossy(k),
+        Some(k) => common::log_escape::escape_key(k),
         None => std::borrow::Cow::Borrowed(""),
     }
 }
@@ -77,42 +93,20 @@ pub fn is_sensitive(cmd: &str, args: &[Bytes]) -> bool {
     }
 }
 
-/// Renders `bytes` for a log line, truncating at `cap` bytes and appending a `…(N more)`
-/// marker naming how many bytes were dropped. The marker matters: without it a truncated
-/// value is indistinguishable from a short one, which turns a log into a misleading record
-/// of what was actually stored.
+/// Renders a stored value for a `trace`-level log line: `common::log_escape::escape_for_log` at
+/// the operator-tunable `Config::log_value_max_bytes` cap, owned.
 ///
-/// Control bytes are escaped as `\xNN`. rocket-mem stores arbitrary bytes, so a value is
-/// fully capable of containing a newline (which would forge a second log line) or an ANSI
-/// escape (which would repaint the operator's terminal) -- neither may reach the log
-/// verbatim. `cap` is counted against the *stored* bytes, before escaping expands them, so
-/// the dropped-byte count stays a true statement about the value.
+/// The escaping and truncation used to live here; they moved to `common` when `key_field`, the
+/// `user`/`cmd`/`host_port` fields and `engine`'s own key fields all turned out to need the same
+/// treatment. This wrapper stays because the *cap* is the distinction worth keeping: a value's
+/// cap is a knob an operator turns to control how much user data reaches a log, while an
+/// identifier's is the fixed `LOG_IDENT_MAX_BYTES`. See that constant's doc comment.
 ///
-/// The escape set is Unicode category `Cc` (`char::is_control()`: C0 controls, DEL, and C1
-/// controls -- this already covers NEL U+0085 and CSI U+009B) plus `\x7f` DEL itself, plus
-/// categories `Zl`/`Zp` (U+2028 LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR). `Zl`/`Zp` are
-/// not controls and cannot move a terminal cursor, but Unicode-aware log consumers (log
-/// shipper multiline filters, Python's `str.splitlines()`, PCRE's `\R`) treat them as hard
-/// line breaks, so a stored value containing one could forge a second log record downstream
-/// just as `\n` would. Both code points exceed 0xFF, so they render as `\x2028`/`\x2029`
-/// under the same `\xNN` format -- unambiguous, so no second escape format is needed.
+/// Returns an owned `String` rather than the escaper's `Cow`, giving up its borrow. That costs
+/// nothing real: the only caller is `redact_args`, which is `trace`-only and allocates a joined
+/// `String` regardless.
 pub fn fmt_value(bytes: &[u8], cap: usize) -> String {
-    let shown = &bytes[..cap.min(bytes.len())];
-    let mut out = String::with_capacity(shown.len());
-    // Decoded lossily first so multi-byte UTF-8 survives as characters rather than being
-    // escaped byte-by-byte; only genuine control characters (plus the Zl/Zp line-breaking
-    // separators) are then expanded.
-    for c in String::from_utf8_lossy(shown).chars() {
-        if c.is_control() || c == '\x7f' || c == '\u{2028}' || c == '\u{2029}' {
-            out.push_str(&format!("\\x{:02x}", c as u32));
-        } else {
-            out.push(c);
-        }
-    }
-    if bytes.len() > cap {
-        out.push_str(&format!("…({} more)", bytes.len() - cap));
-    }
-    out
+    common::log_escape::escape_for_log(bytes, cap).into_owned()
 }
 
 /// The text that replaces a sensitive command's entire argument list.
@@ -180,6 +174,30 @@ mod tests {
             key_field(Some(&key)),
             std::borrow::Cow::Borrowed(_)
         ));
+    }
+
+    #[test]
+    fn key_field_escapes_a_newline_so_a_key_cannot_forge_a_log_line() {
+        // A key is arbitrary client bytes and reaches a `warn`-level slow-log line at the
+        // production default level, so an unescaped `\n` here writes a second, forged record
+        // into the operator's audit trail.
+        let key = Bytes::from_static(b"a\nb");
+        assert_eq!(key_field(Some(&key)), "a\\x0ab");
+        assert!(!key_field(Some(&key)).contains('\n'));
+    }
+
+    #[test]
+    fn key_field_escapes_an_ansi_escape_so_a_key_cannot_repaint_a_terminal() {
+        let key = Bytes::from_static(b"a\x1b[31mb");
+        assert_eq!(key_field(Some(&key)), "a\\x1b[31mb");
+    }
+
+    #[test]
+    fn key_field_caps_an_unbounded_key() {
+        // rocket-mem accepts keys far larger than any log line should carry; without a cap one
+        // client can write an arbitrarily long record into the log.
+        let key = Bytes::from(vec![b'k'; common::log_escape::LOG_IDENT_MAX_BYTES + 7]);
+        assert!(key_field(Some(&key)).ends_with("…(7 more)"));
     }
 
     #[test]

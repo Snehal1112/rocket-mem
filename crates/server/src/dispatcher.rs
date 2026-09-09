@@ -218,8 +218,14 @@ pub fn dispatch(engine: &Engine, frame: Frame, _protocol: &mut Protocol, _client
         // `upper_name` returned `None`, and `command_name_upper` -- which the `cmd` span's own
         // `cmd` field comes from -- calls the same `upper_name`, so on this path the span's field
         // is the empty string. Removing this one loses the information outright.
+        //
+        // Escaped, and note that `upper_name` returning `None` is *not* what bounds this: its
+        // rejection test is `!raw.is_ascii()`, which `\n` and `\x1b` both pass, so a name that
+        // is too long lands here carrying whatever control bytes the client chose. The error
+        // frame below keeps echoing the client's own bytes unescaped -- that is a reply to the
+        // client, not a line in the operator's log.
         let raw = String::from_utf8_lossy(&args[0]);
-        tracing::debug!(cmd = %raw, "unknown command");
+        tracing::debug!(cmd = %crate::logging::escape_ident(&raw), "unknown command");
         return Frame::Error(format!("ERR unknown command '{raw}'"));
     };
     let rest = &args[1..];
@@ -1160,7 +1166,10 @@ pub fn dispatch(engine: &Engine, frame: Frame, _protocol: &mut Protocol, _client
             // neither supplies what this field does.) On both of those paths this field is
             // therefore the only record of *which* command was unknown. Version
             // skew against an AOF or a leader is precisely the case this event exists for.
-            tracing::debug!(cmd = %name.as_str(), "unknown command");
+            //
+            // Escaped: a `CommandName` is ASCII, but `upper_name`'s `is_ascii()` test admits
+            // `\n` and `\x1b` just as happily as it admits letters, so this is client bytes.
+            tracing::debug!(cmd = %crate::logging::escape_ident(name.as_str()), "unknown command");
             Frame::Error(format!("ERR unknown command '{}'", name.as_str()))
         }
     }
@@ -1186,12 +1195,20 @@ fn try_authenticate(
         Some(user) => {
             // `peer` is already attached by the enclosing `conn` span (plan 05/06) -- see this
             // plan's Architecture section. Never log `password` here.
-            tracing::info!(user = %username, "auth success");
+            //
+            // `username` goes through `escape_ident` and never reaches the field raw. This is
+            // the most exposed field in the whole logging surface: it is `info`/`warn`, so it
+            // is on at the production default, and `handle_auth` builds it from a raw client
+            // bulk *before* the client has authenticated. Unescaped, `AUTH "x\n<forged line>"
+            // pw` lets any remote party append arbitrary records -- including a fake
+            // `auth success` -- to the operator's audit trail.
+            tracing::info!(user = %crate::logging::escape_ident(username), "auth success");
             Ok(user)
         }
         None => {
             // Never log `password` here -- see this plan's CRITICAL SECURITY POINT.
-            tracing::warn!(user = %username, "auth failure");
+            // `username` is escaped for the reason given in the `Some` arm above.
+            tracing::warn!(user = %crate::logging::escape_ident(username), "auth failure");
             Err(Frame::Error(
                 "WRONGPASS invalid username-password pair or user is disabled.".into(),
             ))
@@ -2704,7 +2721,7 @@ fn acl_setuser(items: &[Frame], replication: &crate::replication::ReplicationHan
         Ok(()) => {
             // `raw_tokens` can carry ACL SETUSER's `>password` token -- never log it. Only
             // `username` is safe here; see this plan's CRITICAL SECURITY POINT.
-            tracing::info!(user = %username, "ACL SETUSER");
+            tracing::info!(user = %crate::logging::escape_ident(&username), "ACL SETUSER");
             Frame::Simple("OK".into())
         }
         Err(e) => Frame::Error(e.to_string()),
@@ -2725,7 +2742,7 @@ fn acl_deluser(items: &[Frame], replication: &crate::replication::ReplicationHan
             let username = String::from_utf8_lossy(b);
             let removed = replication.acl.del_user(&username);
             if removed {
-                tracing::info!(user = %username, "ACL DELUSER");
+                tracing::info!(user = %crate::logging::escape_ident(&username), "ACL DELUSER");
             }
             removed
         })
@@ -2951,7 +2968,7 @@ pub(crate) fn auth_gate(
         };
         // `cmd`/`key` are already attached by the enclosing `cmd` span (plan 07) -- see this
         // plan's Architecture section, so only `user` needs adding here.
-        tracing::warn!(user = %user.username, "permission denied");
+        tracing::warn!(user = %crate::logging::escape_ident(&user.username), "permission denied");
         return Some(Frame::Error(msg.into()));
     }
     None
@@ -3248,7 +3265,7 @@ pub fn dispatch_and_log(
     // called, silently losing every nested field.
     let _cmd_span = tracing::debug_span!(
         "cmd",
-        cmd = %name,
+        cmd = %crate::logging::escape_ident(name),
         key = %crate::logging::key_field(log_key.as_ref()),
         argc = arg_count,
     )

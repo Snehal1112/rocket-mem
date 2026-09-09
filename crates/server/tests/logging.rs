@@ -988,3 +988,181 @@ fn every_aborting_recovery_failure_is_logged_at_error() {
         "expected exactly one error line per failure, no duplicates:\n{text}"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// Log injection: client-controlled text must never reach a log line unescaped or uncapped.
+//
+// This is a log-*integrity* guard, not a confidentiality one -- no secret or stored value
+// escapes through these fields. What escapes is the operator's ability to trust their own audit
+// trail: `tracing`'s `%` (Display) fields reach the writer verbatim, so a key or username
+// carrying `\n` writes a second, indistinguishable record, and one carrying an ANSI escape
+// repaints the terminal reading it. Both are reachable at the production default of `info`, and
+// the `user` field is reachable *before* the client has authenticated.
+//
+// The escaping itself is unit-tested in `common::log_escape` and `server::logging`. These tests
+// exist because those cannot see what a real subscriber actually writes -- and the whole class
+// of bug here is "the helper is correct but one call site does not use it".
+// ---------------------------------------------------------------------------------------------
+
+/// A forged log record, spelled exactly the way `tracing_subscriber::fmt`'s default format
+/// spells a real one. If this ever reaches the output at the start of a line, neither an
+/// operator reading the file nor a log shipper parsing it can tell it from a genuine record --
+/// and it claims a successful authentication that never happened.
+const FORGED_RECORD: &str =
+    "2000-01-01T00:00:00.000000Z  INFO rocket_mem::dispatcher: auth success user=attacker";
+
+/// The one assertion that distinguishes escaped from unescaped output.
+///
+/// It deliberately does *not* assert the forged text is absent: the payload is legitimately
+/// still there, as data, inside the field it was supplied in. What must be absent is a *line*
+/// beginning with it, because that -- not its presence -- is what makes it a record.
+fn assert_no_forged_record_line(output: &str) {
+    assert!(
+        !output.lines().any(|line| line.starts_with("2000-01-01T")),
+        "client-supplied text forged a log record of its own:\n{output}"
+    );
+}
+
+/// A `ReplicationHandle` whose slow log fires on every command, so the `warn!` in
+/// `SlowLog::maybe_record` -- emitted at this project's production default level, with the slow
+/// log on by default -- is reached deterministically. `Duration::ZERO` would disable the slow
+/// log entirely, hence 1ns.
+fn always_slow() -> rocket_mem::replication::ReplicationHandle {
+    rocket_mem::replication::ReplicationHandle::default()
+        .with_slowlog_threshold(Duration::from_nanos(1))
+}
+
+/// A `ReplicationHandle` with one ACL user, so `AUTH` is answered (and logged) rather than
+/// refused outright by `try_authenticate`'s "no password is set" guard.
+fn with_one_acl_user() -> rocket_mem::replication::ReplicationHandle {
+    let replication = rocket_mem::replication::ReplicationHandle::default();
+    replication
+        .acl
+        .set_user(
+            "alice",
+            &[Bytes::from_static(b"on"), Bytes::from_static(b">pw")],
+        )
+        .expect("configure an ACL");
+    replication
+}
+
+#[test]
+fn a_key_carrying_a_newline_cannot_forge_a_log_record() {
+    let key = format!("realkey\n{FORGED_RECORD}");
+    let output =
+        capture_frames_with_at("warn", always_slow(), vec![cmd(&[b"GET", key.as_bytes()])]);
+
+    assert!(
+        output.contains("slow command recorded"),
+        "the slow-log warning did not fire, so this test proved nothing:\n{output}"
+    );
+    assert_no_forged_record_line(&output);
+    assert!(
+        output.contains("key=realkey\\x0a"),
+        "expected the newline rendered as an escape inside the key field:\n{output}"
+    );
+}
+
+#[test]
+fn a_key_carrying_an_ansi_escape_cannot_repaint_an_operators_terminal() {
+    // `\x1b[2J` clears the screen and `\x1b[31m` recolours everything after it. Neither is
+    // something a stored key gets to do to the terminal an operator reads the log in.
+    let output = capture_frames_with_at(
+        "warn",
+        always_slow(),
+        vec![cmd(&[b"GET", b"realkey\x1b[2J\x1b[31mBOOM"])],
+    );
+
+    assert!(
+        output.contains("slow command recorded"),
+        "the slow-log warning did not fire, so this test proved nothing:\n{output}"
+    );
+    assert!(
+        !output.contains('\x1b'),
+        "a raw ESC byte reached the log line:\n{output:?}"
+    );
+    assert!(
+        output.contains("key=realkey\\x1b[2J\\x1b[31mBOOM"),
+        "expected each ESC rendered as an escape inside the key field:\n{output}"
+    );
+}
+
+#[test]
+fn an_unbounded_key_is_capped_before_it_reaches_the_log() {
+    // Without a cap, one client writes one arbitrarily long record per slow command, at `warn`.
+    let key = "k".repeat(4096);
+    let output =
+        capture_frames_with_at("warn", always_slow(), vec![cmd(&[b"GET", key.as_bytes()])]);
+
+    assert!(
+        output.contains("…(3840 more)"),
+        "expected the key truncated at the identifier cap with a dropped-byte marker:\n{output}"
+    );
+    assert!(
+        output.len() < 1024,
+        "the log line is still unbounded in the key's length; it came to {} bytes",
+        output.len()
+    );
+}
+
+/// The `user` field, the worst of the set: `warn`, so on at the production default, and built
+/// from a raw client bulk *before* the client has authenticated. Any remote party that can
+/// reach an ACL-configured server can append records to its audit trail, unboundedly, with
+/// `AUTH "<newline><forged record>" x`.
+#[test]
+fn a_username_carrying_a_newline_cannot_forge_a_log_record() {
+    let username = format!("alice\n{FORGED_RECORD}");
+    let output = capture_frames_with_at(
+        "warn",
+        with_one_acl_user(),
+        vec![cmd(&[b"AUTH", username.as_bytes(), b"pw"])],
+    );
+
+    assert!(
+        output.contains("auth failure"),
+        "the pre-auth warning did not fire, so this test proved nothing:\n{output}"
+    );
+    assert_no_forged_record_line(&output);
+    assert!(
+        output.contains("user=alice\\x0a"),
+        "expected the newline rendered as an escape inside the user field:\n{output}"
+    );
+}
+
+#[test]
+fn a_username_carrying_an_ansi_escape_cannot_repaint_an_operators_terminal() {
+    let output = capture_frames_with_at(
+        "warn",
+        with_one_acl_user(),
+        vec![cmd(&[b"AUTH", b"alice\x1b[2J\x1b[31mBOOM", b"pw"])],
+    );
+
+    assert!(
+        output.contains("auth failure"),
+        "the pre-auth warning did not fire, so this test proved nothing:\n{output}"
+    );
+    assert!(
+        !output.contains('\x1b'),
+        "a raw ESC byte reached the log line:\n{output:?}"
+    );
+}
+
+#[test]
+fn an_unbounded_username_is_capped_before_it_reaches_the_log() {
+    let username = "u".repeat(4096);
+    let output = capture_frames_with_at(
+        "warn",
+        with_one_acl_user(),
+        vec![cmd(&[b"AUTH", username.as_bytes(), b"pw"])],
+    );
+
+    assert!(
+        output.contains("…(3840 more)"),
+        "expected the username truncated at the identifier cap with a marker:\n{output}"
+    );
+    assert!(
+        output.len() < 1024,
+        "the log line is still unbounded in the username's length; it came to {} bytes",
+        output.len()
+    );
+}

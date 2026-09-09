@@ -1,3 +1,5 @@
+pub mod log_escape;
+
 /// Converts an absolute Unix-millisecond timestamp into a monotonic `Instant` this process's
 /// clock can compare against. A target already in the past collapses to "right now" (the
 /// delta saturates to zero), so an already-elapsed expiry takes effect on the very next

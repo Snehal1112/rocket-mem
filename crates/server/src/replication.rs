@@ -57,8 +57,11 @@ impl ReplicaRegistry {
         replicas.retain(|(addr, tx)| {
             let alive = tx.send(bytes.clone()).is_ok();
             if !alive {
+                // Escaped: `addr` is the address the replica advertised in its own `PSYNC`
+                // frame -- raw client bytes, reaching an `info` event on a server that never
+                // authenticated it. See `connection::serve_replica`'s doc comment.
                 tracing::info!(
-                    host_port = %addr.clone().unwrap_or_else(|| "unknown".to_string()),
+                    host_port = %crate::logging::escape_ident(addr.as_deref().unwrap_or("unknown")),
                     "replica pruned"
                 );
             }
@@ -577,7 +580,7 @@ struct FollowerIdentity {
 /// name) to match the leader-side span opened in `connection.rs`'s `serve_replica` — one name,
 /// grep-able from either end of a replication link. See
 /// ../../../docs/superpowers/specs/2026-09-09-verbose-logging-design.md's span table.
-#[tracing::instrument(name = "repl", skip_all, fields(host_port = %host_port))]
+#[tracing::instrument(name = "repl", skip_all, fields(host_port = %crate::logging::escape_ident(&host_port)))]
 async fn replication_client_loop(
     host_port: String,
     engine: Arc<Engine>,
@@ -606,9 +609,21 @@ async fn replication_client_loop(
         )
         .await
         {
-            Ok(()) => tracing::warn!(%host_port, "replication connection closed, reconnecting"),
+            // `host_port` came from a client's `REPLICAOF <host> <port>`, so it is escaped here
+            // like every other client-controlled field. Admin-gated rather than open, but the
+            // events are `warn` and the escaping costs nothing on a per-reconnect path.
+            Ok(()) => {
+                tracing::warn!(
+                    host_port = %crate::logging::escape_ident(&host_port),
+                    "replication connection closed, reconnecting"
+                )
+            }
             Err(e) => {
-                tracing::warn!(%host_port, error = %e, "replication connection lost, reconnecting")
+                tracing::warn!(
+                    host_port = %crate::logging::escape_ident(&host_port),
+                    error = %e,
+                    "replication connection lost, reconnecting"
+                )
             }
         }
         handles.link_up.store(false, Ordering::Relaxed);
@@ -826,7 +841,9 @@ where
         // which matches the pre-fix behavior for those.
         let _order_guard = aof.map(|a| a.lock_all_shards());
         let reply = crate::dispatcher::dispatch(engine, frame, &mut protocol, 0);
-        tracing::debug!(cmd = %name, "applied replicated command");
+        // Escaped: `replicated_command_name` is a lossy decode of whatever bytes the leader put
+        // in the frame's first bulk, with no length or character restriction of its own.
+        tracing::debug!(cmd = %crate::logging::escape_ident(&name), "applied replicated command");
         // A leader only ever fans out a command whose local execution already succeeded, so
         // an error applying it here means the two sides have genuinely diverged (a bug, or
         // version skew) — logged and skipped, not a reason to tear down and resync, which
