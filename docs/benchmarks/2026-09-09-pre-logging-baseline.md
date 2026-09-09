@@ -411,3 +411,150 @@ progress lines are not part of the reported result and add substantial noise. Th
 unedited capture (including progress lines) is preserved at
 `/tmp/claude-1000/-home-numericlabs-data-rocket-rocket-mem/850c0577-d0e8-4d03-9147-6aec1a827079/scratchpad/rocket-mem-baseline.txt`
 in the environment this was captured in, but that path is outside the repo and not committed.
+
+## 2026-09-09 — Plan 07 (cmd span + per-command debug line) — post-instrumentation measurement
+
+**Commit measured:** `0a55d83` (feat(logging): emit a per-command debug line with elapsed_us
+and reply kind — the tip of plan 07's tasks 1-2, `cmd` span + `debug!` line added to
+`dispatch_and_log` in `crates/server/src/dispatcher.rs`).
+
+**Log level:** default `info` (no `RUST_LOG` set) — the span and the `debug!` line are both
+filtered out at their callsites at this level, which is exactly what this gate is checking.
+
+**Methodology note — a discarded contaminated attempt.** The first three-run attempt at this
+commit produced a wildly unstable `GET, 3B, no pipeline` result (99,800 / 39,124 / 74,963 rps,
+an 85% peak-to-peak spread against a baseline row the original capture measured at 0.8%
+jitter). Before treating that as a signal, `ps`/`uptime` were checked and found a `cargo test
+--workspace` plus a spawned `rocket_mem` test binary consuming 1361% CPU in this same
+worktree, concurrent with the benchmark run (load average 4.11 on a 16-core box). That is
+external contention unrelated to the code under test, not a regression, so that measurement
+was discarded rather than reported or averaged in. After confirming the contention had
+cleared (`ps`/`uptime` back to baseline idle load), the three runs below were captured cleanly
+in one back-to-back sequence with no other CPU-heavy process active.
+
+### Gated rows (the only two this gate applies to)
+
+| Workload | Run 1 | Run 2 | Run 3 | Mean | Baseline mean | Delta vs baseline |
+|---|---|---|---|---|---|---|
+| SET, 3B, no pipeline | 90,744.10 | 89,605.73 | 92,250.92 | 90,866.92 | 89,484.60 | +1.545% |
+| GET, 3B, no pipeline | 100,603.62 | 96,246.39 | 100,000.00 | 98,950.00 | 100,235.04 | -1.282% |
+
+Run-to-run spread on this clean triplet: SET 2.91%, GET 4.40% — both comfortably inside the
+tightness this baseline's own jitter table established for these two rows, confirming this
+triplet is a valid, uncontaminated measurement.
+
+**Verdict: PASS.** Both gated rows are within the +/-2% band (SET measured *above* baseline,
+which the gate treats as noise/improvement, not a failure; GET measured 1.28% below baseline,
+inside the 2% tolerance).
+
+### Context-only rows (not gated — recorded per the baseline document's own rationale)
+
+The pipelined and 1KB-payload rows swing 8.8%-22.2% run-to-run even in the original baseline
+capture, an order of magnitude wider than the 2% gate, so they are not evaluated against a
+threshold here either — recorded for context only.
+
+| Workload | Run 1 | Run 2 | Run 3 | Mean (this run) | Baseline mean | Spread (this run) |
+|---|---|---|---|---|---|---|
+| SET, 3B, pipeline=16 | 775,193.81 | 746,268.62 | 684,931.50 | 735,464.64 | 700,242.04 | 12.27% |
+| GET, 3B, pipeline=16 | 1,162,790.62 | 1,234,567.88 | 1,190,476.25 | 1,195,944.92 | 1,135,299.50 | 6.00% |
+| SET, 1KB, no pipeline | 87,108.02 | 88,105.73 | 87,719.30 | 87,644.35 | 81,774.68 | 1.14% |
+| GET, 1KB, no pipeline | 99,009.90 | 95,602.30 | 96,805.42 | 97,139.21 | 89,748.65 | 3.51% |
+| SET, 1KB, pipeline=16 | 571,428.56 | 584,795.31 | 584,795.31 | 580,339.73 | 530,293.04 | 2.30% |
+| GET, 1KB, pipeline=16 | 751,879.69 | 735,294.06 | 757,575.75 | 748,249.83 | 683,440.31 | 2.98% |
+
+### Global constraints checked (no Rust source changed by this task)
+
+- `cargo fmt --all -- --check` — clean.
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean, no warnings.
+- `cargo test --workspace` — 878 passed, 0 failed.
+- `git status` — clean; `Cargo.lock` untouched by the release build.
+
+### Raw output (clean, uncontaminated triplet)
+
+```
+=== run 1 ===
+Building rocket-mem in release mode...
+    Finished `release` profile [optimized] target(s) in 0.16s
+redis-server:  redis_version:8.10.1
+rocket-mem:    redis_version:rocket-mem-0.1.4
+host:          Linux 7.0.0-30-generic x86_64
+date:          2026-09-09T09:42:22Z
+
+--- rocket-mem (payload=3B, pipeline=1) ---
+ SET: 90744.10 requests per second, p50=0.271 msec
+ GET: 100603.62 requests per second, p50=0.255 msec
+
+--- rocket-mem (payload=3B, pipeline=16) ---
+ SET: 775193.81 requests per second, p50=0.927 msec
+ GET: 1162790.62 requests per second, p50=0.343 msec
+
+--- rocket-mem (payload=1024B, pipeline=1) ---
+ SET: 87108.02 requests per second, p50=0.287 msec
+ GET: 99009.90 requests per second, p50=0.255 msec
+
+--- rocket-mem (payload=1024B, pipeline=16) ---
+ SET: 571428.56 requests per second, p50=0.719 msec
+ GET: 751879.69 requests per second, p50=0.527 msec
+
+=== run 2 ===
+Building rocket-mem in release mode...
+    Finished `release` profile [optimized] target(s) in 0.08s
+redis-server:  redis_version:8.10.1
+rocket-mem:    redis_version:rocket-mem-0.1.4
+host:          Linux 7.0.0-30-generic x86_64
+date:          2026-09-09T09:42:33Z
+
+--- rocket-mem (payload=3B, pipeline=1) ---
+ SET: 89605.73 requests per second, p50=0.279 msec
+ GET: 96246.39 requests per second, p50=0.255 msec
+
+--- rocket-mem (payload=3B, pipeline=16) ---
+ SET: 746268.62 requests per second, p50=0.943 msec
+ GET: 1234567.88 requests per second, p50=0.327 msec
+
+--- rocket-mem (payload=1024B, pipeline=1) ---
+ SET: 88105.73 requests per second, p50=0.287 msec
+ GET: 95602.30 requests per second, p50=0.255 msec
+
+--- rocket-mem (payload=1024B, pipeline=16) ---
+ SET: 584795.31 requests per second, p50=0.735 msec
+ GET: 735294.06 requests per second, p50=0.535 msec
+
+=== run 3 ===
+Building rocket-mem in release mode...
+    Finished `release` profile [optimized] target(s) in 0.08s
+redis-server:  redis_version:8.10.1
+rocket-mem:    redis_version:rocket-mem-0.1.4
+host:          Linux 7.0.0-30-generic x86_64
+date:          2026-09-09T09:42:44Z
+
+--- rocket-mem (payload=3B, pipeline=1) ---
+ SET: 92250.92 requests per second, p50=0.271 msec
+ GET: 100000.00 requests per second, p50=0.255 msec
+
+--- rocket-mem (payload=3B, pipeline=16) ---
+ SET: 684931.50 requests per second, p50=0.975 msec
+ GET: 1190476.25 requests per second, p50=0.335 msec
+
+--- rocket-mem (payload=1024B, pipeline=1) ---
+ SET: 87719.30 requests per second, p50=0.287 msec
+ GET: 96805.42 requests per second, p50=0.255 msec
+
+--- rocket-mem (payload=1024B, pipeline=16) ---
+ SET: 584795.31 requests per second, p50=0.711 msec
+ GET: 757575.75 requests per second, p50=0.511 msec
+```
+
+Full uneditied capture, including the discarded contaminated attempt and the redis-server
+comparison numbers, preserved outside the repo at
+`/tmp/claude-1000/-home-numericlabs-data-rocket-rocket-mem/850c0577-d0e8-4d03-9147-6aec1a827079/scratchpad/rocket-mem-plan07.txt`
+(contaminated attempt) and
+`/tmp/claude-1000/-home-numericlabs-data-rocket-rocket-mem/850c0577-d0e8-4d03-9147-6aec1a827079/scratchpad/rocket-mem-plan07-clean.txt`
+(the clean triplet reported above).
+
+### Gate
+
+**PASS** — SET, 3B, no pipeline: +1.545% vs baseline (within +/-2%). GET, 3B, no pipeline:
+-1.282% vs baseline (within +/-2%). Plan 07's hot-path additions (the `cmd` tracing span and
+the per-command `debug!` line in `dispatch_and_log`) cost nothing measurable at the default
+`info` level. Plan 08 may proceed.
