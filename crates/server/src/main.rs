@@ -256,6 +256,11 @@ async fn main() -> std::io::Result<()> {
     }
     let replication = Arc::new(handle);
 
+    // Must run before the auto-connect block below fires off a connection attempt: an invalid
+    // `replicaof_auth_username`/`replicaof_auth_password` pairing should fail startup outright,
+    // not spawn a doomed connection first and reject the config afterwards.
+    rocket_mem::config::validate_replicaof(&config)?;
+
     // A configured `replicaof` auto-connects on every startup, closing the "restarted follower
     // silently comes back as standalone" footgun documented in
     // docs/superpowers/specs/2026-08-30-sprint-5-spec.md. Fire-and-forget: this spawns its own
@@ -295,7 +300,6 @@ async fn main() -> std::io::Result<()> {
     ));
 
     rocket_mem::config::validate_tls(&config)?;
-    rocket_mem::config::validate_replicaof(&config)?;
 
     if let (Some(tls_addr), Some(cert), Some(key)) = (
         &config.tls_resp_addr,
