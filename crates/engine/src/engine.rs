@@ -95,9 +95,18 @@ impl Engine {
     pub fn active_expire_cycle(&self, shard_idx: usize) -> usize {
         self.store.active_expire_cycle(shard_idx)
     }
-    /// Which shard a key routes to — see `Store::shard_index`.
+    /// Which shard a key routes to — see `Store::shard_index`. Traced at the facade level, not
+    /// inside `Store::shard_index` itself: that method is `#[inline]` and sits on the hot path
+    /// of every single `get`/`set`/`with_ref`/`with_mut`/`with_mut_delta` call, so a log call
+    /// there — even a disabled one — is the single riskiest placement in this series. This
+    /// method is a separate, explicitly-called facade that only the AOF ordering guard and the
+    /// cluster router use today; instrumenting here answers "which shard does this key route
+    /// to" exactly where a caller already asks that question, without adding a branch to the
+    /// per-key read/write path inside `Store`.
     pub fn shard_index(&self, key: &[u8]) -> usize {
-        self.store.shard_index(key)
+        let shard = self.store.shard_index(key);
+        tracing::trace!(key = %String::from_utf8_lossy(key), shard, "shard routing");
+        shard
     }
     /// Ticks the recency clock `get`/`set` stamp entries with. The server calls this from its
     /// 100ms expiry loop; tests that care about LRU ordering call it between the phases they
@@ -453,6 +462,26 @@ mod tests {
             std::time::Instant::now() - std::time::Duration::from_secs(1),
         );
         assert_eq!(engine.key_counts(), (0, 0));
+    }
+
+    #[test]
+    fn shard_index_is_deterministic_and_within_bounds() {
+        let engine = Engine::new();
+        let a = engine.shard_index(b"some-key");
+        let b = engine.shard_index(b"some-key");
+        assert_eq!(a, b, "the same key must always route to the same shard");
+        assert!(a < crate::SHARD_COUNT);
+    }
+
+    #[test]
+    fn shard_index_matches_the_underlying_store() {
+        // Engine::shard_index is a thin facade -- this pins that it never diverges from
+        // what Store computes, which is the only contract callers like the AOF ordering
+        // guard (crates/server/src/aof.rs) actually depend on.
+        let engine = Engine::new();
+        for key in [&b"a"[..], b"bb", b"ccc", b"dddd"] {
+            assert_eq!(engine.shard_index(key), engine.store.shard_index(key));
+        }
     }
 
     #[test]
