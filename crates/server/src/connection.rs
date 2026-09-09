@@ -26,6 +26,7 @@ pub async fn serve(
             Ok(pair) => pair,
             Err(_) => continue, // a failed accept shouldn't take the whole listener down
         };
+        disable_nagle(&socket, peer);
         let client_id = next_client_id;
         next_client_id += 1;
         let engine = Arc::clone(&engine);
@@ -51,6 +52,9 @@ async fn active_expire_loop(engine: Arc<Engine>, replication: Arc<ReplicationHan
     let mut shard_idx: usize = 0;
     loop {
         interval.tick().await;
+        // The only writer of the recency clock every get/set reads. One tick per 100ms is what
+        // keeps that clock off the per-operation hot path -- see `Store::advance_clock`.
+        engine.advance_recency_clock();
         replication.record_expired(engine.active_expire_cycle(shard_idx));
         shard_idx = shard_idx.wrapping_add(1);
     }
@@ -72,6 +76,46 @@ async fn periodic_fsync_loop(aof: Arc<AofWriter>) {
         if let Err(e) = aof.fsync() {
             tracing::error!(error = %e, "aof fsync failed");
         }
+        check_aof_intact(&aof);
+    }
+}
+
+/// Polled once a second by `periodic_fsync_loop`, right after the fsync tick -- see
+/// `AofWriter::is_file_intact`'s doc comment for the failure mode this catches: something
+/// deletes or replaces the AOF while this process keeps writing into the now-orphaned fd,
+/// which otherwise stays completely silent (writes keep succeeding) until the next restart
+/// discards everything written since. A 1-second detection window turns that into a logged
+/// error and a Prometheus gauge flip instead.
+fn check_aof_intact(aof: &AofWriter) {
+    match aof.is_file_intact() {
+        Ok(true) => ::metrics::gauge!("rocket_mem_aof_file_intact").set(1.0),
+        Ok(false) => {
+            ::metrics::gauge!("rocket_mem_aof_file_intact").set(0.0);
+            tracing::error!(
+                path = %aof.path().display(),
+                "AOF file has no directory entry at its configured path -- it was deleted or \
+                 replaced while this process is still writing to it; every byte written since \
+                 will be lost on the next restart unless this is fixed now"
+            );
+        }
+        Err(e) => tracing::error!(error = %e, "aof integrity check failed"),
+    }
+}
+
+/// Turns off Nagle's algorithm for one accepted connection.
+///
+/// `Framed` force-flushes inside `feed` once its write buffer passes `backpressure_boundary`
+/// (8 KiB), so any pipelined batch of replies larger than that leaves the socket as two writes
+/// rather than one. The second is smaller than a loopback MSS and goes out while the first is
+/// still unacknowledged, which is exactly what Nagle holds back -- and a client waiting on the
+/// rest of the batch sends nothing that would acknowledge it, so the write sits until the 40ms
+/// delayed-ACK timer fires. That capped 16-deep pipelined 1KB `GET` at ~20,000 req/s.
+///
+/// Failure is logged and non-fatal: this is a latency optimisation, never a reason to drop an
+/// otherwise-good connection.
+pub(crate) fn disable_nagle(socket: &tokio::net::TcpStream, peer: std::net::SocketAddr) {
+    if let Err(e) = socket.set_nodelay(true) {
+        tracing::warn!(%peer, error = %e, "could not set TCP_NODELAY; pipelined replies may stall");
     }
 }
 
@@ -95,6 +139,9 @@ pub async fn serve_tls(
             Ok(pair) => pair,
             Err(_) => continue,
         };
+        // Set on the underlying TcpStream before the handshake; the TLS layer wrapping it later
+        // does not affect the socket option.
+        disable_nagle(&socket, peer);
         let acceptor = acceptor.clone();
         let client_id = next_client_id;
         next_client_id += 1;
@@ -153,7 +200,7 @@ async fn handle_connection<S>(
     replication.connection_opened();
     let _client_guard = ClientGuard(Arc::clone(&replication));
     let mut framed = Framed::new(socket, RespCodec::default());
-    let session = dispatcher::Session::new();
+    let session = dispatcher::Session::with_peer_addr(peer);
     // Carries a frame pulled ahead by the pipelining peek below, so it isn't re-read.
     let mut pending: Option<Option<std::io::Result<protocol::Frame>>> = None;
     loop {
@@ -252,10 +299,12 @@ async fn serve_replica<S>(
     // reach neither the blob nor the stream -- lost permanently, unrepairable by reconnect,
     // since a reconnect just snapshots a leader that has already moved past it. Lock
     // ordering: lock_for_ordering() before the registry's own mutex, matching this plan's
-    // Global Constraints and the fan-out hook in dispatcher.rs, the only other place both
-    // are taken.
+    // Global Constraints and the fan-out hook in dispatcher.rs, the only other place both are
+    // taken -- there, the order guard for a write's shard(s) is held across both the AOF
+    // append and the registry broadcast, for the same reason: neither critical section may
+    // release the order guard before it has finished touching the registry.
     let (snapshot_bytes, mut rx) = {
-        let _order_guard = aof.lock_for_ordering();
+        let _order_guard = aof.lock_all_shards();
         let bytes = replication.engine().snapshot(0); // 0: a follower keeps no AOF, so the header is moot
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<bytes::Bytes>();
         replication.registry.register(advertised_addr, tx);
@@ -312,6 +361,23 @@ mod tests {
         let path = dir.path().join("test.aof");
         let writer = crate::aof::AofWriter::open(&path, crate::aof::FsyncPolicy::Never).unwrap();
         (dir, Arc::new(writer))
+    }
+
+    /// Covers the helper all four accept loops call (plaintext and TLS, for both RESP and RMP).
+    /// It does not prove those loops call it: each moves its accepted socket straight into a
+    /// connection task, so no test holds a handle on the server side of the connection. Nagle is
+    /// on by default, so observing `nodelay() == true` here means the call really flipped it.
+    #[tokio::test]
+    async fn disable_nagle_sets_tcp_nodelay_on_an_accepted_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+        let (socket, peer) = listener.accept().await.unwrap();
+
+        super::disable_nagle(&socket, peer);
+
+        assert!(socket.nodelay().unwrap());
+        drop(client.await.unwrap());
     }
 
     #[tokio::test]

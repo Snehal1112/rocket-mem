@@ -714,7 +714,7 @@ where
         // matching handle_save's own pattern of holding the lock across the mutating work and
         // nothing else. None when this node has no AofWriter configured (test-only handles),
         // which matches the pre-fix behavior for those.
-        let _order_guard = aof.map(|a| a.lock_for_ordering());
+        let _order_guard = aof.map(|a| a.lock_all_shards());
         let reply = crate::dispatcher::dispatch(engine, frame, &mut protocol, 0);
         // A leader only ever fans out a command whose local execution already succeeded, so
         // an error applying it here means the two sides have genuinely diverged (a bug, or

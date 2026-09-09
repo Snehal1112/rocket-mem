@@ -28,6 +28,11 @@ enum AofMsg {
     /// onto a file an interrupted previous rewrite already partially wrote appends after its
     /// content rather than clobbering it), and swaps the writer thread's target to it.
     Rotate(PathBuf, mpsc::SyncSender<std::io::Result<()>>),
+    /// Compares the open fd's identity against a fresh `stat` of `path` -- see
+    /// `is_file_intact`'s doc comment for why this exists. Carries `path` rather than reading
+    /// `AofWriter::path` itself because the writer thread has no access to `self`, only to
+    /// whatever each message hands it (the same reason `Rotate` carries `new_path`).
+    CheckIntact(PathBuf, mpsc::SyncSender<std::io::Result<bool>>),
 }
 
 /// Bounds the writer thread's queue. Unbounded would let a stalled disk grow the queue
@@ -93,11 +98,26 @@ pub struct AofWriter {
     /// Bounded at `AOF_QUEUE_CAPACITY`; see that constant for why.
     tx: mpsc::SyncSender<AofMsg>,
     policy: FsyncPolicy,
-    /// Held by `dispatcher::dispatch_and_log` across "mutate the engine, then log it" for
-    /// write commands, so concurrent writers' appends always land in the AOF in the same
-    /// relative order their mutations committed in. See
-    /// ../../docs/superpowers/specs/2026-08-30-tech-debt-cleanup-spec.md Item 2.
-    order: Mutex<()>,
+    /// One ordering guard per engine shard, held by `dispatcher::dispatch_and_log` across
+    /// "mutate the engine, then log it" for write commands, so concurrent writers' appends
+    /// always land in the AOF in the same relative order their mutations committed in. The same
+    /// guard also covers the replica fan-out that follows the append: broadcasting after the
+    /// guard is dropped would let two writers to the same key broadcast out of commit order,
+    /// permanently reordering that key on every follower even though the AOF itself stayed
+    /// correct.
+    ///
+    /// Per shard rather than one global guard because replay only needs ordering *per key*:
+    /// two commands touching disjoint keys may be appended in either order and replay
+    /// identically. A single global guard serialised every write in the process, which made
+    /// the engine's 16 independently-locked shards worthless for writes -- pipelined `SET` ran
+    /// ~3x slower than with no guard at all. See
+    /// ../../docs/superpowers/specs/2026-09-08-per-shard-aof-ordering-spec.md, and
+    /// ../../docs/superpowers/specs/2026-08-30-tech-debt-cleanup-spec.md Item 2 for the
+    /// original ordering requirement.
+    ///
+    /// Indexed by `engine::Engine::shard_index`; never acquired except through `lock_shards`
+    /// or `lock_all_shards`, which impose the ascending-index order that prevents deadlock.
+    order: Vec<Mutex<()>>,
     /// Serializes whole rewrites against each other and against `SAVE` -- see
     /// `lock_for_rewrite`. Distinct from `order`, which is far too narrow for this: it is
     /// released the moment `start_rewrite` returns, leaving the manifest read, the snapshot
@@ -168,6 +188,14 @@ impl AofWriter {
                             let result = writer.flush().and_then(|_| writer.get_ref().sync_data());
                             let _ = ack.send(result);
                         }
+                        AofMsg::CheckIntact(path, ack) => {
+                            let result = writer.get_ref().metadata().map(|fd_meta| {
+                                std::fs::metadata(&path)
+                                    .map(|path_meta| same_file(&fd_meta, &path_meta))
+                                    .unwrap_or(false)
+                            });
+                            let _ = ack.send(result);
+                        }
                         AofMsg::Rotate(new_path, ack) => {
                             let result = writer.flush().and_then(|_| writer.get_ref().sync_data());
                             let result = result.and_then(|_| {
@@ -190,7 +218,7 @@ impl AofWriter {
         Ok(Self {
             tx,
             policy,
-            order: Mutex::new(()),
+            order: (0..engine::SHARD_COUNT).map(|_| Mutex::new(())).collect(),
             rewrite: Mutex::new(()),
             path: Mutex::new(path.to_path_buf()),
             base_path: base_path.to_path_buf(),
@@ -247,6 +275,21 @@ impl AofWriter {
         Ok(std::fs::metadata(&*path)?.len())
     }
 
+    /// Whether the file this writer is appending to still has a directory entry at its
+    /// configured path. POSIX lets writes and fsyncs against a deleted (or otherwise
+    /// disconnected) file keep succeeding for as long as this process holds the fd open --
+    /// nothing about `append`/`fsync` fails, and every client keeps getting `OK`. The bytes
+    /// only vanish, silently and all at once, when the fd finally closes (a restart) and the
+    /// kernel frees the orphaned inode with them. This is the check `periodic_fsync_loop` polls
+    /// once a second specifically to turn that silent failure into a loud one before it costs
+    /// hours of writes.
+    pub fn is_file_intact(&self) -> std::io::Result<bool> {
+        let path = self.path.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let (ack_tx, ack_rx) = mpsc::sync_channel(1);
+        self.send(AofMsg::CheckIntact(path, ack_tx))?;
+        run_blocking(|| ack_rx.recv().map_err(writer_gone))?
+    }
+
     /// The fsync policy this writer was opened with. Never changes after `open`.
     pub fn policy(&self) -> FsyncPolicy {
         self.policy
@@ -277,17 +320,44 @@ impl AofWriter {
         Ok(())
     }
 
-    /// Acquired by `dispatcher::dispatch_and_log` around "mutate, then log" for write
-    /// commands -- see the `order` field's doc comment above.
-    #[must_use = "the returned guard must be bound and held across the whole mutate-then-log \
-                  section; dropping it immediately releases the lock and loses the AOF \
+    /// Acquires the ordering guards for `shards`, around "mutate, then log" for a write command
+    /// -- see the `order` field's doc comment above.
+    ///
+    /// Sorts and deduplicates before acquiring, so guards are always taken in ascending shard
+    /// index. That single rule is what makes deadlock impossible between two multi-key commands
+    /// whose key sets overlap in different orders, and it is why callers must come through here
+    /// rather than indexing `order` themselves.
+    ///
+    /// At most one acquisition from this writer may be held live at a time. `let a =
+    /// aof.lock_shards(&[9]); let b = aof.lock_shards(&[3]);` compiles today and would deadlock
+    /// against a concurrent caller that locks the same two shards in the reverse order --
+    /// ascending order only prevents deadlock within a single acquisition's own shard list.
+    #[must_use = "the returned guards must be bound and held across the whole mutate-then-log \
+                  section; dropping them immediately releases the locks and loses the AOF \
                   ordering guarantee entirely"]
-    pub fn lock_for_ordering(&self) -> std::sync::MutexGuard<'_, ()> {
-        // Recover from poison rather than propagate it: this mutex is held across arbitrary
-        // command dispatch (dispatcher::dispatch_and_log), so a panicking command handler
-        // must not turn into a permanent, server-wide write outage. The guarded data is `()`
-        // -- there is no invariant a panicking holder could have left broken.
-        self.order.lock().unwrap_or_else(|e| e.into_inner())
+    pub fn lock_shards(&self, shards: &[usize]) -> Vec<std::sync::MutexGuard<'_, ()>> {
+        let mut idx: Vec<usize> = shards.to_vec();
+        idx.sort_unstable();
+        idx.dedup();
+        idx.into_iter()
+            .map(|i| {
+                // Recover from poison rather than propagate it: these mutexes are held across
+                // arbitrary command dispatch (dispatcher::dispatch_and_log), so a panicking
+                // command handler must not turn into a permanent write outage. The guarded data
+                // is `()` -- there is no invariant a panicking holder could have left broken.
+                self.order[i].lock().unwrap_or_else(|e| e.into_inner())
+            })
+            .collect()
+    }
+
+    /// Every ordering guard, ascending. Required by the paths that need a consistent view of the
+    /// *whole* keyspace rather than of particular keys: `SAVE`, `BGREWRITEAOF`, `serve_replica`'s
+    /// snapshot-then-register, and the follower apply loop (which must exclude a concurrent
+    /// `SAVE` from observing a multi-key command half-applied across shards). Those are all rare
+    /// next to a snapshot walk, so taking 16 locks instead of 1 costs nothing that matters.
+    #[must_use = "the returned guards must be bound and held across the section they protect"]
+    pub fn lock_all_shards(&self) -> Vec<std::sync::MutexGuard<'_, ()>> {
+        self.lock_shards(&(0..self.order.len()).collect::<Vec<_>>())
     }
 
     /// Held by `dispatcher::handle_bgrewriteaof` across its *entire* sequence -- generation read,
@@ -466,6 +536,24 @@ pub fn read_generation(snapshot_path: &Path) -> std::io::Result<u64> {
 /// is not openable; the process's own working directory is the implicit parent, so `.` is synced
 /// instead. Unix-only: Windows cannot open a directory as a file, and this project's release
 /// matrix builds there, so the sync degrades to a no-op rather than failing every commit.
+/// Whether `fd_meta` (from the writer thread's open file descriptor) and `path_meta` (a fresh
+/// `stat` of the configured path) name the same on-disk file. Inode numbers are only unique
+/// within a device, so both must match -- comparing `ino` alone would false-positive if the AOF
+/// were deleted and a new, unrelated file happened to land on a recycled inode on a *different*
+/// filesystem mount. Unix-only for the same reason as `fsync_parent_dir`: Windows has no stable
+/// inode-equivalent exposed through `std::fs::Metadata`, and this project's release matrix builds
+/// there, so the check degrades to "trust the fd" rather than failing every call.
+#[cfg(unix)]
+fn same_file(fd_meta: &std::fs::Metadata, path_meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    fd_meta.dev() == path_meta.dev() && fd_meta.ino() == path_meta.ino()
+}
+
+#[cfg(not(unix))]
+fn same_file(_fd_meta: &std::fs::Metadata, _path_meta: &std::fs::Metadata) -> bool {
+    true
+}
+
 #[cfg(unix)]
 pub(crate) fn fsync_parent_dir(path: &Path) -> std::io::Result<()> {
     let parent = match path.parent() {
@@ -935,8 +1023,437 @@ mod tests {
         assert!(!WRITE_COMMANDS.contains(&"PING"));
     }
 
+    /// The guard for one shard must still serialise everything that touches that shard --
+    /// per-shard guards are only sound if each individual guard is as strict as the single
+    /// global one used to be.
     #[test]
-    fn lock_for_ordering_serializes_concurrent_holders() {
+    fn one_shards_guard_still_serializes_concurrent_holders_of_that_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("same-shard.aof");
+        let writer = std::sync::Arc::new(AofWriter::open(&path, FsyncPolicy::Never).unwrap());
+        let log: std::sync::Arc<Mutex<Vec<(usize, bool)>>> =
+            std::sync::Arc::new(Mutex::new(Vec::new()));
+
+        let mut handles = Vec::new();
+        for id in 0..4 {
+            let writer = std::sync::Arc::clone(&writer);
+            let log = std::sync::Arc::clone(&log);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..50 {
+                    let _guard = writer.lock_shards(&[7]); // all four contend for shard 7
+                    log.lock().unwrap().push((id, true));
+                    std::thread::yield_now();
+                    log.lock().unwrap().push((id, false));
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let log = log.lock().unwrap();
+        let mut i = 0;
+        while i < log.len() {
+            let (id, entering) = log[i];
+            assert!(entering, "expected an entry at position {i}");
+            assert_eq!(
+                log[i + 1],
+                (id, false),
+                "another thread interleaved into shard 7"
+            );
+            i += 2;
+        }
+    }
+
+    /// The point of the whole change: writes to keys in *different* shards must not block each
+    /// other. Without this test a future refactor could quietly reintroduce a global guard and
+    /// cost ~3x on pipelined writes while every correctness test still passed.
+    #[test]
+    fn guards_for_different_shards_do_not_block_each_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("disjoint.aof");
+        let writer = std::sync::Arc::new(AofWriter::open(&path, FsyncPolicy::Never).unwrap());
+
+        let held = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let writer2 = std::sync::Arc::clone(&writer);
+        let held2 = std::sync::Arc::clone(&held);
+        let other = std::thread::spawn(move || {
+            let _guard = writer2.lock_shards(&[1]);
+            // Rendezvous *while still holding* shard 1's guard. If the main thread could not
+            // take shard 2 concurrently, neither side would reach the barrier and the test
+            // would hang rather than fail -- which is why it runs under a joined thread.
+            held2.wait();
+        });
+
+        let _guard = writer.lock_shards(&[2]);
+        held.wait(); // reached only because shard 1 and shard 2 are independent
+        other.join().unwrap();
+    }
+
+    /// Two multi-key commands whose key sets overlap in opposite orders. `lock_shards` sorts
+    /// before acquiring, so this cannot deadlock; the test is what proves the rule is actually
+    /// applied rather than merely documented.
+    #[test]
+    fn overlapping_multi_key_acquisitions_do_not_deadlock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deadlock.aof");
+        let writer = std::sync::Arc::new(AofWriter::open(&path, FsyncPolicy::Never).unwrap());
+
+        let mut handles = Vec::new();
+        for order in [vec![3usize, 9], vec![9usize, 3]] {
+            let writer = std::sync::Arc::clone(&writer);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..200 {
+                    let _guards = writer.lock_shards(&order);
+                    std::thread::yield_now();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
+
+    /// Job 1 of the ordering guard, end to end: the AOF's append order must match the order
+    /// mutations committed in, so a replay reproduces the value that was actually committed.
+    /// One key means one shard, so every writer here contends -- that is the point.
+    ///
+    /// Uses APPEND, not SET, on purpose. SET replaces the value, so only a reordering that
+    /// lands on the very last write of a round is visible -- every earlier reordering gets
+    /// silently overwritten by a later, correctly-ordered write and leaves no trace. APPEND
+    /// accumulates instead, so every write's position in the final string is observable: any
+    /// reordering, anywhere in the round, changes the accumulated result. That turns roughly one
+    /// observable event per round into roughly one per write, which is what makes this test
+    /// actually able to catch the defect it guards against.
+    #[test]
+    fn concurrent_writes_to_one_key_replay_to_the_committed_value() {
+        use std::sync::Arc;
+
+        // A reordering only shows up in this assertion if it lands on the very last write of a
+        // burst -- roughly one chance per burst, no matter how many writes the burst contains.
+        // Many short rounds, each with their own log, turn the same total work into one
+        // independent chance per round instead of one chance per run.
+        const ROUNDS: usize = 200;
+        const WRITERS: usize = 4;
+        const WRITES_PER_WRITER: usize = 25;
+
+        for round in 0..ROUNDS {
+            let dir = tempfile::tempdir().unwrap();
+            let aof_path = dir.path().join("ordering.aof");
+            let aof = Arc::new(AofWriter::open(&aof_path, FsyncPolicy::Never).unwrap());
+            let engine = Arc::new(engine::Engine::new());
+            let replication = Arc::new(crate::replication::ReplicationHandle::new(
+                Arc::clone(&engine),
+                dir.path().join("ordering.snapshot"),
+            ));
+
+            let mut writers = Vec::new();
+            for w in 0..WRITERS {
+                let engine = Arc::clone(&engine);
+                let aof = Arc::clone(&aof);
+                let replication = Arc::clone(&replication);
+                writers.push(std::thread::spawn(move || {
+                    for i in 0..WRITES_PER_WRITER {
+                        let value = format!("w{w}-{i}.");
+                        let frame = protocol::Frame::Array(vec![
+                            protocol::Frame::Bulk(bytes::Bytes::from_static(b"APPEND")),
+                            protocol::Frame::Bulk(bytes::Bytes::from_static(b"hot")),
+                            protocol::Frame::Bulk(bytes::Bytes::from(value)),
+                        ]);
+                        crate::dispatcher::dispatch_and_log(
+                            &engine,
+                            &aof,
+                            &replication,
+                            frame,
+                            &crate::dispatcher::Session::new(),
+                            1,
+                        );
+                    }
+                }));
+            }
+            for w in writers {
+                w.join().unwrap();
+            }
+            aof.fsync().unwrap();
+
+            // Replaying the log must land on whatever the engine actually holds. Because APPEND
+            // accumulates, any AOF line that ever overtook the mutation it logged changes the
+            // accumulated string's order, so replay and the engine would diverge.
+            let replayed = recover(&aof_path, &dir.path().join("absent.snapshot")).unwrap();
+            let committed = engine.get(b"hot");
+            assert!(
+                committed.is_some(),
+                "no writes landed in round {round} -- dispatch_and_log may have silently \
+                 stopped mutating"
+            );
+            assert_eq!(
+                replayed.get(b"hot"),
+                committed,
+                "AOF replay diverged from committed state in round {round}"
+            );
+        }
+    }
+
+    /// Job 2: `SAVE` must produce a point-in-time cut of (offset, keyspace). If the offset is read
+    /// at one instant and the walk happens at another, recovery replays commands the snapshot
+    /// already contains -- which double-counts every non-idempotent command. INCR is used
+    /// deliberately: with SET this bug is invisible.
+    #[test]
+    fn a_save_racing_writes_produces_a_replayable_point_in_time_cut() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let aof_path = dir.path().join("cut.aof");
+        let snapshot_path = dir.path().join("cut.snapshot");
+        let aof = Arc::new(AofWriter::open(&aof_path, FsyncPolicy::Never).unwrap());
+        let engine = Arc::new(engine::Engine::new());
+        let replication = Arc::new(crate::replication::ReplicationHandle::new(
+            Arc::clone(&engine),
+            snapshot_path.clone(),
+        ));
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut writers = Vec::new();
+        for w in 0..4 {
+            let engine = Arc::clone(&engine);
+            let aof = Arc::clone(&aof);
+            let replication = Arc::clone(&replication);
+            let stop = Arc::clone(&stop);
+            writers.push(std::thread::spawn(move || {
+                let key = format!("counter{w}");
+                let mut issued = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    let frame = protocol::Frame::Array(vec![
+                        protocol::Frame::Bulk(bytes::Bytes::from_static(b"INCR")),
+                        protocol::Frame::Bulk(bytes::Bytes::from(key.clone())),
+                    ]);
+                    crate::dispatcher::dispatch_and_log(
+                        &engine,
+                        &aof,
+                        &replication,
+                        frame,
+                        &crate::dispatcher::Session::new(),
+                        1,
+                    );
+                    issued += 1;
+                }
+                issued
+            }));
+        }
+
+        // Fire SAVEs while the counters are climbing, so at least one cut is taken mid-flight.
+        for _ in 0..20 {
+            crate::dispatcher::dispatch_and_log(
+                &engine,
+                &aof,
+                &replication,
+                protocol::Frame::Array(vec![protocol::Frame::Bulk(bytes::Bytes::from_static(
+                    b"SAVE",
+                ))]),
+                &crate::dispatcher::Session::new(),
+                1,
+            );
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        let mut total_issued = 0u64;
+        for w in writers {
+            total_issued += w.join().unwrap();
+        }
+        assert!(
+            total_issued > 0,
+            "no writer issued any INCR -- dispatch_and_log may have silently stopped mutating"
+        );
+        aof.fsync().unwrap();
+
+        // The AOF alone is the reference: every INCR, replayed once. Snapshot-plus-tail must land
+        // on exactly the same counters. A non-atomic cut double-counts and these diverge.
+        let from_aof_only = recover(&aof_path, &dir.path().join("absent.snapshot")).unwrap();
+        let from_snapshot_and_tail = recover(&aof_path, &snapshot_path).unwrap();
+        for w in 0..4 {
+            let key = format!("counter{w}");
+            assert_eq!(
+                from_snapshot_and_tail.get(key.as_bytes()),
+                from_aof_only.get(key.as_bytes()),
+                "snapshot+tail diverged from full replay at {key}"
+            );
+        }
+    }
+
+    /// Job 3: `Store::snapshot_entries` walks shard by shard, so a multi-key write spanning
+    /// shards must be atomic with respect to that walk. Both halves of each MSET carry the same
+    /// generation number, so a half-applied snapshot is directly observable. This is a distinct
+    /// failure mode from append-order inversion (covered elsewhere) or offset-cut double
+    /// counting: here a single write is caught mid-flight, split across two shards, by the
+    /// snapshot walk itself.
+    ///
+    /// `handle_save` takes `lock_all_shards()` -- every one of the 16 order guards -- before it
+    /// reads a single shard. That means a writer holding even one of those guards for its whole
+    /// mutate-then-log section already blocks `SAVE` at that index for the entire operation, both
+    /// keys included. So a writer that locks only a *subset* of its keys' shards (say, just the
+    /// first key's) is not observable here: `SAVE` still stalls on whichever guard the writer
+    /// does hold, and by the time it is released both keys are already written. The only mutation
+    /// this test can actually catch is a writer that holds *no* guard for a multi-key write at
+    /// all -- confirmed by hand against `aof.lock_shards(&[])` at dispatcher.rs, which fails
+    /// within the first save. Locking all of a command's keys' shards is what write-write
+    /// ordering (a separate job) needs; snapshot atomicity here only needs one of them held, so
+    /// this test cannot distinguish "all shards locked" from "some shards locked" -- only from
+    /// "no shards locked."
+    #[test]
+    fn an_mset_spanning_shards_is_never_snapshotted_half_applied() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let aof_path = dir.path().join("mset.aof");
+        let snapshot_path = dir.path().join("mset.snapshot");
+        let aof = Arc::new(AofWriter::open(&aof_path, FsyncPolicy::Never).unwrap());
+        let engine = Arc::new(engine::Engine::new());
+        let replication = Arc::new(crate::replication::ReplicationHandle::new(
+            Arc::clone(&engine),
+            snapshot_path.clone(),
+        ));
+
+        // Pick a pair that actually straddles two shards. Asserting it rather than assuming it
+        // keeps this test meaningful if the hash or the shard count ever changes.
+        let (left, right) = (0..1000)
+            .map(|i| (format!("pair-a-{i}"), format!("pair-b-{i}")))
+            .find(|(a, b)| engine.shard_index(a.as_bytes()) != engine.shard_index(b.as_bytes()))
+            .expect("no key pair landed on different shards");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let engine = Arc::clone(&engine);
+            let aof = Arc::clone(&aof);
+            let replication = Arc::clone(&replication);
+            let stop = Arc::clone(&stop);
+            let (left, right) = (left.clone(), right.clone());
+            std::thread::spawn(move || {
+                let mut generation = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    generation += 1;
+                    let value = bytes::Bytes::from(generation.to_string());
+                    let frame = protocol::Frame::Array(vec![
+                        protocol::Frame::Bulk(bytes::Bytes::from_static(b"MSET")),
+                        protocol::Frame::Bulk(bytes::Bytes::from(left.clone())),
+                        protocol::Frame::Bulk(value.clone()),
+                        protocol::Frame::Bulk(bytes::Bytes::from(right.clone())),
+                        protocol::Frame::Bulk(value),
+                    ]);
+                    crate::dispatcher::dispatch_and_log(
+                        &engine,
+                        &aof,
+                        &replication,
+                        frame,
+                        &crate::dispatcher::Session::new(),
+                        1,
+                    );
+                }
+            })
+        };
+
+        for i in 0..50 {
+            let reply = crate::dispatcher::dispatch_and_log(
+                &engine,
+                &aof,
+                &replication,
+                protocol::Frame::Array(vec![protocol::Frame::Bulk(bytes::Bytes::from_static(
+                    b"SAVE",
+                ))]),
+                &crate::dispatcher::Session::new(),
+                1,
+            );
+            assert_eq!(
+                reply,
+                protocol::Frame::Simple("OK".into()),
+                "SAVE #{i} failed instead of writing a snapshot: {reply:?}"
+            );
+
+            // Read back the snapshot SAVE just wrote and check the pair agrees. Loading it into a
+            // fresh engine deliberately skips the AOF tail: the snapshot alone must be coherent.
+            let gen = read_generation(&snapshot_path).unwrap();
+            let written = generation_path(&snapshot_path, gen);
+            if let Ok(raw) = std::fs::read(&written) {
+                let restored = engine::Engine::new();
+                restored.load_snapshot(&raw).unwrap();
+                let (l, r) = (
+                    restored.get(left.as_bytes()),
+                    restored.get(right.as_bytes()),
+                );
+                // Both absent is fine -- the snapshot predates the first MSET.
+                if l.is_some() || r.is_some() {
+                    assert_eq!(l, r, "snapshot caught an MSET half-applied across shards");
+                }
+            }
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
+    }
+
+    /// Duplicate indices must not self-deadlock: `MSET k1 v1 k1 v2` and any command whose keys
+    /// collide onto one shard reach `lock_shards` with repeats.
+    #[test]
+    fn repeated_shard_indices_are_deduplicated_rather_than_locked_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dedup.aof");
+        let writer = AofWriter::open(&path, FsyncPolicy::Never).unwrap();
+        let guards = writer.lock_shards(&[5, 5, 5, 2, 2]);
+        assert_eq!(guards.len(), 2, "expected one guard per distinct shard");
+    }
+
+    /// The common case: nothing has touched the file since `open`, so the fd and the path still
+    /// name the same inode.
+    #[test]
+    fn is_file_intact_is_true_for_a_freshly_opened_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.aof");
+        let writer = AofWriter::open(&path, FsyncPolicy::Never).unwrap();
+        assert!(writer.is_file_intact().unwrap());
+    }
+
+    /// The incident this guards against: something deletes the AOF out from under a running
+    /// process. POSIX keeps the fd fully writable -- `append`/`fsync` keep succeeding -- but the
+    /// path no longer resolves to that inode, which is exactly the mismatch this method exists
+    /// to catch before the process restarts and silently discards everything written since.
+    #[test]
+    fn is_file_intact_is_false_once_the_path_is_unlinked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.aof");
+        let writer = AofWriter::open(&path, FsyncPolicy::Never).unwrap();
+        writer
+            .append(protocol::Frame::Bulk(bytes::Bytes::from_static(b"x")))
+            .unwrap();
+        writer.fsync().unwrap();
+        assert!(writer.is_file_intact().unwrap());
+
+        std::fs::remove_file(&path).unwrap();
+        assert!(!writer.is_file_intact().unwrap());
+
+        // The orphaned fd keeps accepting writes -- that's the whole danger this test documents.
+        writer
+            .append(protocol::Frame::Bulk(bytes::Bytes::from_static(b"y")))
+            .unwrap();
+        writer.fsync().unwrap();
+    }
+
+    /// A path that now names a *different* file (e.g. something recreated it after a delete) is
+    /// exactly as dangerous as a missing one and must also be reported as not intact.
+    #[test]
+    fn is_file_intact_is_false_once_the_path_is_replaced_by_a_different_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.aof");
+        let writer = AofWriter::open(&path, FsyncPolicy::Never).unwrap();
+        assert!(writer.is_file_intact().unwrap());
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"unrelated content").unwrap();
+        assert!(!writer.is_file_intact().unwrap());
+    }
+
+    #[test]
+    fn lock_all_shards_serializes_concurrent_holders() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.aof");
         let writer = std::sync::Arc::new(AofWriter::open(&path, FsyncPolicy::Never).unwrap());
@@ -949,7 +1466,7 @@ mod tests {
             let log = std::sync::Arc::clone(&log);
             handles.push(std::thread::spawn(move || {
                 for _ in 0..50 {
-                    let _guard = writer.lock_for_ordering();
+                    let _guard = writer.lock_all_shards();
                     log.lock().unwrap().push((id, true)); // entered the critical section
                     std::thread::yield_now();
                     log.lock().unwrap().push((id, false)); // about to leave it

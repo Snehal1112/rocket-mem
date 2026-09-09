@@ -19,7 +19,7 @@ pub struct Engine {
 impl Engine {
     pub fn new() -> Self {
         Self {
-            store: Store::new(16),
+            store: Store::new(crate::SHARD_COUNT),
             maxmemory: None,
             eviction_count: AtomicUsize::new(0),
         }
@@ -27,7 +27,7 @@ impl Engine {
 
     pub fn with_maxmemory(bytes: usize) -> Self {
         Self {
-            store: Store::new(16),
+            store: Store::new(crate::SHARD_COUNT),
             maxmemory: Some(bytes),
             eviction_count: AtomicUsize::new(0),
         }
@@ -94,6 +94,16 @@ impl Engine {
     }
     pub fn active_expire_cycle(&self, shard_idx: usize) -> usize {
         self.store.active_expire_cycle(shard_idx)
+    }
+    /// Which shard a key routes to — see `Store::shard_index`.
+    pub fn shard_index(&self, key: &[u8]) -> usize {
+        self.store.shard_index(key)
+    }
+    /// Ticks the recency clock `get`/`set` stamp entries with. The server calls this from its
+    /// 100ms expiry loop; tests that care about LRU ordering call it between the phases they
+    /// want ordered, since operations within one tick tie. See `Store::advance_clock`.
+    pub fn advance_recency_clock(&self) {
+        self.store.advance_clock()
     }
 
     /// A thin facade over `snapshot::serialize`, matching `Engine`'s existing role over `Store`
