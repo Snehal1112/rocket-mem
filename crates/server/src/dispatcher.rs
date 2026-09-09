@@ -2927,6 +2927,31 @@ fn reply_kind(reply: &Frame) -> &'static str {
     }
 }
 
+/// The command's arguments, excluding the command name -- the same slice `dispatch` calls
+/// `rest`, and the shape `logging::redact_args` expects.
+///
+/// Allocates a `Vec` and bumps one `Bytes` refcount per argument (no data is copied). That cost
+/// is why the only caller guards this behind `tracing::enabled!(Level::TRACE)`: unlike a
+/// `tracing` macro's field expressions, ordinary code before the macro is not lazy, and calling
+/// this unconditionally would allocate on every command at every level.
+///
+/// Non-`Bulk` arguments are skipped rather than rendered: a client can legally frame an integer
+/// where a bulk string belongs, `dispatch` rejects it a moment later, and the log renderer must
+/// not be what falls over on it first.
+fn command_args(frame: &Frame) -> Vec<Bytes> {
+    let Frame::Array(items) = frame else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .skip(1)
+        .filter_map(|f| match f {
+            Frame::Bulk(b) => Some(b.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 /// The `cmd` label value for a command name: its lowercase form if we know the command, the
 /// literal `other` otherwise. The `other` fallback is what bounds Prometheus label cardinality --
 /// without it, a client sending random command names could create unbounded series.
@@ -3087,6 +3112,24 @@ pub fn dispatch_and_log(
         argc = arg_count,
     )
     .entered();
+
+    // Read before `frame` is moved into the inner call below -- the same constraint the `name`
+    // binding at the top of this function carries, for the same reason: `dispatch_and_log_inner`
+    // consumes the frame.
+    //
+    // The `enabled!` guard is not an optimization, it is the point. `command_args` allocates a
+    // `Vec` and bumps a refcount per argument; a `tracing` macro would never evaluate its field
+    // expressions at a disabled level, but this extraction has to happen *outside* the macro to
+    // beat the move, and ordinary code is not lazy. `enabled!` is the same relaxed atomic load
+    // and branch the macro's own check performs, so at the production default of `info` this
+    // whole block costs one branch and allocates nothing.
+    if tracing::enabled!(tracing::Level::TRACE) {
+        let args = command_args(&frame);
+        tracing::trace!(
+            args = %crate::logging::redact_args(name, &args, replication.log_value_max_bytes()),
+            "command arguments"
+        );
+    }
 
     let started = std::time::Instant::now();
 
@@ -3562,6 +3605,70 @@ mod tests {
         // kind of cost the benchmark gate exists to catch.
         let kind: &'static str = reply_kind(&Frame::Null);
         assert_eq!(kind, "ok");
+    }
+
+    #[test]
+    fn command_args_excludes_the_command_name() {
+        assert_eq!(
+            command_args(&cmd(&[b"SET", b"k", b"v"])),
+            vec![Bytes::from_static(b"k"), Bytes::from_static(b"v")]
+        );
+        assert_eq!(command_args(&cmd(&[b"PING"])), Vec::<Bytes>::new());
+    }
+
+    #[test]
+    fn command_args_of_a_non_array_frame_is_empty() {
+        assert_eq!(
+            command_args(&Frame::Simple("PONG".into())),
+            Vec::<Bytes>::new()
+        );
+        assert_eq!(command_args(&Frame::Array(vec![])), Vec::<Bytes>::new());
+    }
+
+    #[test]
+    fn command_args_skips_non_bulk_arguments_rather_than_panicking() {
+        // A client can send `*3\r\n$3\r\nSET\r\n:1\r\n$1\r\nv\r\n`. `dispatch` rejects it later;
+        // the log renderer must not be the thing that falls over on it first.
+        let frame = Frame::Array(vec![
+            Frame::Bulk(Bytes::from_static(b"SET")),
+            Frame::Integer(1),
+            Frame::Bulk(Bytes::from_static(b"v")),
+        ]);
+        assert_eq!(command_args(&frame), vec![Bytes::from_static(b"v")]);
+    }
+
+    #[test]
+    fn the_trace_argument_line_never_renders_an_auth_password() {
+        // Composed exactly as `dispatch_and_log` composes it, so this covers the wiring and not
+        // just `redact_args` in isolation.
+        for frame in [
+            cmd(&[b"AUTH", b"hunter2"]),
+            cmd(&[b"AUTH", b"alice", b"hunter2"]),
+            cmd(&[b"HELLO", b"3", b"AUTH", b"alice", b"hunter2"]),
+            cmd(&[b"ACL", b"SETUSER", b"alice", b">hunter2"]),
+        ] {
+            let name = command_name_upper(&frame).unwrap();
+            let args = command_args(&frame);
+            let rendered = crate::logging::redact_args(name.as_str(), &args, 128);
+            assert_eq!(
+                rendered,
+                "<redacted>",
+                "leaked for {name:?}",
+                name = name.as_str()
+            );
+            assert!(!rendered.contains("hunter2"));
+        }
+    }
+
+    #[test]
+    fn the_trace_argument_line_renders_an_ordinary_command_in_full() {
+        let frame = cmd(&[b"SET", b"k", b"v"]);
+        let name = command_name_upper(&frame).unwrap();
+        let args = command_args(&frame);
+        assert_eq!(
+            crate::logging::redact_args(name.as_str(), &args, 128),
+            "k v"
+        );
     }
 
     #[test]
