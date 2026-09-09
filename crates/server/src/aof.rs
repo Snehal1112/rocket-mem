@@ -1261,6 +1261,112 @@ mod tests {
         }
     }
 
+    /// Job 3: `Store::snapshot_entries` walks shard by shard, so a multi-key write spanning
+    /// shards must be atomic with respect to that walk. Both halves of each MSET carry the same
+    /// generation number, so a half-applied snapshot is directly observable. This is a distinct
+    /// failure mode from append-order inversion (covered elsewhere) or offset-cut double
+    /// counting: here a single write is caught mid-flight, split across two shards, by the
+    /// snapshot walk itself.
+    ///
+    /// `handle_save` takes `lock_all_shards()` -- every one of the 16 order guards -- before it
+    /// reads a single shard. That means a writer holding even one of those guards for its whole
+    /// mutate-then-log section already blocks `SAVE` at that index for the entire operation, both
+    /// keys included. So a writer that locks only a *subset* of its keys' shards (say, just the
+    /// first key's) is not observable here: `SAVE` still stalls on whichever guard the writer
+    /// does hold, and by the time it is released both keys are already written. The only mutation
+    /// this test can actually catch is a writer that holds *no* guard for a multi-key write at
+    /// all -- confirmed by hand against `aof.lock_shards(&[])` at dispatcher.rs, which fails
+    /// within the first save. Locking all of a command's keys' shards is what write-write
+    /// ordering (a separate job) needs; snapshot atomicity here only needs one of them held, so
+    /// this test cannot distinguish "all shards locked" from "some shards locked" -- only from
+    /// "no shards locked."
+    #[test]
+    fn an_mset_spanning_shards_is_never_snapshotted_half_applied() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let aof_path = dir.path().join("mset.aof");
+        let snapshot_path = dir.path().join("mset.snapshot");
+        let aof = Arc::new(AofWriter::open(&aof_path, FsyncPolicy::Never).unwrap());
+        let engine = Arc::new(engine::Engine::new());
+        let replication = Arc::new(crate::replication::ReplicationHandle::new(
+            Arc::clone(&engine),
+            snapshot_path.clone(),
+        ));
+
+        // Pick a pair that actually straddles two shards. Asserting it rather than assuming it
+        // keeps this test meaningful if the hash or the shard count ever changes.
+        let (left, right) = (0..1000)
+            .map(|i| (format!("pair-a-{i}"), format!("pair-b-{i}")))
+            .find(|(a, b)| engine.shard_index(a.as_bytes()) != engine.shard_index(b.as_bytes()))
+            .expect("no key pair landed on different shards");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let engine = Arc::clone(&engine);
+            let aof = Arc::clone(&aof);
+            let replication = Arc::clone(&replication);
+            let stop = Arc::clone(&stop);
+            let (left, right) = (left.clone(), right.clone());
+            std::thread::spawn(move || {
+                let mut generation = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    generation += 1;
+                    let value = bytes::Bytes::from(generation.to_string());
+                    let frame = protocol::Frame::Array(vec![
+                        protocol::Frame::Bulk(bytes::Bytes::from_static(b"MSET")),
+                        protocol::Frame::Bulk(bytes::Bytes::from(left.clone())),
+                        protocol::Frame::Bulk(value.clone()),
+                        protocol::Frame::Bulk(bytes::Bytes::from(right.clone())),
+                        protocol::Frame::Bulk(value),
+                    ]);
+                    crate::dispatcher::dispatch_and_log(
+                        &engine,
+                        &aof,
+                        &replication,
+                        frame,
+                        &crate::dispatcher::Session::new(),
+                        1,
+                    );
+                }
+            })
+        };
+
+        for _ in 0..50 {
+            crate::dispatcher::dispatch_and_log(
+                &engine,
+                &aof,
+                &replication,
+                protocol::Frame::Array(vec![protocol::Frame::Bulk(bytes::Bytes::from_static(
+                    b"SAVE",
+                ))]),
+                &crate::dispatcher::Session::new(),
+                1,
+            );
+
+            // Read back the snapshot SAVE just wrote and check the pair agrees. Loading it into a
+            // fresh engine deliberately skips the AOF tail: the snapshot alone must be coherent.
+            let gen = read_generation(&snapshot_path).unwrap();
+            let written = generation_path(&snapshot_path, gen);
+            if let Ok(raw) = std::fs::read(&written) {
+                let restored = engine::Engine::new();
+                restored.load_snapshot(&raw).unwrap();
+                let (l, r) = (
+                    restored.get(left.as_bytes()),
+                    restored.get(right.as_bytes()),
+                );
+                // Both absent is fine -- the snapshot predates the first MSET.
+                if l.is_some() || r.is_some() {
+                    assert_eq!(l, r, "snapshot caught an MSET half-applied across shards");
+                }
+            }
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
+    }
+
     /// Duplicate indices must not self-deadlock: `MSET k1 v1 k1 v2` and any command whose keys
     /// collide onto one shard reach `lock_shards` with repeats.
     #[test]
