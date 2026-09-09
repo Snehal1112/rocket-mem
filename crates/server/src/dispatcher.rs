@@ -1154,10 +1154,11 @@ pub fn dispatch(engine: &Engine, frame: Frame, _protocol: &mut Protocol, _client
             // `cmd` repeats the `cmd` span's field verbatim, and both are at `debug`, so on the
             // client path this is a genuine duplicate. It stays anyway: `dispatch` has three
             // callers and only `dispatch_and_log` opens that span. `aof::replay` and the follower
-            // apply loop call `dispatch` directly and open no span of their own (neither
-            // `aof::replay_with_stats` nor `replication`'s apply loop is instrumented -- the apply
-            // loop's own `cmd` field is on a sibling event, not an enclosing span), so on both of
-            // those paths this field is the only record of *which* command was unknown. Version
+            // apply loop call `dispatch` directly, and neither opens a `cmd` span. (The follower
+            // path does run inside the `repl` span, but that carries `host_port`, not `cmd`; and
+            // the apply loop's own `cmd` field is on a sibling event, not an enclosing span. So
+            // neither supplies what this field does.) On both of those paths this field is
+            // therefore the only record of *which* command was unknown. Version
             // skew against an AOF or a leader is precisely the case this event exists for.
             tracing::debug!(cmd = %name.as_str(), "unknown command");
             Frame::Error(format!("ERR unknown command '{}'", name.as_str()))
@@ -1548,11 +1549,17 @@ fn cluster_redirect(
     // `Bytes` -- see `key_field`'s own doc comment), rather than relying on the enclosing `cmd`
     // span's own `key` field. Those used to disagree outright for a `KeySpec::Second` command
     // (`MEMORY USAGE <key>`) and now agree, because the span's `key` went key-spec aware too. The
-    // field stays anyway: this event's whole claim is "I routed *this* key to *that* slot", so it
-    // must name the key the redirect actually routed on. `first_key` comes from `command_keys`,
-    // which filters non-`Bulk` frames out before indexing, while the span's comes from
-    // `logged_key`, which indexes the frame directly -- for a malformed frame the two can still
-    // pick different arguments, and this is the one place that difference would matter.
+    // field stays anyway, and the reason is provenance rather than disagreement. This event's
+    // whole claim is "slot `first` was computed from key `K`", so the `K` it prints has to come
+    // from the same extraction that produced the slot -- `command_keys`, which is what `first_key`
+    // and `slots` are both built from just above. Taking it from the span instead would mean the
+    // logged key and the logged slot came out of two different functions, which is exactly the
+    // class of silent disagreement this field's own history is an instance of.
+    //
+    // The two can also still pick different arguments outright: `command_keys` filters non-`Bulk`
+    // frames out before indexing, while the span's `logged_key` indexes the frame directly. That
+    // only bites on a frame `frame_to_args` rejects moments later, so it is the weaker argument of
+    // the two -- provenance is what makes the field worth keeping.
     tracing::debug!(
         key = %crate::logging::key_field(first_key),
         slot = first,
