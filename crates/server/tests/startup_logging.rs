@@ -151,12 +151,16 @@ fn resolved_config_summary_reports_the_effective_log_filter_not_the_configured_o
 
 /// The regression guard for the summary's redaction rule. Every other test in this file runs a
 /// config with no ACL users and no TLS material, so none of them can notice a change that renders
-/// `config` (or `config.acl`) wholesale -- `config::AclUserConfig` has a *derived* `Debug`, so a
-/// single `full = ?config` field would put a plaintext password on stderr at `info` and every
-/// other assertion here would still pass.
+/// `config` (or `config.acl`) wholesale -- a single `full = ?config` field would put the ACL
+/// username and the TLS cert/key paths on stderr at `info` and every other assertion here would
+/// still pass.
 ///
 /// Verified by mutation: adding `full = ?config` to the event makes this test fail on the
-/// `zzsecret` assertion, and only this test.
+/// `zzuser` assertion, and only this test. The `zzsecret` and `zzkeypattern` assertions survive
+/// that mutation now that `config::AclUserConfig` has a hand-written `Debug` -- this test and
+/// that impl are complementary, not redundant: the impl makes the *credential* leak impossible
+/// from any call site, while this test still guards the fields the summary must enumerate by
+/// hand.
 #[test]
 fn secret_bearing_config_is_never_rendered_into_the_summary() {
     let dir = tempfile::tempdir().unwrap();

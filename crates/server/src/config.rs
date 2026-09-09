@@ -84,7 +84,7 @@ pub struct AclBootstrapConfig {
     pub users: Vec<AclUserConfig>,
 }
 
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
 pub struct AclUserConfig {
     pub username: String,
     /// Plaintext in the TOML file, hashed once at load time by plan 04's bootstrap conversion.
@@ -95,6 +95,37 @@ pub struct AclUserConfig {
     /// Raw rule tokens, parsed the same way `ACL SETUSER`'s tokens are (plan 03).
     #[serde(default)]
     pub rules: Vec<String>,
+}
+
+impl std::fmt::Debug for AclUserConfig {
+    /// Hand-written rather than derived, for the same reason `acl::AclUser`'s `Debug` is: a
+    /// derived one would route around `crate::logging`'s redaction policy from any
+    /// `?`-formatted call site. This struct is the stronger case of the two -- `AclUser` holds
+    /// only a password *hash*, while this one holds the operator's plaintext password straight
+    /// out of the TOML file, and it is what `Config`'s own derived `Debug` reaches through.
+    ///
+    /// `None` still renders as `"<nopass>"` rather than the same marker as `Some(_)`, exactly as
+    /// in `acl::AclUser`: knowing a user has no password at all is a routine ACL fact, not a
+    /// secret, and hiding it would only make debugging auth issues harder.
+    ///
+    /// `rules` renders as a count, not verbatim -- unlike `AclUser::rules`, these are *raw*
+    /// `ACL SETUSER` tokens, and a `>password` token is a plaintext credential. The count keeps
+    /// the field's one operational use (did this user's rules load at all?) without rendering
+    /// any token's contents. `username` and `enabled` are non-secret and stay readable, matching
+    /// `acl::AclUser`; a deployment treating usernames as sensitive would have to redact both
+    /// impls together.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let password: &dyn std::fmt::Debug = match &self.password {
+            Some(_) => &"<redacted>",
+            None => &"<nopass>",
+        };
+        f.debug_struct("AclUserConfig")
+            .field("username", &self.username)
+            .field("password", password)
+            .field("enabled", &self.enabled)
+            .field("rules", &self.rules.len())
+            .finish()
+    }
 }
 
 fn default_true() -> bool {
@@ -452,6 +483,76 @@ mod tests {
             );
             Ok(())
         });
+    }
+
+    /// Makes the leak structurally impossible rather than merely forbidden at the one call site
+    /// that formats a `Config` today. `startup_logging.rs`'s
+    /// `secret_bearing_config_is_never_rendered_into_the_summary` guards that call site; this
+    /// guards every present and future one, since `Config`'s derived `Debug` reaches the
+    /// plaintext password only through this struct.
+    #[test]
+    fn acl_user_config_debug_redacts_the_password_and_the_rule_tokens() {
+        let user = AclUserConfig {
+            username: "admin".to_string(),
+            password: Some("zzsecret".to_string()),
+            enabled: true,
+            rules: vec!["allcommands".to_string(), ">zzrulepassword".to_string()],
+        };
+        let rendered = format!("{user:?}");
+
+        assert!(
+            !rendered.contains("zzsecret"),
+            "the plaintext password must never render, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("zzrulepassword") && !rendered.contains("allcommands"),
+            "raw rule tokens can carry a >password, so none may render, got: {rendered}"
+        );
+        assert!(rendered.contains("<redacted>"), "got: {rendered}");
+        assert!(
+            rendered.contains("rules: 2"),
+            "the rule count is the non-secret part worth keeping, got: {rendered}"
+        );
+        // Non-secret fields stay readable, matching `acl::AclUser`'s precedent.
+        assert!(rendered.contains("admin") && rendered.contains("enabled: true"));
+    }
+
+    /// `None` is `nopass`, an operationally useful and non-secret fact, so it must stay
+    /// distinguishable from a redacted real password -- same rule as `acl::AclUser`'s `Debug`.
+    #[test]
+    fn acl_user_config_debug_shows_nopass_distinguishably_from_a_redacted_password() {
+        let user = AclUserConfig {
+            username: "readonly".to_string(),
+            password: None,
+            enabled: true,
+            rules: Vec::new(),
+        };
+        let rendered = format!("{user:?}");
+        assert!(rendered.contains("<nopass>"), "got: {rendered}");
+        assert!(!rendered.contains("<redacted>"), "got: {rendered}");
+    }
+
+    /// The reason the impl above matters: `Config` derives `Debug`, so anything formatting a
+    /// whole config with `{:?}` reaches `acl.users` transitively.
+    #[test]
+    fn config_debug_does_not_leak_an_acl_password_through_the_nested_users() {
+        let cfg = Config {
+            acl: AclBootstrapConfig {
+                users: vec![AclUserConfig {
+                    username: "admin".to_string(),
+                    password: Some("zzsecret".to_string()),
+                    enabled: true,
+                    rules: vec![">zzrulepassword".to_string()],
+                }],
+            },
+            ..Config::default()
+        };
+        let rendered = format!("{cfg:?}");
+        assert!(
+            !rendered.contains("zzsecret") && !rendered.contains("zzrulepassword"),
+            "got: {rendered}"
+        );
+        assert!(rendered.contains("<redacted>"), "got: {rendered}");
     }
 
     #[test]
