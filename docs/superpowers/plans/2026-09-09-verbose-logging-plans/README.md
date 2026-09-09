@@ -30,7 +30,15 @@ Twenty-one TDD implementation plans delivering [the verbose logging spec](../../
 | 18 | [Cluster events](18-cluster-events.md) | 2 | Topology loaded; MOVED redirects |
 | 19 | [Slowlog & metrics events](19-slowlog-and-metrics-events.md) | 2 | Slowlog entries; metrics scrapes |
 | 20 | [Startup & listener events](20-startup-and-listener-events.md) | 3 | Resolved config summary; per-listener bind events |
+| 22 | [Log field consistency sweep](22-log-field-consistency-sweep.md) | 3 | Key-spec-aware `key`; `key_field` relocation; one `protocol` rendering; duplicated span fields |
+| 23 | [Deferred cleanups & decisions](23-deferred-cleanups-and-decisions.md) | 3 | Silent recovery error paths; two small cleanups; record decisions in the spec |
 | 21 | [Docs & final verification](21-docs-and-final-verification.md) | 3 | Logging documentation; full sweep; spec-coverage audit |
+
+**Execution order is 01 → 20, then 22 → 23 → 21.** Plans 22 and 23 were written after plan
+20's review, once the items each earlier review had deliberately deferred outgrew what plan
+21's three tasks could absorb under this series' three-task-per-plan cap. They run before
+plan 21 so that its verification sweep and spec-coverage audit see the finished state. The
+table is in execution order; the file numbers are not contiguous, and that is intentional.
 
 ## Two test harnesses, deliberately
 
