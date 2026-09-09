@@ -3223,16 +3223,22 @@ pub fn dispatch_and_log(
     let log_key = logged_key(&frame, name);
     let label = metric_label(name);
 
-    // The `cmd` span. Every field here is a value this function already computed for the
-    // metrics and slow-log paths just above -- the span adds correlation, not computation, and
-    // `first_key` is already cloned by `command_key_and_arity` (one `Bytes` refcount bump, no
-    // data copy), so the span adds no clone of its own either.
+    // The `cmd` span. `cmd` and `argc` are values this function already computed for the metrics
+    // and slow-log paths just above. `key` is not: `logged_key` above is computed for the span
+    // and for the slow-log `warn!`, and nothing else needs it.
+    //
+    // That selection is EAGER -- it runs on every command at `info`, outside the span's level
+    // check -- and it cannot be made lazy, because the slow-log `warn!` fires at the production
+    // default and needs the same value after `frame` has been moved into
+    // `dispatch_and_log_inner`. Its cost is a `key_spec` match plus at most one `Bytes` refcount
+    // bump. Do not "fix" this by moving `logged_key` inside the span macro: the `warn!` would
+    // then have no key at the level operators actually run.
     //
     // DEBUG, not INFO, and that is the load-bearing choice: `tracing`'s span macros evaluate
     // their field expressions only when the callsite is enabled, so at the production default
-    // of `info` this whole statement is a relaxed atomic load and a branch, and
-    // `key_field`'s UTF-8 validation never runs. An `info_span!` here would run it on every
-    // command in production.
+    // of `info` `key_field`'s UTF-8 validation never runs -- verified by probe, not assumed:
+    // a `panic!` planted in `key_field` leaves the info-level test passing and fires only at
+    // `debug`. An `info_span!` here would run that validation on every command in production.
     //
     // `key` goes through `key_field`, never `?first_key`: `Bytes`'s Debug impl renders
     // byte-by-byte. See this plan's Architecture section.
