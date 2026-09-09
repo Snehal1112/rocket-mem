@@ -923,3 +923,226 @@ date:          2026-09-09T11:02:01Z
  SET: 625000.00 requests per second, p50=0.711 msec
  GET: 699300.69 requests per second, p50=0.543 msec
 ```
+
+## Plan 15 (AOF append trace and fsync debug) — post-instrumentation measurement
+
+**Commit measured:** `cea9d7e` (working tree tip), which contains both of plan 15's AOF
+commits — `eeda76d` (`feat(logging): trace AOF append offset/bytes, debug fsync`) and `cea9d7e`
+itself (`feat(logging): info-level AOF rewrite and recovery replay summary events`). The
+per-command write path only reaches the `trace!` append event and the `debug!` fsync event from
+`eeda76d`; the `info!` rewrite/recovery-replay events from `cea9d7e` fire on rewrite and startup
+recovery only, off the per-command path, and are not analyzed further here.
+
+**Log level:** default `info` (no `RUST_LOG` set) — the append `trace!` and fsync `debug!` call
+sites are both disabled at this level.
+
+Per the gate established in plan 08/plan 12's sections above, this measurement uses the same
+two-part gate: (a) mechanistic (decides PASS/FAIL) and (b) empirical (a >10% gross-regression
+tripwire, not a 2% gate — this harness has a demonstrated ~6-9% run-to-run spread on the two
+gated rows even with zero code change).
+
+### (a) Mechanistic verdict: PASS
+
+The two new call sites, in `crates/server/src/aof.rs`'s `AofWriter::open_with_base` writer-loop:
+
+```rust
+// Append branch (plain, non-fsync write):
+AofMsg::Append(bytes) => {
+    let len = bytes.len() as u64;
+    match writer.write_all(&bytes) {
+        Ok(()) => {
+            tracing::trace!(offset, bytes = len, "aof append");
+            offset += len;
+        }
+        Err(e) => tracing::error!(error = %e, "aof append failed"),
+    }
+}
+// AppendAndFsync branch:
+AofMsg::AppendAndFsync(bytes, ack) => {
+    let len = bytes.len() as u64;
+    let result = writer
+        .write_all(&bytes)
+        .and_then(|_| writer.flush())
+        .and_then(|_| writer.get_ref().sync_data());
+    if result.is_ok() {
+        tracing::trace!(offset, bytes = len, "aof append");
+        offset += len;
+        tracing::debug!(offset, "aof fsync");
+    }
+    let _ = ack.send(result);
+}
+```
+
+1. **Levels below the enabled threshold.** The append event is `trace!`; the fsync event is
+   `debug!`. The server's default `log_level` is `"info"` (`crates/server/src/config.rs:57`),
+   and `resolve_log_filter_directive` only overrides it when `RUST_LOG` is set — not the case
+   for any of the three runs below. `TRACE < DEBUG < INFO`, so both are disabled at the level
+   measured.
+
+2. **Disabled-path cost is one relaxed atomic load.** `tracing`'s public macros expand, via
+   `level_enabled!`, to a comparison against `tracing_core::LevelFilter::current()` (a `Relaxed`
+   `AtomicUsize` load) before any field expression, `ValueSet` construction, or
+   `Subscriber`/`Event::dispatch` call is reached. When disabled, none of that machinery runs;
+   `offset` and `bytes = len` are simply not evaluated.
+
+3. **`tracing`'s `log` feature is off**, confirmed in `Cargo.lock`:
+   ```
+   [[package]]
+   name = "tracing"
+   version = "0.1.44"
+   dependencies = [
+    "pin-project-lite",
+    "tracing-attributes",
+    "tracing-core",
+   ]
+   ```
+   No `log` crate in the dependency list. With the feature on, `tracing`'s macros add a second,
+   always-present `if_log_enabled!` branch that forwards to the `log` facade regardless of the
+   `tracing` level; with it off, that branch does not exist in the compiled binary, so the
+   disabled path really is just the one atomic load plus comparison.
+
+4. **Fields are values the write already computed.** `len` is `bytes.len() as u64` on the
+   `Bytes` buffer already being passed to `writer.write_all(&bytes)`. `offset` is a plain
+   (non-atomic) `u64` local to the AOF writer thread, which the writer-loop's own comment notes
+   processes `AofMsg`s strictly one at a time — so no cross-thread synchronization guards it.
+   Tracking it costs one integer add per successful write, unconditionally (it feeds
+   `current_offset()`/rotation elsewhere, so it isn't itself log-gated) — a single instruction,
+   not new field-evaluation work gated by the disabled `trace!`/`debug!` calls.
+
+5. **No allocation, no lock, no `format!` on the default path.** Both events' arguments are
+   bare `Copy` (`u64`) identifiers; there is no `String`, `format!`, or heap allocation in
+   either call site, gated or not, and no new lock — the writer thread already owned exclusive
+   access to `writer`/`offset` before this plan.
+
+**Verdict: PASS.** Both new AOF events are `trace!`/`debug!`, below the default `info`
+threshold; disablement is a single relaxed atomic load with no field evaluation and no
+secondary always-on `log`-crate branch (feature off); the logged fields are values the write
+path already computed; and the one always-on addition (the plain `u64` offset increment) is a
+single integer add with no allocation, lock, or syscall.
+
+### (b) Empirical: >10% tripwire, not a 2% gate
+
+The figures below are context, per the updated gate. Because this harness has a demonstrated
+~6-9% run-to-run spread on these exact two rows (see plan 08's section above), any single-digit
+delta versus baseline — in either direction — is noise, not signal. Only a delta beyond the
+10% tripwire would indicate a gross regression the harness's own noise floor cannot explain
+away.
+
+**Machine-quiet checks.** `uptime`/`ps aux --sort=-%cpu` were checked immediately before and
+after the three runs. Before: `load average: 1.59, 3.33, 3.28`, top consumers a steady desktop
+background load (`herdr`, `ghostty`, other `claude` sessions, `gnome-shell`, browser) — nothing
+CPU-heavy or benchmark-related. After: `load average: 1.67, 3.03, 3.19`, same steady-state
+processes, no `cargo build`/`cargo test`/other foreign CPU-heavy process observed. No
+contention found; the triplet below was taken as a single clean back-to-back run.
+
+### Gated rows (the only two worth comparing)
+
+| Workload | Run 1 | Run 2 | Run 3 | Mean | Baseline Mean | Delta vs baseline | Spread (this run) |
+|---|---|---|---|---|---|---|---|
+| SET, 3B, no pipeline | 76,103.50 | 92,506.94 | 86,580.09 | 85,063.51 | 89,484.60 | -4.94% | 19.28% |
+| GET, 3B, no pipeline | 91,074.68 | 95,057.03 | 94,696.97 | 93,609.56 | 100,235.04 | -6.61% | 4.25% |
+
+Both rows measured below baseline (SET -4.94%, GET -6.61%), but both deltas sit inside this
+harness's own previously-documented ~6-9% run-to-run noise band and are nowhere near the 10%
+tripwire. This run's SET-row spread (19.28%) is itself wider than that band, driven by one low
+outlier in run 1 (76,103.50 rps against 92.5k/86.6k in runs 2-3) — consistent with the harness's
+known jitter, not a new floor. **The >10% tripwire did not trip.**
+
+### Context-only rows (pipelined and 1KB-payload — not gated)
+
+The other six rows swing 8.8-22.2% natively per the original baseline's jitter table; record
+only, no conclusions drawn.
+
+| Workload | Run 1 | Run 2 | Run 3 | Mean (this run) | Baseline Mean |
+|---|---|---|---|---|---|
+| SET, 3B, pipeline=16 | 680,272.12 | 757,575.75 | 729,927.06 | 722,591.64 | 700,242.04 |
+| GET, 3B, pipeline=16 | 1,098,901.12 | 1,123,595.50 | 1,149,425.38 | 1,123,974.00 | 1,135,299.50 |
+| SET, 1KB, no pipeline | 78,802.20 | 79,176.56 | 69,930.07 | 75,969.61 | 81,774.68 |
+| GET, 1KB, no pipeline | 93,283.58 | 97,943.19 | 96,618.36 | 95,948.38 | 89,748.65 |
+| SET, 1KB, pipeline=16 | 487,804.88 | 512,820.53 | 347,222.25 | 449,282.55 | 530,293.04 |
+| GET, 1KB, pipeline=16 | 671,140.94 | 740,740.69 | 729,927.06 | 713,936.23 | 683,440.31 |
+
+### Global constraints checked (no Rust source changed by this task)
+
+- `cargo fmt --all -- --check` — clean.
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean, no warnings.
+- `cargo test --workspace` — 920 passed, 0 failed (no flakes, no rerun needed).
+- `git status --porcelain` — clean; `Cargo.lock` untouched by the release build.
+
+### Verdicts
+
+**MECHANISTIC: PASS** — the new AOF `trace!` (append) and `debug!` (fsync) events compile to a
+single disabled relaxed-atomic-load check at `info`, with their field expressions never
+expanded into code on that path (no `log`-feature fallback branch either), the fields logged
+are values the write already computed, and the only always-on addition is a one-instruction
+integer increment.
+
+**EMPIRICAL: >10% tripwire not tripped** — SET, 3B, no pipeline measured -4.94% vs baseline;
+GET, 3B, no pipeline measured -6.61% vs baseline. Both are negative but comfortably inside this
+harness's demonstrated ~6-9% run-to-run noise band and well short of the 10% gross-regression
+tripwire. Plan 15's benchmark gate is satisfied on the mechanistic grounds that decide it.
+
+### Raw output
+
+Full output of all three runs preserved outside the repo at
+`/tmp/claude-1000/-home-numericlabs-data-rocket-rocket-mem/850c0577-d0e8-4d03-9147-6aec1a827079/scratchpad/rocket-mem-plan15.txt`.
+Final per-case summary lines (progress-line noise stripped, rocket-mem only):
+
+```
+=== run 1 ===
+date:          2026-09-09T13:10:00Z
+
+--- rocket-mem (payload=3B, pipeline=1) ---
+ SET: 76103.50 requests per second, p50=0.327 msec
+ GET: 91074.68 requests per second, p50=0.271 msec
+
+--- rocket-mem (payload=3B, pipeline=16) ---
+ SET: 680272.12 requests per second, p50=1.031 msec
+ GET: 1098901.12 requests per second, p50=0.367 msec
+
+--- rocket-mem (payload=1024B, pipeline=1) ---
+ SET: 78802.20 requests per second, p50=0.311 msec
+ GET: 93283.58 requests per second, p50=0.271 msec
+
+--- rocket-mem (payload=1024B, pipeline=16) ---
+ SET: 487804.88 requests per second, p50=0.767 msec
+ GET: 671140.94 requests per second, p50=0.591 msec
+
+=== run 2 ===
+date:          2026-09-09T13:10:12Z
+
+--- rocket-mem (payload=3B, pipeline=1) ---
+ SET: 92506.94 requests per second, p50=0.271 msec
+ GET: 95057.03 requests per second, p50=0.263 msec
+
+--- rocket-mem (payload=3B, pipeline=16) ---
+ SET: 757575.75 requests per second, p50=0.935 msec
+ GET: 1123595.50 requests per second, p50=0.367 msec
+
+--- rocket-mem (payload=1024B, pipeline=1) ---
+ SET: 79176.56 requests per second, p50=0.295 msec
+ GET: 97943.19 requests per second, p50=0.255 msec
+
+--- rocket-mem (payload=1024B, pipeline=16) ---
+ SET: 512820.53 requests per second, p50=0.839 msec
+ GET: 740740.69 requests per second, p50=0.535 msec
+
+=== run 3 ===
+date:          2026-09-09T13:10:23Z
+
+--- rocket-mem (payload=3B, pipeline=1) ---
+ SET: 86580.09 requests per second, p50=0.287 msec
+ GET: 94696.97 requests per second, p50=0.263 msec
+
+--- rocket-mem (payload=3B, pipeline=16) ---
+ SET: 729927.06 requests per second, p50=0.975 msec
+ GET: 1149425.38 requests per second, p50=0.351 msec
+
+--- rocket-mem (payload=1024B, pipeline=1) ---
+ SET: 69930.07 requests per second, p50=0.351 msec
+ GET: 96618.36 requests per second, p50=0.255 msec
+
+--- rocket-mem (payload=1024B, pipeline=16) ---
+ SET: 347222.25 requests per second, p50=0.759 msec
+ GET: 729927.06 requests per second, p50=0.535 msec
+```
