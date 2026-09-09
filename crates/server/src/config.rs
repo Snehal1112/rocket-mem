@@ -23,6 +23,19 @@ pub struct Config {
     /// `tls::load_client_config`. Unset means plaintext replication, matching every deployment
     /// before this field existed.
     pub tls_ca_path: Option<String>,
+    /// `host:port` of a leader this node should auto-connect to as a follower on every startup.
+    /// Unset means standalone (or purely live-`REPLICAOF`-driven) operation, matching every
+    /// deployment before this field existed. See `main.rs`'s startup wiring and
+    /// `docs/superpowers/specs/2026-09-09-replicaof-config-file-spec.md`.
+    pub replicaof: Option<String>,
+    /// Username presented in `AUTH` before `PSYNC`, when `replicaof`'s leader has ACL users
+    /// configured. Must be set together with `replicaof_auth_password`, or neither -- see
+    /// `validate_replicaof`.
+    pub replicaof_auth_username: Option<String>,
+    /// Password presented in `AUTH` before `PSYNC`. Plaintext in the TOML file, same as
+    /// `[[acl.users]]`'s own `password` field -- there is no encryption-at-rest for config
+    /// secrets anywhere in this project today.
+    pub replicaof_auth_password: Option<String>,
     pub acl: AclBootstrapConfig,
     /// Log level filter, e.g. "info", "debug", "rocket_mem=debug,warn" -- same syntax as
     /// `RUST_LOG`. Overridden by the `RUST_LOG` env var when it's set (see
@@ -49,6 +62,9 @@ impl Default for Config {
             tls_cert_path: None,
             tls_key_path: None,
             tls_ca_path: None,
+            replicaof: None,
+            replicaof_auth_username: None,
+            replicaof_auth_password: None,
             acl: AclBootstrapConfig::default(),
             log_level: "info".to_string(),
         }
@@ -159,6 +175,15 @@ pub struct Cli {
     /// to over TLS [default: unset, replication stays plaintext]
     #[arg(long)]
     pub tls_ca_path: Option<String>,
+    /// `host:port` of a leader to auto-connect to as a follower on startup [default: unset]
+    #[arg(long)]
+    pub replicaof: Option<String>,
+    /// Username for the AUTH clause sent before PSYNC to --replicaof's leader [default: unset]
+    #[arg(long)]
+    pub replicaof_auth_username: Option<String>,
+    /// Password for the AUTH clause sent before PSYNC to --replicaof's leader [default: unset]
+    #[arg(long)]
+    pub replicaof_auth_password: Option<String>,
     /// Log level filter, e.g. "info", "debug", "rocket_mem=debug,warn" [default: info]
     #[arg(long)]
     pub log_level: Option<String>,
@@ -203,6 +228,9 @@ fn cli_overrides(
     set!(tls_cert_path);
     set!(tls_key_path);
     set!(tls_ca_path);
+    set!(replicaof);
+    set!(replicaof_auth_username);
+    set!(replicaof_auth_password);
     set!(log_level);
     if let Some(v) = cli.slowlog_threshold_micros {
         map.insert("slowlog_threshold_micros", Value::from(v));
@@ -421,6 +449,43 @@ mod tests {
                 Some("/x"),
                 "CLI flag must be able to override an Option<String> field"
             );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn default_config_has_no_replicaof_target() {
+        let cfg = Config::default();
+        assert_eq!(cfg.replicaof, None);
+        assert_eq!(cfg.replicaof_auth_username, None);
+        assert_eq!(cfg.replicaof_auth_password, None);
+    }
+
+    #[test]
+    fn replicaof_is_layered_like_every_other_optional_string_field() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "rocket-mem.toml",
+                "replicaof = \"127.0.0.1:6400\"\nreplicaof_auth_username = \"app\"\n",
+            )?;
+            let cfg = load_layered(Some(std::path::Path::new("rocket-mem.toml"))).unwrap();
+            assert_eq!(cfg.replicaof.as_deref(), Some("127.0.0.1:6400"));
+            assert_eq!(cfg.replicaof_auth_username.as_deref(), Some("app"));
+            assert_eq!(cfg.replicaof_auth_password, None);
+
+            jail.set_env("ROCKET_MEM_REPLICAOF", "127.0.0.1:9999"); // env beats file
+            let cfg = load_layered(Some(std::path::Path::new("rocket-mem.toml"))).unwrap();
+            assert_eq!(cfg.replicaof.as_deref(), Some("127.0.0.1:9999"));
+
+            let cli = Cli::parse_from([
+                "rocket-mem",
+                "--config",
+                "rocket-mem.toml",
+                "--replicaof",
+                "127.0.0.1:1111", // CLI beats env
+            ]);
+            let cfg = load_with_cli(cli).unwrap();
+            assert_eq!(cfg.replicaof.as_deref(), Some("127.0.0.1:1111"));
             Ok(())
         });
     }
