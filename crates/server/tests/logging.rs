@@ -385,6 +385,104 @@ fn cluster_config_load_logs_the_topology_at_info() {
     assert_eq!(config.myself().id, "shard-b"); // load's own return value is unaffected
 }
 
+/// A three-shard topology whose ranges are the even thirds of the slot space, matching the
+/// fixture `crates/server/src/dispatcher.rs`'s own `cluster_handle` test helper uses -- same
+/// slot math, so the same reference keys land on the same nodes.
+const THREE_SHARDS: &str = "shard-a 127.0.0.1:7001 0 5460\n\
+     shard-b 127.0.0.1:7002 5461 10922\n\
+     shard-c 127.0.0.1:7003 10923 16383\n";
+
+/// Dispatches one frame against a cluster-mode node (`node_id`'s slot range per `THREE_SHARDS`)
+/// under a subscriber filtered to `level`, and returns the reply plus everything that subscriber
+/// wrote. `dispatch_and_log`'s cluster-redirect gate is crate-private to invoke directly, so this
+/// drives it the only way an external caller can: through the same public `dispatch_and_log` +
+/// `ReplicationHandle::with_cluster` route `main.rs` itself uses to put a node into cluster mode.
+fn capture_cluster_dispatch_at(level: &str, node_id: &str, frame: Frame) -> (Frame, String) {
+    let config = rocket_mem::cluster::ClusterConfig::parse(THREE_SHARDS, node_id)
+        .expect("parse cluster config");
+    let replication = rocket_mem::replication::ReplicationHandle::default()
+        .with_cluster(std::sync::Arc::new(config));
+
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(BufferWriter(Arc::clone(&buffer)))
+        .with_env_filter(EnvFilter::new(level))
+        .finish();
+
+    let reply = tracing::subscriber::with_default(subscriber, || {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = engine::Engine::new();
+        let aof = rocket_mem::aof::AofWriter::open(
+            &dir.path().join("cluster-logging-test.aof"),
+            rocket_mem::aof::FsyncPolicy::Never,
+        )
+        .expect("open aof");
+        let session = rocket_mem::dispatcher::Session::new();
+        rocket_mem::dispatcher::dispatch_and_log(&engine, &aof, &replication, frame, &session, 1)
+    });
+
+    let bytes_out = buffer.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let text = String::from_utf8(bytes_out).expect("subscriber output is utf-8");
+    (reply, text)
+}
+
+/// Cluster mode's MOVED-redirect event: `cluster_redirect` logs the key, slot, and target node
+/// at `debug`, on the redirect path only. Lives here rather than as a `#[cfg(test)]` capture
+/// assertion in `dispatcher.rs` itself, for the same process-global-callsite-caching reason as
+/// `cluster_config_load_logs_the_topology_at_info` above.
+#[test]
+fn a_moved_redirect_logs_the_key_slot_and_target_node_at_debug() {
+    // "foo" hashes to slot 12182, which shard-c owns -- same fixture as
+    // `dispatcher.rs`'s own `a_key_this_node_does_not_own_is_redirected_with_moved`.
+    let (reply, text) = capture_cluster_dispatch_at(
+        "debug",
+        "shard-a",
+        Frame::Array(vec![
+            Frame::Bulk(Bytes::from_static(b"GET")),
+            Frame::Bulk(Bytes::from_static(b"foo")),
+        ]),
+    );
+    assert_eq!(reply, Frame::Error("MOVED 12182 127.0.0.1:7003".into()));
+    assert!(
+        text.contains("cluster redirect"),
+        "expected the redirect event's message:\n{text}"
+    );
+    assert!(
+        text.contains("foo"),
+        "expected the key in the MOVED debug log:\n{text}"
+    );
+    assert!(
+        text.contains("12182"),
+        "expected the slot in the MOVED debug log:\n{text}"
+    );
+    assert!(
+        text.contains("127.0.0.1:7003"),
+        "expected the target node in the MOVED debug log:\n{text}"
+    );
+}
+
+/// The hot-path guardrail: a key this node owns must never reach the redirect log call, even at
+/// `trace` -- the fast path every correctly-routed command in cluster mode takes.
+#[test]
+fn a_key_this_node_owns_produces_no_cluster_redirect_log() {
+    // "hello" hashes to slot 866, which shard-a (this node) owns.
+    let (reply, text) = capture_cluster_dispatch_at(
+        "trace",
+        "shard-a",
+        Frame::Array(vec![
+            Frame::Bulk(Bytes::from_static(b"SET")),
+            Frame::Bulk(Bytes::from_static(b"hello")),
+            Frame::Bulk(Bytes::from_static(b"1")),
+        ]),
+    );
+    assert_eq!(reply, Frame::Simple("OK".into()));
+    assert!(
+        !text.contains("cluster redirect"),
+        "the owned-key fast path must not log a cluster redirect, got:\n{text}"
+    );
+}
+
 /// Moved from `crates/server/src/connection.rs`'s
 /// `a_replica_registering_and_being_pruned_are_both_logged_at_info`. That test asserted only on
 /// captured log text -- no behavioural assertions -- so nothing behavioural was left behind;

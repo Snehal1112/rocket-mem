@@ -1495,6 +1495,10 @@ fn cluster_redirect(
 ) -> Option<Frame> {
     let cluster = replication.cluster()?;
     let keys = command_keys(frame);
+    // Captured before `keys` is consumed by `into_iter()` below -- `first_key` borrows from
+    // `frame`, which outlives this function, so it stays valid after the `Vec<&Bytes>` container
+    // itself is dropped.
+    let first_key: Option<&Bytes> = keys.first().copied();
     let mut slots = keys.into_iter().map(|k| crate::cluster::key_slot(k));
     let first = slots.next()?; // no keys => nothing to route
     if !slots.all(|s| s == first) {
@@ -1510,6 +1514,25 @@ fn cluster_redirect(
         return None;
     }
     let owner = cluster.owner_of(first);
+    // Only reached on an actual redirect, never on the `owns(first)` fast path above -- that is
+    // what keeps this log call off the hot path every correctly-routed command in cluster mode
+    // takes.
+    //
+    // `key` is logged explicitly here, via the shared `key_field` helper (never `?` on the raw
+    // `Bytes` -- see `key_field`'s own doc comment), rather than relying on the enclosing `cmd`
+    // span's own `key` field. Those normally agree, but not always: the span's `key` comes from
+    // `command_key_and_arity`, which always reports the frame's first *argument*, while `first_key`
+    // here comes from `command_keys`'s key-spec-aware extraction. For a `KeySpec::Second` command
+    // (`MEMORY USAGE <key>`, `OBJECT ENCODING <key>`) those disagree -- the span would show
+    // `USAGE`/`ENCODING`, not the key this redirect is actually routing on -- so leaning on the
+    // span here would silently mislog exactly the commands where getting the key right matters
+    // most.
+    tracing::debug!(
+        key = %key_field(first_key),
+        slot = first,
+        target = %owner.addr,
+        "cluster redirect"
+    );
     Some(Frame::Error(format!("MOVED {first} {}", owner.addr)))
 }
 
