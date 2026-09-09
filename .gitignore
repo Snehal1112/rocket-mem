@@ -26,7 +26,8 @@ dist/
 # Superpowers plugin: isolated worktree workspace
 .worktrees/
 
-.claude
+.claude/*
+!.claude/manual-testing.md
 
 # Node-based dev tools under tools/ (e.g. tools/review-agent)
 tools/*/node_modules/
