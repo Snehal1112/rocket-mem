@@ -106,6 +106,34 @@ async fn main() -> std::io::Result<()> {
         .init();
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "rocket-mem starting");
 
+    // The machine-readable counterpart to the boxed startup banner printed further down this
+    // function, not a replacement for it -- see the verbose logging spec's "Decision: the
+    // startup banner stays separate".
+    //
+    // This lands at `info`, so it reaches every operator's log file and every log aggregator.
+    // `Config` transitively holds credential material -- `acl.users` carries plaintext
+    // passwords and rule tokens, and the TLS cert/key/CA paths name private key material on
+    // disk -- so every field below is enumerated by hand and each is either a bind address, a
+    // non-credential path, a level string, or a plain boolean derived from a secret-bearing
+    // field's *presence*. Never render `config` (or `config.acl`) via `Debug`/`{:?}` here: a
+    // derived `Debug` on a struct that transitively holds credentials is exactly the hazard
+    // `acl::AclUser`'s hand-written `Debug` already exists to prevent. Deliberately absent:
+    // `tls_cert_path`, `tls_key_path`, `tls_ca_path` (summarised only as `tls_enabled`) and
+    // every `acl.users` field (summarised only as `acl_enabled`).
+    tracing::info!(
+        addr = %config.addr,
+        rmp_addr = %config.rmp_addr,
+        metrics_addr = %config.metrics_addr,
+        aof_path = %config.aof_path,
+        snapshot_path = %config.snapshot_path,
+        log_level = %config.log_level,
+        cluster_mode = config.cluster_config.is_some(),
+        acl_enabled = !config.acl.users.is_empty(),
+        acl_user_count = config.acl.users.len(),
+        tls_enabled = config.tls_cert_path.is_some() && config.tls_key_path.is_some(),
+        "resolved config summary"
+    );
+
     let metrics_handle = rocket_mem::metrics::recorder_handle();
 
     let aof_path = std::path::PathBuf::from(&config.aof_path);
