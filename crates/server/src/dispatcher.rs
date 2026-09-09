@@ -1156,10 +1156,19 @@ fn try_authenticate(
         ));
     }
     match replication.acl.authenticate(username, password) {
-        Some(user) => Ok(user),
-        None => Err(Frame::Error(
-            "WRONGPASS invalid username-password pair or user is disabled.".into(),
-        )),
+        Some(user) => {
+            // `peer` is already attached by the enclosing `conn` span (plan 05/06) -- see this
+            // plan's Architecture section. Never log `password` here.
+            tracing::info!(user = %username, "auth success");
+            Ok(user)
+        }
+        None => {
+            // Never log `password` here -- see this plan's CRITICAL SECURITY POINT.
+            tracing::warn!(user = %username, "auth failure");
+            Err(Frame::Error(
+                "WRONGPASS invalid username-password pair or user is disabled.".into(),
+            ))
+        }
     }
 }
 
@@ -3563,6 +3572,54 @@ mod tests {
             .finish();
         tracing::subscriber::with_default(subscriber, f);
         writer.text()
+    }
+
+    #[test]
+    fn try_authenticate_logs_success_at_info_naming_the_user() {
+        let replication = ReplicationHandle::default();
+        replication
+            .acl
+            .set_user(
+                "app",
+                &[Bytes::from_static(b"on"), Bytes::from_static(b">hunter2")],
+            )
+            .unwrap();
+        let log = capture_logs_at(tracing::Level::INFO, || {
+            let result = try_authenticate(&replication, "app", b"hunter2");
+            assert!(result.is_ok());
+        });
+        assert!(
+            log.contains("app"),
+            "expected the username in the event, got: {log}"
+        );
+        assert!(
+            !log.contains("hunter2"),
+            "the password must never be logged, got: {log}"
+        );
+    }
+
+    #[test]
+    fn try_authenticate_logs_failure_at_warn_naming_the_user_never_the_password() {
+        let replication = ReplicationHandle::default();
+        replication
+            .acl
+            .set_user(
+                "app",
+                &[Bytes::from_static(b"on"), Bytes::from_static(b">hunter2")],
+            )
+            .unwrap();
+        let log = capture_logs_at(tracing::Level::WARN, || {
+            let result = try_authenticate(&replication, "app", b"wrong-password");
+            assert!(result.is_err());
+        });
+        assert!(
+            log.contains("app"),
+            "expected the username in the event, got: {log}"
+        );
+        assert!(
+            !log.contains("wrong-password"),
+            "the password must never be logged, got: {log}"
+        );
     }
 
     #[test]
