@@ -175,6 +175,12 @@ fn parse_score(raw: &[u8]) -> Result<f64, Frame> {
 macro_rules! require_args {
     ($rest:expr, $n:expr, $name:expr) => {
         if $rest.len() < $n {
+            tracing::debug!(
+                cmd = %$name,
+                got = %$rest.len(),
+                want = %$n,
+                "wrong number of arguments"
+            );
             return Frame::Error(format!(
                 "ERR wrong number of arguments for '{}' command",
                 $name
@@ -3557,6 +3563,23 @@ mod tests {
             .finish();
         tracing::subscriber::with_default(subscriber, f);
         writer.text()
+    }
+
+    #[test]
+    fn require_args_arity_failure_logs_a_debug_event_with_command_and_counts() {
+        let engine = Engine::new();
+        let log = capture_logs_at(tracing::Level::DEBUG, || {
+            let reply = dispatch(&engine, cmd(&[b"GET"]), &mut Protocol::default(), 1);
+            assert_eq!(
+                reply,
+                Frame::Error("ERR wrong number of arguments for 'get' command".into())
+            );
+        });
+        assert!(log.contains("wrong number of arguments"), "got: {log}");
+        assert!(
+            log.contains("get"),
+            "expected the command name in the event, got: {log}"
+        );
     }
 
     #[test]
