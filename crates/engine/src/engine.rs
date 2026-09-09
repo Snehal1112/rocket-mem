@@ -75,11 +75,26 @@ impl Engine {
     /// Like `with_mut`, but for callers that can report their mutation's byte delta directly
     /// instead of paying `Shard::with_mut`'s O(current collection size) before/after diff --
     /// see `Shard::with_mut_delta`'s doc comment for why that scan matters.
+    ///
+    /// Traces the reported delta at the point it becomes known to `Engine` — after `Store`
+    /// has already applied it to `bytes_used`, so the traced number and the accounted number
+    /// can never disagree. The delta itself may be negative (a shrinking mutation, e.g. `LPOP`),
+    /// which is why the field carries an `isize`, not a `usize`.
     pub fn with_mut_delta<F, R>(&self, key: &[u8], f: F) -> R
     where
         F: FnOnce(Option<&mut Value>) -> (R, isize),
     {
-        let result = self.store.with_mut_delta(key, f);
+        let mut observed_delta: isize = 0;
+        let result = self.store.with_mut_delta(key, |v| {
+            let (r, delta) = f(v);
+            observed_delta = delta;
+            (r, delta)
+        });
+        tracing::trace!(
+            key = %String::from_utf8_lossy(key),
+            bytes = observed_delta,
+            "mutation byte delta"
+        );
         self.maybe_evict();
         result
     }
@@ -462,6 +477,40 @@ mod tests {
             std::time::Instant::now() - std::time::Duration::from_secs(1),
         );
         assert_eq!(engine.key_counts(), (0, 0));
+    }
+
+    #[test]
+    fn with_mut_delta_returns_the_closures_result_and_still_accounts_bytes() {
+        let engine = Engine::new();
+        engine.set(
+            Bytes::from_static(b"k"),
+            Value::String(Bytes::from_static(b"abc")),
+        );
+        let before = engine.memory_used();
+        let returned = engine.with_mut_delta(b"k", |v| {
+            if let Some(Value::String(s)) = v {
+                *s = Bytes::from_static(b"a much longer replacement value");
+                (42, 29) // 29 == "a much longer replacement value".len() - "abc".len()
+            } else {
+                (0, 0)
+            }
+        });
+        assert_eq!(
+            returned, 42,
+            "the closure's own result must still come back unchanged"
+        );
+        assert!(
+            engine.memory_used() > before,
+            "the reported delta must still be accounted"
+        );
+    }
+
+    #[test]
+    fn with_mut_delta_on_a_missing_key_reports_no_delta_and_creates_nothing() {
+        let engine = Engine::new();
+        let saw_none = engine.with_mut_delta(b"missing", |v| (v.is_none(), 0));
+        assert!(saw_none);
+        assert!(!engine.exists(b"missing"));
     }
 
     #[test]
