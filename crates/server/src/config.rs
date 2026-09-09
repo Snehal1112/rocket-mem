@@ -42,6 +42,10 @@ pub struct Config {
     /// `resolve_log_filter_directive` below); this field is the *default* for a deployment
     /// that doesn't set RUST_LOG, not a competing source of truth.
     pub log_level: String,
+    /// Maximum bytes of a value or argument rendered into a `trace`-level log line before
+    /// truncation. Only consulted at `trace` -- lower it to keep trace logs readable, raise
+    /// it to see whole values. See `logging::fmt_value`.
+    pub log_value_max_bytes: u64,
 }
 
 impl Default for Config {
@@ -67,6 +71,7 @@ impl Default for Config {
             replicaof_auth_password: None,
             acl: AclBootstrapConfig::default(),
             log_level: "info".to_string(),
+            log_value_max_bytes: 128,
         }
     }
 }
@@ -187,6 +192,9 @@ pub struct Cli {
     /// Log level filter, e.g. "info", "debug", "rocket_mem=debug,warn" [default: info]
     #[arg(long)]
     pub log_level: Option<String>,
+    /// Max bytes of a value rendered into a trace-level log line [default: 128]
+    #[arg(long)]
+    pub log_value_max_bytes: Option<u64>,
 }
 
 /// `Serialized::defaults` embeds every field including the unset `None`s, which would make an
@@ -234,6 +242,9 @@ fn cli_overrides(
     set!(log_level);
     if let Some(v) = cli.slowlog_threshold_micros {
         map.insert("slowlog_threshold_micros", Value::from(v));
+    }
+    if let Some(v) = cli.log_value_max_bytes {
+        map.insert("log_value_max_bytes", Value::from(v));
     }
     Serialized::defaults(map)
 }
@@ -552,6 +563,39 @@ mod tests {
             ]);
             let cfg = load_with_cli(cli).unwrap();
             assert_eq!(cfg.log_level, "error");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn log_value_max_bytes_defaults_to_128() {
+        figment::Jail::expect_with(|_jail| {
+            let cfg = load_layered(None).unwrap();
+            assert_eq!(cfg.log_value_max_bytes, 128);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn log_value_max_bytes_is_layered_like_every_other_numeric_field() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("rocket-mem.toml", "log_value_max_bytes = 64\n")?;
+            let cfg = load_layered(Some(std::path::Path::new("rocket-mem.toml"))).unwrap();
+            assert_eq!(cfg.log_value_max_bytes, 64);
+
+            jail.set_env("ROCKET_MEM_LOG_VALUE_MAX_BYTES", "32"); // env beats file
+            let cfg = load_layered(Some(std::path::Path::new("rocket-mem.toml"))).unwrap();
+            assert_eq!(cfg.log_value_max_bytes, 32);
+
+            let cli = Cli::parse_from([
+                "rocket-mem",
+                "--config",
+                "rocket-mem.toml",
+                "--log-value-max-bytes",
+                "16", // CLI beats env
+            ]);
+            let cfg = load_with_cli(cli).unwrap();
+            assert_eq!(cfg.log_value_max_bytes, 16);
             Ok(())
         });
     }
