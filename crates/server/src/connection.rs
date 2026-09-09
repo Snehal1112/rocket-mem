@@ -185,6 +185,7 @@ impl Drop for ClientGuard {
     }
 }
 
+#[tracing::instrument(skip_all, fields(conn_id = client_id, %peer, protocol = "resp", %tls))]
 async fn handle_connection<S>(
     socket: S,
     peer: std::net::SocketAddr,
@@ -196,7 +197,7 @@ async fn handle_connection<S>(
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    tracing::info!(%peer, protocol = "resp", tls, "connection accepted");
+    tracing::info!("connection accepted");
     replication.connection_opened();
     let _client_guard = ClientGuard(Arc::clone(&replication));
     let mut framed = Framed::new(socket, RespCodec::default());
