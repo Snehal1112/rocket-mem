@@ -312,18 +312,26 @@ async fn serve_replica<S>(
 {
     use tokio::io::AsyncWriteExt;
 
-    // ONE critical section: snapshot + register, so no write can slip between them. Taken
-    // separately, a write committing after the snapshot walk but before registration would
-    // reach neither the blob nor the stream -- lost permanently, unrepairable by reconnect,
-    // since a reconnect just snapshots a leader that has already moved past it. Lock
-    // ordering: lock_for_ordering() before the registry's own mutex, matching this plan's
-    // Global Constraints and the fan-out hook in dispatcher.rs, the only other place both are
-    // taken -- there, the order guard for a write's shard(s) is held across both the AOF
-    // append and the registry broadcast, for the same reason: neither critical section may
-    // release the order guard before it has finished touching the registry.
+    // ONE critical section: read the offset, snapshot, and register, so no write can slip
+    // between them. Taken separately, a write committing after the snapshot walk but before
+    // registration would reach neither the blob nor the stream -- lost permanently,
+    // unrepairable by reconnect, since a reconnect just snapshots a leader that has already
+    // moved past it. Reading `master_repl_offset` inside the same section is what makes the
+    // header the follower is about to seed itself from describe exactly this blob: the fan-out
+    // site advances that counter while holding the same AOF ordering guard, so nothing can
+    // advance it between this read and the registration below. Lock ordering:
+    // lock_for_ordering() before the registry's own mutex, matching this plan's Global
+    // Constraints and the fan-out hook in dispatcher.rs, the only other place both are taken --
+    // there, the order guard for a write's shard(s) is held across both the AOF append and the
+    // registry broadcast, for the same reason: neither critical section may release the order
+    // guard before it has finished touching the registry.
     let (snapshot_bytes, mut rx) = {
         let _order_guard = aof.lock_all_shards();
-        let bytes = replication.engine().snapshot(0); // 0: a follower keeps no AOF, so the header is moot
+        // The header's stream position, for a PSYNC image, is the leader's replication offset --
+        // not an AOF length. See `Engine::snapshot`'s doc comment for the parameter's two
+        // meanings.
+        let handoff_offset = replication.master_repl_offset();
+        let bytes = replication.engine().snapshot(handoff_offset);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<bytes::Bytes>();
         replication.registry.register(advertised_addr, tx);
         (bytes, rx)
@@ -829,6 +837,77 @@ mod tests {
         assert_eq!(
             ping.next().await.unwrap().unwrap(),
             Frame::Simple("PONG".into())
+        );
+    }
+
+    /// The snapshot's own 8-byte header carries the leader's live replication offset to a
+    /// newly-attaching follower. This is not a wire-format change: the field has always been
+    /// transmitted on this path, it was just always zero.
+    #[tokio::test]
+    async fn psync_stamps_the_leaders_replication_offset_into_the_snapshot_header() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let engine = Arc::new(Engine::new());
+        let (_dir, aof) = test_aof();
+        let replication = Arc::new(crate::replication::ReplicationHandle::new(
+            Arc::clone(&engine),
+            std::env::temp_dir().join("psync-test-unused-4.snapshot"),
+        ));
+        tokio::spawn(serve(
+            listener,
+            Arc::clone(&engine),
+            Arc::clone(&aof),
+            Arc::clone(&replication),
+        ));
+
+        // Take a write first, so the leader's offset is non-zero before any follower attaches.
+        // A header that is still 0 here would be indistinguishable from the old hardcoded value.
+        let mut client = Framed::new(
+            TcpStream::connect(addr).await.unwrap(),
+            RespCodec::default(),
+        );
+        client
+            .send(Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"SET")),
+                Frame::Bulk(Bytes::from_static(b"k")),
+                Frame::Bulk(Bytes::from_static(b"v")),
+            ]))
+            .await
+            .unwrap();
+        assert_eq!(
+            client.next().await.unwrap().unwrap(),
+            Frame::Simple("OK".into())
+        );
+        let leader_offset = replication.master_repl_offset();
+        assert!(
+            leader_offset > 0,
+            "the write should have advanced the leader offset"
+        );
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let mut framed = Framed::new(stream, RespCodec::default());
+        framed
+            .send(Frame::Array(vec![Frame::Bulk(Bytes::from_static(
+                b"PSYNC",
+            ))]))
+            .await
+            .unwrap();
+        let mut parts = framed.into_parts();
+
+        use tokio::io::AsyncReadExt;
+        let mut len_buf = [0u8; 8];
+        parts.io.read_exact(&mut len_buf).await.unwrap();
+        let len = u64::from_le_bytes(len_buf) as usize;
+        let mut blob = vec![0u8; len];
+        parts.io.read_exact(&mut blob).await.unwrap();
+
+        // The blob's own first 8 bytes are the snapshot header, little-endian.
+        let mut header = [0u8; 8];
+        header.copy_from_slice(&blob[..8]);
+        assert_eq!(
+            u64::from_le_bytes(header),
+            leader_offset,
+            "the PSYNC snapshot header must carry the leader's live replication offset"
         );
     }
 }

@@ -107,18 +107,27 @@ impl Engine {
     }
 
     /// A thin facade over `snapshot::serialize`, matching `Engine`'s existing role over `Store`
-    /// (see `CLAUDE.md`). `aof_offset` is opaque to `Engine` — it's only ever the caller's AOF
-    /// length, which `Engine` has no access to; see `snapshot::serialize`'s own doc comment.
+    /// (see `CLAUDE.md`). `aof_offset` is opaque to `Engine`: it is whatever stream position the
+    /// caller says this image corresponds to, which `Engine` has no way to compute itself. It
+    /// has two meanings, one per caller. `handle_save` passes the AOF's current durable length,
+    /// so recovery can replay only the tail after the snapshot. `serve_replica` passes the
+    /// leader's live `master_repl_offset`, so a newly-attaching follower learns where in the
+    /// replication stream its snapshot sits and can count on from there. The parameter keeps its
+    /// `aof_offset` name rather than being renamed to something neutral, because renaming it
+    /// would churn the whole engine crate for no behavior change; see `snapshot::serialize`'s
+    /// own doc comment.
     pub fn snapshot(&self, aof_offset: u64) -> Vec<u8> {
         crate::snapshot::serialize(&self.store, aof_offset)
     }
 
-    /// A thin facade over `snapshot::deserialize`. Deliberately bypasses `maxmemory` eviction —
-    /// `load_snapshot_entries` goes through `Store::set`, not `Engine::set` — so a snapshot
-    /// larger than a configured ceiling lands whole and is only trimmed back under it by the
-    /// next write that calls `Engine::set`/`with_mut`. Evicting *while* loading would silently
-    /// discard keys the operator asked to restore, which is never the right behavior for a
-    /// restore path.
+    /// A thin facade over `snapshot::deserialize`. Returns the blob's header — the stream
+    /// position this image corresponds to, whose meaning depends on who wrote it (see
+    /// `snapshot` above): an AOF length for a disk snapshot, a replication-stream offset for a
+    /// `PSYNC` snapshot. Deliberately bypasses `maxmemory` eviction — `load_snapshot_entries`
+    /// goes through `Store::set`, not `Engine::set` — so a snapshot larger than a configured
+    /// ceiling lands whole and is only trimmed back under it by the next write that calls
+    /// `Engine::set`/`with_mut`. Evicting *while* loading would silently discard keys the
+    /// operator asked to restore, which is never the right behavior for a restore path.
     pub fn load_snapshot(&self, bytes: &[u8]) -> Result<u64, crate::snapshot::SnapshotError> {
         crate::snapshot::deserialize(&self.store, bytes)
     }

@@ -68,11 +68,15 @@ pub enum SnapshotError {
     Decode(String),
 }
 
-/// `aof_offset` is written into the blob's 8-byte little-endian header — the caller (holding
-/// `AofWriter::lock_for_ordering()`, per the sprint-5 spec's SAVE atomicity decision) is the
-/// only one who knows the AOF's current durable length, so it's passed in rather than
-/// discovered here. Pass `0` when there's no AOF to correlate against (a follower's `PSYNC`
-/// reply, which discards the offset on the receiving end anyway).
+/// `aof_offset` is written into the blob's 8-byte little-endian header. It is the stream
+/// position this image corresponds to, and which stream that is depends on the caller — the
+/// parameter's name records only its original caller, not the full set. `SAVE` passes the AOF's
+/// current durable length (the caller holds `AofWriter::lock_for_ordering()`, per the sprint-5
+/// spec's SAVE atomicity decision, and is the only one who knows that length, so it is passed in
+/// rather than discovered here). A leader answering `PSYNC` passes its live
+/// `master_repl_offset`, so the follower reading this blob can seed its own `slave_repl_offset`
+/// from the header and count on from there; that path used to pass `0` and discard the value on
+/// receipt. Pass `0` only when there is genuinely no stream position to correlate against.
 pub fn serialize(store: &Store, aof_offset: u64) -> Vec<u8> {
     let entries: Vec<SerializableEntry> = store
         .snapshot_entries()
@@ -90,11 +94,12 @@ pub fn serialize(store: &Store, aof_offset: u64) -> Vec<u8> {
     out
 }
 
-/// Replaces `store`'s entire contents with what's encoded in `bytes`, returning the AOF
-/// offset from the blob's header. An entry whose `expires_at_unix_ms` is already in the past
-/// (compared directly as wall-clock milliseconds, not via a round trip through `Instant` —
-/// see the sprint-5 spec for why that distinction matters) is dropped rather than loaded and
-/// left for the expiry reaper to clean up later.
+/// Replaces `store`'s entire contents with what's encoded in `bytes`, returning the stream
+/// position from the blob's header — an AOF length when a `SAVE` wrote it, a replication-stream
+/// offset when a leader's `PSYNC` reply did (see `serialize` above). An entry whose
+/// `expires_at_unix_ms` is already in the past (compared directly as wall-clock milliseconds,
+/// not via a round trip through `Instant` — see the sprint-5 spec for why that distinction
+/// matters) is dropped rather than loaded and left for the expiry reaper to clean up later.
 pub fn deserialize(store: &Store, bytes: &[u8]) -> Result<u64, SnapshotError> {
     if bytes.len() < 8 {
         return Err(SnapshotError::TooShort);
