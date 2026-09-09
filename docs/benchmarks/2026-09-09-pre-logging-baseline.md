@@ -23,8 +23,8 @@ order of magnitude, and a later plan's benchmark step re-runs the same harness a
 produce the same eight-way breakdown. So the table below keeps one row per workload
 variant (matching the convention already used in
 [`2026-08-30-redis-benchmark.md`](2026-08-30-redis-benchmark.md)) with Run 1/Run 2/Run 3/Mean
-columns, rather than collapsing to two rows. A later plan's benchmark step should compare each
-workload variant against the matching row here.
+columns, rather than collapsing to two rows. **Only two of these eight rows are gate-worthy —
+see the Gate section below for which two, and why the rest are recorded as context only.**
 
 ## rocket-mem requests/sec
 
@@ -39,6 +39,26 @@ workload variant against the matching row here.
 | SET, 1KB, pipeline=16 | 595,238.12 | 510,204.09 | 485,436.91 | 530,293.04 |
 | GET, 1KB, pipeline=16 | 746,268.62 | 671,140.94 | 632,911.38 | 683,440.31 |
 
+### Run-to-run jitter
+
+Peak-to-peak range across the three runs, as a percentage of that row's own mean:
+
+| Workload | Spread (max-min / mean) |
+|---|---|
+| SET, 3B, no pipeline | 7.6% |
+| GET, 3B, no pipeline | 0.8% |
+| SET, 3B, pipeline=16 | 22.2% |
+| GET, 3B, pipeline=16 | 12.1% |
+| SET, 1KB, no pipeline | 8.8% |
+| GET, 1KB, no pipeline | 12.6% |
+| SET, 1KB, pipeline=16 | 20.7% |
+| GET, 1KB, pipeline=16 | 16.6% |
+
+`GET, 3B, no pipeline` and `SET, 3B, no pipeline` are the two tightest rows by a wide margin —
+this is why they are the two rows the Gate section below gates on. Every other row swings
+8.8%-22.2% between runs of the *same* baseline capture, an order of magnitude wider than the 2%
+gate threshold itself, which is why they are recorded as context only, not gated.
+
 For context, `scripts/benchmark.sh` also benchmarks a real `redis-server` with matched
 durability settings in the same run; those figures are visible in the raw output below but are
 not part of this gate — the gate is about rocket-mem's own numbers staying within 2% of
@@ -48,9 +68,22 @@ separately in [`2026-08-30-redis-benchmark.md`](2026-08-30-redis-benchmark.md) a
 
 ## Gate
 
-A later plan passes its benchmark step when its measured mean, at default `info`,
-is within 2% of the Mean column above. Below-baseline results inside that band are
-noise, not regression; anything worse is a blocker for that plan.
+**The <=2% gate applies ONLY to the two `3B, no pipeline` rows** —
+`SET, 3B, no pipeline` (mean **89,484.60** rps) and `GET, 3B, no pipeline` (mean **100,235.04**
+rps). A later plan passes its benchmark step when its own 3-run mean for unpipelined 3B SET and
+unpipelined 3B GET, measured at default `info`, is within 2% of these two numbers.
+Below-baseline results inside that band are noise, not regression; anything worse is a
+blocker for that plan.
+
+**The other six rows — `1KB, no pipeline` (both SET and GET) and every `pipeline=16` row — are
+recorded as context only and are explicitly NOT part of the gate.** As the jitter table above
+shows, those rows swing 8.8%-22.2% between runs of this very baseline capture, up to an order
+of magnitude wider than the 2% threshold itself. Applying the same <=2% test to them would
+produce spurious "regressions" from pure run-to-run noise, or a false pass that only lands
+in-band by luck. If a future plan needs to gate the pipelined or 1KB-payload throughput too, it
+requires either many more runs to shrink the confidence interval, or a wider tolerance band
+re-derived from this jitter data — not a straight reuse of the 2% figure, which was only ever
+appropriate for the two tight rows it's calibrated against.
 
 ## Raw output
 
