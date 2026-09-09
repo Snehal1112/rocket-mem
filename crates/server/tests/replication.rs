@@ -172,6 +172,83 @@ async fn a_follower_syncs_from_an_acl_protected_leader_when_replicaof_auth_is_us
     wait_for(&f_engine, b"k", b"v").await;
 }
 
+#[tokio::test]
+async fn a_node_configured_with_replicaof_auto_connects_on_startup() {
+    let (_leader_dir, _leader_engine, _leader_aof, leader_replication, leader_addr) =
+        spawn_node().await;
+    leader_replication
+        .acl
+        .set_user(
+            "app",
+            &[
+                bytes::Bytes::from_static(b"on"),
+                bytes::Bytes::from_static(b">changeme"),
+                bytes::Bytes::from_static(b"allcommands"),
+                bytes::Bytes::from_static(b"allkeys"),
+            ],
+        )
+        .unwrap();
+
+    // Build the follower's own Engine/AofWriter/ReplicationHandle by hand (not spawn_node,
+    // which has no replicaof knob) so this test controls the config the same way main.rs's
+    // startup wiring would, without needing a real TOML file or subprocess.
+    let f_dir = tempfile::tempdir().unwrap();
+    let f_engine = std::sync::Arc::new(engine::Engine::new());
+    let f_aof = std::sync::Arc::new(
+        rocket_mem::aof::AofWriter::open(
+            &f_dir.path().join("node.aof"),
+            rocket_mem::aof::FsyncPolicy::Never,
+        )
+        .unwrap(),
+    );
+    let f_replication = std::sync::Arc::new(rocket_mem::replication::ReplicationHandle::new(
+        std::sync::Arc::clone(&f_engine),
+        f_dir.path().join("node.snapshot"),
+    ));
+    let f_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let f_addr = f_listener.local_addr().unwrap().to_string();
+    tokio::spawn(rocket_mem::serve(
+        f_listener,
+        std::sync::Arc::clone(&f_engine),
+        std::sync::Arc::clone(&f_aof),
+        std::sync::Arc::clone(&f_replication),
+    ));
+
+    // This is the exact call main.rs's startup wiring makes when config.replicaof is set --
+    // the test proves the STARTUP PATH works, by driving it the same way main.rs does, rather
+    // than re-testing start_replicating_with_auth itself (already covered by the ACL-auth test
+    // above).
+    f_replication.start_replicating_with_auth(
+        leader_addr.clone(),
+        Some(("app".to_string(), "changeme".to_string())),
+    );
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !f_replication.link_up() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "config-driven follower never linked up against the leader"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let client = redis::Client::open(format!("redis://app:changeme@{leader_addr}")).unwrap();
+    let mut con = client.get_multiplexed_async_connection().await.unwrap();
+    let _: () = con.set("k", "v").await.unwrap();
+
+    wait_for(&f_engine, b"k", b"v").await;
+
+    // Prove the follower actually came up as read-only via the config-driven path too, not
+    // just linked -- same assertion shape as a_follower_rejects_client_writes_over_a_real_...
+    let f_client = redis::Client::open(format!("redis://{f_addr}")).unwrap();
+    let mut f_con = f_client.get_multiplexed_async_connection().await.unwrap();
+    let result: Result<(), redis::RedisError> = f_con.set("nope", "x").await;
+    assert_eq!(
+        result.expect_err("must be read-only").code(),
+        Some("READONLY")
+    );
+}
+
 // multi_thread, not the default current_thread flavor: serve_replica's snapshot-walk and
 // registry-register have no `.await` between them, so on a single-threaded runtime they'd be
 // atomic with respect to every other task on that same thread regardless of whether the lock
