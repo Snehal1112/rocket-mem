@@ -2839,7 +2839,7 @@ fn handle_bgrewriteaof(
 /// `dispatch_and_log`'s own `engine` parameter (`main.rs` constructs one `Engine`, shares it
 /// into both `serve`'s `engine` argument and `ReplicationHandle::new`), so using the handle's
 /// copy here matches the pattern `04-replica-registry-and-leader-fanout.md`'s `PSYNC` handling
-/// already uses (`replication.engine().snapshot(0)`) instead of introducing a second,
+/// already uses (`replication.engine().snapshot(...)`) instead of introducing a second,
 /// redundant `&Engine` parameter that would always alias it anyway — and writes the result to
 /// the current generation's snapshot path, resolved from `replication.snapshot_path()`.
 ///

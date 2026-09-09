@@ -188,13 +188,13 @@ impl Engine {
     /// A thin facade over `snapshot::serialize`, matching `Engine`'s existing role over `Store`
     /// (see `CLAUDE.md`). `aof_offset` is opaque to `Engine`: it is whatever stream position the
     /// caller says this image corresponds to, which `Engine` has no way to compute itself. It
-    /// has two meanings, one per caller. `handle_save` passes the AOF's current durable length,
-    /// so recovery can replay only the tail after the snapshot. `serve_replica` passes the
-    /// leader's live `master_repl_offset`, so a newly-attaching follower learns where in the
-    /// replication stream its snapshot sits and can count on from there. The parameter keeps its
-    /// `aof_offset` name rather than being renamed to something neutral, because renaming it
-    /// would churn the whole engine crate for no behavior change; see `snapshot::serialize`'s
-    /// own doc comment.
+    /// has two meanings, one per stream. Callers passing an AOF offset (`handle_save` and
+    /// `start_rewrite`) let recovery replay only the tail after the snapshot. The caller passing
+    /// a replication stream offset (`serve_replica`) lets a newly-attaching follower learn where
+    /// in the replication stream its snapshot sits and can count on from there. The parameter
+    /// keeps its `aof_offset` name rather than being renamed to something neutral, because
+    /// renaming it would churn the whole engine crate for no behavior change; see
+    /// `snapshot::serialize`'s own doc comment.
     pub fn snapshot(&self, aof_offset: u64) -> Vec<u8> {
         crate::snapshot::serialize(&self.store, aof_offset)
     }
