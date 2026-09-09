@@ -667,6 +667,23 @@ async fn connect_and_sync(
     }
 }
 
+/// Uppercased command name from a replicated frame's first element, for the per-command apply
+/// debug log. `sync_once` has no access to `dispatcher::command_name_upper` (private to that
+/// module); duplicating this tiny extraction locally matches `connection.rs`'s own
+/// `is_psync_command`/`psync_advertised_addr`, which solve the same cross-module-visibility
+/// problem for PSYNC detection. Not on the client dispatch hot path the 2% benchmark gate
+/// covers -- this runs once per replicated frame on the follower's own apply loop, which
+/// already pays for a full `dispatch` call per frame.
+fn replicated_command_name(frame: &protocol::Frame) -> String {
+    let protocol::Frame::Array(items) = frame else {
+        return "?".to_string();
+    };
+    let Some(protocol::Frame::Bulk(name)) = items.first() else {
+        return "?".to_string();
+    };
+    String::from_utf8_lossy(name).to_uppercase()
+}
+
 /// One full sync: `PSYNC`, load the snapshot, then apply every subsequent frame until the
 /// connection ends (cleanly or with an error). Never called `dispatch_and_log` — see this
 /// plan's Global Constraints. Checks `generation` against `my_generation` immediately before
@@ -789,11 +806,15 @@ where
     // received — rebuild a Framed over the same socket (whose read position is exactly past
     // the blob) to resume decoding normally.
     let mut framed = tokio_util::codec::Framed::from_parts(parts);
+    let mut frames_applied: u64 = 0; // per-session counter, not persisted or shared -- see Global Constraints
     while let Some(result) = framed.next().await {
         if generation.load(Ordering::SeqCst) != my_generation {
             return Ok(()); // superseded -- stop applying frames to state a newer task now owns
         }
         let frame = result?;
+        frames_applied += 1;
+        tracing::trace!(offset = frames_applied, "replication stream advanced");
+        let name = replicated_command_name(&frame);
         let mut protocol = protocol::codec::Protocol::default();
         // Mutual exclusion with a concurrent SAVE on this same node: SAVE's shard-by-shard
         // snapshot walk (Store::snapshot_entries) must not observe a multi-key replicated
@@ -805,6 +826,7 @@ where
         // which matches the pre-fix behavior for those.
         let _order_guard = aof.map(|a| a.lock_all_shards());
         let reply = crate::dispatcher::dispatch(engine, frame, &mut protocol, 0);
+        tracing::debug!(cmd = %name, "applied replicated command");
         // A leader only ever fans out a command whose local execution already succeeded, so
         // an error applying it here means the two sides have genuinely diverged (a bug, or
         // version skew) — logged and skipped, not a reason to tear down and resync, which
@@ -1722,5 +1744,79 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("snapshot loaded"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn sync_once_logs_stream_offset_and_the_applied_command_name() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let fake_leader = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut psync_bytes = [0u8; 15];
+            socket.read_exact(&mut psync_bytes).await.unwrap();
+
+            let snapshot_engine = engine::Engine::new();
+            let blob = snapshot_engine.snapshot(0);
+            socket
+                .write_all(&(blob.len() as u64).to_le_bytes())
+                .await
+                .unwrap();
+            socket.write_all(&blob).await.unwrap();
+
+            socket
+                .write_all(b"*3\r\n$3\r\nSET\r\n$11\r\nfrom-stream\r\n$1\r\nv\r\n")
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        });
+
+        let captured = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let engine = std::sync::Arc::new(engine::Engine::new());
+        let host_port = addr.to_string();
+        let generation = Arc::new(AtomicU64::new(0));
+        let sync_task = {
+            let engine = std::sync::Arc::clone(&engine);
+            tokio::spawn(async move {
+                let stream = tokio::net::TcpStream::connect(&host_port).await.unwrap();
+                sync_once(
+                    stream,
+                    &engine,
+                    &generation,
+                    0,
+                    None,
+                    FollowerStatus {
+                        last_apply: &AtomicI64::new(0),
+                        link_up: &AtomicBool::new(false),
+                    },
+                    &FollowerIdentity::default(),
+                )
+                .await
+            })
+        };
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        sync_task.abort();
+        fake_leader.abort();
+        drop(_guard);
+
+        let text = captured.text();
+        assert!(
+            text.contains("replication stream advanced") && text.contains("offset"),
+            "expected an offset-progress trace line:\n{text}"
+        );
+        assert!(
+            text.contains("applied replicated command") && text.contains("SET"),
+            "expected a per-command apply debug line naming SET:\n{text}"
+        );
     }
 }
