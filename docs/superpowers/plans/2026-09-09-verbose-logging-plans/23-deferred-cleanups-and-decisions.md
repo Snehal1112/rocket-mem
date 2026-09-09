@@ -93,6 +93,26 @@ and review reports. Anyone reading the spec afterwards would re-litigate them. A
 - [ ] **Redaction tests must be mutation-checked.** An absence-assertion is only as strong as
       its fixture: asserting "no password appears" against a config containing no password
       proves nothing. This was a real defect, caught in plan 20's review.
+- [ ] **Correct a spec claim plan 22 made untrue.** Around line 87 the spec says the `cmd` span's
+      fields are "values that exist at that point regardless — the span adds correlation, not
+      computation". `logged_key` breaks that: the key-spec selection is genuinely computed per
+      command, and it is **eager**, not deferred behind the span's level check, because the
+      slowlog `warn!` needs the same value after `frame` has been moved. Record what is actually
+      true — the *rendering* (`key_field`, the O(len) UTF-8 pass) stays lazy and is proven so by
+      probe; the *selection* does not. Both facts were established empirically in plan 22, not
+      argued.
+- [ ] **Record the `SLOWLOG GET` exposure as a known, deliberate non-fix.** Plan 22 closed the
+      `ECHO`/`PING` value leak in the log fields but not in `SlowLogEntry.key`, which still stores
+      the command's first argument — so `SLOWLOG GET` hands an uncapped client-supplied payload to
+      any client permitted to run `SLOWLOG`. The same leak, on a surface reachable without
+      filesystem access. `command_key_and_arity` already special-cases `AUTH` for exactly this
+      reason ("would leak the password through `SLOWLOG GET`"), so the argument for extending it
+      to every `KeySpec::None` command is the codebase's own. It was **not** fixed here because it
+      changes a client-visible surface, which is outside this series' scope, and because
+      rocket-mem's slowlog already stores key+arity rather than Redis's full args — so the right
+      shape is a design question, not a cleanup. Write it up as an open decision, name Sprint 8's
+      ACL work as the natural home, and be explicit that the constraint which protected it during
+      plan 22 was a scope guard and not a defence of the behaviour.
 - [ ] **Extend the "Field vocabulary" list** with the names added during execution that were
       never recorded: from plan 18, `node_id` / `first_slot` / `node_count`; from plan 20 and
       its fixes, `addr` / `rmp_addr` / `metrics_addr` / `aof_path` / `snapshot_path` /
