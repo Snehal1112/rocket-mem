@@ -175,6 +175,19 @@ fn parse_score(raw: &[u8]) -> Result<f64, Frame> {
 macro_rules! require_args {
     ($rest:expr, $n:expr, $name:expr) => {
         if $rest.len() < $n {
+            // `cmd` is *not* a duplicate of the `cmd` span's own field, despite both being at
+            // `debug` and the span being a `debug_span!`. Two reasons, either one sufficient:
+            //
+            // * `dispatch` has three callers and only one of them opens that span.
+            //   `aof::replay` and the follower apply loop call `dispatch` directly (deliberately
+            //   -- see `dispatch_and_log`'s doc comment on why a boot-time replay must not count
+            //   as client traffic), so on those paths this field is the only thing naming the
+            //   command whose arity was wrong. A version-skewed AOF or leader is exactly when an
+            //   operator needs it.
+            // * Three call sites pass a subcommand-qualified name -- `"memory usage"`,
+            //   `"object encoding"`, `"debug sleep"` -- which the span's `cmd` (`MEMORY`,
+            //   `OBJECT`, `DEBUG`) cannot express. There the field is strictly more specific
+            //   than the span's, not a copy of it.
             tracing::debug!(
                 cmd = %$name,
                 got = %$rest.len(),
@@ -200,6 +213,11 @@ pub fn dispatch(engine: &Engine, frame: Frame, _protocol: &mut Protocol, _client
     let Some(name) = upper_name(&args[0]) else {
         // Cold path only: a name too long or non-ASCII to be any command we know. The error text
         // is unchanged from before this optimization -- it echoes the client's own bytes.
+        //
+        // `cmd = %raw` is the only place that name appears anywhere. Reaching here means
+        // `upper_name` returned `None`, and `command_name_upper` -- which the `cmd` span's own
+        // `cmd` field comes from -- calls the same `upper_name`, so on this path the span's field
+        // is the empty string. Removing this one loses the information outright.
         let raw = String::from_utf8_lossy(&args[0]);
         tracing::debug!(cmd = %raw, "unknown command");
         return Frame::Error(format!("ERR unknown command '{raw}'"));
@@ -1133,6 +1151,14 @@ pub fn dispatch(engine: &Engine, frame: Frame, _protocol: &mut Protocol, _client
             }
         }
         _ => {
+            // `cmd` repeats the `cmd` span's field verbatim, and both are at `debug`, so on the
+            // client path this is a genuine duplicate. It stays anyway: `dispatch` has three
+            // callers and only `dispatch_and_log` opens that span. `aof::replay` and the follower
+            // apply loop call `dispatch` directly and open no span of their own (neither
+            // `aof::replay_with_stats` nor `replication`'s apply loop is instrumented -- the apply
+            // loop's own `cmd` field is on a sibling event, not an enclosing span), so on both of
+            // those paths this field is the only record of *which* command was unknown. Version
+            // skew against an AOF or a leader is precisely the case this event exists for.
             tracing::debug!(cmd = %name.as_str(), "unknown command");
             Frame::Error(format!("ERR unknown command '{}'", name.as_str()))
         }
