@@ -960,7 +960,24 @@ pub fn dispatch(engine: &Engine, frame: Frame, _protocol: &mut Protocol, _client
                         .collect(),
                 )
             } else {
-                Frame::Array(vec![]) // subcommands (COUNT, INFO, ...) land in Task 2
+                let subcommand = String::from_utf8_lossy(&rest[0]).to_ascii_uppercase();
+                match subcommand.as_str() {
+                    "COUNT" => Frame::Integer(KNOWN_COMMANDS_LOWER.len() as i64),
+                    "INFO" => Frame::Array(
+                        rest[1..]
+                            .iter()
+                            .map(|arg| {
+                                let name_lower = String::from_utf8_lossy(arg).to_ascii_lowercase();
+                                if KNOWN_COMMANDS_LOWER.contains(&name_lower.as_str()) {
+                                    command_info_entry(&name_lower)
+                                } else {
+                                    Frame::Null
+                                }
+                            })
+                            .collect(),
+                    ),
+                    _ => Frame::Array(vec![]),
+                }
             }
         }
         "MEMORY" => {
@@ -4487,6 +4504,50 @@ mod tests {
             };
             assert!(arity < 0, "{name} reported a non-negative arity: {arity}");
         }
+    }
+
+    #[test]
+    fn command_count_returns_the_total_known_command_count() {
+        let engine = Engine::new();
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"COMMAND", b"COUNT"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Integer(KNOWN_COMMANDS_LOWER.len() as i64)
+        );
+    }
+
+    #[test]
+    fn command_info_returns_entries_for_known_names_and_nil_for_unknown() {
+        let engine = Engine::new();
+        let Frame::Array(entries) = dispatch(
+            &engine,
+            cmd(&[b"COMMAND", b"INFO", b"get", b"not-a-real-command"]),
+            &mut Protocol::default(),
+            1,
+        ) else {
+            panic!("COMMAND INFO must reply with an array");
+        };
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0], command_info_entry("get"));
+        assert_eq!(entries[1], Frame::Null);
+    }
+
+    #[test]
+    fn command_info_is_case_insensitive() {
+        let engine = Engine::new();
+        let Frame::Array(entries) = dispatch(
+            &engine,
+            cmd(&[b"COMMAND", b"INFO", b"GeT"]),
+            &mut Protocol::default(),
+            1,
+        ) else {
+            panic!("COMMAND INFO must reply with an array");
+        };
+        assert_eq!(entries[0], command_info_entry("get"));
     }
 
     #[test]
