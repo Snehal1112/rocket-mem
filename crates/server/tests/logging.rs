@@ -145,3 +145,72 @@ fn debug_emits_the_per_command_line() {
         "the per-command line lost its reply field; output was:\n{output}"
     );
 }
+
+#[test]
+fn debug_logs_the_key_but_not_the_value() {
+    // The level taxonomy in one assertion: `debug` is "what happened" (the key), `trace` is
+    // "what the bytes were" (the value). A value leaking into `debug` would make the level an
+    // operator is told is safe to leave on in production a data-exposure decision instead.
+    let output = capture_at("debug");
+    assert!(
+        output.contains("level-key"),
+        "the key is missing from the debug line; output was:\n{output}"
+    );
+    assert!(
+        !output.contains("level-value"),
+        "a stored value reached the log at `debug`; output was:\n{output}"
+    );
+    assert!(
+        !output.contains("command arguments"),
+        "the trace argument line escaped to `debug`; output was:\n{output}"
+    );
+}
+
+#[test]
+fn trace_renders_the_full_argument_list() {
+    let output = capture_at("trace");
+    assert!(
+        output.contains("command arguments"),
+        "the trace argument line is missing at `trace`; output was:\n{output}"
+    );
+    assert!(
+        output.contains("args=level-key level-value"),
+        "the argument list did not render as text; output was:\n{output}"
+    );
+}
+
+#[test]
+fn trace_never_renders_a_credential() {
+    let output = capture_frames_at(
+        "trace",
+        vec![
+            Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"AUTH")),
+                Frame::Bulk(Bytes::from_static(b"alice")),
+                Frame::Bulk(Bytes::from_static(b"hunter2")),
+            ]),
+            Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"HELLO")),
+                Frame::Bulk(Bytes::from_static(b"3")),
+                Frame::Bulk(Bytes::from_static(b"AUTH")),
+                Frame::Bulk(Bytes::from_static(b"alice")),
+                Frame::Bulk(Bytes::from_static(b"hunter2")),
+            ]),
+            Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"ACL")),
+                Frame::Bulk(Bytes::from_static(b"SETUSER")),
+                Frame::Bulk(Bytes::from_static(b"alice")),
+                Frame::Bulk(Bytes::from_static(b">hunter2")),
+            ]),
+        ],
+    );
+    assert!(
+        output.contains("<redacted>"),
+        "a credential-carrying command was not redacted at all; output was:\n{output}"
+    );
+    // The whole point, asserted at the highest-volume level, on the real dispatch path.
+    assert!(
+        !output.contains("hunter2"),
+        "a password reached the log at `trace`; output was:\n{output}"
+    );
+}
