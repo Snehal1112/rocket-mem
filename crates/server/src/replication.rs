@@ -185,6 +185,17 @@ pub struct ReplicationHandle {
     /// `master_link_status`: it tracks the connection, not a byte offset, because this project
     /// has no replication offsets at all.
     link_up: Arc<AtomicBool>,
+    /// Leader side: how many bytes of replication stream this node has produced since it
+    /// started. Advanced by `dispatch_and_log_inner`'s fan-out loop by the encoded length of
+    /// every frame it hands to `ReplicaRegistry::broadcast`, under the same AOF ordering guard
+    /// the broadcast itself is under, so offsets are assigned in exactly fan-out order. It
+    /// counts the write stream this leader produced, not what any replica received, so it
+    /// advances even when no replica is connected. Process-local: it resets to 0 on restart,
+    /// which is safe only because every reconnect is a full resync that re-seeds the follower
+    /// from the snapshot header, so a follower can never carry a stale offset across a leader
+    /// restart. An `Arc` for symmetry with the follower-side counter added in
+    /// `03-follower-replication-offset.md`, whose spawned task is `'static`.
+    master_repl_offset: Arc<AtomicU64>,
     /// Recently-slow commands, recorded by the `dispatch_and_log` wrapper. A plain field, not an
     /// `Option`: it is always present and always cheap when nothing is slow, so there is nothing
     /// to configure away. `main.rs` sets its threshold from the environment via
@@ -224,6 +235,7 @@ impl ReplicationHandle {
             last_save_unix: AtomicI64::new(0),
             master_addr: Mutex::new(None),
             link_up: Arc::new(AtomicBool::new(false)),
+            master_repl_offset: Arc::new(AtomicU64::new(0)),
             slowlog: crate::slowlog::SlowLog::default(),
             acl: crate::acl::AclStore::default(),
             own_addr: None,
@@ -443,6 +455,22 @@ impl ReplicationHandle {
     /// The shared flag itself, for the spawned follower task to write into.
     pub fn link_up_slot(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.link_up)
+    }
+
+    /// Leader side: total replication-stream bytes this node has produced since process start.
+    /// Surfaced as `INFO REPLICATION`'s `master_repl_offset` and the
+    /// `rocket_mem_master_repl_offset` gauge.
+    pub fn master_repl_offset(&self) -> u64 {
+        self.master_repl_offset.load(Ordering::Relaxed)
+    }
+
+    /// Adds `bytes` to the leader's replication offset and returns the new value. Called once
+    /// per broadcast frame from `dispatch_and_log_inner`, while it still holds the AOF ordering
+    /// guard, so the offset advances in the same order the frames are fanned out. `Relaxed` is
+    /// enough: that guard already provides the mutual exclusion, and nothing orders other memory
+    /// against this counter.
+    pub fn advance_master_repl_offset(&self, bytes: u64) -> u64 {
+        self.master_repl_offset.fetch_add(bytes, Ordering::Relaxed) + bytes
     }
 }
 
@@ -850,6 +878,18 @@ mod tests {
             "record_save should store a real unix timestamp, got {}",
             h.last_save_unix()
         );
+    }
+
+    #[test]
+    fn master_repl_offset_starts_at_zero_and_accumulates_byte_counts() {
+        let h = ReplicationHandle::default();
+        assert_eq!(h.master_repl_offset(), 0);
+        assert_eq!(h.advance_master_repl_offset(31), 31);
+        assert_eq!(h.advance_master_repl_offset(11), 42);
+        assert_eq!(h.master_repl_offset(), 42);
+        // A zero-length advance is a no-op, not an error: an empty encode never reaches the
+        // fan-out, but the counter must not care either way.
+        assert_eq!(h.advance_master_repl_offset(0), 42);
     }
 
     #[tokio::test]
