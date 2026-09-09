@@ -67,6 +67,21 @@ fn capture_at(level: &str) -> String {
 
 /// `capture_at` with the frames spelled out, for the tests that need a command other than `SET`.
 fn capture_frames_at(level: &str, frames: Vec<Frame>) -> String {
+    capture_frames_with_at(
+        level,
+        rocket_mem::replication::ReplicationHandle::default(),
+        frames,
+    )
+}
+
+/// `capture_frames_at` with the `ReplicationHandle` supplied, for the tests that need one built
+/// differently -- currently only the slow-log threshold, which `ReplicationHandle::default()`
+/// leaves at the 10ms production default no test command would ever cross.
+fn capture_frames_with_at(
+    level: &str,
+    replication: rocket_mem::replication::ReplicationHandle,
+    frames: Vec<Frame>,
+) -> String {
     let buffer = Arc::new(Mutex::new(Vec::new()));
     let subscriber = tracing_subscriber::fmt()
         .with_ansi(false)
@@ -82,7 +97,6 @@ fn capture_frames_at(level: &str, frames: Vec<Frame>) -> String {
             rocket_mem::aof::FsyncPolicy::Never,
         )
         .expect("open aof");
-        let replication = rocket_mem::replication::ReplicationHandle::default();
         let session = rocket_mem::dispatcher::Session::new();
 
         for frame in frames {
@@ -110,6 +124,16 @@ fn set_frame() -> Frame {
         Frame::Bulk(Bytes::from_static(b"level-key")),
         Frame::Bulk(Bytes::from_static(b"level-value")),
     ])
+}
+
+/// A command frame from its parts, so a test listing several commands stays readable.
+fn cmd(parts: &[&[u8]]) -> Frame {
+    Frame::Array(
+        parts
+            .iter()
+            .map(|p| Frame::Bulk(Bytes::copy_from_slice(p)))
+            .collect(),
+    )
 }
 
 #[test]
@@ -251,6 +275,86 @@ fn the_span_carries_the_command_name_and_arity() {
     assert!(
         output.contains("argc=2"),
         "the cmd span lost its arity; output was:\n{output}"
+    );
+}
+
+/// The `key` field names the command's *key*, picked by the same `key_spec` table the cluster
+/// router routes on -- not "whatever argument came first". Two defects motivated this and the
+/// assertions below cover both: `MEMORY USAGE <key>` / `OBJECT ENCODING <key>` used to report
+/// the subcommand (`USAGE`/`ENCODING`) as the key, and every keyless command reported its first
+/// argument, which for `ECHO <payload>` / `PING <message>` is a client-supplied *value* with no
+/// length cap -- exactly what the spec says never reaches a log line.
+#[test]
+fn the_span_key_is_key_spec_aware_and_never_renders_a_value() {
+    let output = capture_frames_at(
+        "debug",
+        vec![
+            cmd(&[b"MEMORY", b"USAGE", b"memory-key"]),
+            cmd(&[b"OBJECT", b"ENCODING", b"object-key"]),
+            cmd(&[b"ECHO", b"echo-payload"]),
+            cmd(&[b"PING", b"ping-payload"]),
+            cmd(&[b"GET", b"plain-key"]),
+            cmd(&[b"AUTH", b"auth-secret"]),
+        ],
+    );
+    assert!(
+        output.contains("key=memory-key"),
+        "MEMORY USAGE must log the key, not the USAGE subcommand; output was:\n{output}"
+    );
+    assert!(
+        output.contains("key=object-key"),
+        "OBJECT ENCODING must log the key, not the ENCODING subcommand; output was:\n{output}"
+    );
+    assert!(
+        output.contains("cmd=ECHO key= argc=1"),
+        "a keyless command must log an empty key; output was:\n{output}"
+    );
+    assert!(
+        !output.contains("echo-payload"),
+        "ECHO's client-supplied value reached the log; output was:\n{output}"
+    );
+    assert!(
+        !output.contains("ping-payload"),
+        "PING's client-supplied value reached the log; output was:\n{output}"
+    );
+    assert!(
+        output.contains("key=plain-key"),
+        "an ordinary first-argument key must still be logged; output was:\n{output}"
+    );
+    assert!(
+        !output.contains("auth-secret"),
+        "AUTH's password reached the log; output was:\n{output}"
+    );
+}
+
+/// The same key-spec-aware rendering on the slow log's `warn!` -- which, unlike the `cmd` span,
+/// is emitted at this project's production default level, so a wrong or value-carrying `key`
+/// there reaches a real operator's log file rather than only an opt-in `debug` one.
+///
+/// A 1ns threshold makes every command "slow", which is the only way to reach the warn branch
+/// deterministically; `Duration::ZERO` would disable the slow log entirely.
+#[test]
+fn the_slowlog_warning_key_is_key_spec_aware_and_never_renders_a_value() {
+    let output = capture_frames_with_at(
+        "warn",
+        rocket_mem::replication::ReplicationHandle::default()
+            .with_slowlog_threshold(Duration::from_nanos(1)),
+        vec![
+            cmd(&[b"MEMORY", b"USAGE", b"memory-key"]),
+            cmd(&[b"ECHO", b"echo-payload"]),
+        ],
+    );
+    assert!(
+        output.contains("slow command recorded"),
+        "expected the slow-log warning at `warn`; output was:\n{output}"
+    );
+    assert!(
+        output.contains("key=memory-key"),
+        "the slow-log warning must name the key, not the USAGE subcommand; output was:\n{output}"
+    );
+    assert!(
+        !output.contains("echo-payload"),
+        "ECHO's client-supplied value reached a `warn`-level log; output was:\n{output}"
     );
 }
 
@@ -593,6 +697,7 @@ fn maybe_record_only_warns_when_the_command_actually_gets_recorded() {
         Some(Bytes::from_static(b"fast")),
         1,
         Duration::from_micros(50),
+        Some(&Bytes::from_static(b"fast")),
     );
     let after_fast_command =
         String::from_utf8(buffer.lock().unwrap_or_else(|e| e.into_inner()).clone())
@@ -603,11 +708,15 @@ fn maybe_record_only_warns_when_the_command_actually_gets_recorded() {
     );
 
     // At/over the threshold: must log, with the command, key, and elapsed microseconds.
+    // `GET`/`LRANGE` are `KeySpec::First`, so the stored key and the logged key are the same
+    // `Bytes` here -- `dispatch_and_log` is where the two can differ (`MEMORY USAGE <key>`), and
+    // `the_slowlog_warning_key_is_key_spec_aware_and_never_renders_a_value` covers that.
     log.maybe_record(
         "LRANGE",
         Some(Bytes::from_static(b"mylist")),
         3,
         Duration::from_millis(25),
+        Some(&Bytes::from_static(b"mylist")),
     );
     drop(_guard);
     let text = String::from_utf8(buffer.lock().unwrap_or_else(|e| e.into_inner()).clone())

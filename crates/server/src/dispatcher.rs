@@ -2965,7 +2965,49 @@ fn command_key_and_arity(frame: &Frame) -> (Option<Bytes>, usize) {
     (key, items.len().saturating_sub(1))
 }
 
-/// Renders `command_key_and_arity`'s first key for a log field -- the `cmd` span's `key` here,
+/// The key a *log field* should name for `frame`, chosen by the same `key_spec` table
+/// `command_keys` routes cluster traffic on. Deliberately not `command_key_and_arity`'s "first
+/// argument", which is wrong twice over:
+///
+/// * `key_spec` maps `MEMORY`/`OBJECT` to `KeySpec::Second`, so `MEMORY USAGE <key>` and
+///   `OBJECT ENCODING <key>` used to log `key=USAGE`/`key=ENCODING` -- a field confidently
+///   reporting a value that is not a key, which an operator grepping by key never finds.
+/// * `key_spec` maps `PING`, `ECHO` and eighteen other commands (plus every *unknown* command)
+///   to `KeySpec::None`, yet the first argument was rendered anyway. For `ECHO <payload>` and
+///   `PING <message>` that argument is a client-supplied **value**, with no length cap --
+///   `log_value_max_bytes` gates only the trace-level argument line. The spec's invariant is
+///   that logs carry key names and byte lengths, never value contents, and as of the slow log's
+///   `warn!` this field reaches the production default level.
+///
+/// `command_key_and_arity` is left alone on purpose: it also feeds the *stored* `SlowLogEntry`,
+/// which `SLOWLOG GET` exposes to clients. This is a logging fix, not a change to a
+/// client-visible surface.
+///
+/// `name` is `command_name_upper`'s already-uppercased output, which is what `key_spec`'s table
+/// expects; the `""` it yields for a frame that is not a command array falls through to
+/// `KeySpec::None`, i.e. no key -- as does `AUTH`, which must stay keyless.
+///
+/// Called once per command, next to `metric_label`, which already pays the same
+/// `KNOWN_COMMANDS.binary_search` this can fall through to -- so the added cost is of the order
+/// of work this line already does, and cannot be deferred behind a level check: the slow log's
+/// `warn!` needs the result after `frame` has been moved into `dispatch_and_log_inner`.
+fn logged_key(frame: &Frame, name: &str) -> Option<Bytes> {
+    let index = match key_spec(name) {
+        KeySpec::None => return None,
+        KeySpec::Second => 2,
+        // `First`, `All` and `EveryOther` all name argument 1 as their first key.
+        KeySpec::First | KeySpec::All | KeySpec::EveryOther => 1,
+    };
+    let Frame::Array(items) = frame else {
+        return None;
+    };
+    match items.get(index) {
+        Some(Frame::Bulk(b)) => Some(b.clone()), // one refcount bump, no data copy
+        _ => None,
+    }
+}
+
+/// Renders `logged_key`'s key for a log field -- the `cmd` span's `key` here,
 /// and reused by `SlowLog::maybe_record`'s `warn!` for the same reason (see that fn's doc
 /// comment for why that event needs its own copy of the key rather than leaning on the span).
 ///
@@ -2979,7 +3021,7 @@ fn command_key_and_arity(frame: &Frame) -> (Option<Bytes>, usize) {
 /// key, which is essentially all of them, `from_utf8_lossy` returns a `Cow::Borrowed` and
 /// copies nothing.
 ///
-/// `None` -- a keyless command such as `PING`, and `AUTH`, which `command_key_and_arity`
+/// `None` -- a keyless command such as `PING`, `ECHO` or `AUTH`, all of which `logged_key`
 /// deliberately reports as keyless -- renders as the empty string rather than a literal
 /// `"None"`, so a `key=` field is either a real key or visibly absent.
 pub(crate) fn key_field(key: Option<&Bytes>) -> std::borrow::Cow<'_, str> {
@@ -3166,6 +3208,10 @@ pub fn dispatch_and_log(
     let name = command_name_upper(&frame); // read before `frame` is moved into the inner call
     let name = name.as_ref().map(|n| n.as_str()).unwrap_or("");
     let (first_key, arg_count) = command_key_and_arity(&frame);
+    // The key the *log* fields name, which is not always `first_key` -- see `logged_key` for the
+    // two ways the frame's first argument gets that wrong. `first_key` still feeds the stored
+    // `SlowLogEntry` unchanged, because `SLOWLOG GET` exposes it to clients.
+    let log_key = logged_key(&frame, name);
     let label = metric_label(name);
 
     // The `cmd` span. Every field here is a value this function already computed for the
@@ -3188,7 +3234,7 @@ pub fn dispatch_and_log(
     let _cmd_span = tracing::debug_span!(
         "cmd",
         cmd = %name,
-        key = %key_field(first_key.as_ref()),
+        key = %key_field(log_key.as_ref()),
         argc = arg_count,
     )
     .entered();
@@ -3225,7 +3271,7 @@ pub fn dispatch_and_log(
     }
     replication
         .slowlog
-        .maybe_record(name, first_key, arg_count, elapsed);
+        .maybe_record(name, first_key, arg_count, elapsed, log_key.as_ref());
 
     // The per-command line. `cmd`, `key`, and `argc` are not repeated here -- they are on the
     // `cmd` span this event is emitted inside, so the subscriber renders them as span context.
@@ -4875,6 +4921,58 @@ mod tests {
             command_key_and_arity(&cmd(&[b"auth", b"somepassword"])),
             (None, 1)
         );
+    }
+
+    /// `logged_key` is the key-spec-aware rendering the *log* fields use, and it deliberately
+    /// disagrees with `command_key_and_arity` (which still feeds the stored `SlowLogEntry`) in
+    /// exactly the two places the first argument is not a key.
+    #[test]
+    fn logged_key_follows_the_key_spec_rather_than_the_first_argument() {
+        // KeySpec::First / All / EveryOther: argument 1, the same answer as before.
+        assert_eq!(
+            logged_key(&cmd(&[b"SET", b"k", b"v"]), "SET"),
+            Some(Bytes::from_static(b"k"))
+        );
+        assert_eq!(
+            logged_key(&cmd(&[b"DEL", b"a", b"b"]), "DEL"),
+            Some(Bytes::from_static(b"a"))
+        );
+        assert_eq!(
+            logged_key(&cmd(&[b"MSET", b"k1", b"v1", b"k2", b"v2"]), "MSET"),
+            Some(Bytes::from_static(b"k1"))
+        );
+        // KeySpec::Second: the subcommand is not the key.
+        assert_eq!(
+            logged_key(&cmd(&[b"MEMORY", b"USAGE", b"k"]), "MEMORY"),
+            Some(Bytes::from_static(b"k"))
+        );
+        assert_eq!(
+            logged_key(&cmd(&[b"OBJECT", b"ENCODING", b"k"]), "OBJECT"),
+            Some(Bytes::from_static(b"k"))
+        );
+        // A short form of a KeySpec::Second command has no key at all, rather than a subcommand.
+        assert_eq!(logged_key(&cmd(&[b"MEMORY", b"DOCTOR"]), "MEMORY"), None);
+    }
+
+    /// The leak this fixes: a keyless command's first argument is a client-supplied *value*, and
+    /// the log fields apply no length cap to a key. AUTH stays keyless, as it already was.
+    #[test]
+    fn logged_key_is_none_for_every_keyless_command() {
+        assert_eq!(logged_key(&cmd(&[b"ECHO", b"payload"]), "ECHO"), None);
+        assert_eq!(logged_key(&cmd(&[b"PING", b"message"]), "PING"), None);
+        assert_eq!(logged_key(&cmd(&[b"AUTH", b"somepassword"]), "AUTH"), None);
+        assert_eq!(
+            logged_key(&cmd(&[b"ACL", b"SETUSER", b"alice", b">pw"]), "ACL"),
+            None
+        );
+        // An unknown command's arguments are not keys either, and the same no-cap argument
+        // applies to them.
+        assert_eq!(
+            logged_key(&cmd(&[b"NOTACOMMAND", b"arg"]), "NOTACOMMAND"),
+            None
+        );
+        // `command_name_upper` yields "" for a frame that is not a command array.
+        assert_eq!(logged_key(&Frame::Simple("x".into()), ""), None);
     }
 
     #[test]

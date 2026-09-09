@@ -64,12 +64,21 @@ impl SlowLog {
     /// is the overwhelmingly common case -- this is the only slow-log work on the hot path.
     /// `Duration::ZERO` means disabled, not "record everything"; see this plan's Global
     /// Constraints.
+    ///
+    /// `key` is the command's first argument and is what gets *stored* and handed back by
+    /// `SLOWLOG GET`. `log_key` is the key-spec-aware key (`dispatcher::logged_key`) and is used
+    /// only by the `warn!` below -- never stored. The two differ for `MEMORY USAGE <key>` and
+    /// `OBJECT ENCODING <key>`, where the first argument is a subcommand, and for every keyless
+    /// command, where the first argument is a client-supplied value the log must not carry.
+    /// Keeping them separate is deliberate: the stored entry is a client-visible surface this
+    /// logging work must not change.
     pub fn maybe_record(
         &self,
         command: &str,
         key: Option<Bytes>,
         arg_count: usize,
         elapsed: Duration,
+        log_key: Option<&Bytes>,
     ) {
         if self.threshold.is_zero() || elapsed < self.threshold {
             return;
@@ -95,10 +104,10 @@ impl SlowLog {
         // `key` itself, or a production-default deployment's slowlog warning would name no
         // command and no key at all. `key` goes through `key_field` -- the same lossy-UTF-8
         // rendering the `cmd` span already uses -- never `?` on the raw `Bytes`, which renders
-        // byte-by-byte.
+        // byte-by-byte. It renders `log_key`, not the stored `key`: see this fn's doc comment.
         tracing::warn!(
             cmd = %command,
-            key = %crate::dispatcher::key_field(key.as_ref()),
+            key = %crate::dispatcher::key_field(log_key),
             elapsed_us = duration_micros,
             "slow command recorded"
         );
@@ -177,7 +186,7 @@ mod tests {
     #[test]
     fn a_command_under_the_threshold_is_not_recorded() {
         let log = SlowLog::with_threshold(Duration::from_millis(10));
-        log.maybe_record("GET", key(b"k"), 1, Duration::from_micros(50));
+        log.maybe_record("GET", key(b"k"), 1, Duration::from_micros(50), None);
         assert!(log.is_empty());
         assert_eq!(log.len(), 0);
     }
@@ -185,7 +194,7 @@ mod tests {
     #[test]
     fn a_command_at_or_over_the_threshold_is_recorded_with_its_details() {
         let log = SlowLog::with_threshold(Duration::from_millis(10));
-        log.maybe_record("LRANGE", key(b"mylist"), 3, Duration::from_millis(25));
+        log.maybe_record("LRANGE", key(b"mylist"), 3, Duration::from_millis(25), None);
         let entries = log.get(10);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].id, 0);
@@ -199,7 +208,7 @@ mod tests {
     #[test]
     fn a_zero_threshold_disables_recording_entirely() {
         let log = SlowLog::with_threshold(Duration::ZERO);
-        log.maybe_record("GET", key(b"k"), 1, Duration::from_secs(5));
+        log.maybe_record("GET", key(b"k"), 1, Duration::from_secs(5), None);
         assert!(log.is_empty());
     }
 
@@ -207,7 +216,7 @@ mod tests {
     fn get_returns_the_newest_entries_first_and_respects_count() {
         let log = SlowLog::with_threshold(Duration::from_micros(1));
         for i in 0..5u32 {
-            log.maybe_record("SET", None, i as usize, Duration::from_millis(1));
+            log.maybe_record("SET", None, i as usize, Duration::from_millis(1), None);
         }
         let all = log.get(100);
         assert_eq!(all.len(), 5);
@@ -223,7 +232,7 @@ mod tests {
     fn the_buffer_is_bounded_and_drops_the_oldest_entries() {
         let log = SlowLog::with_threshold(Duration::from_micros(1));
         for _ in 0..(SLOWLOG_CAPACITY + 10) {
-            log.maybe_record("SET", None, 2, Duration::from_millis(1));
+            log.maybe_record("SET", None, 2, Duration::from_millis(1), None);
         }
         assert_eq!(log.len(), SLOWLOG_CAPACITY);
         let entries = log.get(SLOWLOG_CAPACITY);
@@ -234,10 +243,10 @@ mod tests {
     #[test]
     fn reset_clears_the_entries_but_ids_keep_counting_up() {
         let log = SlowLog::with_threshold(Duration::from_micros(1));
-        log.maybe_record("SET", None, 2, Duration::from_millis(1));
+        log.maybe_record("SET", None, 2, Duration::from_millis(1), None);
         log.reset();
         assert!(log.is_empty());
-        log.maybe_record("SET", None, 2, Duration::from_millis(1));
+        log.maybe_record("SET", None, 2, Duration::from_millis(1), None);
         // ids are monotonic across a reset, matching real Redis -- an operator correlating a
         // logged id with a later GET must not find it reused.
         assert_eq!(log.get(1)[0].id, 1);
@@ -256,7 +265,7 @@ mod tests {
                 let log = std::sync::Arc::clone(&log);
                 std::thread::spawn(move || {
                     for _ in 0..10 {
-                        log.maybe_record("SET", None, 1, Duration::from_millis(1));
+                        log.maybe_record("SET", None, 1, Duration::from_millis(1), None);
                     }
                 })
             })
@@ -281,9 +290,9 @@ mod tests {
     #[test]
     fn the_default_threshold_is_ten_milliseconds() {
         let log = SlowLog::default();
-        log.maybe_record("GET", None, 1, Duration::from_millis(9));
+        log.maybe_record("GET", None, 1, Duration::from_millis(9), None);
         assert!(log.is_empty());
-        log.maybe_record("GET", None, 1, Duration::from_millis(10));
+        log.maybe_record("GET", None, 1, Duration::from_millis(10), None);
         assert_eq!(log.len(), 1);
     }
 
