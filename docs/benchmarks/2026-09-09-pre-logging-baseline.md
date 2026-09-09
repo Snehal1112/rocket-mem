@@ -650,3 +650,276 @@ preserved outside the repo at
 (first, discarded triplet) and
 `/tmp/claude-1000/-home-numericlabs-data-rocket-rocket-mem/850c0577-d0e8-4d03-9147-6aec1a827079/scratchpad/rocket-mem-plan08-set2.txt`
 (second, reported triplet).
+
+## Plan 12 (engine shard-routing and byte-delta traces) — post-instrumentation measurement
+
+**Commit measured:** `f0d5337` (working tree tip), which contains plan 12's two engine
+commits — `8d12b52` (`feat(engine): trace shard routing at the Engine facade`) and `196a587`
+(`feat(engine): trace mutation byte delta in with_mut_delta`) — plus one unrelated follow-on
+fix, `f0d5337` itself (`fix(acl): redact password_hash from AclUser's Debug output`), which
+touches ACL debug formatting only and has no bearing on the engine hot path measured here.
+
+**Log level:** default `info` (no `RUST_LOG` set) — both new `trace!` call sites
+(`Engine::shard_index`, `Engine::with_mut_delta`) are disabled at this level.
+
+### The gate has changed since plan 12's task-3 brief was written
+
+An investigation during plan 08 established that `scripts/benchmark.sh` on this machine has
+roughly 6-9% run-to-run spread on the two gated rows even with zero code change between runs
+(see plan 08's section above: two triplets on the same commit differed by up to 5.91
+percentage points). A straight 2% gate is therefore about 4x finer than this instrument can
+resolve, and treating it as a strict 2% pass/fail produces false verdicts in both directions.
+Per updated instructions, this measurement uses a two-part gate instead of the plan's original
+single 2%-delta table:
+
+- **(a) Mechanistic** — read the code and macro expansion to establish the new events cost
+  nothing at `info`. This is the actual gate; it decides PASS/FAIL.
+- **(b) Empirical** — still run the harness three times and report honestly, but treat it only
+  as a >10% gross-regression tripwire, not a 2% gate. A result 2-10% below baseline is within
+  this harness's demonstrated noise band and is reported as such, not as a failure.
+
+### (a) Mechanistic verdict: PASS
+
+Both new call sites are `trace!`, not `info!`/`debug!`:
+
+```rust
+// crates/engine/src/engine.rs
+pub fn shard_index(&self, key: &[u8]) -> usize {
+    let shard = self.store.shard_index(key);
+    tracing::trace!(key = %String::from_utf8_lossy(key), shard, "shard routing");
+    shard
+}
+```
+
+```rust
+pub fn with_mut_delta<F, R>(&self, key: &[u8], f: F) -> R
+where
+    F: FnOnce(Option<&mut Value>) -> (R, isize),
+{
+    let mut observed_delta: isize = 0;
+    let result = self.store.with_mut_delta(key, |v| {
+        let (r, delta) = f(v);
+        observed_delta = delta;
+        (r, delta)
+    });
+    tracing::trace!(
+        key = %String::from_utf8_lossy(key),
+        bytes = observed_delta,
+        "mutation byte delta"
+    );
+    self.maybe_evict();
+    result
+}
+```
+
+Tracing the mechanism through the vendored `tracing 0.1.44` and `tracing-core 0.1.36` sources
+(`~/.cargo/registry/src/.../tracing-0.1.44/src/macros.rs`,
+`~/.cargo/registry/src/.../tracing-core-0.1.36/src/metadata.rs`):
+
+1. **`trace!` expands through `event!`, and the enabled check is one relaxed atomic load.**
+   `event!`'s expansion is:
+   ```rust
+   let enabled = $crate::level_enabled!($lvl) && { /* callsite interest check */ };
+   ```
+   and `level_enabled!` is:
+   ```rust
+   macro_rules! level_enabled {
+       ($lvl:expr) => {
+           $lvl <= $crate::level_filters::STATIC_MAX_LEVEL
+               && $lvl <= $crate::level_filters::LevelFilter::current()
+       };
+   }
+   ```
+   `STATIC_MAX_LEVEL` is a compile-time constant (no `max_level_*` feature is set anywhere in
+   this workspace's `Cargo.toml`s, confirmed by `grep -n max_level Cargo.toml crates/*/Cargo.toml`
+   returning nothing, so it defaults to `TRACE` — all levels compiled in, filtered only at
+   runtime). `LevelFilter::current()` is:
+   ```rust
+   pub fn current() -> Self {
+       match MAX_LEVEL.load(Ordering::Relaxed) { ... }
+   }
+   ```
+   — a single relaxed atomic load. At the default `info` level this comparison
+   (`Level::TRACE <= LevelFilter::INFO`) is false, so `enabled` short-circuits to `false`
+   without ever reaching the callsite-interest block. The callsite's `Interest` is cached by
+   `tracing-core` the first time it's queried, but at `info` level that branch of the `&&` is
+   never even evaluated because the left side already failed.
+
+2. **Field expressions — `String::from_utf8_lossy(key)` — are never evaluated on the disabled
+   path.** When `enabled` is `false`, `event!`'s `else` branch runs:
+   ```rust
+   } else {
+       $crate::__tracing_log!($lvl, __CALLSITE, &$crate::valueset_all!(...))
+   }
+   ```
+   `Cargo.lock` confirms the `tracing` crate's own `log` feature is off in this build: its
+   `[[package]] name = "tracing"` dependency list (`pin-project-lite`, `tracing-attributes`,
+   `tracing-core`) has no `log` entry. (`tracing-log` is a separate package pulled in only by
+   `tracing-subscriber`, for the opposite direction — forwarding `log` records into `tracing` —
+   not for making `trace!` fall back to `log::log!`.) With the `log` feature off,
+   `__tracing_log!` is defined as:
+   ```rust
+   #[cfg(not(feature = "log"))]
+   macro_rules! __tracing_log {
+       ($level:expr, $callsite:expr, $value_set:expr) => {};
+   }
+   ```
+   Its expansion body is a literal empty block that never mentions `$value_set`. Because
+   declarative macro arguments that don't appear in the macro's output are never expanded or
+   evaluated (this is standard `macro_rules!` behavior — an uninvoked nested macro call is
+   simply dropped from the AST, not silently run), the `&$crate::valueset_all!(...)` argument —
+   and with it every field expression inside it, including both `String::from_utf8_lossy(key)`
+   calls and the `bytes = observed_delta` field — is never expanded into code at this callsite.
+   The disabled path compiles to `{}`.
+
+3. **No allocation, no lock, and no dispatcher call occurs on the default path.** The only work
+   done when `trace!` is disabled is: the `&&` short-circuit in point 1 (one relaxed atomic
+   load plus one integer comparison) and nothing else — `Event::child_of`/`Event::dispatch`
+   (which would touch the global dispatcher) are only reached inside the `if enabled` branch,
+   which is not taken. `observed_delta` and `String::from_utf8_lossy` are the only
+   candidate allocations/work in this code, and per point 2 neither the `from_utf8_lossy` call
+   nor any `ValueSet` construction happens when disabled.
+
+4. **`Store::shard_index` and `shard.rs` are genuinely untouched.**
+   ```
+   $ git diff --stat c03bb8a..HEAD -- crates/engine/src/store.rs crates/engine/src/shard.rs
+   (no output)
+   $ git diff --stat c03bb8a..HEAD -- crates/engine/
+    crates/engine/src/engine.rs | 84 +++++++++++++++++++++++++++++++++++++++++++--
+    1 file changed, 81 insertions(+), 3 deletions(-)
+   ```
+   Only `engine.rs` changed; the hot inner `#[inline]` `Store::shard_index` and all of
+   `shard.rs` are byte-for-byte identical to the pre-plan-12 commit `c03bb8a`.
+
+**Verdict: PASS.** Both new events are `trace!`, gated by a single relaxed atomic load that
+resolves to "disabled" at `info` before any callsite-interest check runs, and their field
+expressions (including the `String::from_utf8_lossy(key)` calls) are never expanded into
+executable code on the disabled path because `tracing`'s `log` feature is off in this build.
+No allocation, lock, or dispatcher call is reachable when disabled. The genuinely hot,
+per-key-operation `Store::shard_index` remains completely uninstrumented.
+
+### (b) Empirical: >10% tripwire, not a 2% gate
+
+The figures below are context, per the updated gate. Because this harness has a demonstrated
+~6-9% run-to-run spread on these exact two rows (see plan 08's section above), any single-digit
+delta versus baseline — in either direction — is noise, not signal. Only a delta beyond the
+10% tripwire would indicate a gross regression the harness's own noise floor cannot explain
+away.
+
+**Machine-quiet checks.** `uptime`/`ps aux --sort=-%cpu` were checked immediately before and
+after the three runs. Before: `load average: 1.66, 2.46, 4.70` (16-core box), top consumers a
+steady desktop background load (`herdr`, `ghostty`, other `claude` sessions, `rust-analyzer`,
+`gnome-shell`, browser) — nothing CPU-heavy or benchmark-related. After: `load average: 1.63,
+2.34, 4.55`, same steady-state processes, no `cargo build`/`cargo test`/other foreign
+CPU-heavy process observed. No contention found; the triplet below was taken as a single clean
+back-to-back run.
+
+### Gated rows (the only two worth comparing)
+
+| Workload | Run 1 | Run 2 | Run 3 | Mean | Baseline Mean | Delta vs baseline | Spread (this run) |
+|---|---|---|---|---|---|---|---|
+| SET, 3B, no pipeline | 94,966.77 | 93,370.68 | 93,808.63 | 94,048.69 | 89,484.60 | +5.10% | 1.70% |
+| GET, 3B, no pipeline | 101,010.10 | 99,108.03 | 101,419.88 | 100,512.67 | 100,235.04 | +0.28% | 2.30% |
+
+Both rows measured at or above baseline (SET +5.10%, GET +0.28%), and both run-to-run spreads
+(1.70%, 2.30%) are tight — comfortably inside the tightness this baseline's own jitter table
+established for these two rows, and nowhere near the 10% tripwire. **The >10% tripwire did not
+trip; there is no evidence of even a small regression, let alone a gross one.**
+
+### Context-only rows (pipelined and 1KB-payload — not gated)
+
+The other six rows swing 8.8-22.2% natively per the original baseline's jitter table; record
+only, no conclusions drawn.
+
+| Workload | Run 1 | Run 2 | Run 3 | Mean (this run) | Baseline Mean |
+|---|---|---|---|---|---|
+| SET, 3B, pipeline=16 | 740,740.69 | 729,927.06 | 729,927.06 | 733,531.60 | 700,242.04 |
+| GET, 3B, pipeline=16 | 1,190,476.25 | 1,086,956.50 | 1,190,476.25 | 1,155,969.67 | 1,135,299.50 |
+| SET, 1KB, no pipeline | 87,642.41 | 87,183.96 | 87,183.96 | 87,336.78 | 81,774.68 |
+| GET, 1KB, no pipeline | 97,181.73 | 98,911.96 | 98,039.22 | 98,044.30 | 89,748.65 |
+| SET, 1KB, pipeline=16 | 510,204.09 | 446,428.56 | 625,000.00 | 527,210.88 | 530,293.04 |
+| GET, 1KB, pipeline=16 | 746,268.62 | 714,285.69 | 699,300.69 | 719,951.67 | 683,440.31 |
+
+### Global constraints checked (no Rust source changed by this task)
+
+- `cargo fmt --all -- --check` — clean.
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean, no warnings.
+- `cargo test --workspace` — 908 passed, 0 failed (no flakes, no rerun needed).
+- `git status --porcelain` — clean; `Cargo.lock` untouched by the release build.
+
+### Verdicts
+
+**MECHANISTIC: PASS** — the new `trace!` events at `Engine::shard_index` and
+`Engine::with_mut_delta` compile to a single disabled relaxed-atomic-load check at `info`, with
+their field expressions (including `String::from_utf8_lossy(key)`) never expanded into code on
+that path, and the genuinely hot `Store::shard_index`/`shard.rs` remain uninstrumented.
+
+**EMPIRICAL: >10% tripwire not tripped** — SET, 3B, no pipeline measured +5.10% vs baseline;
+GET, 3B, no pipeline measured +0.28% vs baseline. Both are at-or-above baseline, well inside
+this harness's demonstrated ~6-9% run-to-run noise band, and nowhere near the 10%
+gross-regression tripwire. Plan 12's benchmark gate is satisfied; plan 13 may proceed.
+
+### Raw output
+
+Full output of all three runs preserved outside the repo at
+`/tmp/claude-1000/-home-numericlabs-data-rocket-rocket-mem/850c0577-d0e8-4d03-9147-6aec1a827079/scratchpad/rocket-mem-plan12.txt`.
+Final per-case summary lines (progress-line noise stripped):
+
+```
+=== run 1 ===
+date:          2026-09-09T11:01:40Z
+
+--- rocket-mem (payload=3B, pipeline=1) ---
+ SET: 94966.77 requests per second, p50=0.263 msec
+ GET: 101010.10 requests per second, p50=0.247 msec
+
+--- rocket-mem (payload=3B, pipeline=16) ---
+ SET: 740740.69 requests per second, p50=0.951 msec
+ GET: 1190476.25 requests per second, p50=0.351 msec
+
+--- rocket-mem (payload=1024B, pipeline=1) ---
+ SET: 87642.41 requests per second, p50=0.287 msec
+ GET: 97181.73 requests per second, p50=0.255 msec
+
+--- rocket-mem (payload=1024B, pipeline=16) ---
+ SET: 510204.09 requests per second, p50=0.751 msec
+ GET: 746268.62 requests per second, p50=0.511 msec
+
+=== run 2 ===
+date:          2026-09-09T11:01:51Z
+
+--- rocket-mem (payload=3B, pipeline=1) ---
+ SET: 93370.68 requests per second, p50=0.271 msec
+ GET: 99108.03 requests per second, p50=0.255 msec
+
+--- rocket-mem (payload=3B, pipeline=16) ---
+ SET: 729927.06 requests per second, p50=0.983 msec
+ GET: 1086956.50 requests per second, p50=0.383 msec
+
+--- rocket-mem (payload=1024B, pipeline=1) ---
+ SET: 87183.96 requests per second, p50=0.287 msec
+ GET: 98911.96 requests per second, p50=0.255 msec
+
+--- rocket-mem (payload=1024B, pipeline=16) ---
+ SET: 446428.56 requests per second, p50=0.935 msec
+ GET: 714285.69 requests per second, p50=0.551 msec
+
+=== run 3 ===
+date:          2026-09-09T11:02:01Z
+
+--- rocket-mem (payload=3B, pipeline=1) ---
+ SET: 93808.63 requests per second, p50=0.271 msec
+ GET: 101419.88 requests per second, p50=0.247 msec
+
+--- rocket-mem (payload=3B, pipeline=16) ---
+ SET: 729927.06 requests per second, p50=0.975 msec
+ GET: 1190476.25 requests per second, p50=0.343 msec
+
+--- rocket-mem (payload=1024B, pipeline=1) ---
+ SET: 87183.96 requests per second, p50=0.287 msec
+ GET: 98039.22 requests per second, p50=0.255 msec
+
+--- rocket-mem (payload=1024B, pipeline=16) ---
+ SET: 625000.00 requests per second, p50=0.711 msec
+ GET: 699300.69 requests per second, p50=0.543 msec
+```
