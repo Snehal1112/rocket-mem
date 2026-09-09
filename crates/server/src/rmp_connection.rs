@@ -96,6 +96,43 @@ pub async fn serve_tls(
     }
 }
 
+/// Tracks one RMP connection's lifetime state for the connection-closed log event: how long it
+/// was open and how many requests it read off the socket. Emits that event from `Drop`, mirroring
+/// `connection.rs`'s `ConnectionStats` for the RESP path.
+///
+/// Counted at read time, before a request's per-request task is spawned -- not on completion.
+/// Counting on completion would need a counter shared with every spawned task, which without an
+/// atomic (this series' hot-path constraint rules that out) would need a lock on every single
+/// request; counting at read time needs neither, since only this connection's sequential read
+/// loop ever touches the counter.
+struct ConnectionStats {
+    started_at: std::time::Instant,
+    commands_served: u64,
+}
+
+impl ConnectionStats {
+    fn new() -> Self {
+        Self {
+            started_at: std::time::Instant::now(),
+            commands_served: 0,
+        }
+    }
+
+    fn record_command(&mut self) {
+        self.commands_served += 1;
+    }
+}
+
+impl Drop for ConnectionStats {
+    fn drop(&mut self) {
+        tracing::info!(
+            elapsed_us = self.started_at.elapsed().as_micros().min(u64::MAX as u128) as u64,
+            commands_served = self.commands_served,
+            "connection closed"
+        );
+    }
+}
+
 #[tracing::instrument(skip_all, fields(conn_id = client_id, %peer, protocol = "rmp", %tls))]
 async fn handle_connection<S>(
     socket: S,
@@ -111,6 +148,7 @@ async fn handle_connection<S>(
     tracing::info!("connection accepted");
     replication.connection_opened();
     let _client_guard = ClientGuard(Arc::clone(&replication));
+    let mut conn_stats = ConnectionStats::new();
     let framed = Framed::new(socket, RmpCodec);
     let (mut sink, mut stream) = framed.split();
     // ONE Session for this connection's whole lifetime, shared by every request spawned below --
@@ -144,6 +182,7 @@ async fn handle_connection<S>(
                 break;
             }
         };
+        conn_stats.record_command();
         // Blocks once MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION tasks are already mid-dispatch --
         // that's the backpressure: the read loop stops pulling more requests off the socket
         // until one finishes and its permit is released.
@@ -194,6 +233,15 @@ mod tests {
         let path = dir.path().join("test.aof");
         let writer = AofWriter::open(&path, crate::aof::FsyncPolicy::Never).unwrap();
         (dir, Arc::new(writer))
+    }
+
+    #[test]
+    fn connection_stats_counts_each_recorded_command() {
+        let mut stats = ConnectionStats::new();
+        stats.record_command();
+        stats.record_command();
+        stats.record_command();
+        assert_eq!(stats.commands_served, 3);
     }
 
     async fn spawn_test_server() -> (tempfile::TempDir, std::net::SocketAddr, Arc<Engine>) {
