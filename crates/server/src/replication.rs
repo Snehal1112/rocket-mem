@@ -1746,77 +1746,17 @@ mod tests {
         assert!(text.contains("snapshot loaded"), "{text}");
     }
 
-    #[tokio::test]
-    async fn sync_once_logs_stream_offset_and_the_applied_command_name() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let fake_leader = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut psync_bytes = [0u8; 15];
-            socket.read_exact(&mut psync_bytes).await.unwrap();
-
-            let snapshot_engine = engine::Engine::new();
-            let blob = snapshot_engine.snapshot(0);
-            socket
-                .write_all(&(blob.len() as u64).to_le_bytes())
-                .await
-                .unwrap();
-            socket.write_all(&blob).await.unwrap();
-
-            socket
-                .write_all(b"*3\r\n$3\r\nSET\r\n$11\r\nfrom-stream\r\n$1\r\nv\r\n")
-                .await
-                .unwrap();
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        });
-
-        let captured = CapturedLogs::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(captured.clone())
-            .with_max_level(tracing::Level::TRACE)
-            .with_ansi(false)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
-
-        let engine = std::sync::Arc::new(engine::Engine::new());
-        let host_port = addr.to_string();
-        let generation = Arc::new(AtomicU64::new(0));
-        let sync_task = {
-            let engine = std::sync::Arc::clone(&engine);
-            tokio::spawn(async move {
-                let stream = tokio::net::TcpStream::connect(&host_port).await.unwrap();
-                sync_once(
-                    stream,
-                    &engine,
-                    &generation,
-                    0,
-                    None,
-                    FollowerStatus {
-                        last_apply: &AtomicI64::new(0),
-                        link_up: &AtomicBool::new(false),
-                    },
-                    &FollowerIdentity::default(),
-                )
-                .await
-            })
-        };
-
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        sync_task.abort();
-        fake_leader.abort();
-        drop(_guard);
-
-        let text = captured.text();
-        assert!(
-            text.contains("replication stream advanced") && text.contains("offset"),
-            "expected an offset-progress trace line:\n{text}"
-        );
-        assert!(
-            text.contains("applied replicated command") && text.contains("SET"),
-            "expected a per-command apply debug line naming SET:\n{text}"
-        );
-    }
+    // `sync_once_logs_stream_offset_and_the_applied_command_name` used to live here, asserting
+    // on captured `TRACE`/`DEBUG` output from this same call. It flaked: `tracing` caches
+    // callsite `Interest` per callsite, process-globally, the first time a callsite is reached
+    // -- and this unit-test binary runs ~575 tests whose subscribers install and drop
+    // constantly, so whichever test hits `sync_once`'s trace/debug lines first (often with no
+    // subscriber, or one that doesn't want that level) can poison the callsite for the rest of
+    // the process, including this test's own later `TRACE` subscriber. It had no assertions
+    // beyond the captured text -- `sync_once_loads_the_snapshot_then_applies_streamed_frames`
+    // above already covers the behavioural side (snapshot load, frame application) -- so it was
+    // moved wholesale to `crates/server/tests/logging.rs`, a separate integration-test binary
+    // with far fewer tests/callsites where capture assertions have never flaked, driving the
+    // same scenario through the public `ReplicationHandle::start_replicating` instead of the
+    // crate-private `sync_once` directly. Do not re-add a capture assertion here.
 }

@@ -9,9 +9,13 @@
 //! See ../../../docs/superpowers/specs/2026-09-09-verbose-logging-design.md.
 
 use bytes::Bytes;
+use futures_util::{SinkExt, StreamExt};
 use protocol::Frame;
 use std::io;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::net::{TcpListener, TcpStream};
+use tokio_util::codec::Framed;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::EnvFilter;
 
@@ -247,5 +251,171 @@ fn the_span_carries_the_command_name_and_arity() {
     assert!(
         output.contains("argc=2"),
         "the cmd span lost its arity; output was:\n{output}"
+    );
+}
+
+// The two tests below were moved here from `crates/server/src/{replication,connection}.rs`,
+// where they flaked under parallel `cargo test --workspace` (roughly one run in ten). Root
+// cause: `tracing` caches callsite `Interest` per callsite, process-globally, the first time
+// that callsite is reached. Whichever test in a binary happens to touch a given `trace!`/
+// `debug!`/`info!` call site first -- often with no subscriber installed at all, or one that
+// doesn't want that level -- permanently decides whether that callsite is live for every other
+// test in the *same process*, including one installing a subscriber that very much wants it.
+// The unit-test binary those two tests used to live in runs ~575 tests whose subscribers
+// install and drop constantly, so the odds of an unrelated test poisoning the callsite first
+// were high enough to flake regularly. This file compiles to its own, separate binary with far
+// fewer tests and callsites; every capture test in it has run green across the life of this
+// project. Both scenarios below are driven through `rocket_mem`'s public API (`ReplicationHandle`
+// and `serve`) rather than the crate-private functions the original tests called directly, and
+// neither dropped any behavioural coverage: both originals asserted on captured log text only,
+// and the equivalent behavioural checks already exist elsewhere (see each test's comment).
+
+/// Moved from `crates/server/src/replication.rs`'s
+/// `sync_once_logs_stream_offset_and_the_applied_command_name`. That test asserted only on
+/// captured log text -- no engine-state assertions -- so nothing behavioural was left behind;
+/// `sync_once_loads_the_snapshot_then_applies_streamed_frames` (still in `replication.rs`)
+/// covers the snapshot-load/frame-apply behaviour. Drives `sync_once` indirectly through the
+/// public `ReplicationHandle::start_replicating`, since `sync_once` itself is crate-private.
+#[tokio::test]
+async fn sync_once_logs_stream_offset_and_the_applied_command_name() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let fake_leader = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut psync_bytes = [0u8; 15];
+        socket.read_exact(&mut psync_bytes).await.unwrap();
+
+        let snapshot_engine = engine::Engine::new();
+        let blob = snapshot_engine.snapshot(0);
+        socket
+            .write_all(&(blob.len() as u64).to_le_bytes())
+            .await
+            .unwrap();
+        socket.write_all(&blob).await.unwrap();
+
+        socket
+            .write_all(b"*3\r\n$3\r\nSET\r\n$11\r\nfrom-stream\r\n$1\r\nv\r\n")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    });
+
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(BufferWriter(Arc::clone(&buffer)))
+        .with_env_filter(EnvFilter::new("trace"))
+        .finish();
+
+    let engine = Arc::new(engine::Engine::new());
+    let dir = tempfile::tempdir().expect("tempdir");
+    let replication = Arc::new(rocket_mem::replication::ReplicationHandle::new(
+        Arc::clone(&engine),
+        dir.path().join("sync-once-logging-test.snapshot"),
+    ));
+
+    let _guard = tracing::subscriber::set_default(subscriber);
+    replication.start_replicating(addr.to_string());
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    replication.stop_replicating();
+    drop(_guard);
+    fake_leader.abort();
+
+    let bytes_out = buffer.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let text = String::from_utf8(bytes_out).expect("subscriber output is utf-8");
+    assert!(
+        text.contains("replication stream advanced") && text.contains("offset"),
+        "expected an offset-progress trace line:\n{text}"
+    );
+    assert!(
+        text.contains("applied replicated command") && text.contains("SET"),
+        "expected a per-command apply debug line naming SET:\n{text}"
+    );
+}
+
+/// Moved from `crates/server/src/connection.rs`'s
+/// `a_replica_registering_and_being_pruned_are_both_logged_at_info`. That test asserted only on
+/// captured log text -- no behavioural assertions -- so nothing behavioural was left behind;
+/// `psync_with_an_advertised_address_registers_it_on_the_leader` and
+/// `a_registered_replica_is_pruned_after_its_connection_drops` (still in `connection.rs`) cover
+/// the registration and pruning behaviour respectively.
+#[tokio::test]
+async fn a_replica_registering_and_being_pruned_are_both_logged_at_info() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let engine = Arc::new(engine::Engine::new());
+    let dir = tempfile::tempdir().expect("tempdir");
+    let aof = Arc::new(
+        rocket_mem::aof::AofWriter::open(
+            &dir.path().join("replica-register-prune.aof"),
+            rocket_mem::aof::FsyncPolicy::Never,
+        )
+        .expect("open aof"),
+    );
+    let replication = Arc::new(rocket_mem::replication::ReplicationHandle::new(
+        Arc::clone(&engine),
+        dir.path().join("replica-register-prune.snapshot"),
+    ));
+    tokio::spawn(rocket_mem::serve(
+        listener,
+        Arc::clone(&engine),
+        Arc::clone(&aof),
+        Arc::clone(&replication),
+    ));
+
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(BufferWriter(Arc::clone(&buffer)))
+        .with_env_filter(EnvFilter::new("info"))
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let mut framed = Framed::new(
+        TcpStream::connect(addr).await.unwrap(),
+        protocol::codec::RespCodec::default(),
+    );
+    framed
+        .send(Frame::Array(vec![
+            Frame::Bulk(Bytes::from_static(b"PSYNC")),
+            Frame::Bulk(Bytes::from_static(b"127.0.0.1:6480")),
+        ]))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await; // let serve_replica register
+    drop(framed); // disconnect the replica
+
+    // Two broadcasts: the first send after a drop can still succeed on some platforms before the
+    // OS notices the close, so pruning is only guaranteed observable after a second attempt.
+    let mut client = Framed::new(
+        TcpStream::connect(addr).await.unwrap(),
+        protocol::codec::RespCodec::default(),
+    );
+    for _ in 0..2 {
+        client
+            .send(Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"SET")),
+                Frame::Bulk(Bytes::from_static(b"k")),
+                Frame::Bulk(Bytes::from_static(b"v")),
+            ]))
+            .await
+            .unwrap();
+        client.next().await.unwrap().unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    drop(_guard);
+    let bytes_out = buffer.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let text = String::from_utf8(bytes_out).expect("subscriber output is utf-8");
+    assert!(
+        text.contains("replica registered") && text.contains("127.0.0.1:6480"),
+        "expected a registration log naming the advertised address:\n{text}"
+    );
+    assert!(
+        text.contains("replica pruned") && text.contains("127.0.0.1:6480"),
+        "expected a prune log naming the same address:\n{text}"
     );
 }

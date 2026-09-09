@@ -943,74 +943,18 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn a_replica_registering_and_being_pruned_are_both_logged_at_info() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let engine = Arc::new(Engine::new());
-        let (_dir, aof) = test_aof();
-        let replication = Arc::new(crate::replication::ReplicationHandle::new(
-            Arc::clone(&engine),
-            std::env::temp_dir().join("repl-register-prune-test.snapshot"),
-        ));
-        tokio::spawn(serve(
-            listener,
-            Arc::clone(&engine),
-            Arc::clone(&aof),
-            Arc::clone(&replication),
-        ));
-
-        let captured = CapturedLogs::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(captured.clone())
-            .with_max_level(tracing::Level::INFO)
-            .with_ansi(false)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
-
-        let framed = Framed::new(
-            TcpStream::connect(addr).await.unwrap(),
-            RespCodec::default(),
-        );
-        let mut framed = framed;
-        framed
-            .send(Frame::Array(vec![
-                Frame::Bulk(Bytes::from_static(b"PSYNC")),
-                Frame::Bulk(Bytes::from_static(b"127.0.0.1:6480")),
-            ]))
-            .await
-            .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await; // let serve_replica register
-        drop(framed); // disconnect the replica
-
-        // two broadcasts, matching the existing pruning test's own reasoning: the first send
-        // after a drop can still succeed on some platforms before the OS notices the close.
-        let mut client = Framed::new(
-            TcpStream::connect(addr).await.unwrap(),
-            RespCodec::default(),
-        );
-        for _ in 0..2 {
-            client
-                .send(Frame::Array(vec![
-                    Frame::Bulk(Bytes::from_static(b"SET")),
-                    Frame::Bulk(Bytes::from_static(b"k")),
-                    Frame::Bulk(Bytes::from_static(b"v")),
-                ]))
-                .await
-                .unwrap();
-            client.next().await.unwrap().unwrap();
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        drop(_guard);
-        let text = captured.text();
-        assert!(
-            text.contains("replica registered") && text.contains("127.0.0.1:6480"),
-            "expected a registration log naming the advertised address:\n{text}"
-        );
-        assert!(
-            text.contains("replica pruned") && text.contains("127.0.0.1:6480"),
-            "expected a prune log naming the same address:\n{text}"
-        );
-    }
+    // `a_replica_registering_and_being_pruned_are_both_logged_at_info` used to live here,
+    // asserting on captured `INFO` output from a real PSYNC round-trip. It flaked: `tracing`
+    // caches callsite `Interest` per callsite, process-globally, the first time a callsite is
+    // reached -- and this unit-test binary runs ~575 tests whose subscribers install and drop
+    // constantly, so whichever test hit the register/prune callsites first (often with no
+    // subscriber at all) could poison them for the rest of the process, including this test's
+    // own later `INFO` subscriber. It had no assertions beyond the captured text --
+    // `psync_with_an_advertised_address_registers_it_on_the_leader` and
+    // `a_registered_replica_is_pruned_after_its_connection_drops` above already cover the
+    // behavioural side (registration observable via `replication.registry.addrs()`, and the
+    // server staying alive and answering after a prune) -- so it was moved wholesale to
+    // `crates/server/tests/logging.rs`, a separate integration-test binary with far fewer
+    // tests/callsites where capture assertions have never flaked, driving the same scenario
+    // through the public `rocket_mem::serve`. Do not re-add a capture assertion here.
 }
