@@ -149,6 +149,7 @@ pub(crate) fn upper_name(raw: &[u8]) -> Option<CommandName> {
 }
 
 fn engine_error_to_frame(e: common::EngineError) -> Frame {
+    tracing::debug!(error = ?e, "engine error");
     Frame::Error(e.to_string())
 }
 
@@ -3572,6 +3573,27 @@ mod tests {
         assert!(
             log.contains("NOPE"),
             "expected the command name in the event, got: {log}"
+        );
+    }
+
+    #[test]
+    fn engine_error_to_frame_logs_a_debug_event_naming_the_error_variant() {
+        let engine = Engine::new();
+        engine.set(Bytes::from_static(b"k"), Value::List(Default::default()));
+        let log = capture_logs_at(tracing::Level::DEBUG, || {
+            // GET against a List-typed key is the simplest reliable way to reach
+            // engine_error_to_frame with a real WrongType error.
+            let reply = dispatch(&engine, cmd(&[b"GET", b"k"]), &mut Protocol::default(), 1);
+            assert_eq!(
+                reply,
+                Frame::Error(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".into()
+                )
+            );
+        });
+        assert!(
+            log.contains("WrongType"),
+            "expected the error variant name, got: {log}"
         );
     }
 
