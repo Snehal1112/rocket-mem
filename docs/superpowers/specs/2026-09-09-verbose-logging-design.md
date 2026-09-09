@@ -153,8 +153,8 @@ The reasoning from the previous spec still holds: log statements added alongside
 
 Three things here *are* real logic and are tested:
 
-1. **`redact_args`** — unit tests asserting `AUTH`, `HELLO ... AUTH`, `ACL SETUSER`, and `ACL GETUSER` argument lists never render their secret, at any level.
-2. **`fmt_value`** — unit tests for the cap boundary, the `…(N more)` marker, and binary-safe escaping of non-printable bytes.
+1. **`redact_args`** — unit tests asserting `AUTH`, `HELLO ... AUTH`, `ACL SETUSER`, `ACL GETUSER`, and `REPLICAOF ... AUTH` argument lists never render their secret, at any level. This list must stay identical to `is_sensitive`'s match arms; when they drift, the arms are the authority and this line is the bug.
+2. **`fmt_value`** — unit tests for the cap boundary, the `…(N more)` marker, and binary-safe escaping of non-printable bytes — including Unicode `Zl`/`Zp` (U+2028/U+2029), which `char::is_control()` does *not* cover.
 3. **Level separation** — one integration test asserting that a subscriber at `info` emits no per-command lines while the same workload at `debug` does. This guards against a level regression silently enabling the firehose in production, which is the failure mode with the worst consequences here.
 
 Everything else is verified as the previous round was: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, then a live server run inspected by eye at each of `info`, `debug`, and `trace`.
