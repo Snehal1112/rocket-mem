@@ -23,9 +23,11 @@ replication, clustering, and access control apply identically whichever one a cl
 > different cores at the same instant. Real Redis is deliberately single-threaded for command
 > execution; rocket-mem chose sharded locks over that model instead.
 
-> **Project status.** rocket-mem is complete and tested — 829 tests, durability verified under a
+> **Project status.** rocket-mem is complete and tested — 945 tests, durability verified under a
 > `kill -9` chaos loop — but it is not yet production-hardened: there is no failover and no live
-> resharding. Read [Limitations](#limitations) before deploying it.
+> resharding. Read [Limitations](#limitations) before deploying it. Every subsystem — dispatch,
+> engine, protocol codecs, AOF, replication, cluster routing — emits leveled activity logs from
+> `info` milestones down to `trace`-level command and value contents; see [Logging](#logging).
 
 ## Quick start
 
@@ -293,6 +295,123 @@ manifest together with the files it names** — the bare paths are stale once a 
 `SAVE` writes to the current generation, not to them. The generation a rewrite supersedes is
 deleted on a best-effort basis; any older ones left behind by an interrupted cleanup are
 unreferenced and safe to delete.
+
+## Logging
+
+rocket-mem logs through [`tracing`](https://docs.rs/tracing), writing structured, leveled lines
+to **stderr**. There is no log file setting and no rotation — redirecting stderr is the
+operator's job.
+
+The rule that keeps levels predictable: **`info` is milestones, `debug` is what happened,
+`trace` is what the bytes were.**
+
+| Level | Meaning | What you get |
+|---|---|---|
+| `error` | Durability or correctness failure needing action | AOF append/fsync/encode failure, recovery abort, replication apply failure |
+| `warn` | Recovered, retried, or client-caused anomaly | TLS handshake failure, decode error, replication reconnect, discarded AOF tail, ACL denial, eviction, slow-log hits |
+| `info` | Lifecycle milestones — safe to leave on in production | Startup and resolved config, listener bound, connection accept/close, AOF rewrite, snapshot save/load, replica register/prune, auth success |
+| `debug` | Per-command activity and subsystem sub-steps | One line per dispatched command with `elapsed_us`, AOF fsync offsets, active-expire cycles, MOVED redirects, PSYNC handshake steps, per-command replication apply |
+| `trace` | The bytes | Command arguments and value contents (capped), shard routing, mutation byte deltas, codec frame decode and split-read reassembly, replication stream offsets, metrics scrapes |
+
+`info` is the default and stays quiet under load: nothing per-command is emitted at or above it.
+
+### Setting the level
+
+`RUST_LOG`, when set, **wins outright** — it is read directly and short-circuits everything
+else. With `RUST_LOG` unset, the level comes from the `log_level` field, which is layered like
+every other setting (built-in default `info` < TOML < `ROCKET_MEM_*` env < CLI flag, later
+winning):
+
+```bash
+RUST_LOG=debug ./target/release/rocket-mem          # beats every source below
+ROCKET_MEM_LOG_LEVEL=debug ./target/release/rocket-mem
+./target/release/rocket-mem --log-level debug       # beats the env var and the TOML file
+```
+
+```toml
+# rocket-mem.toml — the lowest-precedence source
+log_level = "debug"
+```
+
+All four sources take full [`EnvFilter`](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html)
+directive syntax, not just a bare level, so one subsystem can be turned up without paying for a
+firehose everywhere else:
+
+```bash
+# trace everything replication-related, info for the rest
+RUST_LOG=rocket_mem::replication=trace,info ./target/release/rocket-mem
+
+# debug the dispatcher and the storage engine, leave the protocol codecs at info
+RUST_LOG=rocket_mem::dispatcher=debug,engine=debug,info ./target/release/rocket-mem
+```
+
+The targets are module paths: `rocket_mem::*` for the server, `engine::*` for the storage
+engine, `protocol::*` for the RESP and RMP codecs. The startup line `resolved config summary`
+reports the directive actually in force as `log_filter=`, so a level that did not take effect
+is visible in the log itself rather than having to be inferred.
+
+### Spans: what correlates with what
+
+Three spans carry the correlation. Everything logged inside one inherits its fields, so a single
+`grep` on a `conn_id` follows one client from accept to close, and the `cmd` span stamps the
+command name, key, and arity onto every line the dispatcher and the engine emit while executing
+it. (The AOF writer runs on its own thread and replication applies on its own task, so their
+lines carry their subsystem's own fields rather than a `cmd`.)
+
+| Span | Level | Opened | Fields |
+|---|---|---|---|
+| `conn` | `info` | once per connection, in `connection.rs` and `rmp_connection.rs` | `conn_id`, `peer`, `protocol`, `tls` |
+| `cmd` | `debug` | once per dispatched command, in `dispatcher.rs`'s `dispatch_and_log` | `cmd`, `key`, `argc` |
+| `repl` | `info` | once per replication session, on both the leader and the follower side | `host_port` |
+
+`conn` and `repl` are `info` spans, so their fields decorate every line inside them even at the
+production default:
+
+```
+INFO conn{conn_id=1 peer=127.0.0.1:60768 protocol=RESP tls=false}: connection accepted
+```
+
+`cmd` is a `debug` span on purpose — at `info` it is never entered, and nothing per-command is
+rendered or even computed. That has one consequence worth knowing: an event that fires *above*
+`debug` from inside it — the slow-log `warn`, for instance — carries its own `cmd`/`key` fields
+rather than inheriting them, because at `info` there is no span context to inherit from.
+
+One fixed field vocabulary is used across every crate, so the same name means the same thing
+everywhere: `conn_id`, `peer`, `cmd`, `key`, `argc`, `user`, `error`, `elapsed_us`, `shard`,
+`offset`, `bytes`, `commands_served`, plus the subsystem-specific names catalogued in
+[the logging spec](docs/superpowers/specs/2026-09-09-verbose-logging-design.md#field-vocabulary).
+
+### `trace` writes your data to disk
+
+At `trace`, rocket-mem renders command arguments and value contents into the log, so **a
+trace-level log file is a plaintext copy of the dataset and every mutation applied to it**. Each
+value is truncated at `log_value_max_bytes` (default `128`, see [Configuration](#configuration))
+with a `…(N more)` marker so a truncated value is never mistaken for a short one, and control
+bytes are escaped so a stored newline or ANSI sequence cannot forge a log line. Give a trace log
+the same retention and access controls as the data itself.
+
+### What is redacted, and what is not
+
+Credentials never render. `AUTH`, `HELLO … AUTH …`, `ACL SETUSER`, `ACL GETUSER`, and
+`REPLICAOF <host> <port> AUTH <user> <pass>` have their whole argument list replaced with
+`<redacted>`; the bare forms that carry no secret (`HELLO 3`, `REPLICAOF NO ONE`, `ACL WHOAMI`)
+still log normally. This is enforced in one place, `crates/server/src/logging.rs`, and the
+`engine` and `protocol` crates log key names and byte lengths only — so there is exactly one
+crate to audit when asking whether a secret can reach a log. Two hand-written `Debug` impls
+(`acl::AclUser`, `config::AclUserConfig`) make that structural rather than a call-site
+convention: a stray `{:?}` cannot print a plaintext password or a raw `>password` rule token.
+
+Two residues are known and deliberate, and neither is guarded structurally:
+
+- **`Config` still derives `Debug`.** Rendering it whole would print the ACL **usernames** and
+  the TLS **cert/key/CA paths** — not key material, but more than the startup summary shows. The
+  summary enumerates its fields by hand for exactly this reason; that is a rule at the call site,
+  not something the type system enforces.
+- **`SLOWLOG GET` still returns a keyless command's first argument.** The log fields report
+  `ECHO`/`PING` as keyless, but `SlowLogEntry` keeps storing the first argument, so a client
+  permitted to run `SLOWLOG` can read a client-supplied payload back out — no filesystem access
+  needed. Fixing it changes a client-visible surface and is deferred to the ACL work; see the
+  spec's [known non-fix](docs/superpowers/specs/2026-09-09-verbose-logging-design.md).
 
 ## Deployment
 
