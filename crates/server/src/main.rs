@@ -272,16 +272,7 @@ async fn main() -> std::io::Result<()> {
     // task and never awaits the connection, so placement relative to the listeners below has no
     // functional effect -- and a leader that isn't up yet falls into the same 1-second-backoff
     // reconnect loop a later mid-stream disconnect would use, not a startup failure.
-    if let Some(target) = &config.replicaof {
-        let auth = match (
-            &config.replicaof_auth_username,
-            &config.replicaof_auth_password,
-        ) {
-            (Some(u), Some(p)) => Some((u.clone(), p.clone())),
-            _ => None,
-        };
-        replication.start_replicating_with_auth(target.clone(), auth);
-    }
+    replication.start_replicating_from_config(&config);
 
     let metrics_listener = tokio::net::TcpListener::bind(&config.metrics_addr).await?;
     listeners.push((

@@ -304,6 +304,23 @@ pub fn validate_replicaof(config: &Config) -> Result<(), std::io::Error> {
     Ok(())
 }
 
+/// Derives the AUTH tuple `start_replicating_with_auth` needs from a `Config`'s
+/// `replicaof_auth_username`/`replicaof_auth_password` fields -- `None` unless both are set.
+/// `validate_replicaof` guarantees these two fields are never partially set by the time startup
+/// reaches this, but this stays a plain match (not an `unwrap`) so it's correct regardless of
+/// call order. `ReplicationHandle::start_replicating_from_config` is the only production caller;
+/// pulled out as its own function so it -- and the `Config` -> auth-tuple mapping it does -- can
+/// be exercised directly from a test without hand-building `start_replicating_with_auth`'s args.
+pub fn replicaof_auth(config: &Config) -> Option<(String, String)> {
+    match (
+        &config.replicaof_auth_username,
+        &config.replicaof_auth_password,
+    ) {
+        (Some(u), Some(p)) => Some((u.clone(), p.clone())),
+        _ => None,
+    }
+}
+
 /// Resolves the log filter directive: `RUST_LOG`, when set, wins over `log_level` -- the
 /// standard `tracing` convention of letting an operator's env var override any code- or
 /// config-file-supplied default. Returns a plain `String` (not an `EnvFilter`) so this stays
@@ -663,6 +680,24 @@ mod tests {
             ..Config::default()
         };
         assert!(validate_replicaof(&cfg).is_ok());
+    }
+
+    #[test]
+    fn replicaof_auth_is_none_when_neither_field_is_set() {
+        assert_eq!(replicaof_auth(&Config::default()), None);
+    }
+
+    #[test]
+    fn replicaof_auth_pairs_username_and_password_when_both_are_set() {
+        let cfg = Config {
+            replicaof_auth_username: Some("app".to_string()),
+            replicaof_auth_password: Some("changeme".to_string()),
+            ..Config::default()
+        };
+        assert_eq!(
+            replicaof_auth(&cfg),
+            Some(("app".to_string(), "changeme".to_string()))
+        );
     }
 
     #[test]

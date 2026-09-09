@@ -354,6 +354,20 @@ impl ReplicationHandle {
         self.is_replica.store(true, Ordering::Relaxed);
     }
 
+    /// Config-driven equivalent of the "if `replicaof` is set, auto-connect" startup wiring
+    /// `main.rs` runs on every launch: derives the AUTH tuple via `config::replicaof_auth` and
+    /// calls `start_replicating_with_auth`, the same way `main.rs` does. A no-op when
+    /// `config.replicaof` is unset -- standalone startup takes no replication action at all.
+    /// `main.rs` calls this after `config::validate_replicaof`; tests drive it with a hand-built
+    /// `Config` instead of hand-building `start_replicating_with_auth`'s arguments directly, so
+    /// they exercise the actual `Config` -> connection mapping, not just the connection itself.
+    pub fn start_replicating_from_config(&self, config: &crate::config::Config) {
+        if let Some(target) = &config.replicaof {
+            let auth = crate::config::replicaof_auth(config);
+            self.start_replicating_with_auth(target.clone(), auth);
+        }
+    }
+
     /// Cancels the running replication task (if any) and returns this node to normal,
     /// writable operation. Also bumps the generation so a stale task's in-flight poll can no
     /// longer apply state even when nothing new replaces it.

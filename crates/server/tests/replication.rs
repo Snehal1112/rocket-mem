@@ -189,39 +189,25 @@ async fn a_node_configured_with_replicaof_auto_connects_on_startup() {
         )
         .unwrap();
 
-    // Build the follower's own Engine/AofWriter/ReplicationHandle by hand (not spawn_node,
-    // which has no replicaof knob) so this test controls the config the same way main.rs's
-    // startup wiring would, without needing a real TOML file or subprocess.
-    let f_dir = tempfile::tempdir().unwrap();
-    let f_engine = std::sync::Arc::new(engine::Engine::new());
-    let f_aof = std::sync::Arc::new(
-        rocket_mem::aof::AofWriter::open(
-            &f_dir.path().join("node.aof"),
-            rocket_mem::aof::FsyncPolicy::Never,
-        )
-        .unwrap(),
-    );
-    let f_replication = std::sync::Arc::new(rocket_mem::replication::ReplicationHandle::new(
-        std::sync::Arc::clone(&f_engine),
-        f_dir.path().join("node.snapshot"),
-    ));
-    let f_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let f_addr = f_listener.local_addr().unwrap().to_string();
-    tokio::spawn(rocket_mem::serve(
-        f_listener,
-        std::sync::Arc::clone(&f_engine),
-        std::sync::Arc::clone(&f_aof),
-        std::sync::Arc::clone(&f_replication),
-    ));
+    // spawn_node's node is otherwise indistinguishable from one main.rs would start -- there's
+    // no need to hand-build Engine/AofWriter/ReplicationHandle/listener here, because the
+    // config-driven auto-connect below is fire-and-forget and has no dependency on when (or
+    // whether) any listener has bound yet, exactly like main.rs's own startup wiring, which
+    // fires it before binding any of its own listeners.
+    let (_f_dir, f_engine, _f_aof, f_replication, f_addr) = spawn_node().await;
 
-    // This is the exact call main.rs's startup wiring makes when config.replicaof is set --
-    // the test proves the STARTUP PATH works, by driving it the same way main.rs does, rather
-    // than re-testing start_replicating_with_auth itself (already covered by the ACL-auth test
-    // above).
-    f_replication.start_replicating_with_auth(
-        leader_addr.clone(),
-        Some(("app".to_string(), "changeme".to_string())),
-    );
+    // A real `Config` carrying `replicaof`/auth fields, exactly as a TOML file or `--replicaof`
+    // CLI flag would produce -- then driven through `start_replicating_from_config`, the same
+    // shared helper main.rs's startup wiring calls. This is what actually proves the Config ->
+    // auth-tuple mapping and the auto-connect wiring itself, rather than re-testing
+    // `start_replicating_with_auth` directly (already covered by the ACL-auth test above).
+    let config = rocket_mem::config::Config {
+        replicaof: Some(leader_addr.clone()),
+        replicaof_auth_username: Some("app".to_string()),
+        replicaof_auth_password: Some("changeme".to_string()),
+        ..rocket_mem::config::Config::default()
+    };
+    f_replication.start_replicating_from_config(&config);
 
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
     while !f_replication.link_up() {
