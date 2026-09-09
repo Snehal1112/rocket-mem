@@ -336,6 +336,55 @@ async fn sync_once_logs_stream_offset_and_the_applied_command_name() {
     );
 }
 
+/// Cluster mode's startup event: `ClusterConfig::load` logs this node's own id, slot range, and
+/// the topology's node count once, on the success path, at `info`.
+///
+/// Lives here rather than as a `#[cfg(test)]` capture assertion inside `cluster.rs` itself, per
+/// this project's established rule (see the comment block above): `tracing` caches callsite
+/// `Interest` per callsite, process-globally, and the `rocket-mem` unit-test binary runs ~575
+/// tests whose subscribers install and drop constantly, so a capture assertion living there would
+/// flake under `cargo test --workspace`. `ClusterConfig::load` is `pub fn` on a `pub mod`, so it
+/// is reachable here through the same public-API route the two tests above already use.
+#[test]
+fn cluster_config_load_logs_the_topology_at_info() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("cluster.conf");
+    std::fs::write(
+        &path,
+        "shard-a 127.0.0.1:7001 0 5460\n\
+         shard-b 127.0.0.1:7002 5461 10922\n\
+         shard-c 127.0.0.1:7003 10923 16383\n",
+    )
+    .expect("write cluster config");
+
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(BufferWriter(Arc::clone(&buffer)))
+        .with_env_filter(EnvFilter::new("info"))
+        .finish();
+
+    let config = tracing::subscriber::with_default(subscriber, || {
+        rocket_mem::cluster::ClusterConfig::load(&path, "shard-b").expect("load cluster config")
+    });
+
+    let bytes_out = buffer.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let text = String::from_utf8(bytes_out).expect("subscriber output is utf-8");
+    assert!(
+        text.contains("shard-b"),
+        "expected this node's own id in the topology-loaded log:\n{text}"
+    );
+    assert!(
+        text.contains("5461") && text.contains("10922"),
+        "expected this node's own slot range in the topology-loaded log:\n{text}"
+    );
+    assert!(
+        text.contains("cluster topology loaded"),
+        "expected the topology-loaded message:\n{text}"
+    );
+    assert_eq!(config.myself().id, "shard-b"); // load's own return value is unaffected
+}
+
 /// Moved from `crates/server/src/connection.rs`'s
 /// `a_replica_registering_and_being_pruned_are_both_logged_at_info`. That test asserted only on
 /// captured log text -- no behavioural assertions -- so nothing behavioural was left behind;

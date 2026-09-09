@@ -243,7 +243,21 @@ impl ClusterConfig {
     /// landing on the wrong node.
     pub fn load(path: &std::path::Path, node_id: &str) -> std::io::Result<Self> {
         let text = std::fs::read_to_string(path)?;
-        Self::parse(&text, node_id)
+        let config = Self::parse(&text, node_id)?;
+        let me = config.myself();
+        // `main.rs`'s startup banner prints the human-facing counterpart of this (including the
+        // full topology, via `topology_summary`) to stdout; this is the machine-readable one line
+        // on stderr an operator's log pipeline actually captures. INFO, not DEBUG: this fires
+        // once per process lifetime, so there is no hot-path cost to weigh against always having
+        // it in production logs.
+        tracing::info!(
+            node_id = %me.id,
+            first_slot = me.first_slot,
+            last_slot = me.last_slot,
+            node_count = config.nodes.len(),
+            "cluster topology loaded"
+        );
+        Ok(config)
     }
 }
 
