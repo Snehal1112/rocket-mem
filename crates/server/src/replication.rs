@@ -432,6 +432,7 @@ impl ReplicationHandle {
                 FollowerHandles {
                     last_apply,
                     link_up,
+                    slave_offset: self.slave_repl_offset_slot(),
                 },
                 tls_client_config,
                 identity,
@@ -649,6 +650,7 @@ impl Generation {
 struct FollowerStatus<'a> {
     last_apply: &'a AtomicI64,
     link_up: &'a AtomicBool,
+    slave_offset: &'a AtomicU64,
 }
 
 /// Owned counterpart of `FollowerStatus`, held across the whole `replication_client_loop`
@@ -656,6 +658,7 @@ struct FollowerStatus<'a> {
 struct FollowerHandles {
     last_apply: Arc<AtomicI64>,
     link_up: Arc<AtomicBool>,
+    slave_offset: Arc<AtomicU64>,
 }
 
 /// What this follower tells the leader about itself when it `PSYNC`s: the address it
@@ -702,6 +705,7 @@ async fn replication_client_loop(
         let status = FollowerStatus {
             last_apply: &handles.last_apply,
             link_up: &handles.link_up,
+            slave_offset: &handles.slave_offset,
         };
         match connect_and_sync(
             &host_port,
@@ -916,9 +920,17 @@ where
     if generation.load(Ordering::SeqCst) != my_generation {
         return Ok(()); // superseded while reading the blob -- do not clobber the newer task's state
     }
-    engine
+    // The header is the leader's own replication offset as of the moment this blob was captured
+    // and this replica was registered -- both happened inside one AOF ordering critical section
+    // on the leader, so nothing was broadcast in between. Seeding from it is what makes this
+    // follower's offset directly comparable to its leader's; starting from 0 instead would make
+    // every follower that attached to a non-fresh leader look permanently, wrongly behind.
+    let snapshot_offset = engine
         .load_snapshot(&blob)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    status
+        .slave_offset
+        .store(snapshot_offset, Ordering::Relaxed);
     // `info`, not `debug`: the next line is `link_up.store(true)`, so this is the exact moment
     // the follower becomes in-sync. At `debug` a synced follower and one still stuck in the
     // reconnect loop emitted identical output -- nothing -- which is the single question an
@@ -1174,6 +1186,7 @@ mod tests {
                     FollowerStatus {
                         last_apply: &AtomicI64::new(0),
                         link_up: &AtomicBool::new(false),
+                        slave_offset: &AtomicU64::new(0),
                     },
                     &FollowerIdentity::default(),
                 )
@@ -1192,6 +1205,63 @@ mod tests {
         assert_eq!(
             engine.get(b"from-stream"),
             Some(engine::Value::String(bytes::Bytes::from_static(b"v")))
+        );
+    }
+
+    /// The follower must not start counting from zero when it attaches to a leader that has
+    /// already produced a replication stream. The snapshot header carries that position across,
+    /// which is what makes a follower's offset comparable to its leader's.
+    #[tokio::test]
+    async fn sync_once_seeds_the_follower_offset_from_the_snapshot_header() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let fake_leader = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut psync_bytes = [0u8; 15];
+            socket.read_exact(&mut psync_bytes).await.unwrap();
+
+            // 4096: a leader that had already produced 4096 bytes of replication stream before
+            // this follower attached.
+            let blob = engine::Engine::new().snapshot(4096);
+            socket
+                .write_all(&(blob.len() as u64).to_le_bytes())
+                .await
+                .unwrap();
+            socket.write_all(&blob).await.unwrap();
+            // Hold the socket open just long enough for the follower to read the blob, then drop
+            // it so `sync_once` returns on its own instead of needing a timeout.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        });
+
+        let engine = engine::Engine::new();
+        let slave_offset = AtomicU64::new(0);
+        let host_port = addr.to_string();
+        let generation = Arc::new(AtomicU64::new(0));
+        let stream = tokio::net::TcpStream::connect(&host_port).await.unwrap();
+        sync_once(
+            stream,
+            &engine,
+            &generation,
+            0,
+            None,
+            FollowerStatus {
+                last_apply: &AtomicI64::new(0),
+                link_up: &AtomicBool::new(false),
+                slave_offset: &slave_offset,
+            },
+            &FollowerIdentity::default(),
+        )
+        .await
+        .unwrap();
+
+        fake_leader.await.unwrap();
+        assert_eq!(
+            slave_offset.load(Ordering::Relaxed),
+            4096,
+            "the follower must seed its offset from the snapshot header, not start at 0"
         );
     }
 
@@ -1239,6 +1309,7 @@ mod tests {
             FollowerStatus {
                 last_apply: &AtomicI64::new(0),
                 link_up: &AtomicBool::new(false),
+                slave_offset: &AtomicU64::new(0),
             },
             &FollowerIdentity::default(),
         )
@@ -1285,6 +1356,7 @@ mod tests {
             FollowerStatus {
                 last_apply: &AtomicI64::new(0),
                 link_up: &AtomicBool::new(false),
+                slave_offset: &AtomicU64::new(0),
             },
             &FollowerIdentity::default(),
         )
@@ -1336,6 +1408,7 @@ mod tests {
             FollowerStatus {
                 last_apply: &AtomicI64::new(0),
                 link_up: &AtomicBool::new(false),
+                slave_offset: &AtomicU64::new(0),
             },
             &FollowerIdentity {
                 own_addr: Some("127.0.0.1:6479".to_string()),
@@ -1401,6 +1474,7 @@ mod tests {
             FollowerStatus {
                 last_apply: &AtomicI64::new(0),
                 link_up: &AtomicBool::new(false),
+                slave_offset: &AtomicU64::new(0),
             },
             &FollowerIdentity {
                 own_addr: None,
@@ -1444,6 +1518,7 @@ mod tests {
             FollowerStatus {
                 last_apply: &AtomicI64::new(0),
                 link_up: &AtomicBool::new(false),
+                slave_offset: &AtomicU64::new(0),
             },
             &FollowerIdentity {
                 own_addr: None,
@@ -1556,6 +1631,7 @@ mod tests {
                     FollowerStatus {
                         last_apply: &AtomicI64::new(0),
                         link_up: &AtomicBool::new(false),
+                        slave_offset: &AtomicU64::new(0),
                     },
                     &FollowerIdentity::default(),
                 )
@@ -1815,6 +1891,7 @@ mod tests {
             FollowerHandles {
                 last_apply: Arc::new(AtomicI64::new(0)),
                 link_up: Arc::new(AtomicBool::new(false)),
+                slave_offset: Arc::new(AtomicU64::new(0)),
             },
             None,
             FollowerIdentity::default(),
@@ -1879,6 +1956,7 @@ mod tests {
                 FollowerStatus {
                     last_apply: &AtomicI64::new(0),
                     link_up: &AtomicBool::new(false),
+                    slave_offset: &AtomicU64::new(0),
                 },
                 &FollowerIdentity::default(),
             )
