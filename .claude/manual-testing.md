@@ -579,8 +579,9 @@ kill %1
 
 `REPLICAOF <host> <port>` turns the CURRENT node into a read-only follower of the node at
 `<host>:<port>`: it fetches a full snapshot, then streams every subsequent write live.
-`REPLICAOF NO ONE` promotes it back to normal read-write operation. There's no config-file
-equivalent — it's always sent as a live command to an already-running node.
+`REPLICAOF NO ONE` promotes it back to normal read-write operation. `REPLICAOF` itself is always
+a live command sent to an already-running node — but the *initial* connect now has a
+config-file equivalent, below.
 
 As of the `replicaof` config field, the *initial* connect can now be config-driven instead —
 useful for a follower that should resume following its leader automatically after a restart
