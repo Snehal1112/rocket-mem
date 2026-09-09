@@ -165,6 +165,28 @@ so no future contributor bolts a shutdown subsystem onto a logging-scoped plan t
 log line. The same note sits at the call site in `server/main.rs`, above the final `serve`
 call.
 
+**Engine's `per-key TTL expiry (trace)` event is deferred too** — recorded here on 2026-09-09
+by plan 21's closing audit, which found it to be the catalogue's one unbuilt row. The reason
+is [plan 13](../plans/2026-09-09-verbose-logging-plans/13-engine-expiry-and-eviction.md)'s:
+the only place it could fire is `Shard::get`/`with_ref`/`with_mut` discovering
+`entry.is_expired()` on *passive* expiry, which is deeper inside the per-read/write hot path
+than `Store::shard_index` — the placement plan 12 identified as the riskiest in the series and
+deliberately avoided by instrumenting the `Engine` facade instead. It needs its own plan with
+its own benchmark gate, not a line folded into a plan that changes other things at the same
+time. Everything else in the Engine row shipped: shard routing, mutation byte delta, the
+*active*-expire cycle count, and eviction (which shipped as two events, a per-key `debug` and
+a per-cycle `warn`).
+
+**The File column names the subsystem, not always the file the event landed in.** The audit
+found five rows whose event exists but lives elsewhere, in every case because the value the
+event reports is only in scope at the dispatcher: the `HELLO`/RESP3 upgrade (Connection row →
+`dispatcher.rs`), all four ACL events (ACL row → `dispatcher.rs`; `acl.rs` has no call site of
+its own), AOF rewrite start/finish (AOF row → `dispatcher.rs`), snapshot save start/finish
+(Snapshot row → `dispatcher.rs`; `engine/snapshot.rs` has no call site either), and replica
+registration (Replication row → `connection.rs`, next to the `PSYNC` interception that
+performs it; the matching *prune* event is in `replication.rs` as the row says). Read the
+column as "which subsystem", and `grep` for the message rather than opening the named file.
+
 ## Configuration
 
 One new field, which participates in the existing figment layering (defaults < TOML < `ROCKET_MEM_*` env < CLI) exactly like every other field, so `ROCKET_MEM_LOG_VALUE_MAX_BYTES` and `--log-value-max-bytes` fall out of the existing `clap`/figment wiring for free:
