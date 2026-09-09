@@ -561,12 +561,16 @@ pub fn replay_with_stats(
         // and this function deliberately recovers from it by keeping everything before it. The
         // offset and the two lengths are the whole payload -- the discarded bytes are client data
         // and never reach the log.
+        //
+        // The message is present-tense on purpose: this fires *before* the open/`set_len` below,
+        // so a past-tense "truncated" would assert an outcome that has not happened yet and may
+        // still fail. When it does fail, the two `error!`s below say so.
         tracing::warn!(
             aof_path = %path.display(),
             offset = valid_len,
             aof_len = raw.len(),
             reason = tail_reason,
-            "aof tail discarded and truncated"
+            "aof tail discarded; truncating the file to the last complete record"
         );
         let file = OpenOptions::new().write(true).open(path).inspect_err(|e| {
             tracing::error!(

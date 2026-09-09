@@ -135,7 +135,7 @@ impl Drop for ConnectionStats {
 
 // `protocol = %"RMP"`, not `protocol = "rmp"` -- see `connection.rs`'s matching comment for why
 // the sigil and the case are deliberate.
-#[tracing::instrument(skip_all, fields(conn_id = client_id, %peer, protocol = %"RMP", %tls))]
+#[tracing::instrument(name = "conn", skip_all, fields(conn_id = client_id, %peer, protocol = %"RMP", %tls))]
 async fn handle_connection<S>(
     socket: S,
     peer: std::net::SocketAddr,

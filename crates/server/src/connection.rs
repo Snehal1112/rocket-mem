@@ -225,7 +225,11 @@ impl Drop for ConnectionStats {
 // events already spell the same field `protocol=RESP`, unquoted and uppercase, and the spec's
 // reason for a fixed field vocabulary is that a single `grep` follows an activity end to end --
 // which `protocol=RESP` here and `protocol="resp"` there defeated.
-#[tracing::instrument(skip_all, fields(conn_id = client_id, %peer, protocol = %"RESP", %tls))]
+// `name = "conn"` is not cosmetic: without it the span takes the function's name, so every log
+// line on a connection renders as `handle_connection{...}` and the spec's three-span vocabulary
+// (`conn`/`cmd`/`repl`) matches only two of its three names. `serve_replica` below already names
+// its span `repl` for the same reason.
+#[tracing::instrument(name = "conn", skip_all, fields(conn_id = client_id, %peer, protocol = %"RESP", %tls))]
 async fn handle_connection<S>(
     socket: S,
     peer: std::net::SocketAddr,
