@@ -214,3 +214,38 @@ fn trace_never_renders_a_credential() {
         "a password reached the log at `trace`; output was:\n{output}"
     );
 }
+
+#[test]
+fn the_span_renders_the_key_as_text_not_as_debug_bytes() {
+    let output = capture_at("debug");
+    assert!(
+        output.contains("key=level-key"),
+        "the cmd span's key field is missing or not rendered as text; output was:\n{output}"
+    );
+    // The two shapes the mistake produces. `key = ?first_key` on an `Option<Bytes>` renders as
+    // `Some(b"level-key")`; `key = ?key` on a bare `Bytes` renders as `b"level-key"`. Both are
+    // ungreppable, and both cost O(len) of formatting on the hottest path in the project.
+    assert!(
+        !output.contains("Some(b\""),
+        "the key was logged through Debug; output was:\n{output}"
+    );
+    assert!(
+        !output.contains("key=b\""),
+        "the key was logged through Debug; output was:\n{output}"
+    );
+}
+
+#[test]
+fn the_span_carries_the_command_name_and_arity() {
+    // The field vocabulary the spec fixes (`cmd`, `key`, `argc`) is what makes one grep follow
+    // an activity end to end -- a renamed field breaks every runbook written against it.
+    let output = capture_at("debug");
+    assert!(
+        output.contains("cmd=SET"),
+        "the cmd span lost its command name; output was:\n{output}"
+    );
+    assert!(
+        output.contains("argc=2"),
+        "the cmd span lost its arity; output was:\n{output}"
+    );
+}
