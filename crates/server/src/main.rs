@@ -245,6 +245,7 @@ async fn main() -> std::io::Result<()> {
     .with_aof(Arc::clone(&aof))
     .with_own_addr(config.addr.clone())
     .with_slowlog_threshold(slowlog_threshold)
+    .with_log_value_max_bytes(config.log_value_max_bytes)
     .with_acl_bootstrap(acl_users);
     if let Some(cluster) = cluster {
         handle = handle.with_cluster(cluster);

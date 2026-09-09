@@ -201,6 +201,12 @@ pub struct ReplicationHandle {
     /// to configure away. `main.rs` sets its threshold from the environment via
     /// `with_slowlog_threshold`; `new`/`Default` use the 10ms default.
     pub slowlog: crate::slowlog::SlowLog,
+    /// The truncation cap `logging::fmt_value`/`logging::redact_args` apply to each rendered
+    /// argument on the `trace`-level dispatch line. Stored as `usize` so the call site needs no
+    /// cast on the hot path. `main.rs` sets it from `Config::log_value_max_bytes` via
+    /// `with_log_value_max_bytes`; `new`/`Default` use the same 128-byte default `Config` does,
+    /// so the ~25 test-constructed handles behave identically to a real server.
+    log_value_max_bytes: usize,
     /// In-memory ACL users. Empty by default -- every existing test and deployment through
     /// Sprint 7 -- populated only via `with_acl_bootstrap` (from the TOML config's
     /// `[[acl.users]]`) and at runtime via `ACL SETUSER` (plan 08). Never persisted; see
@@ -237,6 +243,7 @@ impl ReplicationHandle {
             link_up: Arc::new(AtomicBool::new(false)),
             master_repl_offset: Arc::new(AtomicU64::new(0)),
             slowlog: crate::slowlog::SlowLog::default(),
+            log_value_max_bytes: 128,
             acl: crate::acl::AclStore::default(),
             own_addr: None,
         }
@@ -287,6 +294,18 @@ impl ReplicationHandle {
         self
     }
 
+    /// Sets the `trace`-level argument truncation cap -- see the `log_value_max_bytes` field.
+    /// A builder method, matching `with_aof`/`with_cluster`/`with_slowlog_threshold`'s existing
+    /// pattern, so the ~25 existing `ReplicationHandle::new` call sites stay untouched.
+    ///
+    /// Takes the `u64` `Config` declares and saturates into `usize`: on a 32-bit target a cap
+    /// larger than the address space would otherwise wrap to a small one and silently log
+    /// *less* than configured.
+    pub fn with_log_value_max_bytes(mut self, cap: u64) -> Self {
+        self.log_value_max_bytes = usize::try_from(cap).unwrap_or(usize::MAX);
+        self
+    }
+
     /// Seeds the ACL store from the config file's `[[acl.users]]` bootstrap list. A builder
     /// method, matching `with_aof`/`with_cluster`/`with_slowlog_threshold`'s existing pattern, so
     /// the ~25 existing `ReplicationHandle::new` call sites (all tests, none configuring ACLs)
@@ -302,6 +321,12 @@ impl ReplicationHandle {
     /// this before extracting any key, so a standalone node pays one `Option` check per command.
     pub fn cluster(&self) -> Option<&Arc<crate::cluster::ClusterConfig>> {
         self.cluster.as_ref()
+    }
+
+    /// The `trace`-level argument truncation cap, read once per command by `dispatch_and_log`
+    /// but only when `trace` is actually enabled.
+    pub fn log_value_max_bytes(&self) -> usize {
+        self.log_value_max_bytes
     }
 
     /// For `SAVE` and (later) `PSYNC` handling, which need the shared `Engine` to snapshot
@@ -1526,5 +1551,28 @@ mod tests {
         assert_eq!(cluster.myself().id, "shard-b");
         assert!(cluster.owns(8001));
         assert!(!cluster.owns(8000));
+    }
+
+    #[test]
+    fn log_value_max_bytes_defaults_to_128() {
+        // Every existing `ReplicationHandle::new`/`default()` call site -- ~25 of them, all
+        // tests -- must keep working untouched, with the same cap `Config::default()` uses.
+        assert_eq!(ReplicationHandle::default().log_value_max_bytes(), 128);
+    }
+
+    #[test]
+    fn with_log_value_max_bytes_overrides_the_default() {
+        let handle = ReplicationHandle::default().with_log_value_max_bytes(16);
+        assert_eq!(handle.log_value_max_bytes(), 16);
+    }
+
+    #[test]
+    fn with_log_value_max_bytes_saturates_an_absurd_config_value() {
+        // The config field is a u64 and `fmt_value` takes a usize. On a 32-bit target a large
+        // configured cap would otherwise truncate to a small one -- silently logging *less*
+        // than asked. Saturate to usize::MAX instead: "no truncation" is the honest reading of
+        // "cap larger than this machine can index".
+        let handle = ReplicationHandle::default().with_log_value_max_bytes(u64::MAX);
+        assert_eq!(handle.log_value_max_bytes(), usize::MAX);
     }
 }
