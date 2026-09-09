@@ -22,6 +22,11 @@ use bytes::Bytes;
 /// `CONFIG` is deliberately absent: rocket-mem's CONFIG surface exposes no credential
 /// parameter (there is no `requirepass` or `masterauth`), so redacting it would guard
 /// nothing. Add an arm here if that ever changes.
+///
+/// `REPLICAOF` was added after a review caught it missing: its six-token form,
+/// `REPLICAOF <host> <port> AUTH <username> <password>`, carries a plaintext password (see
+/// `dispatcher::handle_replicaof`), so it needs the same "only when an AUTH clause is
+/// present" treatment as HELLO.
 pub fn is_sensitive(cmd: &str, args: &[Bytes]) -> bool {
     match cmd {
         // Every form of AUTH: the one-argument password form and the two-argument
@@ -36,6 +41,12 @@ pub fn is_sensitive(cmd: &str, args: &[Bytes]) -> bool {
             args.first(),
             Some(sub) if sub.eq_ignore_ascii_case(b"SETUSER") || sub.eq_ignore_ascii_case(b"GETUSER")
         ),
+        // Only the six-token `REPLICAOF <host> <port> AUTH <username> <password>` form. A
+        // bare `REPLICAOF <host> <port>` and `REPLICAOF NO ONE` carry no secret and stay
+        // loggable. `args` excludes the command name, so the AUTH keyword -- when present --
+        // sits at `args[2]`, matching `handle_replicaof`'s `items[3]` (which includes the
+        // command name at `items[0]`).
+        "REPLICAOF" => args.get(2).is_some_and(|a| a.eq_ignore_ascii_case(b"AUTH")),
         _ => false,
     }
 }
@@ -137,6 +148,26 @@ mod tests {
         assert!(!is_sensitive("ACL", &args(&[b"WHOAMI"])));
         assert!(!is_sensitive("ACL", &args(&[b"LIST"])));
         assert!(!is_sensitive("ACL", &args(&[])));
+    }
+
+    #[test]
+    fn replicaof_is_sensitive_only_when_it_carries_an_auth_clause() {
+        // `REPLICAOF <host> <port> AUTH <user> <pass>` -- args excludes the command name, so
+        // the AUTH keyword sits at args[2]. Verified against `handle_replicaof` in
+        // dispatcher.rs, which parses `items[3]` (items includes the command name at
+        // items[0]).
+        assert!(is_sensitive(
+            "REPLICAOF",
+            &args(&[b"127.0.0.1", b"1", b"AUTH", b"app", b"changeme"])
+        ));
+        assert!(is_sensitive(
+            "REPLICAOF",
+            &args(&[b"127.0.0.1", b"1", b"auth", b"app", b"changeme"])
+        ));
+        // A bare host/port form carries no secret and stays loggable.
+        assert!(!is_sensitive("REPLICAOF", &args(&[b"127.0.0.1", b"1"])));
+        // `REPLICAOF NO ONE` carries no secret either.
+        assert!(!is_sensitive("REPLICAOF", &args(&[b"NO", b"ONE"])));
     }
 
     #[test]
@@ -271,5 +302,16 @@ mod tests {
     fn redact_args_ignores_the_cap_when_redacting() {
         // A tiny cap must not truncate the marker into something that looks like data.
         assert_eq!(redact_args("AUTH", &args(&[b"hunter2"]), 1), "<redacted>");
+    }
+
+    #[test]
+    fn redact_args_never_renders_a_replicaof_auth_password() {
+        let rendered = redact_args(
+            "REPLICAOF",
+            &args(&[b"127.0.0.1", b"1", b"AUTH", b"app", b"changeme"]),
+            128,
+        );
+        assert_eq!(rendered, "<redacted>");
+        assert!(!rendered.contains("changeme"));
     }
 }
