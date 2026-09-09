@@ -196,6 +196,14 @@ pub struct ReplicationHandle {
     /// leader restart. An `Arc` for symmetry with the follower-side counter added in
     /// `03-follower-replication-offset.md`, whose spawned task is `'static`.
     master_repl_offset: Arc<AtomicU64>,
+    /// Follower side: how far into the leader's replication stream this node has processed.
+    /// Seeded by `sync_once` from the snapshot header the leader stamped its own live
+    /// `master_repl_offset` into, then advanced per applied frame by
+    /// `03-follower-replication-offset.md`. An `Arc` because the spawned follower task is
+    /// `'static` and needs its own handle -- the same reason `last_apply_unix` and `link_up`
+    /// are `Arc`s. Meaningless while this node is a leader, and `INFO` only reports it under
+    /// `role:slave`, so a value left over from a previous `REPLICAOF` is never rendered.
+    slave_repl_offset: Arc<AtomicU64>,
     /// Recently-slow commands, recorded by the `dispatch_and_log` wrapper. A plain field, not an
     /// `Option`: it is always present and always cheap when nothing is slow, so there is nothing
     /// to configure away. `main.rs` sets its threshold from the environment via
@@ -236,6 +244,7 @@ impl ReplicationHandle {
             master_addr: Mutex::new(None),
             link_up: Arc::new(AtomicBool::new(false)),
             master_repl_offset: Arc::new(AtomicU64::new(0)),
+            slave_repl_offset: Arc::new(AtomicU64::new(0)),
             slowlog: crate::slowlog::SlowLog::default(),
             acl: crate::acl::AclStore::default(),
             own_addr: None,
@@ -471,6 +480,27 @@ impl ReplicationHandle {
     /// against this counter.
     pub fn advance_master_repl_offset(&self, bytes: u64) -> u64 {
         self.master_repl_offset.fetch_add(bytes, Ordering::Relaxed) + bytes
+    }
+
+    /// Follower side: how far into the leader's stream this node has processed. Surfaced as
+    /// `INFO REPLICATION`'s `slave_repl_offset` (and `master_repl_offset`, which on a follower
+    /// reports the same number) and the `rocket_mem_slave_repl_offset` gauge.
+    pub fn slave_repl_offset(&self) -> u64 {
+        self.slave_repl_offset.load(Ordering::Relaxed)
+    }
+
+    /// Seeds the follower offset to an absolute position. Called once per successful sync, with
+    /// the offset the leader stamped into the snapshot header -- a position in the leader's
+    /// stream, not a delta, which is why this stores rather than adds.
+    pub fn set_slave_repl_offset(&self, offset: u64) {
+        self.slave_repl_offset.store(offset, Ordering::Relaxed);
+    }
+
+    /// The shared slot itself, for the spawned follower task to write into -- the same pattern
+    /// `last_apply_slot` and `link_up_slot` already use, and for the same reason: that task is
+    /// `'static` and cannot borrow from `self`.
+    pub fn slave_repl_offset_slot(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.slave_repl_offset)
     }
 }
 
@@ -890,6 +920,21 @@ mod tests {
         // A zero-length advance is a no-op, not an error: an empty encode never reaches the
         // fan-out, but the counter must not care either way.
         assert_eq!(h.advance_master_repl_offset(0), 42);
+    }
+
+    #[test]
+    fn slave_repl_offset_starts_at_zero_and_can_be_seeded() {
+        let h = ReplicationHandle::default();
+        assert_eq!(h.slave_repl_offset(), 0);
+        // A seed is an absolute store, not an add: it comes from a snapshot header, which is a
+        // position, not a delta.
+        h.set_slave_repl_offset(4096);
+        assert_eq!(h.slave_repl_offset(), 4096);
+        h.set_slave_repl_offset(12);
+        assert_eq!(h.slave_repl_offset(), 12);
+        // The slot handed to the spawned follower task is the same atomic the getter reads.
+        h.slave_repl_offset_slot().store(77, Ordering::Relaxed);
+        assert_eq!(h.slave_repl_offset(), 77);
     }
 
     #[tokio::test]
