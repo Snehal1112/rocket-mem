@@ -185,6 +185,40 @@ impl Drop for ClientGuard {
     }
 }
 
+/// Tracks one RESP connection's lifetime state for the connection-closed log event: how long
+/// it was open and how many commands it served. Emits that event from `Drop` so every one of
+/// `handle_connection`'s several return paths -- decode error, clean EOF, feed failure, flush
+/// failure, and the `serve_replica` hand-off, which never returns normally -- gets it exactly
+/// once, without each of them having to remember. Mirrors `ClientGuard` just above, which
+/// solves the identical problem for the connected-clients counter.
+struct ConnectionStats {
+    started_at: std::time::Instant,
+    commands_served: u64,
+}
+
+impl ConnectionStats {
+    fn new() -> Self {
+        Self {
+            started_at: std::time::Instant::now(),
+            commands_served: 0,
+        }
+    }
+
+    fn record_command(&mut self) {
+        self.commands_served += 1;
+    }
+}
+
+impl Drop for ConnectionStats {
+    fn drop(&mut self) {
+        tracing::info!(
+            elapsed_us = self.started_at.elapsed().as_micros().min(u64::MAX as u128) as u64,
+            commands_served = self.commands_served,
+            "connection closed"
+        );
+    }
+}
+
 #[tracing::instrument(skip_all, fields(conn_id = client_id, %peer, protocol = "resp", %tls))]
 async fn handle_connection<S>(
     socket: S,
@@ -200,6 +234,7 @@ async fn handle_connection<S>(
     tracing::info!("connection accepted");
     replication.connection_opened();
     let _client_guard = ClientGuard(Arc::clone(&replication));
+    let mut conn_stats = ConnectionStats::new();
     let mut framed = Framed::new(socket, RespCodec::default());
     let session = dispatcher::Session::with_peer_addr(peer);
     // Carries a frame pulled ahead by the pipelining peek below, so it isn't re-read.
@@ -254,6 +289,7 @@ async fn handle_connection<S>(
         }
         let response =
             dispatcher::dispatch_and_log(&engine, &aof, &replication, frame, &session, client_id);
+        conn_stats.record_command();
         framed.codec_mut().protocol = session.protocol(); // sync BEFORE sending this reply
                                                           // Buffer without flushing -- a flush is a write syscall, and flushing after
                                                           // every single response is what turned client-side pipelining into a
@@ -386,6 +422,15 @@ mod tests {
     /// It does not prove those loops call it: each moves its accepted socket straight into a
     /// connection task, so no test holds a handle on the server side of the connection. Nagle is
     /// on by default, so observing `nodelay() == true` here means the call really flipped it.
+    #[test]
+    fn connection_stats_counts_each_recorded_command() {
+        let mut stats = ConnectionStats::new();
+        stats.record_command();
+        stats.record_command();
+        stats.record_command();
+        assert_eq!(stats.commands_served, 3);
+    }
+
     #[tokio::test]
     async fn disable_nagle_sets_tcp_nodelay_on_an_accepted_socket() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
