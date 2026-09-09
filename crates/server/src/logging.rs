@@ -9,12 +9,28 @@
 /// marker naming how many bytes were dropped. The marker matters: without it a truncated
 /// value is indistinguishable from a short one, which turns a log into a misleading record
 /// of what was actually stored.
+///
+/// Control bytes are escaped as `\xNN`. rocket-mem stores arbitrary bytes, so a value is
+/// fully capable of containing a newline (which would forge a second log line) or an ANSI
+/// escape (which would repaint the operator's terminal) -- neither may reach the log
+/// verbatim. `cap` is counted against the *stored* bytes, before escaping expands them, so
+/// the dropped-byte count stays a true statement about the value.
 pub fn fmt_value(bytes: &[u8], cap: usize) -> String {
-    if bytes.len() <= cap {
-        return String::from_utf8_lossy(bytes).into_owned();
+    let shown = &bytes[..cap.min(bytes.len())];
+    let mut out = String::with_capacity(shown.len());
+    // Decoded lossily first so multi-byte UTF-8 survives as characters rather than being
+    // escaped byte-by-byte; only genuine control characters are then expanded.
+    for c in String::from_utf8_lossy(shown).chars() {
+        if c.is_control() || c == '\x7f' {
+            out.push_str(&format!("\\x{:02x}", c as u32));
+        } else {
+            out.push(c);
+        }
     }
-    let head = String::from_utf8_lossy(&bytes[..cap]).into_owned();
-    format!("{head}…({} more)", bytes.len() - cap)
+    if bytes.len() > cap {
+        out.push_str(&format!("…({} more)", bytes.len() - cap));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -45,5 +61,30 @@ mod tests {
     #[test]
     fn fmt_value_renders_an_empty_value_as_an_empty_string() {
         assert_eq!(fmt_value(b"", 128), "");
+    }
+
+    #[test]
+    fn fmt_value_escapes_control_bytes_so_a_value_cannot_forge_a_log_line() {
+        assert_eq!(fmt_value(b"a\nb", 128), "a\\x0ab");
+        assert_eq!(fmt_value(b"a\tb", 128), "a\\x09b");
+        assert_eq!(fmt_value(b"a\x1b[31mb", 128), "a\\x1b[31mb");
+    }
+
+    #[test]
+    fn fmt_value_escapes_the_del_byte() {
+        assert_eq!(fmt_value(b"a\x7fb", 128), "a\\x7fb");
+    }
+
+    #[test]
+    fn fmt_value_keeps_printable_ascii_and_multibyte_utf8_intact() {
+        assert_eq!(fmt_value("kéy ok!".as_bytes(), 128), "kéy ok!");
+    }
+
+    #[test]
+    fn fmt_value_counts_the_cap_in_bytes_before_escaping() {
+        // The cap bounds how much of the *stored value* is shown, not how long the rendered
+        // string ends up -- escaping expands bytes, and a cap that drifted with it would make
+        // the truncation count meaningless.
+        assert_eq!(fmt_value(b"\n\n\n\n\n\n", 2), "\\x0a\\x0a…(4 more)");
     }
 }
