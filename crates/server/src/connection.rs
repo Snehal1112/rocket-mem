@@ -376,7 +376,11 @@ async fn serve_replica<S>(
         let _order_guard = aof.lock_all_shards();
         let bytes = replication.engine().snapshot(0); // 0: a follower keeps no AOF, so the header is moot
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<bytes::Bytes>();
+        let host_port = advertised_addr
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
         replication.registry.register(advertised_addr, tx);
+        tracing::info!(host_port = %host_port, "replica registered");
         (bytes, rx)
     };
 
@@ -936,6 +940,77 @@ mod tests {
         assert!(
             text.contains("repl") && text.contains("host_port") && text.contains("127.0.0.1:9999"),
             "expected a new `repl` span carrying host_port=\"127.0.0.1:9999\", got:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_replica_registering_and_being_pruned_are_both_logged_at_info() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let engine = Arc::new(Engine::new());
+        let (_dir, aof) = test_aof();
+        let replication = Arc::new(crate::replication::ReplicationHandle::new(
+            Arc::clone(&engine),
+            std::env::temp_dir().join("repl-register-prune-test.snapshot"),
+        ));
+        tokio::spawn(serve(
+            listener,
+            Arc::clone(&engine),
+            Arc::clone(&aof),
+            Arc::clone(&replication),
+        ));
+
+        let captured = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let framed = Framed::new(
+            TcpStream::connect(addr).await.unwrap(),
+            RespCodec::default(),
+        );
+        let mut framed = framed;
+        framed
+            .send(Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"PSYNC")),
+                Frame::Bulk(Bytes::from_static(b"127.0.0.1:6480")),
+            ]))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await; // let serve_replica register
+        drop(framed); // disconnect the replica
+
+        // two broadcasts, matching the existing pruning test's own reasoning: the first send
+        // after a drop can still succeed on some platforms before the OS notices the close.
+        let mut client = Framed::new(
+            TcpStream::connect(addr).await.unwrap(),
+            RespCodec::default(),
+        );
+        for _ in 0..2 {
+            client
+                .send(Frame::Array(vec![
+                    Frame::Bulk(Bytes::from_static(b"SET")),
+                    Frame::Bulk(Bytes::from_static(b"k")),
+                    Frame::Bulk(Bytes::from_static(b"v")),
+                ]))
+                .await
+                .unwrap();
+            client.next().await.unwrap().unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        drop(_guard);
+        let text = captured.text();
+        assert!(
+            text.contains("replica registered") && text.contains("127.0.0.1:6480"),
+            "expected a registration log naming the advertised address:\n{text}"
+        );
+        assert!(
+            text.contains("replica pruned") && text.contains("127.0.0.1:6480"),
+            "expected a prune log naming the same address:\n{text}"
         );
     }
 }

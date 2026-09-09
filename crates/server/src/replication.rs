@@ -54,7 +54,16 @@ impl ReplicaRegistry {
     /// roll back the write that already committed on the leader.
     pub fn broadcast(&self, bytes: bytes::Bytes) {
         let mut replicas = self.replicas.lock().unwrap_or_else(|e| e.into_inner());
-        replicas.retain(|(_, tx)| tx.send(bytes.clone()).is_ok());
+        replicas.retain(|(addr, tx)| {
+            let alive = tx.send(bytes.clone()).is_ok();
+            if !alive {
+                tracing::info!(
+                    host_port = %addr.clone().unwrap_or_else(|| "unknown".to_string()),
+                    "replica pruned"
+                );
+            }
+            alive
+        });
     }
 
     /// How many replicas are currently registered. Note this counts senders, which are pruned
@@ -687,6 +696,7 @@ where
     // is a raw length-prefixed blob), so it round-trips through the codec's ordinary
     // send/next -- no need for the raw-socket handling PSYNC's reply requires.
     if let Some((username, password)) = &identity.auth {
+        tracing::debug!("sending AUTH to leader");
         framed
             .send(protocol::Frame::Array(vec![
                 protocol::Frame::Bulk(bytes::Bytes::from_static(b"AUTH")),
@@ -698,7 +708,7 @@ where
             Some(Ok(protocol::Frame::Error(e))) => {
                 return Err(std::io::Error::other(format!("leader rejected AUTH: {e}")))
             }
-            Some(Ok(_)) => {} // +OK -- proceed to PSYNC
+            Some(Ok(_)) => tracing::debug!("leader accepted AUTH"), // +OK -- proceed to PSYNC
             Some(Err(e)) => return Err(e),
             None => {
                 return Err(std::io::Error::new(
@@ -723,6 +733,7 @@ where
             b"PSYNC",
         ))]),
     };
+    tracing::debug!("sending PSYNC to leader");
     framed.send(psync_frame).await?;
 
     // Reclaim the raw socket to read the length-prefixed snapshot blob, which is NOT a RESP
@@ -763,6 +774,7 @@ where
     let len = u64::from_le_bytes(len_buf) as usize;
     let mut blob = vec![0u8; len];
     parts.io.read_exact(&mut blob).await?;
+    tracing::debug!(bytes = len, "received snapshot blob from leader");
 
     if generation.load(Ordering::SeqCst) != my_generation {
         return Ok(()); // superseded while reading the blob -- do not clobber the newer task's state
@@ -770,6 +782,7 @@ where
     engine
         .load_snapshot(&blob)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    tracing::debug!("snapshot loaded");
     status.link_up.store(true, Ordering::Relaxed);
 
     // From here on the leader sends plain RESP frames, byte-for-byte what its own AOF
@@ -1647,5 +1660,67 @@ mod tests {
             text.contains("repl") && text.contains("host_port") && text.contains(&host_port),
             "expected a new `repl` span carrying host_port={host_port:?}, got:\n{text}"
         );
+    }
+
+    #[tokio::test]
+    async fn sync_once_logs_each_psync_handshake_step_at_debug() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let fake_leader = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut psync_bytes = [0u8; 15];
+            socket.read_exact(&mut psync_bytes).await.unwrap();
+            let blob = engine::Engine::new().snapshot(0);
+            socket
+                .write_all(&(blob.len() as u64).to_le_bytes())
+                .await
+                .unwrap();
+            socket.write_all(&blob).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        });
+
+        let captured = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let engine = engine::Engine::new();
+        let host_port = addr.to_string();
+        let generation = Arc::new(AtomicU64::new(0));
+        let stream = tokio::net::TcpStream::connect(&host_port).await.unwrap();
+        let sync_task = tokio::spawn(async move {
+            sync_once(
+                stream,
+                &engine,
+                &generation,
+                0,
+                None,
+                FollowerStatus {
+                    last_apply: &AtomicI64::new(0),
+                    link_up: &AtomicBool::new(false),
+                },
+                &FollowerIdentity::default(),
+            )
+            .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        sync_task.abort();
+        fake_leader.abort();
+        drop(_guard);
+
+        let text = captured.text();
+        assert!(text.contains("sending PSYNC to leader"), "{text}");
+        assert!(
+            text.contains("received snapshot blob from leader"),
+            "{text}"
+        );
+        assert!(text.contains("snapshot loaded"), "{text}");
     }
 }
