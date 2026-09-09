@@ -2863,6 +2863,9 @@ pub(crate) fn auth_gate(
         } else {
             "NOPERM this user has no permissions to run this command"
         };
+        // `cmd`/`key` are already attached by the enclosing `cmd` span (plan 07) -- see this
+        // plan's Architecture section, so only `user` needs adding here.
+        tracing::warn!(user = %user.username, "permission denied");
         return Some(Frame::Error(msg.into()));
     }
     None
@@ -3916,6 +3919,44 @@ mod tests {
             enabled: true,
             rules,
         })
+    }
+
+    #[test]
+    fn auth_gate_logs_permission_denied_at_warn_naming_the_user() {
+        let replication = ReplicationHandle::default();
+        replication
+            .acl
+            .set_user(
+                "app",
+                &[
+                    Bytes::from_static(b"on"),
+                    Bytes::from_static(b"+get"),
+                    Bytes::from_static(b"~*"),
+                ],
+            )
+            .unwrap();
+        let session = Session::new();
+        session.set_authenticated_user(Some(acl_user(vec![
+            crate::acl::AclRule::AllowCommand("GET".to_string()),
+            crate::acl::AclRule::AllKeys,
+        ])));
+        let frame = Frame::Array(vec![
+            Frame::Bulk(Bytes::from_static(b"SET")),
+            Frame::Bulk(Bytes::from_static(b"k")),
+            Frame::Bulk(Bytes::from_static(b"v")),
+        ]);
+        let log = capture_logs_at(tracing::Level::WARN, || {
+            let reply = auth_gate(&replication, &session, &frame).unwrap();
+            assert_eq!(
+                reply,
+                Frame::Error("NOPERM this user has no permissions to run this command".into())
+            );
+        });
+        assert!(
+            log.contains("app"),
+            "expected the username in the event, got: {log}"
+        );
+        assert!(log.contains("permission denied"), "got: {log}");
     }
 
     #[test]
