@@ -2715,11 +2715,13 @@ fn handle_bgrewriteaof(
     // commit are what two concurrent rewrites collide on, and `start_rewrite`'s own
     // `lock_for_ordering()` is released long before the commit. See `AofWriter::lock_for_rewrite`.
     let _rewrite_guard = aof.lock_for_rewrite();
+    let started = std::time::Instant::now();
 
     let (next_gen, bytes) = match start_rewrite(aof, replication) {
         Ok(r) => r,
         Err(e) => return Frame::Error(format!("ERR failed to start AOF rewrite: {e}")),
     };
+    tracing::info!(generation = next_gen, "aof rewrite starting");
 
     let new_snapshot_path = crate::aof::generation_path(replication.snapshot_path(), next_gen);
     if let Err(e) = write_snapshot_atomically(&new_snapshot_path, &bytes) {
@@ -2742,6 +2744,12 @@ fn handle_bgrewriteaof(
         old_gen,
     ));
 
+    tracing::info!(
+        generation = next_gen,
+        bytes = bytes.len(),
+        elapsed_us = started.elapsed().as_micros() as u64,
+        "aof rewrite finished"
+    );
     Frame::Simple("OK".into())
 }
 

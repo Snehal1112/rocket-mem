@@ -469,6 +469,16 @@ pub const WRITE_COMMANDS: &[&str] = &[
     "ZINCRBY",
 ];
 
+/// Summary of one `replay_with_stats` call: how many commands were replayed, how many bytes of
+/// the file that consumed, and how long it took. `recover` logs this as the operator-facing line
+/// that answers "why did startup take this long" — see the design spec's AOF event catalogue row
+/// for the recovery replay summary.
+pub struct ReplayStats {
+    pub commands: u64,
+    pub bytes: u64,
+    pub elapsed: std::time::Duration,
+}
+
 /// Replays every command in the AOF at `path` against `engine`, via the plain (non-logging)
 /// `dispatcher::dispatch` — never `dispatch_and_log`, which would re-append what's being
 /// replayed. A missing file is a no-op (nothing to recover on first run). `start_at` is
@@ -477,12 +487,34 @@ pub const WRITE_COMMANDS: &[&str] = &[
 /// out-of-range slice; `aof::recover` (below) is what decides *whether* a mismatched offset
 /// should reach this function at all. A corrupt or incomplete final frame stops replay at the
 /// last fully-decoded frame and truncates the file on disk to that exact byte offset.
+///
+/// Kept as a thin wrapper over `replay_with_stats` so its own signature and behavior never
+/// change — see that function for the counting logic `recover`'s log line needs.
 pub fn replay(path: &Path, engine: &engine::Engine, start_at: u64) -> std::io::Result<()> {
+    replay_with_stats(path, engine, start_at).map(|_| ())
+}
+
+/// Does the same work as `replay`, additionally returning how many commands and bytes were
+/// replayed and how long it took. Split out from `replay` rather than changing `replay` itself,
+/// so `replay`'s eleven existing test call sites in this module need no changes at all.
+pub fn replay_with_stats(
+    path: &Path,
+    engine: &engine::Engine,
+    start_at: u64,
+) -> std::io::Result<ReplayStats> {
     use tokio_util::codec::Decoder;
+
+    let started = std::time::Instant::now();
 
     let raw = match std::fs::read(path) {
         Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ReplayStats {
+                commands: 0,
+                bytes: 0,
+                elapsed: started.elapsed(),
+            });
+        }
         Err(e) => return Err(e),
     };
 
@@ -490,11 +522,13 @@ pub fn replay(path: &Path, engine: &engine::Engine, start_at: u64) -> std::io::R
     let mut buf = bytes::BytesMut::from(&raw[start..]);
     let mut codec = protocol::codec::RespCodec::default();
     let mut valid_len = start;
+    let mut commands: u64 = 0;
     loop {
         let before = buf.len();
         match codec.decode(&mut buf) {
             Ok(Some(frame)) => {
                 valid_len += before - buf.len();
+                commands += 1;
                 let mut protocol = protocol::codec::Protocol::default();
                 crate::dispatcher::dispatch(engine, frame, &mut protocol, 0);
             }
@@ -506,7 +540,11 @@ pub fn replay(path: &Path, engine: &engine::Engine, start_at: u64) -> std::io::R
         let file = OpenOptions::new().write(true).open(path)?;
         file.set_len(valid_len as u64)?;
     }
-    Ok(())
+    Ok(ReplayStats {
+        commands,
+        bytes: (valid_len - start) as u64,
+        elapsed: started.elapsed(),
+    })
 }
 
 /// The manifest path derived from `snapshot_path` — always `<snapshot_path>.manifest`, never
@@ -648,7 +686,13 @@ pub fn recover(aof_path: &Path, snapshot_path: &Path) -> std::io::Result<engine:
                             "snapshot offset past end of AOF; discarding snapshot and replaying full AOF"
                         );
                         let fresh = engine::Engine::new();
-                        replay(aof_path, &fresh, 0)?;
+                        let stats = replay_with_stats(aof_path, &fresh, 0)?;
+                        tracing::info!(
+                            commands = stats.commands,
+                            bytes = stats.bytes,
+                            elapsed_us = stats.elapsed.as_micros() as u64,
+                            "aof recovery replay complete"
+                        );
                         return Ok(fresh);
                     }
                     Some(_) => offset,
@@ -666,7 +710,13 @@ pub fn recover(aof_path: &Path, snapshot_path: &Path) -> std::io::Result<engine:
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
         Err(e) => return Err(e),
     };
-    replay(aof_path, &engine, start_at)?;
+    let stats = replay_with_stats(aof_path, &engine, start_at)?;
+    tracing::info!(
+        commands = stats.commands,
+        bytes = stats.bytes,
+        elapsed_us = stats.elapsed.as_micros() as u64,
+        "aof recovery replay complete"
+    );
     Ok(engine)
 }
 
@@ -777,6 +827,59 @@ mod tests {
         assert_eq!(
             engine.get(b"b"),
             Some(Value::String(bytes::Bytes::from_static(b"2")))
+        );
+    }
+
+    #[test]
+    fn replay_with_stats_counts_every_command_and_byte_replayed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.aof");
+        let raw: &[u8] =
+            b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n*3\r\n$3\r\nSET\r\n$1\r\nb\r\n$1\r\n2\r\n";
+        write_raw(&path, raw);
+        let engine = Engine::new();
+        let stats = replay_with_stats(&path, &engine, 0).unwrap();
+        assert_eq!(stats.commands, 2);
+        assert_eq!(stats.bytes, raw.len() as u64);
+    }
+
+    #[test]
+    fn replay_with_stats_excludes_a_corrupt_tail_from_both_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.aof");
+        let valid = b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n";
+        write_raw(&path, valid);
+        write_raw(&path, b"*3\r\n$3\r\nSET\r\n$1\r\nb\r\n$3\r\ngar"); // truncated mid-bulk-body
+        let engine = Engine::new();
+        let stats = replay_with_stats(&path, &engine, 0).unwrap();
+        assert_eq!(stats.commands, 1);
+        assert_eq!(stats.bytes, valid.len() as u64);
+    }
+
+    #[test]
+    fn replay_with_stats_on_a_missing_file_reports_zero_commands_and_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does-not-exist.aof");
+        let engine = Engine::new();
+        let stats = replay_with_stats(&path, &engine, 0).unwrap();
+        assert_eq!(stats.commands, 0);
+        assert_eq!(stats.bytes, 0);
+    }
+
+    #[test]
+    fn replay_still_reports_no_stats_and_behaves_exactly_as_before() {
+        // `replay` is now a thin wrapper over `replay_with_stats`; this test pins its public
+        // signature and behavior so a future change to `replay_with_stats` cannot silently
+        // change what `replay`'s many existing callers observe.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.aof");
+        write_raw(&path, b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n");
+        let engine = Engine::new();
+        let result: std::io::Result<()> = replay(&path, &engine, 0);
+        assert!(result.is_ok());
+        assert_eq!(
+            engine.get(b"a"),
+            Some(Value::String(bytes::Bytes::from_static(b"1")))
         );
     }
 
