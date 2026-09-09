@@ -272,6 +272,7 @@ Configuration is layered, each level overriding the one before: built-in default
 | `cluster_config` / `cluster_node_id` | unset | Cluster topology file and this node's entry |
 | `slowlog_threshold_micros` | `10000` | Commands at or over this are recorded; `0` disables |
 | `log_level` | `info` | Log level filter for `tracing`; `RUST_LOG` env var always overrides it |
+| `log_value_max_bytes` | `128` | Max bytes of a value rendered into a `trace` log line; `trace` logs your data in plaintext |
 
 Every field, with its TOML key, environment variable, CLI flag, and ACL bootstrap format, is in
 [`docs/config-reference.md`](docs/config-reference.md).
