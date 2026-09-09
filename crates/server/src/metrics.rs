@@ -119,6 +119,12 @@ async fn serve_one_scrape(
     let response = if path == "/metrics" || path.starts_with("/metrics?") {
         refresh_sampled_gauges(&engine, &replication);
         let body = handle.render();
+        // `trace`, not `debug`: this endpoint is scraped on a fixed interval (Prometheus
+        // defaults to 15s) for as long as the process runs, so anything louder would be
+        // constant background noise at a level operators are told is safe to leave on. No
+        // enclosing span carries this -- `serve_one_scrape` is its own accept-loop task, wired
+        // up independently of `serve()`'s per-connection spans -- so the event stands alone.
+        tracing::trace!(bytes = body.len(), "metrics scrape served");
         format!(
             "HTTP/1.1 200 OK\r\n\
              Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n\
@@ -213,4 +219,15 @@ mod tests {
             "expected 200 for /metrics?format=openmetrics, got: {with_query}"
         );
     }
+
+    // A capture assertion on `serve_one_scrape`'s `trace!` output does not live here. `tracing`
+    // caches callsite `Interest` per callsite, process-globally, the first time that callsite
+    // is reached (see `test(logging): stop asserting on captured logs from unit-test binaries`
+    // for the two tests this bit for real). The test above scrapes `/metrics` three times with
+    // no subscriber installed, which would reach the new `trace!` callsite first in the
+    // ~575-test unit binary this file compiles into and could permanently decide it's
+    // uninteresting before a later test's own capture subscriber gets a turn.
+    // `a_metrics_scrape_is_traced_and_a_404_is_not` lives in `crates/server/tests/logging.rs`
+    // instead, a separate, much smaller integration binary where this callsite is touched by
+    // nothing else. Do not re-add a capture assertion here.
 }

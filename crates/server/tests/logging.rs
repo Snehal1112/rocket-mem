@@ -625,3 +625,71 @@ fn maybe_record_only_warns_when_the_command_actually_gets_recorded() {
         "expected elapsed_us (25000) in the slowlog warning:\n{text}"
     );
 }
+
+/// A served `/metrics` scrape traces its byte count; a 404 does not. Lives here rather than as
+/// a `#[cfg(test)]` capture assertion inside `crates/server/src/metrics.rs` itself, per this
+/// file's established rule (see the comment block above `maybe_record_only_warns_...` and the
+/// one further up): `crates/server/src/metrics.rs`'s own
+/// `the_metrics_endpoint_serves_the_rendered_registry_and_404s_everything_else` scrapes
+/// `/metrics` three times with no subscriber installed, in the same ~575-test unit binary,
+/// which could permanently decide the new `trace!` callsite is uninteresting before a capture
+/// test's own subscriber ever got a turn.
+#[tokio::test]
+async fn a_metrics_scrape_is_traced_and_a_404_is_not() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let handle = rocket_mem::metrics::recorder_handle();
+    let engine = Arc::new(engine::Engine::new());
+    let replication = Arc::new(rocket_mem::replication::ReplicationHandle::default());
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(rocket_mem::metrics::serve_metrics(
+        listener,
+        handle,
+        Arc::clone(&engine),
+        Arc::clone(&replication),
+    ));
+
+    async fn get(addr: std::net::SocketAddr, path: &str) -> String {
+        let mut socket = TcpStream::connect(addr).await.unwrap();
+        socket
+            .write_all(format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut response = String::new();
+        socket.read_to_string(&mut response).await.unwrap();
+        response
+    }
+
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(BufferWriter(Arc::clone(&buffer)))
+        .with_max_level(tracing::Level::TRACE)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let missing = get(addr, "/nope").await;
+    assert!(
+        missing.starts_with("HTTP/1.1 404 Not Found\r\n"),
+        "{missing}"
+    );
+    let after_404 = String::from_utf8(buffer.lock().unwrap_or_else(|e| e.into_inner()).clone())
+        .expect("subscriber output is utf-8");
+    assert!(
+        after_404.is_empty(),
+        "a 404 must not trigger the scrape-served trace, got:\n{after_404}"
+    );
+
+    let body = get(addr, "/metrics").await;
+    assert!(body.starts_with("HTTP/1.1 200 OK\r\n"), "{body}");
+
+    drop(_guard);
+    let text = String::from_utf8(buffer.lock().unwrap_or_else(|e| e.into_inner()).clone())
+        .expect("subscriber output is utf-8");
+    assert!(
+        text.contains("metrics scrape served") && text.contains("bytes"),
+        "expected a trace-level scrape event carrying a byte count:\n{text}"
+    );
+}
