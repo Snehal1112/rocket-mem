@@ -90,7 +90,9 @@ Instead, exactly three spans carry the correlation, and everything nested inheri
 
 One fixed set of field names across every crate and subsystem, so a single `grep` follows an activity end to end:
 
-`conn_id`, `peer`, `cmd`, `key`, `argc`, `user`, `error`, `elapsed_us`, `shard`, `offset`, `bytes`.
+`conn_id`, `peer`, `cmd`, `key`, `argc`, `user`, `error`, `elapsed_us`, `shard`, `offset`, `bytes`, `commands_served`.
+
+`commands_served` was added during planning: the connection-closed event needs to report how much work a connection did before it went away, and none of the other names carried that meaning. Any further addition goes through the same route — extend this list rather than inventing a synonym at a call site, since the value of a fixed vocabulary is entirely in its being exhaustive.
 
 ## Decision: log content — values at `trace`, secrets never
 
