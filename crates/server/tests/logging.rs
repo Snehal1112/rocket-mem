@@ -1167,6 +1167,64 @@ fn an_unbounded_username_is_capped_before_it_reaches_the_log() {
     );
 }
 
+/// `maybe_evict` runs after **every** mutation, so once the store sits at `maxmemory` every
+/// subsequent write evicts something. A `warn!` on each such cycle therefore means one `warn`
+/// line per write, at the production default level, for as long as the pressure lasts -- exactly
+/// the firehose the level taxonomy exists to prevent, and for a `maxmemory` deployment the
+/// loudest line in the log.
+///
+/// Both halves of the fix are asserted here, in one capture at `debug` so the file's capture-test
+/// count does not grow twice: eviction becoming active is still reported at `warn` (it is a
+/// genuine operational milestone -- silence would be the opposite mistake), and the per-cycle
+/// detail an operator opts into is still there, per cycle, at `debug`.
+///
+/// Lives here rather than beside the other eviction tests in `crates/engine/src/engine.rs`, per
+/// this file's established rule (see the comment block further up): those tests drive
+/// `maybe_evict` with no subscriber installed, in the same unit-test binary, so the new
+/// callsites' `Interest` could be cached before a capture assertion there ever got a turn.
+#[test]
+fn sustained_eviction_reports_its_onset_but_never_one_warn_per_write() {
+    // 100-byte values against a 2_000-byte ceiling: the first handful of writes fill it, and
+    // every write after that evicts, which is the steady state under test.
+    let engine = engine::Engine::with_maxmemory(2_000);
+
+    let (evictions, text) = capture_during("debug", || {
+        for i in 0..300 {
+            engine.set(
+                Bytes::from(format!("evict-{i}")),
+                engine::Value::String(Bytes::from(vec![b'x'; 100])),
+            );
+        }
+        engine.eviction_count()
+    });
+
+    assert!(
+        evictions > 200,
+        "the ceiling did not force sustained eviction, so this test proved nothing: \
+         {evictions} evictions"
+    );
+    assert_eq!(
+        text.matches("WARN").count(),
+        1,
+        "sustained eviction emitted {} warn lines across 300 writes and {evictions} evictions; \
+         the warn roll-up must not scale with the write rate:\n{text}",
+        text.matches("WARN").count()
+    );
+    assert!(
+        text.contains("maxmemory eviction active"),
+        "eviction became active and the operator was never told at the default level:\n{text}"
+    );
+    // The opt-in detail: still one summary per cycle, and still one line per evicted key.
+    assert!(
+        text.matches("maxmemory eviction cycle").count() > 1,
+        "the per-cycle summary must survive at `debug`, once per cycle:\n{text}"
+    );
+    assert!(
+        text.contains("evicted key"),
+        "the per-key eviction line must survive at `debug`:\n{text}"
+    );
+}
+
 // ---------------------------------------------------------------------------------------------
 // Span *names*, as they render.
 //

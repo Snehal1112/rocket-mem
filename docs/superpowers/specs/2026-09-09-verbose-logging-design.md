@@ -174,8 +174,15 @@ than `Store::shard_index` — the placement plan 12 identified as the riskiest i
 deliberately avoided by instrumenting the `Engine` facade instead. It needs its own plan with
 its own benchmark gate, not a line folded into a plan that changes other things at the same
 time. Everything else in the Engine row shipped: shard routing, mutation byte delta, the
-*active*-expire cycle count, and eviction (which shipped as two events, a per-key `debug` and
-a per-cycle `warn`).
+*active*-expire cycle count, and eviction — which shipped as three events, not the row's one:
+a per-key `debug`, a per-cycle `debug`, and a rate-limited `warn` roll-up. Both demotions from
+the row's `warn` are volume, on two different axes. Within a cycle, `MAX_EVICTION_ATTEMPTS` is
+1000, so a `warn` per key could be 1000 lines from one call. Across cycles, `maybe_evict` runs
+after *every* mutation, so at `maxmemory` every write evicts and even a per-cycle `warn` is a
+per-write `warn` — the loudest line in such a deployment's log. What an operator actually needs
+at the default level is "this node is evicting", so that is what the `warn` roll-up says
+(`maxmemory eviction active`), immediately on the first eviction and at most once a minute
+after: its volume is a function of wall time, never of the write rate.
 
 **The File column names the subsystem, not always the file the event landed in.** The audit
 found five rows whose event exists but lives elsewhere, in every case because the value the

@@ -23,7 +23,7 @@ replication, clustering, and access control apply identically whichever one a cl
 > different cores at the same instant. Real Redis is deliberately single-threaded for command
 > execution; rocket-mem chose sharded locks over that model instead.
 
-> **Project status.** rocket-mem is complete and tested — 945 tests, durability verified under a
+> **Project status.** rocket-mem is complete and tested — 975 tests, durability verified under a
 > `kill -9` chaos loop — but it is not yet production-hardened: there is no failover and no live
 > resharding. Read [Limitations](#limitations) before deploying it. Every subsystem — dispatch,
 > engine, protocol codecs, AOF, replication, cluster routing — emits leveled activity logs from
@@ -308,12 +308,16 @@ The rule that keeps levels predictable: **`info` is milestones, `debug` is what 
 | Level | Meaning | What you get |
 |---|---|---|
 | `error` | Durability or correctness failure needing action | AOF append/fsync/encode failure, recovery abort, replication apply failure |
-| `warn` | Recovered, retried, or client-caused anomaly | TLS handshake failure, decode error, replication reconnect, discarded AOF tail, ACL denial, eviction, slow-log hits |
+| `warn` | Recovered, retried, or client-caused anomaly | TLS handshake failure, decode error, replication reconnect, discarded AOF tail, ACL denial, `maxmemory` eviction becoming active, slow-log hits |
 | `info` | Lifecycle milestones — safe to leave on in production | Startup and resolved config, listener bound, connection accept/close, AOF rewrite, snapshot save/load, replica register/prune, auth success |
-| `debug` | Per-command activity and subsystem sub-steps | One line per dispatched command with `elapsed_us`, AOF fsync offsets, active-expire cycles, MOVED redirects, PSYNC handshake steps, per-command replication apply |
+| `debug` | Per-command activity and subsystem sub-steps | One line per dispatched command with `elapsed_us`, AOF fsync offsets, active-expire cycles, per-key and per-cycle eviction detail, MOVED redirects, PSYNC handshake steps, per-command replication apply |
 | `trace` | The bytes | Command arguments and value contents (capped), shard routing, mutation byte deltas, codec frame decode and split-read reassembly, replication stream offsets, metrics scrapes |
 
 `info` is the default and stays quiet under load: nothing per-command is emitted at or above it.
+The one event that could otherwise become per-command is `maxmemory` eviction — once the store
+sits at its ceiling, every write evicts something — so the `warn` an operator sees
+(`maxmemory eviction active`) fires immediately on the first eviction and then at most once a
+minute for as long as the pressure lasts. Per-key and per-cycle eviction detail is at `debug`.
 
 ### Setting the level
 

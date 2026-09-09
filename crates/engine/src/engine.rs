@@ -1,7 +1,35 @@
 use crate::{store::Store, Value};
 use bytes::Bytes;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+
+/// The `reason` field every `maxmemory`-driven eviction event carries. One constant so the
+/// per-key `debug`, the per-cycle `debug` and the `warn` roll-up can never drift apart -- an
+/// operator greps `reason=` across all three.
+const EVICTION_REASON: &str = "maxmemory";
+
+/// How often the `warn`-level "eviction is active" roll-up may fire, per `Engine`.
+///
+/// One minute, not one cycle: `maybe_evict` runs after every mutation, so at `maxmemory` every
+/// write evicts and a per-cycle `warn` is a per-write `warn`. A minute keeps the report frequent
+/// enough that an operator watching a live log sees pressure appear promptly and sees it stay,
+/// while making the line's volume a function of wall time rather than of the write rate.
+const EVICTION_WARN_INTERVAL_SECS: u64 = 60;
+
+/// `last_eviction_warn_secs`'s "no roll-up has ever been emitted" sentinel, so the very first
+/// eviction reports immediately instead of waiting out an interval.
+const NEVER_WARNED: u64 = u64::MAX;
+
+/// Whether an eviction roll-up is due, given the previous one's stamp and the current
+/// elapsed-seconds reading. Split out from `Engine::report_eviction_pressure` purely so the
+/// interval rule is testable without a minute of wall-clock time in the test suite.
+///
+/// Note the third case this encodes: a stamp more than an interval in the past re-arms the
+/// report, so a second episode of memory pressure minutes after the first is announced again
+/// rather than being silently folded into the first episode's already-spent slot.
+fn eviction_warn_is_due(last: u64, now: u64) -> bool {
+    last == NEVER_WARNED || now.saturating_sub(last) >= EVICTION_WARN_INTERVAL_SECS
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TtlStatus {
@@ -14,6 +42,12 @@ pub struct Engine {
     store: Store,
     maxmemory: Option<usize>,
     eviction_count: AtomicUsize,
+    /// The origin the eviction roll-up measures elapsed seconds from. An `Instant`, so it is
+    /// monotonic and immune to a wall-clock step; never read outside `report_eviction_pressure`.
+    started_at: Instant,
+    /// Seconds since `started_at` at which the last `warn` eviction roll-up fired, or
+    /// `NEVER_WARNED`. See `report_eviction_pressure`.
+    last_eviction_warn_secs: AtomicU64,
 }
 
 impl Engine {
@@ -22,6 +56,8 @@ impl Engine {
             store: Store::new(crate::SHARD_COUNT),
             maxmemory: None,
             eviction_count: AtomicUsize::new(0),
+            started_at: Instant::now(),
+            last_eviction_warn_secs: AtomicU64::new(NEVER_WARNED),
         }
     }
 
@@ -30,6 +66,8 @@ impl Engine {
             store: Store::new(crate::SHARD_COUNT),
             maxmemory: Some(bytes),
             eviction_count: AtomicUsize::new(0),
+            started_at: Instant::now(),
+            last_eviction_warn_secs: AtomicU64::new(NEVER_WARNED),
         }
     }
 
@@ -200,17 +238,25 @@ impl Engine {
     /// touch, repeating until back under budget or `MAX_EVICTION_ATTEMPTS` is hit — a bounded
     /// loop even if the ceiling is misconfigured smaller than a single entry.
     ///
-    /// Logs each individual eviction at `debug` (key + bytes freed + reason), then exactly one
-    /// `warn!` summarizing the whole cycle (count + bytes reclaimed) if anything was evicted.
-    /// The spec's event catalogue asks for a `warn!` per eviction, but `MAX_EVICTION_ATTEMPTS`
-    /// is 1000 -- a single call under sustained memory pressure could otherwise emit 1000 warn
-    /// lines, which is not what "occasional... eviction under memory pressure" (the spec's own
-    /// description of warn's intended volume) means. One warn per cycle, at debug per key,
-    /// serves the same operator-facing intent without the flood.
+    /// Logging here has to survive volume on two independent axes, and the spec's event
+    /// catalogue ("a `warn!` per eviction") survives neither:
+    ///
+    /// *Within* one cycle, `MAX_EVICTION_ATTEMPTS` is 1000, so a single call could emit 1000
+    /// warn lines. Hence per-key detail at `debug` and one summary for the whole cycle.
+    ///
+    /// *Across* cycles, `maybe_evict` runs after **every** mutation (`set`, `with_mut`,
+    /// `with_mut_delta`), so once the store sits at `maxmemory` every subsequent write evicts
+    /// something and the per-cycle summary fires on every write. At `warn` that is one line per
+    /// write for as long as the pressure lasts — the same flood one axis further out, and on a
+    /// `maxmemory` deployment it would be the loudest line in the log. Hence the per-cycle
+    /// summary is `debug` too, and the `warn` an operator actually needs is the rate-limited
+    /// roll-up in `report_eviction_pressure` below: the first eviction reports immediately (the
+    /// operational milestone — eviction must never be silent at the default level), and after
+    /// that the report's volume is a function of wall time, not of the write rate.
     fn maybe_evict(&self) {
         const MAX_EVICTION_ATTEMPTS: usize = 1000;
         const SAMPLE_PER_SHARD: usize = 5;
-        const REASON: &str = "maxmemory";
+        const REASON: &str = EVICTION_REASON;
         let Some(ceiling) = self.maxmemory else {
             return;
         };
@@ -240,13 +286,53 @@ impl Engine {
             attempts += 1;
         }
         if attempts > 0 {
-            tracing::warn!(
+            tracing::debug!(
                 evicted = attempts,
                 bytes = total_freed,
                 reason = REASON,
                 "maxmemory eviction cycle"
             );
+            self.report_eviction_pressure(attempts, total_freed);
         }
+    }
+
+    /// The one eviction event emitted at the production default level: "this node is evicting".
+    ///
+    /// Rate-limited to one line per `EVICTION_WARN_INTERVAL_SECS` per `Engine`, because its
+    /// caller runs once per *write* under sustained pressure — see `maybe_evict`'s doc comment.
+    /// The first eviction is never suppressed (`NEVER_WARNED`), so the milestone an operator has
+    /// to see arrives the moment it happens; a later line means the pressure is still on.
+    ///
+    /// Cost, on a path that already sampled all 16 shards and removed a key: one relaxed atomic
+    /// load, one `Instant::elapsed` (a vDSO `clock_gettime`, tens of nanoseconds), and — only on
+    /// the at-most-once-a-minute branch — one relaxed compare-exchange plus a second relaxed
+    /// load. No lock, no allocation, no `SystemTime`, and nothing at all when `maxmemory` is
+    /// unset or the store is under its ceiling, since `maybe_evict` returns before reaching here.
+    ///
+    /// The compare-exchange, rather than a plain store, is what keeps concurrent writers on
+    /// different shards from each emitting the same line: only the thread that successfully
+    /// claims the interval logs, and a thread that loses the race skips it — which is precisely
+    /// the intended outcome, since the winner has just logged.
+    fn report_eviction_pressure(&self, evicted: usize, bytes: usize) {
+        let last = self.last_eviction_warn_secs.load(Ordering::Relaxed);
+        let now = self.started_at.elapsed().as_secs();
+        if !eviction_warn_is_due(last, now) {
+            return;
+        }
+        if self
+            .last_eviction_warn_secs
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        tracing::warn!(
+            evicted,
+            bytes,
+            evicted_total = self.eviction_count.load(Ordering::Relaxed),
+            reason = EVICTION_REASON,
+            "maxmemory eviction active"
+        );
     }
 }
 
@@ -648,6 +734,64 @@ mod tests {
     fn evicted_entry_size_of_a_missing_key_is_zero() {
         let engine = Engine::new();
         assert_eq!(engine.evicted_entry_size(b"missing"), 0);
+    }
+
+    /// The interval rule behind the eviction roll-up, as a pure decision -- so the "re-arms after
+    /// a quiet period" case is covered without a minute of wall time in the suite. Sits with the
+    /// other eviction tests rather than in `crates/server/tests/logging.rs`, which asserts on
+    /// rendered output; this asserts on the rule itself and needs no subscriber.
+    #[test]
+    fn an_eviction_roll_up_is_due_at_first_eviction_and_then_only_once_per_interval() {
+        // The first eviction ever: reported immediately. Eviction becoming active is an
+        // operational milestone, so it must never wait out an interval before being announced.
+        assert!(eviction_warn_is_due(NEVER_WARNED, 0));
+        assert!(eviction_warn_is_due(NEVER_WARNED, 9_999));
+
+        // Inside the interval -- the steady state, where `maybe_evict` runs on every write.
+        assert!(!eviction_warn_is_due(0, 0));
+        assert!(!eviction_warn_is_due(0, EVICTION_WARN_INTERVAL_SECS - 1));
+        assert!(!eviction_warn_is_due(1_000, 1_000));
+
+        // An interval later, and long after: still on, so say so again.
+        assert!(eviction_warn_is_due(0, EVICTION_WARN_INTERVAL_SECS));
+        assert!(eviction_warn_is_due(
+            1_000,
+            1_000 + EVICTION_WARN_INTERVAL_SECS
+        ));
+        assert!(eviction_warn_is_due(0, 86_400));
+    }
+
+    /// The claim itself: the first report takes the interval's slot, and a second report inside
+    /// the same interval neither logs nor moves the stamp. Between them these two tests cover
+    /// what `crates/server/tests/logging.rs`'s capture test observes end to end.
+    #[test]
+    fn the_first_eviction_claims_the_roll_up_slot_and_a_later_one_does_not_reclaim_it() {
+        let engine = Engine::with_maxmemory(300);
+        assert_eq!(
+            engine.last_eviction_warn_secs.load(Ordering::Relaxed),
+            NEVER_WARNED,
+            "a fresh engine has never reported eviction pressure"
+        );
+
+        engine.report_eviction_pressure(1, 100);
+        let claimed = engine.last_eviction_warn_secs.load(Ordering::Relaxed);
+        assert_ne!(
+            claimed, NEVER_WARNED,
+            "the first report must fire rather than wait out an interval"
+        );
+
+        // Park the stamp an interval ahead of anything `elapsed().as_secs()` can return during
+        // this test, so the next call is unambiguously inside the interval.
+        let parked = claimed + EVICTION_WARN_INTERVAL_SECS;
+        engine
+            .last_eviction_warn_secs
+            .store(parked, Ordering::Relaxed);
+        engine.report_eviction_pressure(1, 100);
+        assert_eq!(
+            engine.last_eviction_warn_secs.load(Ordering::Relaxed),
+            parked,
+            "a report inside the interval must be suppressed, not reclaim the slot"
+        );
     }
 
     #[test]
