@@ -685,7 +685,20 @@ pub fn recover(aof_path: &Path, snapshot_path: &Path) -> std::io::Result<engine:
                         Err(e) => return Err(e),
                     };
                     match aof_len {
-                        None => return Ok(engine),
+                        None => {
+                            // No commands/bytes/elapsed_us fields here on purpose: those would
+                            // look identical to the "AOF present but zero-length" case below
+                            // (which legitimately replays an empty file and reports
+                            // commands=0 bytes=0), and this path never touches the AOF at all --
+                            // the snapshot alone is the entire recovered state. Same message
+                            // prefix and level as that summary so one grep for "aof recovery
+                            // replay complete" still surfaces every recovery outcome.
+                            tracing::info!(
+                                aof_path = %aof_path.display(),
+                                "aof recovery replay complete (no aof file; snapshot is the entire recovered state)"
+                            );
+                            return Ok(engine);
+                        }
                         Some(len) if offset > len => {
                             tracing::warn!(
                                 snapshot_path = %snapshot_path.display(),
