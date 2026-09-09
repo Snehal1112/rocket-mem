@@ -28,6 +28,9 @@ want to change from the default.
 | `tls_rmp_addr` | `ROCKET_MEM_TLS_RMP_ADDR` | `--tls-rmp-addr` | unset | TCP address for a TLS-wrapped RMP listener, run alongside the plaintext one at `rmp_addr`. Unset means no TLS RMP listener. Setting this requires `tls_cert_path` and `tls_key_path` — see the TLS note below. |
 | `tls_cert_path` | `ROCKET_MEM_TLS_CERT_PATH` | `--tls-cert-path` | unset | Path to a PEM certificate chain, shared by both TLS listeners. |
 | `tls_key_path` | `ROCKET_MEM_TLS_KEY_PATH` | `--tls-key-path` | unset | Path to a PEM private key, shared by both TLS listeners. |
+| `replicaof` | `ROCKET_MEM_REPLICAOF` | `--replicaof` | unset | `host:port` of a leader to auto-connect to as a follower on every startup. Unset means standalone (or purely live-`REPLICAOF`-driven) operation. |
+| `replicaof_auth_username` | `ROCKET_MEM_REPLICAOF_AUTH_USERNAME` | `--replicaof-auth-username` | unset | Username sent in `AUTH` before `PSYNC`, when `replicaof`'s leader has ACL users configured. Must be set together with `replicaof_auth_password`, or neither. |
+| `replicaof_auth_password` | `ROCKET_MEM_REPLICAOF_AUTH_PASSWORD` | `--replicaof-auth-password` | unset | Password sent in `AUTH` before `PSYNC`. Plaintext in the TOML file, same as `[[acl.users]]`'s own `password` field. |
 | `[[acl.users]]` | *(file-only — no flat env var for an array)* | *(file-only)* | empty | Bootstrap ACL users, loaded once at startup. See "The `[[acl.users]]` array" below. |
 
 `--config <path>` is a fifth, special-cased CLI flag: it names which TOML file gets merged
@@ -43,6 +46,17 @@ also be set. `rocket-mem` checks this at startup, before binding either TLS list
 aborts immediately with a clear error if the cert or key path is missing — it will not
 silently start up with that TLS listener simply never bound. This check runs regardless of
 which layer supplied the TLS address (TOML, env var, or CLI flag).
+
+### `replicaof`'s auth pair is all-or-nothing; the target itself is not validated
+
+If `replicaof_auth_username` or `replicaof_auth_password` is set, both must be — `rocket-mem`
+checks this at startup, before any listener binds, and aborts immediately if only one is set.
+`replicaof` itself (the `host:port` target) is **not** validated at startup: a bad host or an
+unreachable leader is only discoverable by actually attempting the connection, so it fails
+soft — the node starts normally, and its background reconnect loop retries once a second
+forever, exactly as it would for a leader that later becomes unreachable. This mirrors the
+live `REPLICAOF` command's existing behavior; see `.claude/manual-testing.md`'s "Replication
+(`REPLICAOF`)" section.
 
 ### Malformed values fail startup, not silently
 
