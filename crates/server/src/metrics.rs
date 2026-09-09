@@ -181,6 +181,7 @@ mod tests {
             response
         }
 
+        replication.advance_master_repl_offset(42);
         let body = get(addr, "/metrics").await;
         assert!(body.starts_with("HTTP/1.1 200 OK\r\n"), "{body}");
         assert!(
@@ -190,7 +191,7 @@ mod tests {
         assert!(body.contains("rocket_mem_keys 1"), "{body}");
         assert!(body.contains("rocket_mem_connected_clients 1"), "{body}");
         assert!(body.contains("rocket_mem_memory_used_bytes"), "{body}");
-        assert!(body.contains("rocket_mem_master_repl_offset"), "{body}");
+        assert!(body.contains("rocket_mem_master_repl_offset 42"), "{body}");
 
         let missing = get(addr, "/nope").await;
         assert!(

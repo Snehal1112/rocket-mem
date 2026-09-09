@@ -188,12 +188,12 @@ pub struct ReplicationHandle {
     /// Leader side: how many bytes of replication stream this node has produced since it
     /// started. Advanced by `dispatch_and_log_inner`'s fan-out loop by the encoded length of
     /// every frame it hands to `ReplicaRegistry::broadcast`, under the same AOF ordering guard
-    /// the broadcast itself is under, so offsets are assigned in exactly fan-out order. It
-    /// counts the write stream this leader produced, not what any replica received, so it
-    /// advances even when no replica is connected. Process-local: it resets to 0 on restart,
-    /// which is safe only because every reconnect is a full resync that re-seeds the follower
-    /// from the snapshot header, so a follower can never carry a stale offset across a leader
-    /// restart. An `Arc` for symmetry with the follower-side counter added in
+    /// the broadcast itself is under, so the advance and broadcast are atomic as observed under
+    /// lock_all_shards. It counts the write stream this leader produced, not what any replica
+    /// received, so it advances even when no replica is connected. Process-local: it resets to 0
+    /// on restart, which is safe only because every reconnect is a full resync that re-seeds the
+    /// follower from the snapshot header, so a follower can never carry a stale offset across a
+    /// leader restart. An `Arc` for symmetry with the follower-side counter added in
     /// `03-follower-replication-offset.md`, whose spawned task is `'static`.
     master_repl_offset: Arc<AtomicU64>,
     /// Recently-slow commands, recorded by the `dispatch_and_log` wrapper. A plain field, not an

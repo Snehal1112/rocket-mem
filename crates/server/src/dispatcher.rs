@@ -3257,10 +3257,10 @@ fn dispatch_and_log_inner(
     // for this command done, is the guard's work finished.
     for encoded in to_broadcast {
         // The replication offset advances here, under the same guard and in the same iteration
-        // as the broadcast, so offset order matches fan-out order exactly. It counts the bytes
-        // this leader produced, not the bytes anyone received, so it advances even when the
-        // registry is empty -- that is what makes it comparable across a leader and a follower
-        // that attached later. `encoded.len()` is read before the move into `broadcast`.
+        // as the broadcast, so the advance and broadcast are atomic as observed under lock_all_shards.
+        // It counts the bytes this leader produced, not the bytes anyone received, so it advances
+        // even when the registry is empty -- that is what makes it comparable across a leader and
+        // a follower that attached later. `encoded.len()` is read before the move into `broadcast`.
         replication.advance_master_repl_offset(encoded.len() as u64);
         replication.registry.broadcast(encoded);
     }
