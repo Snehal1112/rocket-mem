@@ -172,6 +172,7 @@ impl Decoder for RespCodec {
         match parse_frame(src)? {
             Some((frame, consumed)) => {
                 src.advance(consumed);
+                tracing::trace!(kind = frame.kind(), len = frame.log_len(), "frame decoded");
                 Ok(Some(frame))
             }
             None => Ok(None),

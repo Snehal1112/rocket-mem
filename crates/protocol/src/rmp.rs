@@ -257,6 +257,7 @@ impl Decoder for RmpCodec {
         src.advance(HEADER_LEN);
         let mut payload = src.split_to(payload_len as usize);
         let frame = decode_frame(&mut payload)?;
+        tracing::trace!(kind = frame.kind(), len = frame.log_len(), "frame decoded");
         Ok(Some(RmpMessage {
             request_id,
             msg_type,
