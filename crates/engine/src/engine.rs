@@ -124,9 +124,12 @@ impl Engine {
     /// inside `Store::shard_index` itself: that method is `#[inline]` and sits on the hot path
     /// of every single `get`/`set`/`with_ref`/`with_mut`/`with_mut_delta` call, so a log call
     /// there — even a disabled one — is the single riskiest placement in this series. This
-    /// method is a separate, explicitly-called facade that only the AOF ordering guard and the
-    /// cluster router use today; instrumenting here answers "which shard does this key route
-    /// to" exactly where a caller already asks that question, without adding a branch to the
+    /// method is a separate, explicitly-called facade with exactly one production caller today:
+    /// the AOF ordering guard in `dispatch()` (`crates/server/src/dispatcher.rs`), which calls it
+    /// once per key for every write command -- not on the read path. (Cluster mode does not call
+    /// it at all; key-slot routing there goes through `crate::cluster::key_slot`, an unrelated
+    /// CRC16 computation.) Instrumenting here answers "which shard does this key route to"
+    /// exactly where that caller already asks the question, without adding a branch to the
     /// per-key read/write path inside `Store`.
     pub fn shard_index(&self, key: &[u8]) -> usize {
         let shard = self.store.shard_index(key);
