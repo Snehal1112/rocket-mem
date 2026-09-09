@@ -244,37 +244,51 @@ impl Decoder for RmpCodec {
             }
             return Ok(None);
         }
-        if src[0..2] != MAGIC {
-            return Err(invalid_data("bad rmp magic"));
+        // A single closure so a protocol-error warn can be logged once, on any `Err` this
+        // header/payload decoding produces, without duplicating a log call at every `return
+        // Err(...)` site below.
+        let result = (|| -> io::Result<Option<RmpMessage>> {
+            if src[0..2] != MAGIC {
+                return Err(invalid_data("bad rmp magic"));
+            }
+            if src[2] != VERSION {
+                return Err(invalid_data("unsupported rmp version"));
+            }
+            let msg_type = MsgType::from_byte(src[3])?;
+            let request_id = u64::from_be_bytes(src[4..12].try_into().unwrap());
+            let payload_len = u32::from_be_bytes(src[12..16].try_into().unwrap());
+            if payload_len > MAX_RMP_FRAME_LEN {
+                return Err(invalid_data("rmp payload_len exceeds MAX_RMP_FRAME_LEN"));
+            }
+            let total_len = HEADER_LEN + payload_len as usize;
+            if src.len() < total_len {
+                tracing::trace!(
+                    buffered = src.len(),
+                    needed = total_len,
+                    "split-read reassembly: awaiting rmp payload"
+                );
+                src.reserve(total_len - src.len());
+                return Ok(None);
+            }
+            src.advance(HEADER_LEN);
+            let mut payload = src.split_to(payload_len as usize);
+            let frame = decode_frame(&mut payload)?;
+            tracing::trace!(kind = frame.kind(), len = frame.log_len(), "frame decoded");
+            Ok(Some(RmpMessage {
+                request_id,
+                msg_type,
+                frame,
+            }))
+        })();
+
+        // Every `invalid_data(...)` message above is a `&'static str` literal, and
+        // `decode_frame`'s errors are the same static-message shape (see `invalid_data` calls in
+        // `decode_frame_inner`) or a `Utf8Error`, whose Display renders only a byte count and
+        // offset -- never client-supplied bytes. Safe to log in full.
+        if let Err(ref e) = result {
+            tracing::warn!(error = %e, "protocol error decoding rmp message");
         }
-        if src[2] != VERSION {
-            return Err(invalid_data("unsupported rmp version"));
-        }
-        let msg_type = MsgType::from_byte(src[3])?;
-        let request_id = u64::from_be_bytes(src[4..12].try_into().unwrap());
-        let payload_len = u32::from_be_bytes(src[12..16].try_into().unwrap());
-        if payload_len > MAX_RMP_FRAME_LEN {
-            return Err(invalid_data("rmp payload_len exceeds MAX_RMP_FRAME_LEN"));
-        }
-        let total_len = HEADER_LEN + payload_len as usize;
-        if src.len() < total_len {
-            tracing::trace!(
-                buffered = src.len(),
-                needed = total_len,
-                "split-read reassembly: awaiting rmp payload"
-            );
-            src.reserve(total_len - src.len());
-            return Ok(None);
-        }
-        src.advance(HEADER_LEN);
-        let mut payload = src.split_to(payload_len as usize);
-        let frame = decode_frame(&mut payload)?;
-        tracing::trace!(kind = frame.kind(), len = frame.log_len(), "frame decoded");
-        Ok(Some(RmpMessage {
-            request_id,
-            msg_type,
-            frame,
-        }))
+        result
     }
 }
 

@@ -169,13 +169,13 @@ impl Decoder for RespCodec {
     type Error = io::Error;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Frame>, Self::Error> {
-        match parse_frame(src)? {
-            Some((frame, consumed)) => {
+        match parse_frame(src) {
+            Ok(Some((frame, consumed))) => {
                 src.advance(consumed);
                 tracing::trace!(kind = frame.kind(), len = frame.log_len(), "frame decoded");
                 Ok(Some(frame))
             }
-            None => {
+            Ok(None) => {
                 if !src.is_empty() {
                     // A genuine split read: some bytes have arrived but not enough to complete
                     // a frame yet. An empty buffer (nothing arrived at all) is not reassembly in
@@ -187,6 +187,13 @@ impl Decoder for RespCodec {
                     );
                 }
                 Ok(None)
+            }
+            // `e`'s Display text is always either a static literal (e.g. "bad integer") or a
+            // `Utf8Error`, whose Display renders only a byte count and offset -- never the
+            // invalid bytes themselves -- so this never leaks client-supplied content.
+            Err(e) => {
+                tracing::warn!(error = %e, "protocol error decoding frame");
+                Err(e)
             }
         }
     }
