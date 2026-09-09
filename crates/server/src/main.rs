@@ -96,9 +96,12 @@ async fn main() -> std::io::Result<()> {
     let log_color = std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none();
     let color = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
 
-    let filter = tracing_subscriber::EnvFilter::new(
-        rocket_mem::config::resolve_log_filter_directive(&config.log_level),
-    );
+    // Hoisted out of the `EnvFilter::new(...)` call so the config summary below can log the
+    // directive that is actually in force. `config.log_level` is only the fallback -- `RUST_LOG`
+    // wins (see `resolve_log_filter_directive`) -- so logging the config field would have the
+    // summary claim `info` while the process emits `debug` lines.
+    let log_filter_directive = rocket_mem::config::resolve_log_filter_directive(&config.log_level);
+    let filter = tracing_subscriber::EnvFilter::new(&log_filter_directive);
     tracing_subscriber::fmt()
         .with_ansi(log_color)
         .with_writer(std::io::stderr)
@@ -118,19 +121,31 @@ async fn main() -> std::io::Result<()> {
     // field's *presence*. Never render `config` (or `config.acl`) via `Debug`/`{:?}` here: a
     // derived `Debug` on a struct that transitively holds credentials is exactly the hazard
     // `acl::AclUser`'s hand-written `Debug` already exists to prevent. Deliberately absent:
-    // `tls_cert_path`, `tls_key_path`, `tls_ca_path` (summarised only as `tls_enabled`) and
-    // every `acl.users` field (summarised only as `acl_enabled`).
+    // `tls_cert_path`, `tls_key_path`, `tls_ca_path` (summarised only as the two `tls_*_enabled`
+    // booleans) and every `acl.users` field (summarised only as `acl_enabled`/`acl_user_count`).
+    // `startup_logging.rs`'s `secret_bearing_config_is_never_rendered_into_the_summary` is the
+    // regression guard for all of that -- it starts the binary with a real-shaped ACL user and
+    // TLS material and fails if any of it reaches stderr.
+    //
+    // `tls_enabled` means "this process is serving TLS listeners", derived from the addresses
+    // rather than from cert/key presence: cert and key set with no `tls_*_addr` binds no TLS
+    // listener at all, and `validate_tls` already rejects the reverse, so the addresses are the
+    // honest signal. TLS *replication* is a separate switch (`tls_ca_path`) that turns on no
+    // listener, so it gets its own field instead of being folded into this one.
     tracing::info!(
         addr = %config.addr,
         rmp_addr = %config.rmp_addr,
         metrics_addr = %config.metrics_addr,
         aof_path = %config.aof_path,
         snapshot_path = %config.snapshot_path,
-        log_level = %config.log_level,
+        log_filter = %log_filter_directive,
+        log_value_max_bytes = config.log_value_max_bytes,
+        slowlog_threshold_micros = config.slowlog_threshold_micros,
         cluster_mode = config.cluster_config.is_some(),
         acl_enabled = !config.acl.users.is_empty(),
         acl_user_count = config.acl.users.len(),
-        tls_enabled = config.tls_cert_path.is_some() && config.tls_key_path.is_some(),
+        tls_enabled = config.tls_resp_addr.is_some() || config.tls_rmp_addr.is_some(),
+        tls_replication_enabled = config.tls_ca_path.is_some(),
         "resolved config summary"
     );
 

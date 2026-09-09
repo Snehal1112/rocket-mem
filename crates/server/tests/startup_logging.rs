@@ -117,8 +117,35 @@ fn resolved_config_summary_is_logged_at_startup() {
     assert!(stderr.contains("acl_user_count=0"), "got:\n{stderr}");
     assert!(stderr.contains("tls_enabled=false"), "got:\n{stderr}");
     assert!(
+        stderr.contains("tls_replication_enabled=false"),
+        "got:\n{stderr}"
+    );
+    // The two config fields that govern this series' own output. An operator staring at a
+    // truncated trace log needs `log_value_max_bytes` in the log to explain it.
+    assert!(stderr.contains("log_value_max_bytes=128"), "got:\n{stderr}");
+    assert!(
+        stderr.contains("slowlog_threshold_micros=10000"),
+        "got:\n{stderr}"
+    );
+    assert!(
         !stderr.to_lowercase().contains("password"),
         "config summary must never log credential material, got:\n{stderr}"
+    );
+}
+
+/// The summary must report the filter that is *in force*, not `config.log_level`. `RUST_LOG`
+/// beats the config field (`config::resolve_log_filter_directive`), so logging the field would
+/// have the summary claim `info` while the very same process emits `debug` lines -- exactly the
+/// question an operator reads this event to answer.
+#[test]
+fn resolved_config_summary_reports_the_effective_log_filter_not_the_configured_one() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let stderr = spawn_and_capture_stderr(dir.path(), &[("RUST_LOG", "debug")], &[], 3);
+
+    assert!(
+        stderr.contains("log_filter=debug"),
+        "expected the RUST_LOG-resolved directive, not config.log_level's 'info', got:\n{stderr}"
     );
 }
 
