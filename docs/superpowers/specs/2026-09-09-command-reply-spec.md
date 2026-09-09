@@ -54,8 +54,8 @@ every lookup misses and logs.
 
 ## Decision
 
-`"COMMAND"` (no subcommand) returns one 6-element entry per `KNOWN_COMMANDS_LOWER` entry
-(`dispatcher.rs:2825-2917`, 91 commands today). A new helper builds each entry entirely from
+`"COMMAND"` (no subcommand) returns one 6-element entry per `KNOWN_COMMANDS` entry
+(`dispatcher.rs:2825-2917`, 88 commands today). A new helper builds each entry entirely from
 tables that already exist and are already each other's source of truth for a related concern —
 no new classification is invented:
 
@@ -63,7 +63,7 @@ no new classification is invented:
 [name, arity, flags, first_key, last_key, step]
 ```
 
-- **`name`**: the lowercase command name, taken directly from `KNOWN_COMMANDS_LOWER`.
+- **`name`**: the lowercase form of the command's `KNOWN_COMMANDS` entry.
 - **`flags`**: a one-element array, `["write"]` if the uppercased name appears in
   `aof::WRITE_COMMANDS` (`aof.rs:399-438`, 38 commands), else `["readonly"]`. No other flag
   category (`admin`, `pubsub`, `fast`, `loading`, `stale`, ...) is populated — see Out of scope.
@@ -113,7 +113,7 @@ Today, `"COMMAND"` matches on the top-level command name alone and never inspect
 `COMMAND COUNT`, `COMMAND INFO ...`, and any other subcommand all hit the same empty-array stub.
 This spec adds the two subcommands a client is actually likely to send:
 
-- **`COMMAND COUNT`** → `Frame::Integer(KNOWN_COMMANDS_LOWER.len() as i64)`.
+- **`COMMAND COUNT`** → `Frame::Integer(KNOWN_COMMANDS.len() as i64)`.
 - **`COMMAND INFO [name ...]`** → one entry per requested name, using the same per-command builder
   as bare `COMMAND`; an unrecognized name maps to `Frame::Null` at that position (matching real
   Redis's behavior of returning nil for a command it doesn't know), never an error.
@@ -142,16 +142,17 @@ This spec adds the two subcommands a client is actually likely to send:
 
 New tests:
 
-1. **Full coverage.** `COMMAND`'s reply array has exactly `KNOWN_COMMANDS_LOWER.len()` entries, and
-   every entry's name (case-insensitively) is a member of `KNOWN_COMMANDS_LOWER` — a regression
-   guard against the two tables drifting apart, in the same spirit as the existing
-   `metric_label_table_matches_known_commands`-style guard.
+1. **Full coverage.** `COMMAND`'s reply array has exactly `KNOWN_COMMANDS.len()` entries, and each
+   entry's name matches, in order, the lowercased form of the corresponding `KNOWN_COMMANDS`
+   entry — an order-preserving correspondence check against `KNOWN_COMMANDS` itself, rather than a
+   cross-table drift guard, since the reply is now derived from that single table directly and
+   there is no second table to drift out of sync with it.
 2. **Keyless commands.** `PING`'s entry has `first_key=0, last_key=0, step=0` and
    `flags=["readonly"]` (it is `key_spec::None` and not in `WRITE_COMMANDS`).
 3. **Single-key write.** `SET`'s entry has `flags=["write"]`, `first_key=1, last_key=1, step=1`.
 4. **Multi-key `All`.** `DEL`'s entry has `first_key=1, last_key=-1, step=1`.
 5. **`EveryOther`.** `MSET`'s entry has `first_key=1, last_key=-1, step=2`.
-6. **`COMMAND COUNT`** returns `Frame::Integer(KNOWN_COMMANDS_LOWER.len() as i64)`.
+6. **`COMMAND COUNT`** returns `Frame::Integer(KNOWN_COMMANDS.len() as i64)`.
 7. **`COMMAND INFO`** with a mix of a known command (e.g. `GET`) and an unknown name returns the
    known command's real entry and `Frame::Null` for the unknown one, in request order.
 8. **Arity sign.** Every entry's arity is negative (the `key_spec`-derived convention above never
@@ -166,10 +167,10 @@ suite can authenticate against a real 3-node cluster, confirm the
 
 ## Risks
 
-- **`KNOWN_COMMANDS` / `KNOWN_COMMANDS_LOWER` / `WRITE_COMMANDS` / `key_spec` drifting out of sync**
-  as new commands are added over time — this spec adds a fourth consumer of tables that already
-  had to stay in sync for metrics labeling and CROSSSLOT enforcement; Test 1 above is the specific
-  regression guard for this design's own risk of a silently-incomplete `COMMAND` reply.
+- **`KNOWN_COMMANDS` / `WRITE_COMMANDS` / `key_spec` drifting out of sync** as new commands are
+  added over time — this spec adds a new consumer of tables that already had to stay in sync for
+  metrics labeling and CROSSSLOT enforcement; Test 1 above is the specific regression guard for
+  this design's own risk of a silently-incomplete `COMMAND` reply.
 - **Reporting a minimum-only arity** could theoretically confuse a client library that validates
   argument counts against `COMMAND`'s arity client-side before sending. No client in this
   project's actual usage (go-redis, `redis-cli` in its default mode) does this — both rely on the
