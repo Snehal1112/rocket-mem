@@ -219,7 +219,13 @@ impl Drop for ConnectionStats {
     }
 }
 
-#[tracing::instrument(skip_all, fields(conn_id = client_id, %peer, protocol = "resp", %tls))]
+// `protocol = %"RESP"`, not `protocol = "resp"`. A bare `&str` field records through `Debug`, so
+// the plain literal rendered `protocol="resp"` -- quoted, and the only quoted field on a line
+// whose neighbours read `conn_id=1 peer=127.0.0.1:60768 tls=false`. `main.rs`'s "listener bound"
+// events already spell the same field `protocol=RESP`, unquoted and uppercase, and the spec's
+// reason for a fixed field vocabulary is that a single `grep` follows an activity end to end --
+// which `protocol=RESP` here and `protocol="resp"` there defeated.
+#[tracing::instrument(skip_all, fields(conn_id = client_id, %peer, protocol = %"RESP", %tls))]
 async fn handle_connection<S>(
     socket: S,
     peer: std::net::SocketAddr,

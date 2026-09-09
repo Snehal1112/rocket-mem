@@ -1520,15 +1520,15 @@ fn cluster_redirect(
     //
     // `key` is logged explicitly here, via the shared `key_field` helper (never `?` on the raw
     // `Bytes` -- see `key_field`'s own doc comment), rather than relying on the enclosing `cmd`
-    // span's own `key` field. Those normally agree, but not always: the span's `key` comes from
-    // `command_key_and_arity`, which always reports the frame's first *argument*, while `first_key`
-    // here comes from `command_keys`'s key-spec-aware extraction. For a `KeySpec::Second` command
-    // (`MEMORY USAGE <key>`, `OBJECT ENCODING <key>`) those disagree -- the span would show
-    // `USAGE`/`ENCODING`, not the key this redirect is actually routing on -- so leaning on the
-    // span here would silently mislog exactly the commands where getting the key right matters
-    // most.
+    // span's own `key` field. Those used to disagree outright for a `KeySpec::Second` command
+    // (`MEMORY USAGE <key>`) and now agree, because the span's `key` went key-spec aware too. The
+    // field stays anyway: this event's whole claim is "I routed *this* key to *that* slot", so it
+    // must name the key the redirect actually routed on. `first_key` comes from `command_keys`,
+    // which filters non-`Bulk` frames out before indexing, while the span's comes from
+    // `logged_key`, which indexes the frame directly -- for a malformed frame the two can still
+    // pick different arguments, and this is the one place that difference would matter.
     tracing::debug!(
-        key = %key_field(first_key),
+        key = %crate::logging::key_field(first_key),
         slot = first,
         target = %owner.addr,
         "cluster redirect"
@@ -3007,30 +3007,6 @@ fn logged_key(frame: &Frame, name: &str) -> Option<Bytes> {
     }
 }
 
-/// Renders `logged_key`'s key for a log field -- the `cmd` span's `key` here,
-/// and reused by `SlowLog::maybe_record`'s `warn!` for the same reason (see that fn's doc
-/// comment for why that event needs its own copy of the key rather than leaning on the span).
-///
-/// `pub(crate)` rather than private: `slowlog.rs` needs the same lossy-UTF-8, never-`Debug`
-/// rendering this fn already gives the `cmd` span, and duplicating the logic would risk the two
-/// diverging.
-///
-/// A `Bytes` must never reach a log line through `Debug`: that impl renders byte-by-byte, so a
-/// key logged with `?` comes out unreadable *and* costs O(len) of formatting on the hottest
-/// path in the project. Lossy UTF-8 is the right rendering instead -- and for a valid-UTF-8
-/// key, which is essentially all of them, `from_utf8_lossy` returns a `Cow::Borrowed` and
-/// copies nothing.
-///
-/// `None` -- a keyless command such as `PING`, `ECHO` or `AUTH`, all of which `logged_key`
-/// deliberately reports as keyless -- renders as the empty string rather than a literal
-/// `"None"`, so a `key=` field is either a real key or visibly absent.
-pub(crate) fn key_field(key: Option<&Bytes>) -> std::borrow::Cow<'_, str> {
-    match key {
-        Some(k) => String::from_utf8_lossy(k),
-        None => std::borrow::Cow::Borrowed(""),
-    }
-}
-
 /// The `reply` field for the per-command `debug!` line: `"error"` for an error reply, `"ok"`
 /// for every other frame shape.
 ///
@@ -3234,7 +3210,7 @@ pub fn dispatch_and_log(
     let _cmd_span = tracing::debug_span!(
         "cmd",
         cmd = %name,
-        key = %key_field(log_key.as_ref()),
+        key = %crate::logging::key_field(log_key.as_ref()),
         argc = arg_count,
     )
     .entered();
@@ -3799,41 +3775,6 @@ mod tests {
             log.contains("unknown command"),
             "expected an unknown-command event, got: {log}"
         );
-    }
-
-    #[test]
-    fn key_field_renders_a_key_as_text_never_as_debug_bytes() {
-        let key = Bytes::from_static(b"mykey");
-        assert_eq!(key_field(Some(&key)), "mykey");
-        // The failure this guards: `Bytes`'s Debug impl renders byte-by-byte, so a key logged
-        // with `?` comes out as `b"mykey"` or a numeric list. Neither is greppable, and both
-        // are O(len) of formatting on the hottest path in the project.
-        assert!(!key_field(Some(&key)).contains('['));
-        assert!(!key_field(Some(&key)).contains("b\""));
-    }
-
-    #[test]
-    fn key_field_renders_a_keyless_command_as_an_empty_string() {
-        // PING, and every other command `command_key_and_arity` returns `None` for -- including
-        // AUTH, which it deliberately reports as keyless so the password can never surface here.
-        assert_eq!(key_field(None), "");
-    }
-
-    #[test]
-    fn key_field_renders_a_non_utf8_key_lossily_without_panicking() {
-        let key = Bytes::from_static(&[0x61, 0xff, 0x62]);
-        assert_eq!(key_field(Some(&key)), "a\u{fffd}b");
-    }
-
-    #[test]
-    fn key_field_borrows_a_valid_utf8_key_instead_of_allocating() {
-        // This is the perf claim the span rests on: for a valid-UTF-8 key the Cow is Borrowed,
-        // so entering the span copies no key bytes.
-        let key = Bytes::from_static(b"mykey");
-        assert!(matches!(
-            key_field(Some(&key)),
-            std::borrow::Cow::Borrowed(_)
-        ));
     }
 
     #[test]

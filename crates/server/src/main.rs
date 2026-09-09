@@ -327,7 +327,11 @@ async fn main() -> std::io::Result<()> {
     // rather than calling `local_addr()` twice. The `protocol` label is the very same `&str`
     // the banner's `listeners` block uses, so the log and the banner can never disagree about
     // a listener's name. Both are rendered with `%` so the field lands unquoted and greppable,
-    // matching the rest of this series' fields.
+    // matching the rest of this series' fields -- and, since the field-consistency sweep, the
+    // `protocol` field on `connection.rs`'s and `rmp_connection.rs`'s connection spans too, which
+    // used to render `protocol="resp"`/`protocol="rmp"` against these unquoted uppercase ones.
+    // `metrics` stays lowercase: it names this HTTP endpoint, not one of the two wire protocols
+    // the project spells RESP and RMP everywhere else, and only this one site ever emits it.
     let metrics_addr_str = format!("http://{}/metrics", metrics_listener.local_addr()?);
     tracing::info!(protocol = %"metrics", addr = %metrics_addr_str, "listener bound");
     listeners.push(("metrics", metrics_addr_str));

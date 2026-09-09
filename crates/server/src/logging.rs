@@ -7,6 +7,32 @@
 
 use bytes::Bytes;
 
+/// Renders `dispatcher::logged_key`'s key for a log field -- the `cmd` span's `key`, and
+/// `SlowLog::maybe_record`'s `warn!` (see that fn's doc comment for why that event needs its own
+/// copy of the key rather than leaning on the span).
+///
+/// Lives here rather than in `dispatcher.rs`, where it started, because it has two callers in
+/// two modules and this module is the one the spec designates as *the single auditable place a
+/// secret could reach a log*. Reuse over duplication was always right; the destination was not.
+///
+/// A `Bytes` must never reach a log line through `Debug`: that impl renders byte-by-byte, so a
+/// key logged with `?` comes out unreadable *and* costs O(len) of formatting on the hottest
+/// path in the project. Lossy UTF-8 is the right rendering instead -- and for a valid-UTF-8
+/// key, which is essentially all of them, `from_utf8_lossy` returns a `Cow::Borrowed` and
+/// copies nothing.
+///
+/// `None` -- a keyless command such as `PING`, `ECHO` or `AUTH`, all of which
+/// `dispatcher::logged_key` deliberately reports as keyless -- renders as the empty string
+/// rather than a literal `"None"`, so a `key=` field is either a real key or visibly absent.
+/// `pub(crate)`, not `pub` like this module's other helpers: it had that visibility in
+/// `dispatcher.rs` and moving a function must not widen the crate's public surface.
+pub(crate) fn key_field(key: Option<&Bytes>) -> std::borrow::Cow<'_, str> {
+    match key {
+        Some(k) => String::from_utf8_lossy(k),
+        None => std::borrow::Cow::Borrowed(""),
+    }
+}
+
 /// Whether `cmd`'s argument list carries credential material and must never be rendered into
 /// a log line at any level.
 ///
@@ -119,6 +145,41 @@ mod tests {
 
     fn args(items: &[&[u8]]) -> Vec<Bytes> {
         items.iter().map(|b| Bytes::copy_from_slice(b)).collect()
+    }
+
+    #[test]
+    fn key_field_renders_a_key_as_text_never_as_debug_bytes() {
+        let key = Bytes::from_static(b"mykey");
+        assert_eq!(key_field(Some(&key)), "mykey");
+        // The failure this guards: `Bytes`'s Debug impl renders byte-by-byte, so a key logged
+        // with `?` comes out as `b"mykey"` or a numeric list. Neither is greppable, and both
+        // are O(len) of formatting on the hottest path in the project.
+        assert!(!key_field(Some(&key)).contains('['));
+        assert!(!key_field(Some(&key)).contains("b\""));
+    }
+
+    #[test]
+    fn key_field_renders_a_keyless_command_as_an_empty_string() {
+        // PING, and every other command `dispatcher::logged_key` returns `None` for -- including
+        // AUTH, which it deliberately reports as keyless so the password can never surface here.
+        assert_eq!(key_field(None), "");
+    }
+
+    #[test]
+    fn key_field_renders_a_non_utf8_key_lossily_without_panicking() {
+        let key = Bytes::from_static(&[0x61, 0xff, 0x62]);
+        assert_eq!(key_field(Some(&key)), "a\u{fffd}b");
+    }
+
+    #[test]
+    fn key_field_borrows_a_valid_utf8_key_instead_of_allocating() {
+        // This is the perf claim the span rests on: for a valid-UTF-8 key the Cow is Borrowed,
+        // so entering the span copies no key bytes.
+        let key = Bytes::from_static(b"mykey");
+        assert!(matches!(
+            key_field(Some(&key)),
+            std::borrow::Cow::Borrowed(_)
+        ));
     }
 
     #[test]

@@ -107,7 +107,7 @@ impl SlowLog {
         // byte-by-byte. It renders `log_key`, not the stored `key`: see this fn's doc comment.
         tracing::warn!(
             cmd = %command,
-            key = %crate::dispatcher::key_field(log_key),
+            key = %crate::logging::key_field(log_key),
             elapsed_us = duration_micros,
             "slow command recorded"
         );

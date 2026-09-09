@@ -669,6 +669,14 @@ async fn a_replica_registering_and_being_pruned_are_both_logged_at_info() {
         text.contains("replica pruned") && text.contains("127.0.0.1:6480"),
         "expected a prune log naming the same address:\n{text}"
     );
+    // The connection span's `protocol` field, unquoted and uppercase, matching the same field on
+    // `main.rs`'s "listener bound" events. It used to render `protocol="resp"` -- a bare `&str`
+    // records through `Debug` -- so neither `grep protocol=RESP` nor `grep 'protocol="resp"'`
+    // found both, defeating the fixed field vocabulary's whole purpose.
+    assert!(
+        text.contains("protocol=RESP"),
+        "expected the connection span's protocol field unquoted and uppercase:\n{text}"
+    );
 }
 
 /// `SlowLog::maybe_record`'s `warn!` -- lives here rather than as a `#[cfg(test)]` capture
