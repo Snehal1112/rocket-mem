@@ -951,7 +951,18 @@ pub fn dispatch(engine: &Engine, frame: Frame, _protocol: &mut Protocol, _client
             Frame::Bulk(rest[0].clone())
         }
         "SELECT" => Frame::Simple("OK".into()), // single logical DB only, per 2026-08-29-sprint-2-spec.md scope
-        "COMMAND" => Frame::Array(vec![]), // enough that clients probing capabilities don't choke
+        "COMMAND" => {
+            if rest.is_empty() {
+                Frame::Array(
+                    KNOWN_COMMANDS_LOWER
+                        .iter()
+                        .map(|n| command_info_entry(n))
+                        .collect(),
+                )
+            } else {
+                Frame::Array(vec![]) // subcommands (COUNT, INFO, ...) land in Task 2
+            }
+        }
         "MEMORY" => {
             require_args!(rest, 1, "memory");
             let subcommand = String::from_utf8_lossy(&rest[0]).to_ascii_uppercase();
@@ -1255,6 +1266,128 @@ pub(crate) const KNOWN_COMMANDS: &[&str] = &[
     "ZREM",
     "ZSCORE",
 ];
+
+pub(crate) const KNOWN_COMMANDS_LOWER: &[&str] = &[
+    "acl",
+    "append",
+    "auth",
+    "bgrewriteaof",
+    "cluster",
+    "command",
+    "debug",
+    "decr",
+    "del",
+    "echo",
+    "exists",
+    "expire",
+    "expireat",
+    "get",
+    "getrange",
+    "getset",
+    "hdel",
+    "hello",
+    "hexists",
+    "hget",
+    "hgetall",
+    "hincrby",
+    "hkeys",
+    "hlen",
+    "hmget",
+    "hscan",
+    "hset",
+    "hsetnx",
+    "hvals",
+    "incr",
+    "incrby",
+    "info",
+    "keys",
+    "lindex",
+    "linsert",
+    "llen",
+    "lpop",
+    "lpush",
+    "lrange",
+    "lrem",
+    "lset",
+    "ltrim",
+    "memory",
+    "mget",
+    "mset",
+    "msetnx",
+    "object",
+    "persist",
+    "pexpire",
+    "pexpireat",
+    "ping",
+    "psync",
+    "pttl",
+    "randomkey",
+    "rename",
+    "renamenx",
+    "replicaof",
+    "rpop",
+    "rpush",
+    "sadd",
+    "save",
+    "scan",
+    "scard",
+    "sdiff",
+    "sdiffstore",
+    "select",
+    "set",
+    "setrange",
+    "sinter",
+    "sinterstore",
+    "sismember",
+    "slowlog",
+    "smembers",
+    "spop",
+    "srandmember",
+    "srem",
+    "strlen",
+    "sunion",
+    "sunionstore",
+    "ttl",
+    "type",
+    "zadd",
+    "zcard",
+    "zincrby",
+    "zrange",
+    "zrank",
+    "zrem",
+    "zscore",
+];
+
+/// Builds one `COMMAND`/`COMMAND INFO` reply entry for `name_lower`, a lowercase member of
+/// `KNOWN_COMMANDS_LOWER`. Every field is derived from `key_spec` and `aof::WRITE_COMMANDS` --
+/// tables that already exist for CROSSSLOT enforcement and AOF replay respectively -- so this
+/// function introduces no new per-command classification data. See
+/// `docs/superpowers/specs/2026-09-09-command-reply-spec.md` for why a 6-element reply is
+/// sufficient and why `arity` is reported as a lower bound rather than an exact value.
+fn command_info_entry(name_lower: &str) -> Frame {
+    let name_upper = name_lower.to_ascii_uppercase();
+    let (first_key, last_key, step, key_count) = match key_spec(name_upper.as_str()) {
+        KeySpec::None => (0, 0, 0, 0),
+        KeySpec::First => (1, 1, 1, 1),
+        KeySpec::Second => (2, 2, 1, 2),
+        KeySpec::All => (1, -1, 1, 1),
+        KeySpec::EveryOther => (1, -1, 2, 2),
+    };
+    let arity = -(key_count + 1);
+    let flag = if crate::aof::WRITE_COMMANDS.contains(&name_upper.as_str()) {
+        "write"
+    } else {
+        "readonly"
+    };
+    Frame::Array(vec![
+        Frame::Bulk(Bytes::from(name_lower.to_string())),
+        Frame::Integer(arity),
+        Frame::Array(vec![Frame::Bulk(Bytes::from_static(flag.as_bytes()))]),
+        Frame::Integer(first_key),
+        Frame::Integer(last_key),
+        Frame::Integer(step),
+    ])
+}
 
 /// Which of a command's arguments are keys, for cluster-slot routing. Total over every command
 /// this server answers; `First` is the default because it is correct for ~70 of the 84, and
@@ -4247,12 +4380,113 @@ mod tests {
     }
 
     #[test]
-    fn command_replies_with_an_empty_array_rather_than_erroring() {
+    fn command_replies_with_full_command_metadata() {
         let engine = Engine::new();
+        let Frame::Array(entries) =
+            dispatch(&engine, cmd(&[b"COMMAND"]), &mut Protocol::default(), 1)
+        else {
+            panic!("COMMAND must reply with an array");
+        };
+        assert_eq!(entries.len(), KNOWN_COMMANDS_LOWER.len());
+        for entry in &entries {
+            let Frame::Array(fields) = entry else {
+                panic!("each COMMAND entry must be an array");
+            };
+            assert_eq!(
+                fields.len(),
+                6,
+                "each COMMAND entry must have exactly 6 fields"
+            );
+            let Frame::Bulk(name) = &fields[0] else {
+                panic!("field 0 must be the command name");
+            };
+            let name = std::str::from_utf8(name).unwrap();
+            assert!(
+                KNOWN_COMMANDS_LOWER.contains(&name),
+                "{name} is not in KNOWN_COMMANDS_LOWER"
+            );
+        }
+    }
+
+    #[test]
+    fn command_info_entry_for_a_keyless_command() {
+        let Frame::Array(fields) = command_info_entry("ping") else {
+            panic!("expected an array");
+        };
+        assert_eq!(fields[0], Frame::Bulk(Bytes::from_static(b"ping")));
+        assert_eq!(fields[1], Frame::Integer(-1)); // key_spec::None -> k=0 -> arity -(0+1)
         assert_eq!(
-            dispatch(&engine, cmd(&[b"COMMAND"]), &mut Protocol::default(), 1),
-            Frame::Array(vec![])
+            fields[2],
+            Frame::Array(vec![Frame::Bulk(Bytes::from_static(b"readonly"))])
         );
+        assert_eq!(fields[3], Frame::Integer(0)); // first_key
+        assert_eq!(fields[4], Frame::Integer(0)); // last_key
+        assert_eq!(fields[5], Frame::Integer(0)); // step
+    }
+
+    #[test]
+    fn command_info_entry_for_a_single_key_write() {
+        let Frame::Array(fields) = command_info_entry("set") else {
+            panic!("expected an array");
+        };
+        assert_eq!(fields[1], Frame::Integer(-2)); // key_spec::First -> k=1 -> arity -(1+1)
+        assert_eq!(
+            fields[2],
+            Frame::Array(vec![Frame::Bulk(Bytes::from_static(b"write"))])
+        );
+        assert_eq!(fields[3], Frame::Integer(1));
+        assert_eq!(fields[4], Frame::Integer(1));
+        assert_eq!(fields[5], Frame::Integer(1));
+    }
+
+    #[test]
+    fn command_info_entry_for_key_spec_all() {
+        let Frame::Array(fields) = command_info_entry("del") else {
+            panic!("expected an array");
+        };
+        assert_eq!(fields[1], Frame::Integer(-2)); // key_spec::All -> k=1 -> arity -(1+1)
+        assert_eq!(
+            fields[2],
+            Frame::Array(vec![Frame::Bulk(Bytes::from_static(b"write"))])
+        );
+        assert_eq!(fields[3], Frame::Integer(1));
+        assert_eq!(fields[4], Frame::Integer(-1));
+        assert_eq!(fields[5], Frame::Integer(1));
+    }
+
+    #[test]
+    fn command_info_entry_for_key_spec_every_other() {
+        let Frame::Array(fields) = command_info_entry("mset") else {
+            panic!("expected an array");
+        };
+        assert_eq!(fields[1], Frame::Integer(-3)); // key_spec::EveryOther -> k=2 -> arity -(2+1)
+        assert_eq!(fields[3], Frame::Integer(1));
+        assert_eq!(fields[4], Frame::Integer(-1));
+        assert_eq!(fields[5], Frame::Integer(2));
+    }
+
+    #[test]
+    fn command_info_entry_for_key_spec_second() {
+        let Frame::Array(fields) = command_info_entry("memory") else {
+            panic!("expected an array");
+        };
+        assert_eq!(fields[1], Frame::Integer(-3)); // key_spec::Second -> k=2 -> arity -(2+1)
+        assert_eq!(fields[3], Frame::Integer(2));
+        assert_eq!(fields[4], Frame::Integer(2));
+        assert_eq!(fields[5], Frame::Integer(1));
+    }
+
+    #[test]
+    fn every_command_info_entry_has_negative_arity() {
+        for name in KNOWN_COMMANDS_LOWER {
+            let Frame::Array(fields) = command_info_entry(name) else {
+                panic!("expected an array for {name}");
+            };
+            let Frame::Integer(arity) = fields[1] else {
+                panic!("field 1 must be an integer for {name}");
+            };
+            assert!(arity < 0, "{name} reported a non-negative arity: {arity}");
+        }
     }
 
     #[test]
