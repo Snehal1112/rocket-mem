@@ -1791,6 +1791,11 @@ mod tests {
         );
     }
 
+    /// The matching assertion on this path's *log* line lives in
+    /// `crates/server/tests/logging.rs`'s `snapshot_only_recovery_logs_a_distinguishable_summary_at_info`
+    /// -- do not re-add it here. Every recovery test in this module calls `recover` with no
+    /// subscriber installed, and `tracing` caches a callsite's `Interest` process-globally on
+    /// first reach, so a capture assertion in this binary can be decided `never` before it runs.
     #[test]
     fn recover_with_a_snapshot_and_no_aof_keeps_the_snapshot_state() {
         let dir = tempfile::tempdir().unwrap();

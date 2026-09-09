@@ -881,6 +881,48 @@ fn a_truncated_aof_tail_warns_with_an_offset_and_never_the_discarded_bytes() {
     );
 }
 
+/// The snapshot-only recovery path's own summary event. `aof.rs`'s
+/// `recover_with_a_snapshot_and_no_aof_keeps_the_snapshot_state` covers the behaviour -- that a
+/// missing AOF must not discard the snapshot -- but asserted nothing about the log, so the event
+/// could have been deleted with every test still green. This is the log half, and it lives here
+/// rather than in that test for this file's usual callsite-`Interest` reason.
+///
+/// The absence assertion is the point of the event: this path deliberately omits `commands`,
+/// `bytes` and `elapsed_us`, because reporting `commands=0 bytes=0` would look identical to the
+/// genuinely-empty-AOF case, which does replay a file. It shares the other path's message prefix
+/// on purpose, so one grep still finds every recovery outcome.
+#[test]
+fn snapshot_only_recovery_logs_a_distinguishable_summary_at_info() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let aof_path = dir.path().join("absent.aof"); // deliberately never created
+    let snapshot_path = dir.path().join("snapshot-only.snapshot");
+
+    let snapshotted = engine::Engine::new();
+    snapshotted.set(
+        Bytes::from_static(b"k"),
+        engine::Value::String(Bytes::from_static(b"snapshot-value")),
+    );
+    // A nonzero embedded offset, as a real snapshot taken after some AOF writes would have.
+    std::fs::write(&snapshot_path, snapshotted.snapshot(31)).expect("write snapshot");
+
+    let (recovered, text) = capture_during("info", || {
+        rocket_mem::aof::recover(&aof_path, &snapshot_path).expect("recover")
+    });
+
+    assert!(
+        recovered.get(b"k").is_some(),
+        "the snapshot alone is the recovered state here"
+    );
+    assert!(
+        text.contains("aof recovery replay complete (no aof file"),
+        "expected the snapshot-only recovery summary at `info`:\n{text}"
+    );
+    assert!(
+        !text.contains("commands="),
+        "the no-aof summary must not report replay counts it never measured:\n{text}"
+    );
+}
+
 /// The four ways `recover` gives up and returns an `Err` to `main`, which turns them into a
 /// process exit. Every one of them used to be completely silent -- the operator saw a dead
 /// process and nothing else -- so each now logs at `error`: unlike the truncated tail above,

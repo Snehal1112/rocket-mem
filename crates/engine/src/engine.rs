@@ -217,6 +217,12 @@ impl Engine {
             let Some((key, _)) = candidates.into_iter().min_by_key(|(_, tick)| *tick) else {
                 break; // nothing left to evict
             };
+            // Not a `memory_used()` before/after delta, and this is not a style preference. That
+            // total sums all 16 shards, so a write landing on any other shard between the two
+            // reads skews the number -- it could come out too small, zero, or nonsensical while
+            // still looking authoritative in the log. Concurrent access is the normal condition
+            // here. Reading the evicted key's own accounted size instead is exact, and costs one
+            // `memory_used()` read per iteration rather than three.
             let freed = self.evicted_entry_size(&key);
             self.store.del(&key);
             total_freed += freed;
