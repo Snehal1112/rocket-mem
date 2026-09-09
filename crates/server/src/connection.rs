@@ -339,6 +339,20 @@ fn psync_advertised_addr(frame: &protocol::Frame) -> Option<String> {
 /// Takes ownership of `framed`'s underlying socket and never returns until the replica
 /// connection dies. `PSYNC` has no reply frame of its own — the length-prefixed snapshot blob
 /// (not a RESP value) stands in for one.
+///
+/// The `repl` span is the correlation backbone for every replication log line on the leader
+/// side, matching `replication.rs`'s follower-side span of the same name. `host_port` is the
+/// address this replica advertised in its own `PSYNC <addr>` frame, or the fixed sentinel
+/// `"unknown"` for a bare `PSYNC` (an old client, or a test) — see `psync_advertised_addr`'s
+/// doc comment. This span is reached from `handle_connection`'s own already-open span (which
+/// carries `conn_id`/`peer`/`protocol`/`tls`), so it deliberately does not re-log any of those --
+/// only the one field neither ancestor span already has. See
+/// ../../../docs/superpowers/specs/2026-09-09-verbose-logging-design.md's span table.
+#[tracing::instrument(
+    name = "repl",
+    skip_all,
+    fields(host_port = %advertised_addr.clone().unwrap_or_else(|| "unknown".to_string()))
+)]
 async fn serve_replica<S>(
     framed: Framed<S, RespCodec>,
     aof: &AofWriter,
@@ -875,6 +889,53 @@ mod tests {
         assert_eq!(
             ping.next().await.unwrap().unwrap(),
             Frame::Simple("PONG".into())
+        );
+    }
+
+    use crate::logging::test_support::CapturedLogs;
+
+    #[tokio::test]
+    async fn serve_replica_opens_a_repl_span_naming_the_advertised_host_port() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let engine = Arc::new(Engine::new());
+        let (_dir, aof) = test_aof();
+        let replication = Arc::new(crate::replication::ReplicationHandle::new(
+            Arc::clone(&engine),
+            std::env::temp_dir().join("repl-span-test.snapshot"),
+        ));
+        tokio::spawn(serve(
+            listener,
+            Arc::clone(&engine),
+            Arc::clone(&aof),
+            Arc::clone(&replication),
+        ));
+
+        let captured = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::NEW)
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let mut framed = Framed::new(stream, RespCodec::default());
+        framed
+            .send(Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"PSYNC")),
+                Frame::Bulk(Bytes::from_static(b"127.0.0.1:9999")),
+            ]))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await; // let serve_replica open its span
+
+        drop(_guard);
+        let text = captured.text();
+        assert!(
+            text.contains("repl") && text.contains("host_port") && text.contains("127.0.0.1:9999"),
+            "expected a new `repl` span carrying host_port=\"127.0.0.1:9999\", got:\n{text}"
         );
     }
 }

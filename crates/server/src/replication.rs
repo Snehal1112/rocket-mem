@@ -560,6 +560,15 @@ struct FollowerIdentity {
 /// same loop body. `generation` lets this task detect it has been superseded by a later
 /// `start_replicating`/`stop_replicating` call and stop applying state — see
 /// `ReplicationHandle::generation`'s doc comment.
+///
+/// The `repl` span is the correlation backbone for every replication log line on the follower
+/// side: it wraps this whole function, so the pre-existing `tracing::warn!` reconnect-logging
+/// calls inside the loop below, and every event this plan's later tasks add, inherit
+/// `host_port` for free. Named `"repl"` explicitly (rather than the default, the function's own
+/// name) to match the leader-side span opened in `connection.rs`'s `serve_replica` — one name,
+/// grep-able from either end of a replication link. See
+/// ../../../docs/superpowers/specs/2026-09-09-verbose-logging-design.md's span table.
+#[tracing::instrument(name = "repl", skip_all, fields(host_port = %host_port))]
 async fn replication_client_loop(
     host_port: String,
     engine: Arc<Engine>,
@@ -1574,5 +1583,69 @@ mod tests {
         // "cap larger than this machine can index".
         let handle = ReplicationHandle::default().with_log_value_max_bytes(u64::MAX);
         assert_eq!(handle.log_value_max_bytes(), usize::MAX);
+    }
+
+    use crate::logging::test_support::CapturedLogs;
+
+    #[tokio::test]
+    async fn replication_client_loop_opens_a_repl_span_naming_the_leader_host_port() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let host_port = addr.to_string();
+
+        let fake_leader = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut psync_bytes = [0u8; 15];
+            socket.read_exact(&mut psync_bytes).await.unwrap();
+            let blob = engine::Engine::new().snapshot(0);
+            socket
+                .write_all(&(blob.len() as u64).to_le_bytes())
+                .await
+                .unwrap();
+            socket.write_all(&blob).await.unwrap();
+            // keep the socket open long enough for the span to still be active when this test
+            // samples the captured output below
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        });
+
+        let captured = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::NEW)
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let engine = Arc::new(Engine::new());
+        let generation = Arc::new(AtomicU64::new(0));
+        let task = tokio::spawn(replication_client_loop(
+            host_port.clone(),
+            engine,
+            Generation {
+                counter: Arc::clone(&generation),
+                mine: 0,
+            },
+            None,
+            FollowerHandles {
+                last_apply: Arc::new(AtomicI64::new(0)),
+                link_up: Arc::new(AtomicBool::new(false)),
+            },
+            None,
+            FollowerIdentity::default(),
+        ));
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        task.abort();
+        fake_leader.abort();
+        drop(_guard);
+
+        let text = captured.text();
+        assert!(
+            text.contains("repl") && text.contains("host_port") && text.contains(&host_port),
+            "expected a new `repl` span carrying host_port={host_port:?}, got:\n{text}"
+        );
     }
 }
