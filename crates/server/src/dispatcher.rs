@@ -193,10 +193,9 @@ pub fn dispatch(engine: &Engine, frame: Frame, _protocol: &mut Protocol, _client
     let Some(name) = upper_name(&args[0]) else {
         // Cold path only: a name too long or non-ASCII to be any command we know. The error text
         // is unchanged from before this optimization -- it echoes the client's own bytes.
-        return Frame::Error(format!(
-            "ERR unknown command '{}'",
-            String::from_utf8_lossy(&args[0])
-        ));
+        let raw = String::from_utf8_lossy(&args[0]);
+        tracing::debug!(cmd = %raw, "unknown command");
+        return Frame::Error(format!("ERR unknown command '{raw}'"));
     };
     let rest = &args[1..];
 
@@ -1126,7 +1125,10 @@ pub fn dispatch(engine: &Engine, frame: Frame, _protocol: &mut Protocol, _client
                 _ => Frame::Error(format!("ERR unknown DEBUG subcommand '{subcommand}'")),
             }
         }
-        _ => Frame::Error(format!("ERR unknown command '{}'", name.as_str())),
+        _ => {
+            tracing::debug!(cmd = %name.as_str(), "unknown command");
+            Frame::Error(format!("ERR unknown command '{}'", name.as_str()))
+        }
     }
 }
 
@@ -3536,6 +3538,57 @@ mod tests {
                 .map(|p| Frame::Bulk(Bytes::copy_from_slice(p)))
                 .collect(),
         )
+    }
+
+    /// Runs `f` with a `tracing` subscriber installed (scoped to the current thread only, via
+    /// `tracing::subscriber::with_default`) that writes formatted log lines into an in-memory
+    /// buffer (`crate::logging::test_support::CapturedLogs`), and returns everything it wrote as
+    /// a `String`. This lets plan 10's tests assert on log *content*, not just on the unchanged
+    /// `Frame` reply, without a second ad-hoc capture harness -- the shared one lives in
+    /// `logging.rs` because a helper under `tests/` compiles as a separate crate and cannot be
+    /// imported from a unit test module in `src/`.
+    fn capture_logs_at<F: FnOnce()>(level: tracing::Level, f: F) -> String {
+        let writer = crate::logging::test_support::CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(writer.clone())
+            .with_max_level(level)
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        writer.text()
+    }
+
+    #[test]
+    fn unknown_command_from_the_catchall_match_arm_logs_a_debug_event() {
+        let engine = Engine::new();
+        let log = capture_logs_at(tracing::Level::DEBUG, || {
+            let reply = dispatch(&engine, cmd(&[b"NOPE"]), &mut Protocol::default(), 1);
+            assert_eq!(reply, Frame::Error("ERR unknown command 'NOPE'".into()));
+        });
+        assert!(
+            log.contains("unknown command"),
+            "expected an unknown-command event, got: {log}"
+        );
+        assert!(
+            log.contains("NOPE"),
+            "expected the command name in the event, got: {log}"
+        );
+    }
+
+    #[test]
+    fn unknown_command_from_the_malformed_name_cold_path_logs_a_debug_event() {
+        let engine = Engine::new();
+        // Longer than MAX_COMMAND_NAME_LEN (32) so `upper_name` returns `None` and `dispatch`
+        // takes the cold path at line 193, not the catch-all match arm at line 1129.
+        let too_long = b"A".repeat(MAX_COMMAND_NAME_LEN + 1);
+        let log = capture_logs_at(tracing::Level::DEBUG, || {
+            let reply = dispatch(&engine, cmd(&[&too_long]), &mut Protocol::default(), 1);
+            assert!(matches!(reply, Frame::Error(_)));
+        });
+        assert!(
+            log.contains("unknown command"),
+            "expected an unknown-command event, got: {log}"
+        );
     }
 
     #[test]

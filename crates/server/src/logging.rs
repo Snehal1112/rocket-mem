@@ -342,3 +342,51 @@ mod tests {
         assert_eq!(fmt_value("kéy ok!".as_bytes(), 128), "kéy ok!");
     }
 }
+
+/// A log-capture harness for unit tests that need to assert on rendered log text.
+///
+/// Lives here, in the crate's own `src`, rather than in `tests/logging.rs`: Rust compiles each
+/// file under `tests/` as a separate crate, so a helper there is not importable from a
+/// `#[cfg(test)] mod tests` inside `src/`. The two cannot be merged.
+///
+/// `#[cfg(test)]` and introduced at its first use, because an unused test helper would trip
+/// `clippy -D warnings`' dead-code lint.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::{Arc, Mutex};
+
+    /// A `tracing_subscriber::fmt` writer backed by a shared buffer. Uses `tracing-subscriber`'s
+    /// own public `MakeWriter` trait -- no new dependency.
+    #[derive(Clone, Default)]
+    pub(crate) struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            // `unwrap_or_else(|e| e.into_inner())` rather than `unwrap()`: a test that panics
+            // while holding this lock would otherwise poison it and turn one real failure into
+            // a cascade of unrelated ones.
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogs;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl CapturedLogs {
+        /// The log text captured so far.
+        pub(crate) fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap_or_else(|e| e.into_inner())).into_owned()
+        }
+    }
+}
