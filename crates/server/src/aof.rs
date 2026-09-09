@@ -100,7 +100,11 @@ pub struct AofWriter {
     policy: FsyncPolicy,
     /// One ordering guard per engine shard, held by `dispatcher::dispatch_and_log` across
     /// "mutate the engine, then log it" for write commands, so concurrent writers' appends
-    /// always land in the AOF in the same relative order their mutations committed in.
+    /// always land in the AOF in the same relative order their mutations committed in. The same
+    /// guard also covers the replica fan-out that follows the append: broadcasting after the
+    /// guard is dropped would let two writers to the same key broadcast out of commit order,
+    /// permanently reordering that key on every follower even though the AOF itself stayed
+    /// correct.
     ///
     /// Per shard rather than one global guard because replay only needs ordering *per key*:
     /// two commands touching disjoint keys may be appended in either order and replay
@@ -323,6 +327,11 @@ impl AofWriter {
     /// index. That single rule is what makes deadlock impossible between two multi-key commands
     /// whose key sets overlap in different orders, and it is why callers must come through here
     /// rather than indexing `order` themselves.
+    ///
+    /// At most one acquisition from this writer may be held live at a time. `let a =
+    /// aof.lock_shards(&[9]); let b = aof.lock_shards(&[3]);` compiles today and would deadlock
+    /// against a concurrent caller that locks the same two shards in the reverse order --
+    /// ascending order only prevents deadlock within a single acquisition's own shard list.
     #[must_use = "the returned guards must be bound and held across the whole mutate-then-log \
                   section; dropping them immediately releases the locks and loses the AOF \
                   ordering guarantee entirely"]
@@ -1171,9 +1180,15 @@ mod tests {
             // accumulates, any AOF line that ever overtook the mutation it logged changes the
             // accumulated string's order, so replay and the engine would diverge.
             let replayed = recover(&aof_path, &dir.path().join("absent.snapshot")).unwrap();
+            let committed = engine.get(b"hot");
+            assert!(
+                committed.is_some(),
+                "no writes landed in round {round} -- dispatch_and_log may have silently \
+                 stopped mutating"
+            );
             assert_eq!(
                 replayed.get(b"hot"),
-                engine.get(b"hot"),
+                committed,
                 "AOF replay diverged from committed state in round {round}"
             );
         }
@@ -1242,9 +1257,14 @@ mod tests {
         }
 
         stop.store(true, Ordering::Relaxed);
+        let mut total_issued = 0u64;
         for w in writers {
-            w.join().unwrap();
+            total_issued += w.join().unwrap();
         }
+        assert!(
+            total_issued > 0,
+            "no writer issued any INCR -- dispatch_and_log may have silently stopped mutating"
+        );
         aof.fsync().unwrap();
 
         // The AOF alone is the reference: every INCR, replayed once. Snapshot-plus-tail must land
@@ -1333,8 +1353,8 @@ mod tests {
             })
         };
 
-        for _ in 0..50 {
-            crate::dispatcher::dispatch_and_log(
+        for i in 0..50 {
+            let reply = crate::dispatcher::dispatch_and_log(
                 &engine,
                 &aof,
                 &replication,
@@ -1343,6 +1363,11 @@ mod tests {
                 ))]),
                 &crate::dispatcher::Session::new(),
                 1,
+            );
+            assert_eq!(
+                reply,
+                protocol::Frame::Simple("OK".into()),
+                "SAVE #{i} failed instead of writing a snapshot: {reply:?}"
             );
 
             // Read back the snapshot SAVE just wrote and check the pair agrees. Loading it into a

@@ -23,7 +23,7 @@ replication, clustering, and access control apply identically whichever one a cl
 > different cores at the same instant. Real Redis is deliberately single-threaded for command
 > execution; rocket-mem chose sharded locks over that model instead.
 
-> **Project status.** rocket-mem is complete and tested — 791 tests, durability verified under a
+> **Project status.** rocket-mem is complete and tested — 829 tests, durability verified under a
 > `kill -9` chaos loop — but it is not yet production-hardened: there is no failover and no live
 > resharding. Read [Limitations](#limitations) before deploying it.
 

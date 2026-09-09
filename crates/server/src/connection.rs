@@ -299,8 +299,10 @@ async fn serve_replica<S>(
     // reach neither the blob nor the stream -- lost permanently, unrepairable by reconnect,
     // since a reconnect just snapshots a leader that has already moved past it. Lock
     // ordering: lock_for_ordering() before the registry's own mutex, matching this plan's
-    // Global Constraints and the fan-out hook in dispatcher.rs, the only other place both
-    // are taken.
+    // Global Constraints and the fan-out hook in dispatcher.rs, the only other place both are
+    // taken -- there, the order guard for a write's shard(s) is held across both the AOF
+    // append and the registry broadcast, for the same reason: neither critical section may
+    // release the order guard before it has finished touching the registry.
     let (snapshot_bytes, mut rx) = {
         let _order_guard = aof.lock_all_shards();
         let bytes = replication.engine().snapshot(0); // 0: a follower keeps no AOF, so the header is moot

@@ -3124,11 +3124,15 @@ fn dispatch_and_log_inner(
     // Every frame still gets attempted even after a failure, so whatever can land on disk
     // does -- see the multi-frame note above about SET EX/PX's [SET, PEXPIREAT] pair.
     let mut aof_failed = false;
-    // Collected under the ordering guard, sent after it is released. The guard exists to keep
-    // AOF append order equal to mutation-commit order; replica fan-out was never part of that
-    // invariant (replicas apply what they receive, in receipt order), and holding a lock every
-    // concurrent writer contends for across the broadcast made it the top contention site in a
-    // pipelined-SET profile.
+    // Collected under the ordering guard and broadcast before it is released. Replicas apply
+    // whatever they receive in receipt order, so if two writers to the same key broadcast in
+    // the opposite order their appends committed in, every follower permanently reorders that
+    // key relative to the leader -- unrepairable by reconnect, since a fresh PSYNC just
+    // snapshots a leader that has already moved past it. Dropping the guard before the
+    // broadcast loop (instead of after) briefly looked free -- `broadcast` walks an empty
+    // registry when nothing is attached -- but it reopens exactly that race the instant a
+    // replica is connected. The guard must stay held across both the AOF append and the
+    // fan-out.
     let mut to_broadcast: Vec<Bytes> = Vec::new();
     for frame_to_log in to_log {
         // A logging failure must not fail the client's reply outright, but it must not be
@@ -3162,13 +3166,16 @@ fn dispatch_and_log_inner(
         // periodic fsync loop lives in connection.rs (periodic_fsync_loop); Never does
         // nothing here.
     }
-    // Every AOF append for this command has landed, so the ordering invariant is satisfied and
-    // the guard's work is done. Dropping it here rather than at end-of-scope keeps the replica
-    // fan-out -- which walks the registry and pushes into per-replica queues -- off the lock.
-    drop(_order_guard);
+    // Broadcast while still holding the ordering guard: two writers to the same key must
+    // broadcast in the same relative order their appends landed in, or followers permanently
+    // diverge from the leader (see the comment above `to_broadcast`). Broadcasting is a mutex
+    // acquisition plus N unbounded-channel sends -- it never blocks on I/O -- so this costs
+    // nothing worth trading correctness for. Only now, with every append and every broadcast
+    // for this command done, is the guard's work finished.
     for encoded in to_broadcast {
         replication.registry.broadcast(encoded);
     }
+    drop(_order_guard);
     // Only Always promises the client's reply won't precede durability -- EverySecond/Never
     // are fire-and-forget by design, so a write that hasn't landed yet is expected, not an
     // error to report back.
@@ -9302,6 +9309,11 @@ mod tests {
     /// falls back to locking all sixteen shards for it -- correct, but it throws away the entire
     /// point of per-shard ordering. `WRITE_COMMANDS` and `key_spec` derive their answers
     /// independently, so nothing but this test keeps them in step.
+    ///
+    /// The invariant this test enforces is "covers every key the command WRITES", not merely
+    /// "yields at least one key". A future `COPY`, `SMOVE`, or `LMOVE` inheriting the default
+    /// `KeySpec::First` would pass this test while only taking the guard for one of its two
+    /// mutated keys, silently reopening the ordering hole this whole mechanism exists to close.
     #[test]
     fn every_write_command_enumerates_at_least_one_key() {
         for name in crate::aof::WRITE_COMMANDS {
