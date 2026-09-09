@@ -56,6 +56,7 @@ pub fn refresh_sampled_gauges(engine: &Engine, replication: &ReplicationHandle) 
     ::metrics::gauge!("rocket_mem_connected_replicas").set(replication.registry.len() as f64);
     ::metrics::gauge!("rocket_mem_replication_last_apply_timestamp_seconds")
         .set(replication.last_apply_unix() as f64);
+    ::metrics::gauge!("rocket_mem_master_repl_offset").set(replication.master_repl_offset() as f64);
     ::metrics::counter!("rocket_mem_evicted_keys_total").absolute(engine.eviction_count() as u64);
     ::metrics::counter!("rocket_mem_expired_keys_total").absolute(replication.expired_keys());
     ::metrics::counter!("rocket_mem_connections_total").absolute(replication.total_connections());
@@ -189,6 +190,7 @@ mod tests {
         assert!(body.contains("rocket_mem_keys 1"), "{body}");
         assert!(body.contains("rocket_mem_connected_clients 1"), "{body}");
         assert!(body.contains("rocket_mem_memory_used_bytes"), "{body}");
+        assert!(body.contains("rocket_mem_master_repl_offset"), "{body}");
 
         let missing = get(addr, "/nope").await;
         assert!(

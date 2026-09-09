@@ -1929,6 +1929,13 @@ fn info_text(
                 };
                 out.push_str(&format!("slave{i}:ip={ip},port={port},state=online\r\n"));
             }
+            // After the per-replica lines, matching real Redis's own field order. This is a
+            // count of replication-stream bytes this leader has produced, so it is non-zero on
+            // a leader that has taken writes even if no replica has ever connected.
+            out.push_str(&format!(
+                "master_repl_offset:{}\r\n",
+                replication.master_repl_offset()
+            ));
         }
         out.push_str("\r\n");
     }
@@ -5127,6 +5134,7 @@ mod tests {
         let text = info_text_for(&replication, &engine, &[b"replication"]);
         assert!(text.contains("role:master\r\n"), "{text}");
         assert!(text.contains("connected_slaves:1\r\n"), "{text}");
+        assert!(text.contains("master_repl_offset:0\r\n"), "{text}");
         assert!(!text.contains("master_host:"), "{text}");
     }
 
@@ -5151,6 +5159,36 @@ mod tests {
         assert!(
             text.contains("slave1:ip=?,port=0,state=online\r\n"),
             "{text}"
+        );
+    }
+
+    /// The reported offset is the live counter, not a placeholder -- and it is non-zero on a
+    /// leader that has never had a replica attached, because it counts the write stream itself.
+    #[test]
+    fn info_reports_the_live_master_replication_offset() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let replication = ReplicationHandle::default();
+
+        let before = info_text_for_writer(&replication, &engine, &aof, &[b"replication"]);
+        assert!(before.contains("master_repl_offset:0\r\n"), "{before}");
+
+        dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"SET", b"k", b"v"]),
+            &Session::new(),
+            1,
+        );
+
+        let expected = crate::aof::encode_frame(&cmd(&[b"SET", b"k", b"v"]))
+            .unwrap()
+            .len();
+        let after = info_text_for_writer(&replication, &engine, &aof, &[b"replication"]);
+        assert!(
+            after.contains(&format!("master_repl_offset:{expected}\r\n")),
+            "{after}"
         );
     }
 
