@@ -3249,6 +3249,12 @@ fn dispatch_and_log_inner(
     // nothing worth trading correctness for. Only now, with every append and every broadcast
     // for this command done, is the guard's work finished.
     for encoded in to_broadcast {
+        // The replication offset advances here, under the same guard and in the same iteration
+        // as the broadcast, so offset order matches fan-out order exactly. It counts the bytes
+        // this leader produced, not the bytes anyone received, so it advances even when the
+        // registry is empty -- that is what makes it comparable across a leader and a follower
+        // that attached later. `encoded.len()` is read before the move into `broadcast`.
+        replication.advance_master_repl_offset(encoded.len() as u64);
         replication.registry.broadcast(encoded);
     }
     drop(_order_guard);
@@ -5145,6 +5151,67 @@ mod tests {
         assert!(
             text.contains("slave1:ip=?,port=0,state=online\r\n"),
             "{text}"
+        );
+    }
+
+    /// The offset is a byte count of the replication stream this leader produced, so it must
+    /// advance for a write even with no replica attached, must not advance for a read, and must
+    /// accumulate both frames of a multi-frame write (`SET ... EX n` logs a flagless `SET` plus
+    /// an absolute `PEXPIREAT`).
+    #[test]
+    fn writes_advance_the_master_replication_offset_with_no_replicas_attached() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let replication = ReplicationHandle::default();
+        assert!(replication.registry.is_empty());
+        assert_eq!(replication.master_repl_offset(), 0);
+
+        dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"SET", b"k", b"v"]),
+            &Session::new(),
+            1,
+        );
+        let one_set = crate::aof::encode_frame(&cmd(&[b"SET", b"k", b"v"]))
+            .unwrap()
+            .len() as u64;
+        assert_eq!(
+            replication.master_repl_offset(),
+            one_set,
+            "a write must advance the offset by exactly the bytes it broadcast"
+        );
+
+        dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"GET", b"k"]),
+            &Session::new(),
+            1,
+        );
+        assert_eq!(
+            replication.master_repl_offset(),
+            one_set,
+            "a read produces no replication stream and must not move the offset"
+        );
+
+        dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"SET", b"t", b"v", b"EX", b"10"]),
+            &Session::new(),
+            1,
+        );
+        // Two frames, so strictly more than one flagless SET's worth. The PEXPIREAT's exact
+        // length depends on a wall-clock millisecond timestamp, so this asserts the accumulation
+        // rather than a brittle exact total.
+        assert!(
+            replication.master_repl_offset() > one_set * 2,
+            "SET with a TTL broadcasts two frames and must advance by both, got {}",
+            replication.master_repl_offset()
         );
     }
 
