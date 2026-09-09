@@ -558,3 +558,95 @@ comparison numbers, preserved outside the repo at
 -1.282% vs baseline (within +/-2%). Plan 07's hot-path additions (the `cmd` tracing span and
 the per-command `debug!` line in `dispatch_and_log`) cost nothing measurable at the default
 `info` level. Plan 08 may proceed.
+
+## 2026-09-09 — Plan 08 (trace-level argument rendering) — post-instrumentation measurement
+
+**Commit measured:** `3a45b2f` (`feat(logging): add the trace-level redacted argument line`,
+on top of `8e0d066` `feat(logging): thread log_value_max_bytes to the dispatcher via
+ReplicationHandle` — both commits of plan 08's tasks 1-2, adding a `trace!` line in
+`dispatch_and_log` in `crates/server/src/dispatcher.rs` that renders each command's arguments
+through `redact_args`, guarded by `if tracing::enabled!(tracing::Level::TRACE)`).
+
+**Log level:** default `info` (no `RUST_LOG` set) — the guard is meant to make the trace
+rendering, and its allocation, unreachable at this level.
+
+**Methodology note — an inconclusive first triplet, then a clean second triplet.** The
+first three-run attempt produced `SET, 3B, no pipeline` and `GET, 3B, no pipeline` spreads of
+16.88% and 12.75% — both over the 10% ceiling this baseline document's own jitter table
+established for these two rows as "wildly disagreeing" rather than gate-worthy. `ps`/`uptime`
+were checked immediately before and after that triplet and found only the machine's normal
+steady-state background load (long-running desktop daemons at 15-19% CPU) — no `cargo
+test`/`cargo build`/other CPU-heavy foreign process, unlike plan 07's clearly-identified
+1361%-CPU contamination case. With no external cause to discard a specific run "for cause," a
+second triplet was captured instead of cherry-picking within the first. That second triplet's
+spread came in under the 10% ceiling (8.52% and 9.10%) and is reported below as the
+gate-eligible measurement. `redis-server`'s own numbers (unchanged code, run as a control in
+the same script invocations) stayed within ~1% of its original baseline capture in both
+triplets, while `rocket-mem` measured below its own baseline in the SET row in 5 of 6 runs
+across both triplets (the sixth landed 0.05% above baseline) and in the GET row in 6 of 6 runs
+— a consistent, one-directional signal against a control that did not move, not noise
+scattered around zero.
+
+### Gated rows — reported measurement (second, clean triplet)
+
+| Workload | Run 1 | Run 2 | Run 3 | Mean | Baseline mean | Delta vs baseline | Spread |
+|---|---|---|---|---|---|---|---|
+| SET, 3B, no pipeline | 84,817.64 | 89,525.52 | 82,236.84 | 85,526.67 | 89,484.60 | -4.42% | 8.52% |
+| GET, 3B, no pipeline | 88,888.89 | 97,465.88 | 96,525.09 | 94,293.29 | 100,235.04 | -5.93% | 9.10% |
+
+Both spreads are under the 10% ceiling (a valid, gate-eligible measurement per this document's
+own rule), and both deltas fall well outside the +/-2% gate band.
+
+### Gated rows — first (discarded) triplet, for transparency
+
+| Workload | Run 1 | Run 2 | Run 3 | Mean | Spread |
+|---|---|---|---|---|---|
+| SET, 3B, no pipeline | 71,633.23 | 85,178.88 | 83,892.62 | 80,234.91 | 16.88% |
+| GET, 3B, no pipeline | 84,817.64 | 96,525.09 | 94,250.71 | 91,864.48 | 12.75% |
+
+Not used for the verdict (spread over the 10% ceiling makes it inconclusive on its own), but
+its direction is consistent with the clean triplet above — every value in it is also below the
+original baseline mean.
+
+**Verdict: FAIL.** SET, 3B, no pipeline measured -4.42% vs the original baseline (outside
++/-2%); GET, 3B, no pipeline measured -5.93% vs the original baseline (outside +/-2%). Per
+plan 08's own task-3 brief: "If this gate fails while plan 07's passed, the `enabled!` guard
+in Task 2, Step 4 is the first thing to check — an extraction that escaped the guard is
+exactly what a per-command allocation at `info` looks like." No Rust source was changed by
+this measurement task.
+
+### Context-only rows (not gated — recorded per the baseline document's own rationale)
+
+From the reported (second) triplet. The pipelined and 1KB-payload rows swing 8.8%-22.2%
+run-to-run even in the original baseline capture, an order of magnitude wider than the 2%
+gate, so they are not evaluated against a threshold here either — recorded for context only.
+
+| Workload | Run 1 | Run 2 | Run 3 | Mean (this run) | Baseline mean |
+|---|---|---|---|---|---|
+| SET, 3B, pipeline=16 | 740,740.69 | 689,655.19 | 757,575.75 | 729,323.88 | 700,242.04 |
+| GET, 3B, pipeline=16 | 1,123,595.50 | 961,538.44 | 1,234,567.88 | 1,106,567.27 | 1,135,299.50 |
+| SET, 1KB, no pipeline | 82,304.52 | 80,710.25 | 78,492.93 | 80,502.57 | 81,774.68 |
+| GET, 1KB, no pipeline | 82,712.98 | 92,421.44 | 89,928.05 | 88,354.16 | 89,748.65 |
+| SET, 1KB, pipeline=16 | 487,804.88 | 613,496.94 | 476,190.50 | 525,830.77 | 530,293.04 |
+| GET, 1KB, pipeline=16 | 617,283.94 | 724,637.69 | 709,219.88 | 683,713.84 | 683,440.31 |
+
+### Global constraints checked (no Rust source changed by this task)
+
+- `git status --porcelain` — clean; `Cargo.lock` untouched.
+- `cargo fmt --all -- --check` — clean.
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean, no warnings.
+- `cargo test --workspace` — 886 passed, 0 failed.
+
+### Cumulative drift note
+
+This measurement is cumulative drift from the original pre-logging baseline, now covering the
+instrumentation added by plans 05 through 08 (span/field setup, the per-command `debug!` line,
+`log_value_max_bytes` threading, and this plan's `trace!`-level argument line) — not just
+plan 08's own diff in isolation.
+
+Full raw output (both triplets, including the `redis-benchmark -q` progress-line noise) is
+preserved outside the repo at
+`/tmp/claude-1000/-home-numericlabs-data-rocket-rocket-mem/850c0577-d0e8-4d03-9147-6aec1a827079/scratchpad/rocket-mem-plan08.txt`
+(first, discarded triplet) and
+`/tmp/claude-1000/-home-numericlabs-data-rocket-rocket-mem/850c0577-d0e8-4d03-9147-6aec1a827079/scratchpad/rocket-mem-plan08-set2.txt`
+(second, reported triplet).
