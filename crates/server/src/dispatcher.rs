@@ -2891,6 +2891,24 @@ fn command_key_and_arity(frame: &Frame) -> (Option<Bytes>, usize) {
     (key, items.len().saturating_sub(1))
 }
 
+/// Renders `command_key_and_arity`'s first key for the `cmd` span's `key` field.
+///
+/// A `Bytes` must never reach a log line through `Debug`: that impl renders byte-by-byte, so a
+/// key logged with `?` comes out unreadable *and* costs O(len) of formatting on the hottest
+/// path in the project. Lossy UTF-8 is the right rendering instead -- and for a valid-UTF-8
+/// key, which is essentially all of them, `from_utf8_lossy` returns a `Cow::Borrowed` and
+/// copies nothing.
+///
+/// `None` -- a keyless command such as `PING`, and `AUTH`, which `command_key_and_arity`
+/// deliberately reports as keyless -- renders as the empty string rather than a literal
+/// `"None"`, so a `key=` field is either a real key or visibly absent.
+fn key_field(key: Option<&Bytes>) -> std::borrow::Cow<'_, str> {
+    match key {
+        Some(k) => String::from_utf8_lossy(k),
+        None => std::borrow::Cow::Borrowed(""),
+    }
+}
+
 /// The `cmd` label value for a command name: its lowercase form if we know the command, the
 /// literal `other` otherwise. The `other` fallback is what bounds Prometheus label cardinality --
 /// without it, a client sending random command names could create unbounded series.
@@ -3026,6 +3044,32 @@ pub fn dispatch_and_log(
     let name = name.as_ref().map(|n| n.as_str()).unwrap_or("");
     let (first_key, arg_count) = command_key_and_arity(&frame);
     let label = metric_label(name);
+
+    // The `cmd` span. Every field here is a value this function already computed for the
+    // metrics and slow-log paths just above -- the span adds correlation, not computation, and
+    // `first_key` is already cloned by `command_key_and_arity` (one `Bytes` refcount bump, no
+    // data copy), so the span adds no clone of its own either.
+    //
+    // DEBUG, not INFO, and that is the load-bearing choice: `tracing`'s span macros evaluate
+    // their field expressions only when the callsite is enabled, so at the production default
+    // of `info` this whole statement is a relaxed atomic load and a branch, and
+    // `key_field`'s UTF-8 validation never runs. An `info_span!` here would run it on every
+    // command in production.
+    //
+    // `key` goes through `key_field`, never `?first_key`: `Bytes`'s Debug impl renders
+    // byte-by-byte. See this plan's Architecture section.
+    //
+    // The guard must be bound to a *named* variable. `let _ = ....entered()` drops the
+    // `EnteredSpan` immediately and the span closes before `dispatch_and_log_inner` is even
+    // called, silently losing every nested field.
+    let _cmd_span = tracing::debug_span!(
+        "cmd",
+        cmd = %name,
+        key = %key_field(first_key.as_ref()),
+        argc = arg_count,
+    )
+    .entered();
+
     let started = std::time::Instant::now();
 
     let reply = dispatch_and_log_inner(engine, aof, replication, frame, session, client_id);
@@ -3417,6 +3461,41 @@ mod tests {
                 .map(|p| Frame::Bulk(Bytes::copy_from_slice(p)))
                 .collect(),
         )
+    }
+
+    #[test]
+    fn key_field_renders_a_key_as_text_never_as_debug_bytes() {
+        let key = Bytes::from_static(b"mykey");
+        assert_eq!(key_field(Some(&key)), "mykey");
+        // The failure this guards: `Bytes`'s Debug impl renders byte-by-byte, so a key logged
+        // with `?` comes out as `b"mykey"` or a numeric list. Neither is greppable, and both
+        // are O(len) of formatting on the hottest path in the project.
+        assert!(!key_field(Some(&key)).contains('['));
+        assert!(!key_field(Some(&key)).contains("b\""));
+    }
+
+    #[test]
+    fn key_field_renders_a_keyless_command_as_an_empty_string() {
+        // PING, and every other command `command_key_and_arity` returns `None` for -- including
+        // AUTH, which it deliberately reports as keyless so the password can never surface here.
+        assert_eq!(key_field(None), "");
+    }
+
+    #[test]
+    fn key_field_renders_a_non_utf8_key_lossily_without_panicking() {
+        let key = Bytes::from_static(&[0x61, 0xff, 0x62]);
+        assert_eq!(key_field(Some(&key)), "a\u{fffd}b");
+    }
+
+    #[test]
+    fn key_field_borrows_a_valid_utf8_key_instead_of_allocating() {
+        // This is the perf claim the span rests on: for a valid-UTF-8 key the Cow is Borrowed,
+        // so entering the span copies no key bytes.
+        let key = Bytes::from_static(b"mykey");
+        assert!(matches!(
+            key_field(Some(&key)),
+            std::borrow::Cow::Borrowed(_)
+        ));
     }
 
     #[test]
