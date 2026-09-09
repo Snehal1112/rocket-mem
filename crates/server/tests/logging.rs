@@ -126,6 +126,26 @@ fn set_frame() -> Frame {
     ])
 }
 
+/// Runs `f` under a subscriber filtered to `level` and returns its result together with
+/// everything that subscriber wrote. The recovery tests at the bottom of this file drive
+/// `aof::recover` rather than the dispatcher, so `capture_frames_at` above does not fit them.
+fn capture_during<T>(level: &str, f: impl FnOnce() -> T) -> (T, String) {
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(BufferWriter(Arc::clone(&buffer)))
+        .with_env_filter(EnvFilter::new(level))
+        .finish();
+
+    let value = tracing::subscriber::with_default(subscriber, f);
+
+    let bytes = buffer.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    (
+        value,
+        String::from_utf8(bytes).expect("subscriber output is utf-8"),
+    )
+}
+
 /// A command frame from its parts, so a test listing several commands stays readable.
 fn cmd(parts: &[&[u8]]) -> Frame {
     Frame::Array(
@@ -808,5 +828,121 @@ async fn a_metrics_scrape_is_traced_and_a_404_is_not() {
     assert!(
         text.contains("metrics scrape served") && text.contains("bytes"),
         "expected a trace-level scrape event carrying a byte count:\n{text}"
+    );
+}
+
+/// A complete `SET a 1` command, the prefix every AOF fixture below starts from.
+const ONE_VALID_COMMAND: &[u8] = b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n";
+
+/// A half-written trailing record -- the state a crash mid-append leaves -- is a condition
+/// `replay_with_stats` deliberately tolerates: it stops at the last complete record and truncates
+/// the file to that offset. So it is a `warn`, not an `error`; promoting it would make an ordinary
+/// crash restart look like a fault. What it must carry is the offset it stopped at and the length
+/// it stopped short of, and what it must never carry is the discarded bytes themselves -- those
+/// are client data, and this event fires at a level an operator leaves on in production.
+///
+/// Lives here rather than in `aof.rs`'s own `mod tests`, per this file's established rule (see
+/// the comment block further up): every recovery test in that module calls `recover` with no
+/// subscriber installed, in the same ~575-test unit binary, so the callsite's `Interest` could be
+/// cached `never` before a capture assertion there ever got a turn.
+#[test]
+fn a_truncated_aof_tail_warns_with_an_offset_and_never_the_discarded_bytes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let aof_path = dir.path().join("truncated.aof");
+    let mut contents = ONE_VALID_COMMAND.to_vec();
+    // A bulk header promising 20 bytes followed by only 15: incomplete, never decodable.
+    contents.extend_from_slice(b"*3\r\n$3\r\nSET\r\n$1\r\nb\r\n$20\r\ntop-secret-tail");
+    std::fs::write(&aof_path, &contents).expect("write aof");
+    let snapshot_path = dir.path().join("absent.snapshot");
+
+    let (engine, text) = capture_during("warn", || {
+        rocket_mem::aof::recover(&aof_path, &snapshot_path).expect("recover")
+    });
+
+    assert!(
+        engine.get(b"a").is_some(),
+        "the complete record before the truncated tail must still have been replayed"
+    );
+    assert!(
+        text.contains("aof tail discarded"),
+        "expected a warn naming the discarded tail:\n{text}"
+    );
+    assert!(
+        text.contains(&format!("offset={}", ONE_VALID_COMMAND.len())),
+        "expected the offset the good data ends at:\n{text}"
+    );
+    assert!(
+        text.contains(&format!("aof_len={}", contents.len())),
+        "expected the file's full length alongside the offset:\n{text}"
+    );
+    assert!(
+        !text.contains("top-secret-tail"),
+        "the discarded bytes themselves reached the log:\n{text}"
+    );
+}
+
+/// The four ways `recover` gives up and returns an `Err` to `main`, which turns them into a
+/// process exit. Every one of them used to be completely silent -- the operator saw a dead
+/// process and nothing else -- so each now logs at `error`: unlike the truncated tail above,
+/// none of these is recovered from, and startup does not continue.
+///
+/// One test covering all four rather than four tests, deliberately: they share a subscriber and a
+/// tempdir, and this file's capture-test count is under watch (plan 21's Task 2).
+#[test]
+fn every_aborting_recovery_failure_is_logged_at_error() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // The failing fixtures. Each names a path that exists but cannot serve its role: a directory
+    // where a file is expected reads back as an error that is *not* `NotFound`, which is the one
+    // distinction `recover`'s own matches turn on. No permissions games, so this behaves the same
+    // for any user running the suite.
+    let unreadable_dir = dir.path().join("a-directory");
+    std::fs::create_dir(&unreadable_dir).expect("create dir");
+    let a_file = dir.path().join("a-file");
+    std::fs::write(&a_file, b"not a directory").expect("write file");
+
+    let bad_manifest_snapshot = dir.path().join("bad-manifest.snapshot");
+    std::fs::write(
+        dir.path().join("bad-manifest.snapshot.manifest"),
+        b"not-a-number",
+    )
+    .expect("write manifest");
+
+    // A snapshot that loads cleanly, so recovery gets far enough to stat the AOF.
+    let good_snapshot = dir.path().join("good.snapshot");
+    std::fs::write(&good_snapshot, engine::Engine::new().snapshot(0)).expect("write snapshot");
+
+    let (results, text) = capture_during("error", || {
+        [
+            // The generation manifest is present but not a number.
+            rocket_mem::aof::recover(&dir.path().join("absent.aof"), &bad_manifest_snapshot),
+            // The snapshot path cannot be read at all (and is not merely absent).
+            rocket_mem::aof::recover(&dir.path().join("absent.aof"), &unreadable_dir),
+            // The AOF path cannot be read at all (and is not merely absent).
+            rocket_mem::aof::recover(&unreadable_dir, &dir.path().join("absent.snapshot")),
+            // The AOF cannot even be stat-ed: a path under a plain file is `ENOTDIR`, not
+            // `NotFound`, so it is not the "snapshot alone is the whole state" case.
+            rocket_mem::aof::recover(&a_file.join("under-a-file.aof"), &good_snapshot),
+        ]
+    });
+
+    for (i, result) in results.iter().enumerate() {
+        assert!(result.is_err(), "fixture {i} was expected to fail recovery");
+    }
+    for expected in [
+        "aof recovery failed: generation manifest unreadable",
+        "aof recovery failed: snapshot file unreadable",
+        "aof recovery failed: aof file unreadable",
+        "aof recovery failed: aof file metadata unreadable",
+    ] {
+        assert!(
+            text.contains(expected),
+            "expected an error log for `{expected}`:\n{text}"
+        );
+    }
+    assert_eq!(
+        text.matches("ERROR").count(),
+        4,
+        "expected exactly one error line per failure, no duplicates:\n{text}"
     );
 }

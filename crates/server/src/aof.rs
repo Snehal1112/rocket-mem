@@ -515,7 +515,17 @@ pub fn replay_with_stats(
                 elapsed: started.elapsed(),
             });
         }
-        Err(e) => return Err(e),
+        Err(e) => {
+            // Not a missing file (handled above) but an unreadable one, which aborts startup --
+            // `recover`'s only caller is `main`, which propagates this into a process exit. Logged
+            // here rather than at the two `recover` call sites so it is reported exactly once.
+            tracing::error!(
+                aof_path = %path.display(),
+                error = %e,
+                "aof recovery failed: aof file unreadable"
+            );
+            return Err(e);
+        }
     };
 
     let start = (start_at as usize).min(raw.len());
@@ -523,6 +533,11 @@ pub fn replay_with_stats(
     let mut codec = protocol::codec::RespCodec::default();
     let mut valid_len = start;
     let mut commands: u64 = 0;
+    // Which of the two tolerated tail conditions ended the loop, for the warning below. Both are
+    // handled identically -- this only names the cause. The decode error itself is deliberately
+    // not carried: `RespCodec::decode` already logs it (see `codec.rs`'s `protocol error decoding
+    // frame`), so repeating it here would only duplicate a line an operator already has.
+    let mut tail_reason = "incomplete";
     loop {
         let before = buf.len();
         match codec.decode(&mut buf) {
@@ -532,13 +547,42 @@ pub fn replay_with_stats(
                 let mut protocol = protocol::codec::Protocol::default();
                 crate::dispatcher::dispatch(engine, frame, &mut protocol, 0);
             }
-            Ok(None) | Err(_) => break, // incomplete or corrupt tail — stop here, keep what decoded
+            // Incomplete or corrupt tail — stop here, keep what decoded.
+            Ok(None) => break,
+            Err(_) => {
+                tail_reason = "corrupt";
+                break;
+            }
         }
     }
 
     if valid_len < raw.len() {
-        let file = OpenOptions::new().write(true).open(path)?;
-        file.set_len(valid_len as u64)?;
+        // `warn`, not `error`: a half-written trailing record is what a crash mid-append leaves,
+        // and this function deliberately recovers from it by keeping everything before it. The
+        // offset and the two lengths are the whole payload -- the discarded bytes are client data
+        // and never reach the log.
+        tracing::warn!(
+            aof_path = %path.display(),
+            offset = valid_len,
+            aof_len = raw.len(),
+            reason = tail_reason,
+            "aof tail discarded and truncated"
+        );
+        let file = OpenOptions::new().write(true).open(path).inspect_err(|e| {
+            tracing::error!(
+                aof_path = %path.display(),
+                error = %e,
+                "aof recovery failed: cannot open the aof to truncate its discarded tail"
+            );
+        })?;
+        file.set_len(valid_len as u64).inspect_err(|e| {
+            tracing::error!(
+                aof_path = %path.display(),
+                offset = valid_len,
+                error = %e,
+                "aof recovery failed: cannot truncate the aof to its last complete record"
+            );
+        })?;
     }
     Ok(ReplayStats {
         commands,
@@ -659,7 +703,18 @@ pub fn write_generation_atomically(snapshot_path: &Path, gen: u64) -> std::io::R
 /// constraint is what makes "byte 0 onward is always the complete history" always true, and
 /// therefore why the fallback is always correct rather than merely convenient.
 pub fn recover(aof_path: &Path, snapshot_path: &Path) -> std::io::Result<engine::Engine> {
-    let gen = read_generation(snapshot_path)?;
+    // Every failure below is logged at `error` and then propagated unchanged: `main` is
+    // `recover`'s only production caller and turns an `Err` here into a process exit, so without
+    // a log line the operator sees a dead server and nothing naming the file that killed it.
+    // The tolerated conditions -- an unreadable snapshot, an offset past the AOF's end, a
+    // truncated tail -- keep their `warn`, because startup continues through all three.
+    let gen = read_generation(snapshot_path).inspect_err(|e| {
+        tracing::error!(
+            snapshot_path = %snapshot_path.display(),
+            error = %e,
+            "aof recovery failed: generation manifest unreadable"
+        );
+    })?;
     let aof_path = &generation_path(aof_path, gen);
     let snapshot_path = &generation_path(snapshot_path, gen);
 
@@ -682,7 +737,14 @@ pub fn recover(aof_path: &Path, snapshot_path: &Path) -> std::io::Result<engine:
                     let aof_len = match std::fs::metadata(aof_path) {
                         Ok(m) => Some(m.len()),
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-                        Err(e) => return Err(e),
+                        Err(e) => {
+                            tracing::error!(
+                                aof_path = %aof_path.display(),
+                                error = %e,
+                                "aof recovery failed: aof file metadata unreadable"
+                            );
+                            return Err(e);
+                        }
                     };
                     match aof_len {
                         None => {
@@ -730,7 +792,17 @@ pub fn recover(aof_path: &Path, snapshot_path: &Path) -> std::io::Result<engine:
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
-        Err(e) => return Err(e),
+        // Distinct from the `snapshot unreadable` warning above: that one is a snapshot whose
+        // *bytes* would not decode, which recovery survives by replaying the whole AOF instead.
+        // This is a snapshot file that could not be read at all, which it does not survive.
+        Err(e) => {
+            tracing::error!(
+                snapshot_path = %snapshot_path.display(),
+                error = %e,
+                "aof recovery failed: snapshot file unreadable"
+            );
+            return Err(e);
+        }
     };
     let stats = replay_with_stats(aof_path, &engine, start_at)?;
     tracing::info!(
