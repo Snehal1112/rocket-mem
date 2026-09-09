@@ -10,6 +10,7 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::sync::Semaphore;
 use tokio_util::codec::Framed;
+use tracing::Instrument;
 
 /// Caps how many requests on one RMP connection can be mid-dispatch at once. Once the
 /// cap is hit, the read loop's next `semaphore.acquire_owned().await` blocks -- it stops
@@ -167,6 +168,15 @@ async fn handle_connection<S>(
     let (tx, mut rx) = mpsc::channel::<RmpMessage>(MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION);
     let semaphore = Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION));
 
+    // This function's own `#[instrument]` span -- the `conn` span, since nothing between the
+    // attribute and here opens another one. Captured once, and cloned into every request task
+    // spawned below, because `tracing`'s current-span context is *task-local*: a bare
+    // `tokio::spawn` starts with an empty context, so without this every event the spawned task
+    // emits (the `cmd` span, `auth success`/`auth failure`, `permission denied`, the slow-log
+    // warning, the AOF errors) would have no `conn` parent and carry no `conn_id`, `peer`,
+    // `protocol` or `tls`. RESP gets this for free by dispatching inline; RMP has to ask.
+    let conn_span = tracing::Span::current();
+
     let writer = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             if sink.send(msg).await.is_err() {
@@ -199,25 +209,30 @@ async fn handle_connection<S>(
         let session = Arc::clone(&session);
         // Spawned, not awaited inline: the read loop must go straight back to decoding the next
         // request without waiting for this one's reply -- that's what makes multiple in-flight
-        // requests on one connection possible at all.
-        tokio::spawn(async move {
-            let _permit = permit; // released (dropped) when this task ends, freeing a slot
-            let reply = dispatcher::dispatch_and_log(
-                &engine,
-                &aof,
-                &replication,
-                request.frame,
-                &session,
-                client_id,
-            );
-            let _ = tx
-                .send(RmpMessage {
-                    request_id: request.request_id,
-                    msg_type: MsgType::Response,
-                    frame: reply,
-                })
-                .await; // bounded channel: send is now async
-        });
+        // requests on one connection possible at all. `.instrument(conn_span.clone())` is what
+        // keeps the connection's correlation fields on everything this task logs; see the
+        // `conn_span` binding above.
+        tokio::spawn(
+            async move {
+                let _permit = permit; // released (dropped) when this task ends, freeing a slot
+                let reply = dispatcher::dispatch_and_log(
+                    &engine,
+                    &aof,
+                    &replication,
+                    request.frame,
+                    &session,
+                    client_id,
+                );
+                let _ = tx
+                    .send(RmpMessage {
+                        request_id: request.request_id,
+                        msg_type: MsgType::Response,
+                        frame: reply,
+                    })
+                    .await; // bounded channel: send is now async
+            }
+            .instrument(conn_span.clone()),
+        );
     }
     drop(tx);
     let _ = writer.await;

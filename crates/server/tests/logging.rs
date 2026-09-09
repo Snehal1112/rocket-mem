@@ -1253,3 +1253,92 @@ async fn the_connection_and_replication_spans_render_under_the_names_conn_and_re
         "the leader-side replication span is not rendering as `repl`; output was:\n{text}"
     );
 }
+
+/// The `conn` span must parent RMP command dispatch, exactly as it already does on RESP.
+///
+/// RESP dispatches inline in the connection task, so its `cmd` span nests under `conn` for free.
+/// RMP dispatches each request in its own `tokio::spawn` (deliberately -- that is what allows
+/// several in-flight requests per connection), and `tracing`'s current-span context is
+/// **task-local**: a bare `tokio::spawn` starts with no current span, so everything nested under
+/// RMP dispatch used to emit with no `conn` parent at all -- no `conn_id`, no `peer`, no
+/// `protocol`, no `tls`. That silently made the spec's central promise -- three spans carry
+/// correlation and everything nested inherits it -- true for one protocol and false for the
+/// other, so an operator could not attribute an RMP `permission denied` to a peer.
+///
+/// Asserting on the `cmd` span's own event is the strongest available check: it is the innermost
+/// thing dispatch emits, so if *it* renders the `conn{…}:cmd{…}:` prefix, everything else the
+/// spawned task emits (auth events, the slow-log warning, the AOF errors) inherits the same
+/// parent.
+#[tokio::test]
+async fn an_rmp_command_dispatched_in_its_own_task_still_logs_under_the_conn_span() {
+    use protocol::rmp::{MsgType, RmpCodec, RmpMessage};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let engine = Arc::new(engine::Engine::new());
+    let dir = tempfile::tempdir().expect("tempdir");
+    let aof = Arc::new(
+        rocket_mem::aof::AofWriter::open(
+            &dir.path().join("rmp-conn-span.aof"),
+            rocket_mem::aof::FsyncPolicy::Never,
+        )
+        .expect("open aof"),
+    );
+    let replication = Arc::new(rocket_mem::replication::ReplicationHandle::default());
+    tokio::spawn(rocket_mem::rmp_connection::serve(
+        listener,
+        Arc::clone(&engine),
+        Arc::clone(&aof),
+        Arc::clone(&replication),
+    ));
+
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(BufferWriter(Arc::clone(&buffer)))
+        .with_env_filter(EnvFilter::new("debug"))
+        .finish();
+    // `set_default` scopes the subscriber to this thread, and `#[tokio::test]` builds a
+    // current-thread runtime -- so the server's connection task and the per-request task it
+    // spawns both run on this very thread and see this subscriber. A multi-thread runtime here
+    // would capture nothing.
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let mut con = Framed::new(TcpStream::connect(addr).await.unwrap(), RmpCodec);
+    con.send(RmpMessage {
+        request_id: 1,
+        msg_type: MsgType::Request,
+        frame: cmd(&[b"SET", b"rmp-span-key", b"rmp-span-value"]),
+    })
+    .await
+    .unwrap();
+    let reply = con.next().await.unwrap().unwrap();
+    assert_eq!(reply.frame, Frame::Simple("OK".into()));
+
+    drop(_guard);
+    let bytes_out = buffer.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let text = String::from_utf8(bytes_out).expect("subscriber output is utf-8");
+
+    let dispatched: Vec<&str> = text
+        .lines()
+        .filter(|line| line.contains("command dispatched"))
+        .collect();
+    assert!(
+        !dispatched.is_empty(),
+        "no per-command line was captured at all, so this test proved nothing:\n{text}"
+    );
+    for line in dispatched {
+        assert!(
+            line.contains("conn{conn_id="),
+            "an RMP command logged with no `conn` parent span:\n{line}"
+        );
+        assert!(
+            line.contains("protocol=RMP"),
+            "the inherited `conn` span lost its protocol field:\n{line}"
+        );
+        assert!(
+            line.contains("cmd{cmd=SET"),
+            "the `cmd` span is missing from the per-command line:\n{line}"
+        );
+    }
+}
