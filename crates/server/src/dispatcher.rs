@@ -2770,6 +2770,7 @@ fn handle_save(
     aof: &crate::aof::AofWriter,
     replication: &crate::replication::ReplicationHandle,
 ) -> Frame {
+    let started = std::time::Instant::now();
     // Resolved, never bare: once a rewrite has committed, the manifest names the only
     // snapshot/AOF pair `recover` will ever read, so a `SAVE` written to the bare path would be
     // a permanent no-op that still reports success.
@@ -2785,6 +2786,7 @@ fn handle_save(
         Err(e) => return Frame::Error(format!("ERR failed to read AOF generation: {e}")),
     };
     let path = crate::aof::generation_path(replication.snapshot_path(), gen);
+    tracing::info!(path = %path.display(), "snapshot save starting");
 
     let bytes = {
         let _order_guard = aof.lock_all_shards();
@@ -2798,6 +2800,12 @@ fn handle_save(
     match write_snapshot_atomically(&path, &bytes) {
         Ok(()) => {
             replication.record_save();
+            tracing::info!(
+                path = %path.display(),
+                bytes = bytes.len(),
+                elapsed_us = started.elapsed().as_micros() as u64,
+                "snapshot save finished"
+            );
             Frame::Simple("OK".into())
         }
         Err(e) => Frame::Error(format!("ERR failed to write snapshot: {e}")),
