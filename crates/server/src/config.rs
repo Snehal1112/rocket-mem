@@ -484,16 +484,20 @@ mod tests {
         figment::Jail::expect_with(|jail| {
             jail.create_file(
                 "rocket-mem.toml",
-                "replicaof = \"127.0.0.1:6400\"\nreplicaof_auth_username = \"app\"\n",
+                "replicaof = \"127.0.0.1:6400\"\nreplicaof_auth_username = \"app\"\nreplicaof_auth_password = \"changeme\"\n",
             )?;
             let cfg = load_layered(Some(std::path::Path::new("rocket-mem.toml"))).unwrap();
             assert_eq!(cfg.replicaof.as_deref(), Some("127.0.0.1:6400"));
             assert_eq!(cfg.replicaof_auth_username.as_deref(), Some("app"));
-            assert_eq!(cfg.replicaof_auth_password, None);
+            assert_eq!(cfg.replicaof_auth_password.as_deref(), Some("changeme"));
 
             jail.set_env("ROCKET_MEM_REPLICAOF", "127.0.0.1:9999"); // env beats file
+            jail.set_env("ROCKET_MEM_REPLICAOF_AUTH_USERNAME", "envuser"); // env beats file
+            jail.set_env("ROCKET_MEM_REPLICAOF_AUTH_PASSWORD", "envpass"); // env beats file
             let cfg = load_layered(Some(std::path::Path::new("rocket-mem.toml"))).unwrap();
             assert_eq!(cfg.replicaof.as_deref(), Some("127.0.0.1:9999"));
+            assert_eq!(cfg.replicaof_auth_username.as_deref(), Some("envuser"));
+            assert_eq!(cfg.replicaof_auth_password.as_deref(), Some("envpass"));
 
             let cli = Cli::parse_from([
                 "rocket-mem",
@@ -501,9 +505,15 @@ mod tests {
                 "rocket-mem.toml",
                 "--replicaof",
                 "127.0.0.1:1111", // CLI beats env
+                "--replicaof-auth-username",
+                "cliuser", // CLI beats env
+                "--replicaof-auth-password",
+                "clipass", // CLI beats env
             ]);
             let cfg = load_with_cli(cli).unwrap();
             assert_eq!(cfg.replicaof.as_deref(), Some("127.0.0.1:1111"));
+            assert_eq!(cfg.replicaof_auth_username.as_deref(), Some("cliuser"));
+            assert_eq!(cfg.replicaof_auth_password.as_deref(), Some("clipass"));
             Ok(())
         });
     }

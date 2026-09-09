@@ -258,8 +258,13 @@ async fn main() -> std::io::Result<()> {
 
     // Must run before the auto-connect block below fires off a connection attempt: an invalid
     // `replicaof_auth_username`/`replicaof_auth_password` pairing should fail startup outright,
-    // not spawn a doomed connection first and reject the config afterwards.
+    // not spawn a doomed connection first and reject the config afterwards. `validate_tls` is
+    // hoisted here too (rather than left by the TLS listeners below) for the same reason: it is a
+    // pure function of `&Config` with no dependency on anything constructed later, so a broken TLS
+    // config must abort startup before the auto-connect block below can load a leader's snapshot
+    // into this node's engine and append to its own AOF.
     rocket_mem::config::validate_replicaof(&config)?;
+    rocket_mem::config::validate_tls(&config)?;
 
     // A configured `replicaof` auto-connects on every startup, closing the "restarted follower
     // silently comes back as standalone" footgun documented in
@@ -298,8 +303,6 @@ async fn main() -> std::io::Result<()> {
         Arc::clone(&aof),
         Arc::clone(&replication),
     ));
-
-    rocket_mem::config::validate_tls(&config)?;
 
     if let (Some(tls_addr), Some(cert), Some(key)) = (
         &config.tls_resp_addr,
