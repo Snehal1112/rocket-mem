@@ -256,6 +256,23 @@ async fn main() -> std::io::Result<()> {
     }
     let replication = Arc::new(handle);
 
+    // A configured `replicaof` auto-connects on every startup, closing the "restarted follower
+    // silently comes back as standalone" footgun documented in
+    // docs/superpowers/specs/2026-08-30-sprint-5-spec.md. Fire-and-forget: this spawns its own
+    // task and never awaits the connection, so placement relative to the listeners below has no
+    // functional effect -- and a leader that isn't up yet falls into the same 1-second-backoff
+    // reconnect loop a later mid-stream disconnect would use, not a startup failure.
+    if let Some(target) = &config.replicaof {
+        let auth = match (
+            &config.replicaof_auth_username,
+            &config.replicaof_auth_password,
+        ) {
+            (Some(u), Some(p)) => Some((u.clone(), p.clone())),
+            _ => None,
+        };
+        replication.start_replicating_with_auth(target.clone(), auth);
+    }
+
     let metrics_listener = tokio::net::TcpListener::bind(&config.metrics_addr).await?;
     listeners.push((
         "metrics",
@@ -278,6 +295,7 @@ async fn main() -> std::io::Result<()> {
     ));
 
     rocket_mem::config::validate_tls(&config)?;
+    rocket_mem::config::validate_replicaof(&config)?;
 
     if let (Some(tls_addr), Some(cert), Some(key)) = (
         &config.tls_resp_addr,
@@ -340,12 +358,13 @@ async fn main() -> std::io::Result<()> {
     for line in &cluster_topology_lines {
         body.push(format!("{:BANNER_LABEL_WIDTH$}{line}", ""));
     }
-    // A live count, not a hardcoded message: `REPLICAOF` has no config-file equivalent (see
-    // .claude/manual-testing.md's "Replication" section), so this node is never itself a
-    // replica of anything yet at the moment this banner prints. A replica CAN already be
-    // registered here, though -- a TLS RESP listener (spawned above, before this point) starts
-    // accepting connections immediately, so a fast-connecting replica's PSYNC can land before
-    // this banner prints, even though the plaintext RESP listener (served only after the
+    // A live count, not a hardcoded message: this only reports INBOUND replicas (nodes
+    // currently PSYNC'd to this one). This node's own OUTBOUND role (whether it is itself
+    // replicating from a configured `replicaof` target) is reported separately, right below --
+    // see docs/superpowers/specs/2026-09-09-replicaof-config-file-spec.md. A replica CAN already
+    // be registered here, though -- a TLS RESP listener (spawned above, before this point)
+    // starts accepting connections immediately, so a fast-connecting replica's PSYNC can land
+    // before this banner prints, even though the plaintext RESP listener (served only after the
     // banner, at the bottom of this function) cannot.
     let replica_addrs = replication.registry.addrs();
     if replica_addrs.is_empty() {
@@ -363,6 +382,17 @@ async fn main() -> std::io::Result<()> {
             let shown = addr.as_deref().unwrap_or("?");
             body.push(format!("{:BANNER_LABEL_WIDTH$}slave{i} {shown}", ""));
         }
+    }
+    if let Some(target) = &config.replicaof {
+        let auth_note = if config.replicaof_auth_username.is_some() {
+            "auth configured"
+        } else {
+            "no auth"
+        };
+        body.push(format!(
+            "{}replicating from {target} ({auth_note})",
+            banner_label("replicaof", color)
+        ));
     }
     body.push(paint("2", "listeners", color));
     let listener_label_width = listeners.iter().map(|(l, _)| l.len()).max().unwrap_or(0);
