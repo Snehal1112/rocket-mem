@@ -107,8 +107,18 @@ impl Engine {
     pub fn ttl(&self, key: &[u8]) -> TtlStatus {
         self.store.ttl(key)
     }
+    /// Sweeps shard `shard_idx` for expired keys — see `Store::active_expire_cycle`. Logs at
+    /// `debug` only when it actually removed something: the server drives this from a 100ms
+    /// loop across all 16 shards (160 calls/sec), and at typical TTL usage almost every sweep
+    /// finds nothing to do. A `debug` line for a zero-count sweep, 160 times a second, would
+    /// drown out every other `debug` event this series adds — so silence on an empty sweep is
+    /// the correct behavior, not a gap.
     pub fn active_expire_cycle(&self, shard_idx: usize) -> usize {
-        self.store.active_expire_cycle(shard_idx)
+        let removed = self.store.active_expire_cycle(shard_idx);
+        if removed > 0 {
+            tracing::debug!(shard = shard_idx, removed, "active expire cycle");
+        }
+        removed
     }
     /// Which shard a key routes to — see `Store::shard_index`. Traced at the facade level, not
     /// inside `Store::shard_index` itself: that method is `#[inline]` and sits on the hot path
@@ -326,6 +336,19 @@ mod tests {
         // sweep every shard once — the key's shard is wherever it landed
         let total_removed: usize = (0..16).map(|i| engine.active_expire_cycle(i)).sum();
         assert_eq!(total_removed, 1);
+    }
+
+    #[test]
+    fn active_expire_cycle_on_a_shard_with_nothing_expired_returns_zero() {
+        let engine = Engine::new();
+        engine.set(
+            Bytes::from_static(b"still-alive"),
+            Value::String(Bytes::from_static(b"v")),
+        );
+        // sweep every shard once -- none of them have anything expired
+        let total_removed: usize = (0..16).map(|i| engine.active_expire_cycle(i)).sum();
+        assert_eq!(total_removed, 0);
+        assert!(engine.exists(b"still-alive"));
     }
 
     #[test]
