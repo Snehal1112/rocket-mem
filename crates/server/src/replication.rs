@@ -54,7 +54,19 @@ impl ReplicaRegistry {
     /// roll back the write that already committed on the leader.
     pub fn broadcast(&self, bytes: bytes::Bytes) {
         let mut replicas = self.replicas.lock().unwrap_or_else(|e| e.into_inner());
-        replicas.retain(|(_, tx)| tx.send(bytes.clone()).is_ok());
+        replicas.retain(|(addr, tx)| {
+            let alive = tx.send(bytes.clone()).is_ok();
+            if !alive {
+                // Escaped: `addr` is the address the replica advertised in its own `PSYNC`
+                // frame -- raw client bytes, reaching an `info` event on a server that never
+                // authenticated it. See `connection::serve_replica`'s doc comment.
+                tracing::info!(
+                    host_port = %crate::logging::escape_ident(addr.as_deref().unwrap_or("unknown")),
+                    "replica pruned"
+                );
+            }
+            alive
+        });
     }
 
     /// How many replicas are currently registered. Note this counts senders, which are pruned
@@ -209,6 +221,12 @@ pub struct ReplicationHandle {
     /// to configure away. `main.rs` sets its threshold from the environment via
     /// `with_slowlog_threshold`; `new`/`Default` use the 10ms default.
     pub slowlog: crate::slowlog::SlowLog,
+    /// The truncation cap `logging::fmt_value`/`logging::redact_args` apply to each rendered
+    /// argument on the `trace`-level dispatch line. Stored as `usize` so the call site needs no
+    /// cast on the hot path. `main.rs` sets it from `Config::log_value_max_bytes` via
+    /// `with_log_value_max_bytes`; `new`/`Default` use the same 128-byte default `Config` does,
+    /// so the ~25 test-constructed handles behave identically to a real server.
+    log_value_max_bytes: usize,
     /// In-memory ACL users. Empty by default -- every existing test and deployment through
     /// Sprint 7 -- populated only via `with_acl_bootstrap` (from the TOML config's
     /// `[[acl.users]]`) and at runtime via `ACL SETUSER` (plan 08). Never persisted; see
@@ -246,6 +264,7 @@ impl ReplicationHandle {
             master_repl_offset: Arc::new(AtomicU64::new(0)),
             slave_repl_offset: Arc::new(AtomicU64::new(0)),
             slowlog: crate::slowlog::SlowLog::default(),
+            log_value_max_bytes: 128,
             acl: crate::acl::AclStore::default(),
             own_addr: None,
         }
@@ -296,6 +315,18 @@ impl ReplicationHandle {
         self
     }
 
+    /// Sets the `trace`-level argument truncation cap -- see the `log_value_max_bytes` field.
+    /// A builder method, matching `with_aof`/`with_cluster`/`with_slowlog_threshold`'s existing
+    /// pattern, so the ~25 existing `ReplicationHandle::new` call sites stay untouched.
+    ///
+    /// Takes the `u64` `Config` declares and saturates into `usize`: on a 32-bit target a cap
+    /// larger than the address space would otherwise wrap to a small one and silently log
+    /// *less* than configured.
+    pub fn with_log_value_max_bytes(mut self, cap: u64) -> Self {
+        self.log_value_max_bytes = usize::try_from(cap).unwrap_or(usize::MAX);
+        self
+    }
+
     /// Seeds the ACL store from the config file's `[[acl.users]]` bootstrap list. A builder
     /// method, matching `with_aof`/`with_cluster`/`with_slowlog_threshold`'s existing pattern, so
     /// the ~25 existing `ReplicationHandle::new` call sites (all tests, none configuring ACLs)
@@ -311,6 +342,12 @@ impl ReplicationHandle {
     /// this before extracting any key, so a standalone node pays one `Option` check per command.
     pub fn cluster(&self) -> Option<&Arc<crate::cluster::ClusterConfig>> {
         self.cluster.as_ref()
+    }
+
+    /// The `trace`-level argument truncation cap, read once per command by `dispatch_and_log`
+    /// but only when `trace` is actually enabled.
+    pub fn log_value_max_bytes(&self) -> usize {
+        self.log_value_max_bytes
     }
 
     /// For `SAVE` and (later) `PSYNC` handling, which need the shared `Engine` to snapshot
@@ -335,44 +372,92 @@ impl ReplicationHandle {
         self.start_replicating_with_auth(host_port, None);
     }
 
+    /// What triggered a role transition, for the `source` field on the `info` events below. An
+    /// operator reading a log during an incident has to be able to tell "a client told this node
+    /// to follow" from "this node started up already following" -- the two have completely
+    /// different causes and completely different fixes, and without this field they render
+    /// identically.
+    const SOURCE_COMMAND: &'static str = "command";
+    const SOURCE_CONFIG: &'static str = "config";
+
     /// Same as `start_replicating`, but also authenticates against the leader with `AUTH
     /// <username> <password>` before `PSYNC` -- required when the leader has ACL users
     /// configured, since an unauthenticated `PSYNC` is otherwise rejected with `NOAUTH` and
     /// replication can never complete. See `handle_replicaof`'s `REPLICAOF ... AUTH user pass`
     /// clause, the only production caller of this with `Some`.
     pub fn start_replicating_with_auth(&self, host_port: String, auth: Option<(String, String)>) {
-        let mut task = self.follower_task.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(old) = task.take() {
-            old.abort();
+        self.start_replicating_inner(host_port, auth, Self::SOURCE_COMMAND);
+    }
+
+    /// The one place this node actually becomes a follower, and therefore the one place the
+    /// `info`-level transition event belongs. Both public entry points funnel through here, so no
+    /// present or future caller can flip the role silently -- the alternative, an event at each
+    /// entry point, is call-site discipline again, which is exactly what this series keeps
+    /// replacing with structure. `source` is the only thing the entry points know that this
+    /// function cannot derive, so it is the only thing they pass down.
+    fn start_replicating_inner(
+        &self,
+        host_port: String,
+        auth: Option<(String, String)>,
+        source: &'static str,
+    ) {
+        // Deliberately scoped: the `info!` below must not run while `follower_task`'s mutex is
+        // held. Writing a log line is I/O, and a subscriber is free to block on it.
+        let auth_configured = auth.is_some();
+        {
+            let mut task = self.follower_task.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(old) = task.take() {
+                old.abort();
+            }
+            let my_generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+            let engine = Arc::clone(&self.engine);
+            let generation = Arc::clone(&self.generation);
+            let aof = self.aof.clone();
+            let tls_client_config = self.replication_tls_client_config.clone();
+            let last_apply = self.last_apply_slot();
+            *self.master_addr.lock().unwrap_or_else(|e| e.into_inner()) = Some(host_port.clone());
+            let link_up = self.link_up_slot();
+            let identity = FollowerIdentity {
+                own_addr: self.own_addr.clone(),
+                auth,
+            };
+            *task = Some(tokio::spawn(replication_client_loop(
+                host_port.clone(),
+                engine,
+                Generation {
+                    counter: generation,
+                    mine: my_generation,
+                },
+                aof,
+                FollowerHandles {
+                    last_apply,
+                    link_up,
+                },
+                tls_client_config,
+                identity,
+            )));
+            self.is_replica.store(true, Ordering::Relaxed);
         }
-        let my_generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        let engine = Arc::clone(&self.engine);
-        let generation = Arc::clone(&self.generation);
-        let aof = self.aof.clone();
-        let tls_client_config = self.replication_tls_client_config.clone();
-        let last_apply = self.last_apply_slot();
-        *self.master_addr.lock().unwrap_or_else(|e| e.into_inner()) = Some(host_port.clone());
-        let link_up = self.link_up_slot();
-        let identity = FollowerIdentity {
-            own_addr: self.own_addr.clone(),
-            auth,
-        };
-        *task = Some(tokio::spawn(replication_client_loop(
-            host_port,
-            engine,
-            Generation {
-                counter: generation,
-                mine: my_generation,
-            },
-            aof,
-            FollowerHandles {
-                last_apply,
-                link_up,
-            },
-            tls_client_config,
-            identity,
-        )));
-        self.is_replica.store(true, Ordering::Relaxed);
+
+        // `auth = <bool>`, never the credential: the AUTH tuple carries the leader's plaintext
+        // password, from `REPLICAOF <host> <port> AUTH <user> <pass>` or from
+        // `Config::replicaof_auth_password`. Whether auth is configured at all is the
+        // operationally useful half and is not a secret; the username is omitted too, since it
+        // adds nothing an operator cannot read out of the config. `host_port` is
+        // client-controlled on the command path, so it goes through `escape_ident` like every
+        // other client-supplied field in this crate.
+        //
+        // `source` is rendered with `%`, not recorded bare: a bare `&str` field is
+        // Debug-formatted by `tracing-subscriber` and comes out as `source="command"`, while
+        // every other fixed-vocabulary field in this project (`protocol`, `cmd`, `key`) renders
+        // unquoted. One grep should match them all -- see the spec's note on `protocol` being
+        // unified the same way in plan 22.
+        tracing::info!(
+            host_port = %crate::logging::escape_ident(&host_port),
+            auth = auth_configured,
+            source = %source,
+            "replication started, node is now a follower"
+        );
     }
 
     /// Config-driven equivalent of the "if `replicaof` is set, auto-connect" startup wiring
@@ -385,7 +470,10 @@ impl ReplicationHandle {
     pub fn start_replicating_from_config(&self, config: &crate::config::Config) {
         if let Some(target) = &config.replicaof {
             let auth = crate::config::replicaof_auth(config);
-            self.start_replicating_with_auth(target.clone(), auth);
+            // `SOURCE_CONFIG`, not the `start_replicating_with_auth` route: this is the startup
+            // auto-connect, and its transition event must be distinguishable from a client's live
+            // `REPLICAOF`. Same event, same fields, different `source`.
+            self.start_replicating_inner(target.clone(), auth, Self::SOURCE_CONFIG);
         }
     }
 
@@ -393,14 +481,38 @@ impl ReplicationHandle {
     /// writable operation. Also bumps the generation so a stale task's in-flight poll can no
     /// longer apply state even when nothing new replaces it.
     pub fn stop_replicating(&self) {
-        let mut task = self.follower_task.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(old) = task.take() {
-            old.abort();
+        // Scoped for the same reason `start_replicating_inner`'s body is: no logging under the
+        // mutex. `master_addr.take()` doubles as the "was this node actually a follower?" test --
+        // it is `Some` exactly while a follower task is live, set in `start_replicating_inner` and
+        // cleared only here.
+        let previous_leader = {
+            let mut task = self.follower_task.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(old) = task.take() {
+                old.abort();
+            }
+            self.generation.fetch_add(1, Ordering::SeqCst);
+            self.is_replica.store(false, Ordering::Relaxed);
+            let previous_leader = self
+                .master_addr
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            self.link_up.store(false, Ordering::Relaxed);
+            previous_leader
+        };
+
+        // `REPLICAOF NO ONE` against a node that was never a follower is a no-op, not a
+        // milestone, so it must not claim a promotion that did not happen -- an operator reading
+        // "promoted to leader" during a failover has to be able to trust it. Still logged, at
+        // `debug`, because "the command arrived and did nothing" is itself worth being able to
+        // see when a failover script appears to have run and nothing changed.
+        match previous_leader {
+            Some(host_port) => tracing::info!(
+                host_port = %crate::logging::escape_ident(&host_port),
+                "replication stopped, node promoted to leader"
+            ),
+            None => tracing::debug!("replication stop requested, but node was not a follower"),
         }
-        self.generation.fetch_add(1, Ordering::SeqCst);
-        self.is_replica.store(false, Ordering::Relaxed);
-        *self.master_addr.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        self.link_up.store(false, Ordering::Relaxed);
     }
 
     /// Called once per accepted client connection. Bumps both the live gauge and the lifetime
@@ -565,6 +677,15 @@ struct FollowerIdentity {
 /// same loop body. `generation` lets this task detect it has been superseded by a later
 /// `start_replicating`/`stop_replicating` call and stop applying state — see
 /// `ReplicationHandle::generation`'s doc comment.
+///
+/// The `repl` span is the correlation backbone for every replication log line on the follower
+/// side: it wraps this whole function, so the pre-existing `tracing::warn!` reconnect-logging
+/// calls inside the loop below, and every event this plan's later tasks add, inherit
+/// `host_port` for free. Named `"repl"` explicitly (rather than the default, the function's own
+/// name) to match the leader-side span opened in `connection.rs`'s `serve_replica` — one name,
+/// grep-able from either end of a replication link. See
+/// ../../../docs/superpowers/specs/2026-09-09-verbose-logging-design.md's span table.
+#[tracing::instrument(name = "repl", skip_all, fields(host_port = %crate::logging::escape_ident(&host_port)))]
 async fn replication_client_loop(
     host_port: String,
     engine: Arc<Engine>,
@@ -593,9 +714,21 @@ async fn replication_client_loop(
         )
         .await
         {
-            Ok(()) => tracing::warn!(%host_port, "replication connection closed, reconnecting"),
+            // `host_port` came from a client's `REPLICAOF <host> <port>`, so it is escaped here
+            // like every other client-controlled field. Admin-gated rather than open, but the
+            // events are `warn` and the escaping costs nothing on a per-reconnect path.
+            Ok(()) => {
+                tracing::warn!(
+                    host_port = %crate::logging::escape_ident(&host_port),
+                    "replication connection closed, reconnecting"
+                )
+            }
             Err(e) => {
-                tracing::warn!(%host_port, error = %e, "replication connection lost, reconnecting")
+                tracing::warn!(
+                    host_port = %crate::logging::escape_ident(&host_port),
+                    error = %e,
+                    "replication connection lost, reconnecting"
+                )
             }
         }
         handles.link_up.store(false, Ordering::Relaxed);
@@ -654,6 +787,23 @@ async fn connect_and_sync(
     }
 }
 
+/// Uppercased command name from a replicated frame's first element, for the per-command apply
+/// debug log. `sync_once` has no access to `dispatcher::command_name_upper` (private to that
+/// module); duplicating this tiny extraction locally matches `connection.rs`'s own
+/// `is_psync_command`/`psync_advertised_addr`, which solve the same cross-module-visibility
+/// problem for PSYNC detection. Not on the client dispatch hot path the 2% benchmark gate
+/// covers -- this runs once per replicated frame on the follower's own apply loop, which
+/// already pays for a full `dispatch` call per frame.
+fn replicated_command_name(frame: &protocol::Frame) -> String {
+    let protocol::Frame::Array(items) = frame else {
+        return "?".to_string();
+    };
+    let Some(protocol::Frame::Bulk(name)) = items.first() else {
+        return "?".to_string();
+    };
+    String::from_utf8_lossy(name).to_uppercase()
+}
+
 /// One full sync: `PSYNC`, load the snapshot, then apply every subsequent frame until the
 /// connection ends (cleanly or with an error). Never called `dispatch_and_log` — see this
 /// plan's Global Constraints. Checks `generation` against `my_generation` immediately before
@@ -683,6 +833,7 @@ where
     // is a raw length-prefixed blob), so it round-trips through the codec's ordinary
     // send/next -- no need for the raw-socket handling PSYNC's reply requires.
     if let Some((username, password)) = &identity.auth {
+        tracing::debug!("sending AUTH to leader");
         framed
             .send(protocol::Frame::Array(vec![
                 protocol::Frame::Bulk(bytes::Bytes::from_static(b"AUTH")),
@@ -694,7 +845,7 @@ where
             Some(Ok(protocol::Frame::Error(e))) => {
                 return Err(std::io::Error::other(format!("leader rejected AUTH: {e}")))
             }
-            Some(Ok(_)) => {} // +OK -- proceed to PSYNC
+            Some(Ok(_)) => tracing::debug!("leader accepted AUTH"), // +OK -- proceed to PSYNC
             Some(Err(e)) => return Err(e),
             None => {
                 return Err(std::io::Error::new(
@@ -719,6 +870,7 @@ where
             b"PSYNC",
         ))]),
     };
+    tracing::debug!("sending PSYNC to leader");
     framed.send(psync_frame).await?;
 
     // Reclaim the raw socket to read the length-prefixed snapshot blob, which is NOT a RESP
@@ -759,6 +911,7 @@ where
     let len = u64::from_le_bytes(len_buf) as usize;
     let mut blob = vec![0u8; len];
     parts.io.read_exact(&mut blob).await?;
+    tracing::debug!(bytes = len, "received snapshot blob from leader");
 
     if generation.load(Ordering::SeqCst) != my_generation {
         return Ok(()); // superseded while reading the blob -- do not clobber the newer task's state
@@ -766,17 +919,33 @@ where
     engine
         .load_snapshot(&blob)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    // `info`, not `debug`: the next line is `link_up.store(true)`, so this is the exact moment
+    // the follower becomes in-sync. At `debug` a synced follower and one still stuck in the
+    // reconnect loop emitted identical output -- nothing -- which is the single question an
+    // operator asks about a follower.
+    //
+    // The message deliberately does not reuse `aof.rs`'s `snapshot loaded`, which is the
+    // *recovery* path reading this node's own snapshot file off disk at startup. Both are `info`
+    // and both would otherwise match one grep while meaning opposite things: one says "this node
+    // restored its own state", the other says "this node took a leader's state". `host_port`
+    // comes free from the enclosing `repl` span, which is `info`-level and therefore entered at
+    // the production default -- see the spec's span-field-duplication rule.
+    tracing::info!(bytes = len, "follower in sync with leader");
     status.link_up.store(true, Ordering::Relaxed);
 
     // From here on the leader sends plain RESP frames, byte-for-byte what its own AOF
     // received — rebuild a Framed over the same socket (whose read position is exactly past
     // the blob) to resume decoding normally.
     let mut framed = tokio_util::codec::Framed::from_parts(parts);
+    let mut frames_applied: u64 = 0; // per-session counter, not persisted or shared -- see Global Constraints
     while let Some(result) = framed.next().await {
         if generation.load(Ordering::SeqCst) != my_generation {
             return Ok(()); // superseded -- stop applying frames to state a newer task now owns
         }
         let frame = result?;
+        frames_applied += 1;
+        tracing::trace!(offset = frames_applied, "replication stream advanced");
+        let name = replicated_command_name(&frame);
         let mut protocol = protocol::codec::Protocol::default();
         // Mutual exclusion with a concurrent SAVE on this same node: SAVE's shard-by-shard
         // snapshot walk (Store::snapshot_entries) must not observe a multi-key replicated
@@ -788,6 +957,9 @@ where
         // which matches the pre-fix behavior for those.
         let _order_guard = aof.map(|a| a.lock_all_shards());
         let reply = crate::dispatcher::dispatch(engine, frame, &mut protocol, 0);
+        // Escaped: `replicated_command_name` is a lossy decode of whatever bytes the leader put
+        // in the frame's first bulk, with no length or character restriction of its own.
+        tracing::debug!(cmd = %crate::logging::escape_ident(&name), "applied replicated command");
         // A leader only ever fans out a command whose local execution already succeeded, so
         // an error applying it here means the two sides have genuinely diverged (a bug, or
         // version skew) — logged and skipped, not a reason to tear down and resync, which
@@ -1572,4 +1744,175 @@ mod tests {
         assert!(cluster.owns(8001));
         assert!(!cluster.owns(8000));
     }
+
+    #[test]
+    fn log_value_max_bytes_defaults_to_128() {
+        // Every existing `ReplicationHandle::new`/`default()` call site -- ~25 of them, all
+        // tests -- must keep working untouched, with the same cap `Config::default()` uses.
+        assert_eq!(ReplicationHandle::default().log_value_max_bytes(), 128);
+    }
+
+    #[test]
+    fn with_log_value_max_bytes_overrides_the_default() {
+        let handle = ReplicationHandle::default().with_log_value_max_bytes(16);
+        assert_eq!(handle.log_value_max_bytes(), 16);
+    }
+
+    #[test]
+    fn with_log_value_max_bytes_saturates_an_absurd_config_value() {
+        // The config field is a u64 and `fmt_value` takes a usize. On a 32-bit target a large
+        // configured cap would otherwise truncate to a small one -- silently logging *less*
+        // than asked. Saturate to usize::MAX instead: "no truncation" is the honest reading of
+        // "cap larger than this machine can index".
+        let handle = ReplicationHandle::default().with_log_value_max_bytes(u64::MAX);
+        assert_eq!(handle.log_value_max_bytes(), usize::MAX);
+    }
+
+    use crate::logging::test_support::CapturedLogs;
+
+    #[tokio::test]
+    async fn replication_client_loop_opens_a_repl_span_naming_the_leader_host_port() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let host_port = addr.to_string();
+
+        let fake_leader = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut psync_bytes = [0u8; 15];
+            socket.read_exact(&mut psync_bytes).await.unwrap();
+            let blob = engine::Engine::new().snapshot(0);
+            socket
+                .write_all(&(blob.len() as u64).to_le_bytes())
+                .await
+                .unwrap();
+            socket.write_all(&blob).await.unwrap();
+            // keep the socket open long enough for the span to still be active when this test
+            // samples the captured output below
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        });
+
+        let captured = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::NEW)
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let engine = Arc::new(Engine::new());
+        let generation = Arc::new(AtomicU64::new(0));
+        let task = tokio::spawn(replication_client_loop(
+            host_port.clone(),
+            engine,
+            Generation {
+                counter: Arc::clone(&generation),
+                mine: 0,
+            },
+            None,
+            FollowerHandles {
+                last_apply: Arc::new(AtomicI64::new(0)),
+                link_up: Arc::new(AtomicBool::new(false)),
+            },
+            None,
+            FollowerIdentity::default(),
+        ));
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        task.abort();
+        fake_leader.abort();
+        drop(_guard);
+
+        let text = captured.text();
+        // `repl{host_port=`, not `repl` and `host_port` separately: the separate form matched
+        // the function's own name (`replication_client_loop` contains `repl`) and so could not
+        // tell a correctly-named span from `#[instrument]`'s default, which is the exact bug
+        // that went unnoticed on the connection span for ~80 commits. See the span-name section
+        // at the bottom of `tests/logging.rs`.
+        assert!(
+            text.contains("repl{host_port=") && text.contains(&host_port),
+            "expected a new `repl` span carrying host_port={host_port:?}, got:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_once_logs_each_psync_handshake_step_at_debug() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let fake_leader = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut psync_bytes = [0u8; 15];
+            socket.read_exact(&mut psync_bytes).await.unwrap();
+            let blob = engine::Engine::new().snapshot(0);
+            socket
+                .write_all(&(blob.len() as u64).to_le_bytes())
+                .await
+                .unwrap();
+            socket.write_all(&blob).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        });
+
+        let captured = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let engine = engine::Engine::new();
+        let host_port = addr.to_string();
+        let generation = Arc::new(AtomicU64::new(0));
+        let stream = tokio::net::TcpStream::connect(&host_port).await.unwrap();
+        let sync_task = tokio::spawn(async move {
+            sync_once(
+                stream,
+                &engine,
+                &generation,
+                0,
+                None,
+                FollowerStatus {
+                    last_apply: &AtomicI64::new(0),
+                    link_up: &AtomicBool::new(false),
+                },
+                &FollowerIdentity::default(),
+            )
+            .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        sync_task.abort();
+        fake_leader.abort();
+        drop(_guard);
+
+        let text = captured.text();
+        assert!(text.contains("sending PSYNC to leader"), "{text}");
+        assert!(
+            text.contains("received snapshot blob from leader"),
+            "{text}"
+        );
+        // Not `snapshot loaded` -- that message belongs to `aof.rs`'s recovery path, and this
+        // event was deliberately renamed so one grep cannot conflate "restored my own state" with
+        // "took the leader's state". It is `info` now, so a `DEBUG` subscriber still sees it.
+        assert!(text.contains("follower in sync with leader"), "{text}");
+    }
+
+    // `sync_once_logs_stream_offset_and_the_applied_command_name` used to live here, asserting
+    // on captured `TRACE`/`DEBUG` output from this same call. It flaked: `tracing` caches
+    // callsite `Interest` per callsite, process-globally, the first time a callsite is reached
+    // -- and this unit-test binary runs ~575 tests whose subscribers install and drop
+    // constantly, so whichever test hits `sync_once`'s trace/debug lines first (often with no
+    // subscriber, or one that doesn't want that level) can poison the callsite for the rest of
+    // the process, including this test's own later `TRACE` subscriber. It had no assertions
+    // beyond the captured text -- `sync_once_loads_the_snapshot_then_applies_streamed_frames`
+    // above already covers the behavioural side (snapshot load, frame application) -- so it was
+    // moved wholesale to `crates/server/tests/logging.rs`, a separate integration-test binary
+    // with far fewer tests/callsites where capture assertions have never flaked, driving the
+    // same scenario through the public `ReplicationHandle::start_replicating` instead of the
+    // crate-private `sync_once` directly. Do not re-add a capture assertion here.
 }

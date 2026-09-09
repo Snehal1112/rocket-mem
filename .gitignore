@@ -26,6 +26,10 @@ dist/
 # Superpowers plugin: isolated worktree workspace
 .worktrees/
 
+# Superpowers subagent-driven-development scratch: ledger, briefs, reports,
+# review packages. Recovery state for an in-flight plan, never part of history.
+.superpowers/
+
 .claude/*
 !.claude/manual-testing.md
 

@@ -10,6 +10,7 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::sync::Semaphore;
 use tokio_util::codec::Framed;
+use tracing::Instrument;
 
 /// Caps how many requests on one RMP connection can be mid-dispatch at once. Once the
 /// cap is hit, the read loop's next `semaphore.acquire_owned().await` blocks -- it stops
@@ -96,6 +97,46 @@ pub async fn serve_tls(
     }
 }
 
+/// Tracks one RMP connection's lifetime state for the connection-closed log event: how long it
+/// was open and how many requests it read off the socket. Emits that event from `Drop`, mirroring
+/// `connection.rs`'s `ConnectionStats` for the RESP path.
+///
+/// Counted at read time, before a request's per-request task is spawned -- not on completion.
+/// Counting on completion would need a counter shared with every spawned task, which without an
+/// atomic (this series' hot-path constraint rules that out) would need a lock on every single
+/// request; counting at read time needs neither, since only this connection's sequential read
+/// loop ever touches the counter.
+struct ConnectionStats {
+    started_at: std::time::Instant,
+    commands_served: u64,
+}
+
+impl ConnectionStats {
+    fn new() -> Self {
+        Self {
+            started_at: std::time::Instant::now(),
+            commands_served: 0,
+        }
+    }
+
+    fn record_command(&mut self) {
+        self.commands_served += 1;
+    }
+}
+
+impl Drop for ConnectionStats {
+    fn drop(&mut self) {
+        tracing::info!(
+            elapsed_us = self.started_at.elapsed().as_micros().min(u64::MAX as u128) as u64,
+            commands_served = self.commands_served,
+            "connection closed"
+        );
+    }
+}
+
+// `protocol = %"RMP"`, not `protocol = "rmp"` -- see `connection.rs`'s matching comment for why
+// the sigil and the case are deliberate.
+#[tracing::instrument(name = "conn", skip_all, fields(conn_id = client_id, %peer, protocol = %"RMP", %tls))]
 async fn handle_connection<S>(
     socket: S,
     peer: std::net::SocketAddr,
@@ -107,9 +148,10 @@ async fn handle_connection<S>(
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    tracing::info!(%peer, protocol = "rmp", tls, "connection accepted");
+    tracing::info!("connection accepted");
     replication.connection_opened();
     let _client_guard = ClientGuard(Arc::clone(&replication));
+    let mut conn_stats = ConnectionStats::new();
     let framed = Framed::new(socket, RmpCodec);
     let (mut sink, mut stream) = framed.split();
     // ONE Session for this connection's whole lifetime, shared by every request spawned below --
@@ -125,6 +167,15 @@ async fn handle_connection<S>(
     // every reply that was already in progress written out before the connection fully closes.
     let (tx, mut rx) = mpsc::channel::<RmpMessage>(MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION);
     let semaphore = Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION));
+
+    // This function's own `#[instrument]` span -- the `conn` span, since nothing between the
+    // attribute and here opens another one. Captured once, and cloned into every request task
+    // spawned below, because `tracing`'s current-span context is *task-local*: a bare
+    // `tokio::spawn` starts with an empty context, so without this every event the spawned task
+    // emits (the `cmd` span, `auth success`/`auth failure`, `permission denied`, the slow-log
+    // warning, the AOF errors) would have no `conn` parent and carry no `conn_id`, `peer`,
+    // `protocol` or `tls`. RESP gets this for free by dispatching inline; RMP has to ask.
+    let conn_span = tracing::Span::current();
 
     let writer = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
@@ -143,6 +194,7 @@ async fn handle_connection<S>(
                 break;
             }
         };
+        conn_stats.record_command();
         // Blocks once MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION tasks are already mid-dispatch --
         // that's the backpressure: the read loop stops pulling more requests off the socket
         // until one finishes and its permit is released.
@@ -157,25 +209,30 @@ async fn handle_connection<S>(
         let session = Arc::clone(&session);
         // Spawned, not awaited inline: the read loop must go straight back to decoding the next
         // request without waiting for this one's reply -- that's what makes multiple in-flight
-        // requests on one connection possible at all.
-        tokio::spawn(async move {
-            let _permit = permit; // released (dropped) when this task ends, freeing a slot
-            let reply = dispatcher::dispatch_and_log(
-                &engine,
-                &aof,
-                &replication,
-                request.frame,
-                &session,
-                client_id,
-            );
-            let _ = tx
-                .send(RmpMessage {
-                    request_id: request.request_id,
-                    msg_type: MsgType::Response,
-                    frame: reply,
-                })
-                .await; // bounded channel: send is now async
-        });
+        // requests on one connection possible at all. `.instrument(conn_span.clone())` is what
+        // keeps the connection's correlation fields on everything this task logs; see the
+        // `conn_span` binding above.
+        tokio::spawn(
+            async move {
+                let _permit = permit; // released (dropped) when this task ends, freeing a slot
+                let reply = dispatcher::dispatch_and_log(
+                    &engine,
+                    &aof,
+                    &replication,
+                    request.frame,
+                    &session,
+                    client_id,
+                );
+                let _ = tx
+                    .send(RmpMessage {
+                        request_id: request.request_id,
+                        msg_type: MsgType::Response,
+                        frame: reply,
+                    })
+                    .await; // bounded channel: send is now async
+            }
+            .instrument(conn_span.clone()),
+        );
     }
     drop(tx);
     let _ = writer.await;
@@ -193,6 +250,15 @@ mod tests {
         let path = dir.path().join("test.aof");
         let writer = AofWriter::open(&path, crate::aof::FsyncPolicy::Never).unwrap();
         (dir, Arc::new(writer))
+    }
+
+    #[test]
+    fn connection_stats_counts_each_recorded_command() {
+        let mut stats = ConnectionStats::new();
+        stats.record_command();
+        stats.record_command();
+        stats.record_command();
+        assert_eq!(stats.commands_served, 3);
     }
 
     async fn spawn_test_server() -> (tempfile::TempDir, std::net::SocketAddr, Arc<Engine>) {

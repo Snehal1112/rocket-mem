@@ -160,12 +160,37 @@ fn validate_username(username: &str) -> Result<(), AclError> {
 
 /// One configured ACL user: its login state, password hash (`None` for `nopass`), and the
 /// ordered list of rules `is_allowed` folds to answer permission questions.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AclUser {
     pub username: String,
     pub password_hash: Option<String>,
     pub enabled: bool,
     pub rules: Vec<AclRule>,
+}
+
+impl std::fmt::Debug for AclUser {
+    /// Hand-written rather than derived so `password_hash` can never reach a log line.
+    /// The project's redaction policy lives in `crate::logging`, but a derived `Debug`
+    /// would route around it from any `?`-formatted call site in the codebase; this makes
+    /// that impossible rather than merely forbidden. The marker is fixed-width and does not
+    /// vary with the hash, so it leaks nothing about the secret's presence or length.
+    ///
+    /// `None` still renders as `"<nopass>"` rather than the same marker as `Some(_)` --
+    /// knowing a user has no password at all is a routine ACL fact (it's what `ACL LIST`
+    /// itself reports as `nopass`), not a secret, and collapsing it into `<redacted>` would
+    /// only make debugging auth issues harder without hiding anything real.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let password_hash: &dyn std::fmt::Debug = match &self.password_hash {
+            Some(_) => &"<redacted>",
+            None => &"<nopass>",
+        };
+        f.debug_struct("AclUser")
+            .field("username", &self.username)
+            .field("password_hash", password_hash)
+            .field("enabled", &self.enabled)
+            .field("rules", &self.rules)
+            .finish()
+    }
 }
 
 impl AclUser {
@@ -435,6 +460,30 @@ mod tests {
             enabled: true,
             rules,
         }
+    }
+
+    #[test]
+    fn debug_never_renders_the_password_hash() {
+        let hash = "argon2id$super-secret-hash-marker-should-not-leak";
+        let u = AclUser {
+            username: "alice".to_string(),
+            password_hash: Some(hash.to_string()),
+            enabled: true,
+            rules: vec![],
+        };
+        let rendered = format!("{u:?}");
+        assert!(
+            !rendered.contains(hash),
+            "Debug output must never contain the password hash, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("super-secret-hash-marker"),
+            "Debug output must never contain a substring of the password hash, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("alice"),
+            "Debug output should still show the username, got: {rendered}"
+        );
     }
 
     #[test]

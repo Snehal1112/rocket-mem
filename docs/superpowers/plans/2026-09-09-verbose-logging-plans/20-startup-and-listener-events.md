@@ -434,7 +434,13 @@ git commit -m "docs(logging): record that shutdown logging is deferred pending s
 
 ## Next plan
 
-[`21-docs-and-final-verification.md`](21-docs-and-final-verification.md) — documents the
-logging capability for operators, runs the full verification sweep (fmt/clippy/test/
-benchmark/manual) against the whole series' cumulative cost, and audits the spec's Event
-catalogue row by row. It is the last plan in the series.
+[`22-log-field-consistency-sweep.md`](22-log-field-consistency-sweep.md) — clears the
+defects each earlier plan's review deliberately deferred: a `cmd` span `key` field that is
+both wrong for `MEMORY`/`OBJECT` and value-leaking for `ECHO`/`PING`, a `protocol` field
+rendered two incompatible ways, and genuinely duplicated span fields.
+
+**Execution order is 20 → 22 → 23 → 21, not 20 → 21.** Plans 22 and 23 were written after
+plan 20's review, once the deferred items had accumulated past what plan 21's three tasks
+could absorb under this series' three-task cap. They must run before plan 21, because plan
+21's Task 2 is the final verification sweep and Task 3 the spec-coverage audit — both must
+see the finished state rather than a state carrying six known defects.

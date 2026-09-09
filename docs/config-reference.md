@@ -22,6 +22,7 @@ want to change from the default.
 | `snapshot_path` | `ROCKET_MEM_SNAPSHOT_PATH` | `--snapshot-path` | `./dump.snapshot` | Path to the point-in-time snapshot file written by `SAVE` and loaded on startup. |
 | `slowlog_threshold_micros` | `ROCKET_MEM_SLOWLOG_THRESHOLD_MICROS` | `--slowlog-threshold-micros` | `10000` | Minimum command duration, in microseconds, that gets logged to the slow log. `0` disables the slow log entirely. |
 | `log_level` | `ROCKET_MEM_LOG_LEVEL` | `--log-level` | `info` | Log level filter passed to `tracing`'s `EnvFilter`, e.g. `info`, `debug`, `rocket_mem=debug,warn`. Same syntax as `RUST_LOG`, which — when set — always overrides this field. |
+| `log_value_max_bytes` | `ROCKET_MEM_LOG_VALUE_MAX_BYTES` | `--log-value-max-bytes` | `128` | Maximum bytes of a value or command argument rendered into a `trace`-level log line before truncation. Only consulted at `trace`. |
 | `cluster_config` | `ROCKET_MEM_CLUSTER_CONFIG` | `--cluster-config` | unset | Path to the cluster topology file. Requires `cluster_node_id` to also be set; unset means standalone (non-cluster) mode. |
 | `cluster_node_id` | `ROCKET_MEM_CLUSTER_NODE_ID` | `--cluster-node-id` | unset | This node's id within `cluster_config`'s topology. Requires `cluster_config` to also be set. |
 | `tls_resp_addr` | `ROCKET_MEM_TLS_RESP_ADDR` | `--tls-resp-addr` | unset | TCP address for a TLS-wrapped RESP listener, run alongside the plaintext one at `addr`. Unset means no TLS RESP listener. Setting this requires `tls_cert_path` and `tls_key_path` — see the TLS note below. |
@@ -32,6 +33,13 @@ want to change from the default.
 | `replicaof_auth_username` | `ROCKET_MEM_REPLICAOF_AUTH_USERNAME` | `--replicaof-auth-username` | unset | Username sent in `AUTH` before `PSYNC`, when `replicaof`'s leader has ACL users configured. Must be set together with `replicaof_auth_password`, or neither. |
 | `replicaof_auth_password` | `ROCKET_MEM_REPLICAOF_AUTH_PASSWORD` | `--replicaof-auth-password` | unset | Password sent in `AUTH` before `PSYNC`. Plaintext in the TOML file, same as `[[acl.users]]`'s own `password` field. |
 | `[[acl.users]]` | *(file-only — no flat env var for an array)* | *(file-only)* | empty | Bootstrap ACL users, loaded once at startup. See "The `[[acl.users]]` array" below. |
+
+> **`trace` writes your data to disk.** At `trace`, rocket-mem logs command arguments and
+> value contents, so a trace-level log file is a plaintext copy of the dataset and every
+> mutation applied to it, capped per value by `log_value_max_bytes`. Credentials are always
+> redacted (`AUTH`, `HELLO ... AUTH`, `ACL SETUSER`, `ACL GETUSER`, `REPLICAOF ... AUTH`), but
+> ordinary values are not. Treat a trace log with the same retention and access controls as
+> the data itself.
 
 `--config <path>` is a fifth, special-cased CLI flag: it names which TOML file gets merged
 into the layers above, so it isn't itself one of the layered fields. If `--config` is

@@ -158,6 +158,11 @@ impl AofWriter {
     /// from. They differ only when opening at a non-zero generation.
     fn open_with_base(path: &Path, base_path: &Path, policy: FsyncPolicy) -> std::io::Result<Self> {
         let file = OpenOptions::new().create(true).append(true).open(path)?;
+        // The writer thread processes `AofMsg`s strictly one at a time, so this plain `u64` —
+        // not an atomic — is the whole cost of tracking the running offset for the trace log
+        // below. No cross-thread synchronization, and `append_encoded`/`fsync` on the calling
+        // side never touch it.
+        let mut offset = file.metadata().map(|m| m.len()).unwrap_or(0);
         let mut writer = BufWriter::new(file);
         let (tx, rx) = mpsc::sync_channel::<AofMsg>(AOF_QUEUE_CAPACITY);
 
@@ -169,8 +174,13 @@ impl AofWriter {
                         // Fire-and-forget: the caller already returned, so stderr is the only
                         // place an error can go.
                         AofMsg::Append(bytes) => {
-                            if let Err(e) = writer.write_all(&bytes) {
-                                tracing::error!(error = %e, "aof append failed");
+                            let len = bytes.len() as u64;
+                            match writer.write_all(&bytes) {
+                                Ok(()) => {
+                                    tracing::trace!(offset, bytes = len, "aof append");
+                                    offset += len;
+                                }
+                                Err(e) => tracing::error!(error = %e, "aof append failed"),
                             }
                         }
                         // The acked variants hand the real I/O result back to the waiting
@@ -178,14 +188,23 @@ impl AofWriter {
                         // write was requested. A failed send just means the caller gave up
                         // waiting; dropping the result is the only sensible response.
                         AofMsg::AppendAndFsync(bytes, ack) => {
+                            let len = bytes.len() as u64;
                             let result = writer
                                 .write_all(&bytes)
                                 .and_then(|_| writer.flush())
                                 .and_then(|_| writer.get_ref().sync_data());
+                            if result.is_ok() {
+                                tracing::trace!(offset, bytes = len, "aof append");
+                                offset += len;
+                                tracing::debug!(offset, "aof fsync");
+                            }
                             let _ = ack.send(result);
                         }
                         AofMsg::Flush(ack) => {
                             let result = writer.flush().and_then(|_| writer.get_ref().sync_data());
+                            if result.is_ok() {
+                                tracing::debug!(offset, "aof fsync");
+                            }
                             let _ = ack.send(result);
                         }
                         AofMsg::CheckIntact(path, ack) => {
@@ -203,6 +222,10 @@ impl AofWriter {
                             });
                             let result = match result {
                                 Ok(file) => {
+                                    // Not always 0: `rotate_to`'s own doc comment notes the new
+                                    // path may already have content from an interrupted previous
+                                    // rewrite, in which case appends resume after it, not at 0.
+                                    offset = file.metadata().map(|m| m.len()).unwrap_or(0);
                                     writer = BufWriter::new(file);
                                     Ok(())
                                 }
@@ -446,6 +469,16 @@ pub const WRITE_COMMANDS: &[&str] = &[
     "ZINCRBY",
 ];
 
+/// Summary of one `replay_with_stats` call: how many commands were replayed, how many bytes of
+/// the file that consumed, and how long it took. `recover` logs this as the operator-facing line
+/// that answers "why did startup take this long" — see the design spec's AOF event catalogue row
+/// for the recovery replay summary.
+pub struct ReplayStats {
+    pub commands: u64,
+    pub bytes: u64,
+    pub elapsed: std::time::Duration,
+}
+
 /// Replays every command in the AOF at `path` against `engine`, via the plain (non-logging)
 /// `dispatcher::dispatch` — never `dispatch_and_log`, which would re-append what's being
 /// replayed. A missing file is a no-op (nothing to recover on first run). `start_at` is
@@ -454,36 +487,112 @@ pub const WRITE_COMMANDS: &[&str] = &[
 /// out-of-range slice; `aof::recover` (below) is what decides *whether* a mismatched offset
 /// should reach this function at all. A corrupt or incomplete final frame stops replay at the
 /// last fully-decoded frame and truncates the file on disk to that exact byte offset.
+///
+/// Kept as a thin wrapper over `replay_with_stats` so its own signature and behavior never
+/// change — see that function for the counting logic `recover`'s log line needs.
 pub fn replay(path: &Path, engine: &engine::Engine, start_at: u64) -> std::io::Result<()> {
+    replay_with_stats(path, engine, start_at).map(|_| ())
+}
+
+/// Does the same work as `replay`, additionally returning how many commands and bytes were
+/// replayed and how long it took. Split out from `replay` rather than changing `replay` itself,
+/// so `replay`'s eleven existing test call sites in this module need no changes at all.
+pub fn replay_with_stats(
+    path: &Path,
+    engine: &engine::Engine,
+    start_at: u64,
+) -> std::io::Result<ReplayStats> {
     use tokio_util::codec::Decoder;
+
+    let started = std::time::Instant::now();
 
     let raw = match std::fs::read(path) {
         Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ReplayStats {
+                commands: 0,
+                bytes: 0,
+                elapsed: started.elapsed(),
+            });
+        }
+        Err(e) => {
+            // Not a missing file (handled above) but an unreadable one, which aborts startup --
+            // `recover`'s only caller is `main`, which propagates this into a process exit. Logged
+            // here rather than at the two `recover` call sites so it is reported exactly once.
+            tracing::error!(
+                aof_path = %path.display(),
+                error = %e,
+                "aof recovery failed: aof file unreadable"
+            );
+            return Err(e);
+        }
     };
 
     let start = (start_at as usize).min(raw.len());
     let mut buf = bytes::BytesMut::from(&raw[start..]);
     let mut codec = protocol::codec::RespCodec::default();
     let mut valid_len = start;
+    let mut commands: u64 = 0;
+    // Which of the two tolerated tail conditions ended the loop, for the warning below. Both are
+    // handled identically -- this only names the cause. The decode error itself is deliberately
+    // not carried: `RespCodec::decode` already logs it (see `codec.rs`'s `protocol error decoding
+    // frame`), so repeating it here would only duplicate a line an operator already has.
+    let mut tail_reason = "incomplete";
     loop {
         let before = buf.len();
         match codec.decode(&mut buf) {
             Ok(Some(frame)) => {
                 valid_len += before - buf.len();
+                commands += 1;
                 let mut protocol = protocol::codec::Protocol::default();
                 crate::dispatcher::dispatch(engine, frame, &mut protocol, 0);
             }
-            Ok(None) | Err(_) => break, // incomplete or corrupt tail — stop here, keep what decoded
+            // Incomplete or corrupt tail — stop here, keep what decoded.
+            Ok(None) => break,
+            Err(_) => {
+                tail_reason = "corrupt";
+                break;
+            }
         }
     }
 
     if valid_len < raw.len() {
-        let file = OpenOptions::new().write(true).open(path)?;
-        file.set_len(valid_len as u64)?;
+        // `warn`, not `error`: a half-written trailing record is what a crash mid-append leaves,
+        // and this function deliberately recovers from it by keeping everything before it. The
+        // offset and the two lengths are the whole payload -- the discarded bytes are client data
+        // and never reach the log.
+        //
+        // The message is present-tense on purpose: this fires *before* the open/`set_len` below,
+        // so a past-tense "truncated" would assert an outcome that has not happened yet and may
+        // still fail. When it does fail, the two `error!`s below say so.
+        tracing::warn!(
+            aof_path = %path.display(),
+            offset = valid_len,
+            aof_len = raw.len(),
+            reason = tail_reason,
+            "aof tail discarded; truncating the file to the last complete record"
+        );
+        let file = OpenOptions::new().write(true).open(path).inspect_err(|e| {
+            tracing::error!(
+                aof_path = %path.display(),
+                error = %e,
+                "aof recovery failed: cannot open the aof to truncate its discarded tail"
+            );
+        })?;
+        file.set_len(valid_len as u64).inspect_err(|e| {
+            tracing::error!(
+                aof_path = %path.display(),
+                offset = valid_len,
+                error = %e,
+                "aof recovery failed: cannot truncate the aof to its last complete record"
+            );
+        })?;
     }
-    Ok(())
+    Ok(ReplayStats {
+        commands,
+        bytes: (valid_len - start) as u64,
+        elapsed: started.elapsed(),
+    })
 }
 
 /// The manifest path derived from `snapshot_path` — always `<snapshot_path>.manifest`, never
@@ -598,52 +707,118 @@ pub fn write_generation_atomically(snapshot_path: &Path, gen: u64) -> std::io::R
 /// constraint is what makes "byte 0 onward is always the complete history" always true, and
 /// therefore why the fallback is always correct rather than merely convenient.
 pub fn recover(aof_path: &Path, snapshot_path: &Path) -> std::io::Result<engine::Engine> {
-    let gen = read_generation(snapshot_path)?;
+    // Every failure below is logged at `error` and then propagated unchanged: `main` is
+    // `recover`'s only production caller and turns an `Err` here into a process exit, so without
+    // a log line the operator sees a dead server and nothing naming the file that killed it.
+    // The tolerated conditions -- an unreadable snapshot, an offset past the AOF's end, a
+    // truncated tail -- keep their `warn`, because startup continues through all three.
+    let gen = read_generation(snapshot_path).inspect_err(|e| {
+        tracing::error!(
+            snapshot_path = %snapshot_path.display(),
+            error = %e,
+            "aof recovery failed: generation manifest unreadable"
+        );
+    })?;
     let aof_path = &generation_path(aof_path, gen);
     let snapshot_path = &generation_path(snapshot_path, gen);
 
     let engine = engine::Engine::new();
     let start_at = match std::fs::read(snapshot_path) {
-        Ok(bytes) => match engine.load_snapshot(&bytes) {
-            Ok(offset) => {
-                // A missing AOF is distinct from a zero-length one: the former means the
-                // snapshot alone is the recovered state (per the spec's hybrid-recovery
-                // decision), the latter means the offset genuinely overshoots and the
-                // snapshot/AOF pair has diverged.
-                let aof_len = match std::fs::metadata(aof_path) {
-                    Ok(m) => Some(m.len()),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-                    Err(e) => return Err(e),
-                };
-                match aof_len {
-                    None => return Ok(engine),
-                    Some(len) if offset > len => {
-                        tracing::warn!(
-                            snapshot_path = %snapshot_path.display(),
-                            offset,
-                            aof_len = len,
-                            "snapshot offset past end of AOF; discarding snapshot and replaying full AOF"
-                        );
-                        let fresh = engine::Engine::new();
-                        replay(aof_path, &fresh, 0)?;
-                        return Ok(fresh);
+        Ok(bytes) => {
+            let load_started = std::time::Instant::now();
+            match engine.load_snapshot(&bytes) {
+                Ok(offset) => {
+                    // `snapshot_path`, matching the four other events in this same function and
+                    // the config key of the same name. It used to be `path` alone, which meant
+                    // `grep snapshot_path` missed the single most important snapshot event on
+                    // the recovery path -- the one saying the snapshot was actually loaded.
+                    tracing::info!(
+                        snapshot_path = %snapshot_path.display(),
+                        bytes = bytes.len(),
+                        elapsed_us = load_started.elapsed().as_micros() as u64,
+                        "snapshot loaded"
+                    );
+                    // A missing AOF is distinct from a zero-length one: the former means the
+                    // snapshot alone is the recovered state (per the spec's hybrid-recovery
+                    // decision), the latter means the offset genuinely overshoots and the
+                    // snapshot/AOF pair has diverged.
+                    let aof_len = match std::fs::metadata(aof_path) {
+                        Ok(m) => Some(m.len()),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                        Err(e) => {
+                            tracing::error!(
+                                aof_path = %aof_path.display(),
+                                error = %e,
+                                "aof recovery failed: aof file metadata unreadable"
+                            );
+                            return Err(e);
+                        }
+                    };
+                    match aof_len {
+                        None => {
+                            // No commands/bytes/elapsed_us fields here on purpose: those would
+                            // look identical to the "AOF present but zero-length" case below
+                            // (which legitimately replays an empty file and reports
+                            // commands=0 bytes=0), and this path never touches the AOF at all --
+                            // the snapshot alone is the entire recovered state. Same message
+                            // prefix and level as that summary so one grep for "aof recovery
+                            // replay complete" still surfaces every recovery outcome.
+                            tracing::info!(
+                                aof_path = %aof_path.display(),
+                                "aof recovery replay complete (no aof file; snapshot is the entire recovered state)"
+                            );
+                            return Ok(engine);
+                        }
+                        Some(len) if offset > len => {
+                            tracing::warn!(
+                                snapshot_path = %snapshot_path.display(),
+                                offset,
+                                aof_len = len,
+                                "snapshot offset past end of AOF; discarding snapshot and replaying full AOF"
+                            );
+                            let fresh = engine::Engine::new();
+                            let stats = replay_with_stats(aof_path, &fresh, 0)?;
+                            tracing::info!(
+                                commands = stats.commands,
+                                bytes = stats.bytes,
+                                elapsed_us = stats.elapsed.as_micros() as u64,
+                                "aof recovery replay complete"
+                            );
+                            return Ok(fresh);
+                        }
+                        Some(_) => offset,
                     }
-                    Some(_) => offset,
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        snapshot_path = %snapshot_path.display(),
+                        error = %e,
+                        "snapshot unreadable; falling back to full AOF replay"
+                    );
+                    0
                 }
             }
-            Err(e) => {
-                tracing::warn!(
-                    snapshot_path = %snapshot_path.display(),
-                    error = %e,
-                    "snapshot unreadable; falling back to full AOF replay"
-                );
-                0
-            }
-        },
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
-        Err(e) => return Err(e),
+        // Distinct from the `snapshot unreadable` warning above: that one is a snapshot whose
+        // *bytes* would not decode, which recovery survives by replaying the whole AOF instead.
+        // This is a snapshot file that could not be read at all, which it does not survive.
+        Err(e) => {
+            tracing::error!(
+                snapshot_path = %snapshot_path.display(),
+                error = %e,
+                "aof recovery failed: snapshot file unreadable"
+            );
+            return Err(e);
+        }
     };
-    replay(aof_path, &engine, start_at)?;
+    let stats = replay_with_stats(aof_path, &engine, start_at)?;
+    tracing::info!(
+        commands = stats.commands,
+        bytes = stats.bytes,
+        elapsed_us = stats.elapsed.as_micros() as u64,
+        "aof recovery replay complete"
+    );
     Ok(engine)
 }
 
@@ -754,6 +929,59 @@ mod tests {
         assert_eq!(
             engine.get(b"b"),
             Some(Value::String(bytes::Bytes::from_static(b"2")))
+        );
+    }
+
+    #[test]
+    fn replay_with_stats_counts_every_command_and_byte_replayed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.aof");
+        let raw: &[u8] =
+            b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n*3\r\n$3\r\nSET\r\n$1\r\nb\r\n$1\r\n2\r\n";
+        write_raw(&path, raw);
+        let engine = Engine::new();
+        let stats = replay_with_stats(&path, &engine, 0).unwrap();
+        assert_eq!(stats.commands, 2);
+        assert_eq!(stats.bytes, raw.len() as u64);
+    }
+
+    #[test]
+    fn replay_with_stats_excludes_a_corrupt_tail_from_both_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.aof");
+        let valid = b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n";
+        write_raw(&path, valid);
+        write_raw(&path, b"*3\r\n$3\r\nSET\r\n$1\r\nb\r\n$3\r\ngar"); // truncated mid-bulk-body
+        let engine = Engine::new();
+        let stats = replay_with_stats(&path, &engine, 0).unwrap();
+        assert_eq!(stats.commands, 1);
+        assert_eq!(stats.bytes, valid.len() as u64);
+    }
+
+    #[test]
+    fn replay_with_stats_on_a_missing_file_reports_zero_commands_and_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does-not-exist.aof");
+        let engine = Engine::new();
+        let stats = replay_with_stats(&path, &engine, 0).unwrap();
+        assert_eq!(stats.commands, 0);
+        assert_eq!(stats.bytes, 0);
+    }
+
+    #[test]
+    fn replay_still_reports_no_stats_and_behaves_exactly_as_before() {
+        // `replay` is now a thin wrapper over `replay_with_stats`; this test pins its public
+        // signature and behavior so a future change to `replay_with_stats` cannot silently
+        // change what `replay`'s many existing callers observe.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.aof");
+        write_raw(&path, b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n");
+        let engine = Engine::new();
+        let result: std::io::Result<()> = replay(&path, &engine, 0);
+        assert!(result.is_ok());
+        assert_eq!(
+            engine.get(b"a"),
+            Some(Value::String(bytes::Bytes::from_static(b"1")))
         );
     }
 
@@ -1571,6 +1799,11 @@ mod tests {
         );
     }
 
+    /// The matching assertion on this path's *log* line lives in
+    /// `crates/server/tests/logging.rs`'s `snapshot_only_recovery_logs_a_distinguishable_summary_at_info`
+    /// -- do not re-add it here. Every recovery test in this module calls `recover` with no
+    /// subscriber installed, and `tracing` caches a callsite's `Interest` process-globally on
+    /// first reach, so a capture assertion in this binary can be decided `never` before it runs.
     #[test]
     fn recover_with_a_snapshot_and_no_aof_keeps_the_snapshot_state() {
         let dir = tempfile::tempdir().unwrap();

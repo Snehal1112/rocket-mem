@@ -149,6 +149,7 @@ pub(crate) fn upper_name(raw: &[u8]) -> Option<CommandName> {
 }
 
 fn engine_error_to_frame(e: common::EngineError) -> Frame {
+    tracing::debug!(error = ?e, "engine error");
     Frame::Error(e.to_string())
 }
 
@@ -174,6 +175,25 @@ fn parse_score(raw: &[u8]) -> Result<f64, Frame> {
 macro_rules! require_args {
     ($rest:expr, $n:expr, $name:expr) => {
         if $rest.len() < $n {
+            // `cmd` is *not* a duplicate of the `cmd` span's own field, despite both being at
+            // `debug` and the span being a `debug_span!`. Two reasons, either one sufficient:
+            //
+            // * `dispatch` has three callers and only one of them opens that span.
+            //   `aof::replay` and the follower apply loop call `dispatch` directly (deliberately
+            //   -- see `dispatch_and_log`'s doc comment on why a boot-time replay must not count
+            //   as client traffic), so on those paths this field is the only thing naming the
+            //   command whose arity was wrong. A version-skewed AOF or leader is exactly when an
+            //   operator needs it.
+            // * Three call sites pass a subcommand-qualified name -- `"memory usage"`,
+            //   `"object encoding"`, `"debug sleep"` -- which the span's `cmd` (`MEMORY`,
+            //   `OBJECT`, `DEBUG`) cannot express. There the field is strictly more specific
+            //   than the span's, not a copy of it.
+            tracing::debug!(
+                cmd = %$name,
+                got = %$rest.len(),
+                want = %$n,
+                "wrong number of arguments"
+            );
             return Frame::Error(format!(
                 "ERR wrong number of arguments for '{}' command",
                 $name
@@ -193,10 +213,20 @@ pub fn dispatch(engine: &Engine, frame: Frame, _protocol: &mut Protocol, _client
     let Some(name) = upper_name(&args[0]) else {
         // Cold path only: a name too long or non-ASCII to be any command we know. The error text
         // is unchanged from before this optimization -- it echoes the client's own bytes.
-        return Frame::Error(format!(
-            "ERR unknown command '{}'",
-            String::from_utf8_lossy(&args[0])
-        ));
+        //
+        // `cmd = %raw` is the only place that name appears anywhere. Reaching here means
+        // `upper_name` returned `None`, and `command_name_upper` -- which the `cmd` span's own
+        // `cmd` field comes from -- calls the same `upper_name`, so on this path the span's field
+        // is the empty string. Removing this one loses the information outright.
+        //
+        // Escaped, and note that `upper_name` returning `None` is *not* what bounds this: its
+        // rejection test is `!raw.is_ascii()`, which `\n` and `\x1b` both pass, so a name that
+        // is too long lands here carrying whatever control bytes the client chose. The error
+        // frame below keeps echoing the client's own bytes unescaped -- that is a reply to the
+        // client, not a line in the operator's log.
+        let raw = String::from_utf8_lossy(&args[0]);
+        tracing::debug!(cmd = %crate::logging::escape_ident(&raw), "unknown command");
+        return Frame::Error(format!("ERR unknown command '{raw}'"));
     };
     let rest = &args[1..];
 
@@ -1126,7 +1156,22 @@ pub fn dispatch(engine: &Engine, frame: Frame, _protocol: &mut Protocol, _client
                 _ => Frame::Error(format!("ERR unknown DEBUG subcommand '{subcommand}'")),
             }
         }
-        _ => Frame::Error(format!("ERR unknown command '{}'", name.as_str())),
+        _ => {
+            // `cmd` repeats the `cmd` span's field verbatim, and both are at `debug`, so on the
+            // client path this is a genuine duplicate. It stays anyway: `dispatch` has three
+            // callers and only `dispatch_and_log` opens that span. `aof::replay` and the follower
+            // apply loop call `dispatch` directly, and neither opens a `cmd` span. (The follower
+            // path does run inside the `repl` span, but that carries `host_port`, not `cmd`; and
+            // the apply loop's own `cmd` field is on a sibling event, not an enclosing span. So
+            // neither supplies what this field does.) On both of those paths this field is
+            // therefore the only record of *which* command was unknown. Version
+            // skew against an AOF or a leader is precisely the case this event exists for.
+            //
+            // Escaped: a `CommandName` is ASCII, but `upper_name`'s `is_ascii()` test admits
+            // `\n` and `\x1b` just as happily as it admits letters, so this is client bytes.
+            tracing::debug!(cmd = %crate::logging::escape_ident(name.as_str()), "unknown command");
+            Frame::Error(format!("ERR unknown command '{}'", name.as_str()))
+        }
     }
 }
 
@@ -1147,10 +1192,27 @@ fn try_authenticate(
         ));
     }
     match replication.acl.authenticate(username, password) {
-        Some(user) => Ok(user),
-        None => Err(Frame::Error(
-            "WRONGPASS invalid username-password pair or user is disabled.".into(),
-        )),
+        Some(user) => {
+            // `peer` is already attached by the enclosing `conn` span (plan 05/06) -- see this
+            // plan's Architecture section. Never log `password` here.
+            //
+            // `username` goes through `escape_ident` and never reaches the field raw. This is
+            // the most exposed field in the whole logging surface: it is `info`/`warn`, so it
+            // is on at the production default, and `handle_auth` builds it from a raw client
+            // bulk *before* the client has authenticated. Unescaped, `AUTH "x\n<forged line>"
+            // pw` lets any remote party append arbitrary records -- including a fake
+            // `auth success` -- to the operator's audit trail.
+            tracing::info!(user = %crate::logging::escape_ident(username), "auth success");
+            Ok(user)
+        }
+        None => {
+            // Never log `password` here -- see this plan's CRITICAL SECURITY POINT.
+            // `username` is escaped for the reason given in the `Some` arm above.
+            tracing::warn!(user = %crate::logging::escape_ident(username), "auth failure");
+            Err(Frame::Error(
+                "WRONGPASS invalid username-password pair or user is disabled.".into(),
+            ))
+        }
     }
 }
 
@@ -1477,6 +1539,10 @@ fn cluster_redirect(
 ) -> Option<Frame> {
     let cluster = replication.cluster()?;
     let keys = command_keys(frame);
+    // Captured before `keys` is consumed by `into_iter()` below -- `first_key` borrows from
+    // `frame`, which outlives this function, so it stays valid after the `Vec<&Bytes>` container
+    // itself is dropped.
+    let first_key: Option<&Bytes> = keys.first().copied();
     let mut slots = keys.into_iter().map(|k| crate::cluster::key_slot(k));
     let first = slots.next()?; // no keys => nothing to route
     if !slots.all(|s| s == first) {
@@ -1492,6 +1558,31 @@ fn cluster_redirect(
         return None;
     }
     let owner = cluster.owner_of(first);
+    // Only reached on an actual redirect, never on the `owns(first)` fast path above -- that is
+    // what keeps this log call off the hot path every correctly-routed command in cluster mode
+    // takes.
+    //
+    // `key` is logged explicitly here, via the shared `key_field` helper (never `?` on the raw
+    // `Bytes` -- see `key_field`'s own doc comment), rather than relying on the enclosing `cmd`
+    // span's own `key` field. Those used to disagree outright for a `KeySpec::Second` command
+    // (`MEMORY USAGE <key>`) and now agree, because the span's `key` went key-spec aware too. The
+    // field stays anyway, and the reason is provenance rather than disagreement. This event's
+    // whole claim is "slot `first` was computed from key `K`", so the `K` it prints has to come
+    // from the same extraction that produced the slot -- `command_keys`, which is what `first_key`
+    // and `slots` are both built from just above. Taking it from the span instead would mean the
+    // logged key and the logged slot came out of two different functions, which is exactly the
+    // class of silent disagreement this field's own history is an instance of.
+    //
+    // The two can also still pick different arguments outright: `command_keys` filters non-`Bulk`
+    // frames out before indexing, while the span's `logged_key` indexes the frame directly. That
+    // only bites on a frame `frame_to_args` rejects moments later, so it is the weaker argument of
+    // the two -- provenance is what makes the field worth keeping.
+    tracing::debug!(
+        key = %crate::logging::key_field(first_key),
+        slot = first,
+        target = %owner.addr,
+        "cluster redirect"
+    );
     Some(Frame::Error(format!("MOVED {first} {}", owner.addr)))
 }
 
@@ -1562,6 +1653,15 @@ fn handle_replicaof(
         None
     };
 
+    // No `tracing::` call here, deliberately. Both transitions are logged at `info` by
+    // `ReplicationHandle::start_replicating_inner` and `stop_replicating`, which are the choke
+    // points every path -- this command, the startup auto-connect, and any future caller --
+    // funnels through, so the event cannot be lost by someone adding a fourth entry point. A
+    // second event here would only duplicate it, and this site knows nothing the handle does not:
+    // `start_replicating_with_auth` already tags its event `source=command`, which is exactly
+    // what distinguishes this path from `start_replicating_from_config`'s `source=config`.
+    // The credential in `auth` must never be logged and is not; see `logging::is_sensitive`'s
+    // `REPLICAOF` arm for the `trace`-level argument line, which redacts the whole list.
     if a.eq_ignore_ascii_case(b"NO") && b.eq_ignore_ascii_case(b"ONE") {
         if auth.is_some() {
             return Some(Frame::Error("ERR syntax error".into()));
@@ -2065,6 +2165,7 @@ fn handle_hello(
                     return Some(Frame::Error("NOAUTH Authentication required.".into()));
                 }
                 session.set_protocol(Protocol::Resp2);
+                tracing::debug!(resp_version = %2, "HELLO protocol negotiated");
                 hello_reply(session.protocol(), client_id, role, mode)
             }
             b"3" => {
@@ -2078,6 +2179,7 @@ fn handle_hello(
                     return Some(Frame::Error("NOAUTH Authentication required.".into()));
                 }
                 session.set_protocol(Protocol::Resp3);
+                tracing::debug!(resp_version = %3, "HELLO protocol negotiated");
                 hello_reply(session.protocol(), client_id, role, mode)
             }
             _ => Frame::Error("NOPROTO unsupported protocol version".into()),
@@ -2625,7 +2727,12 @@ fn acl_setuser(items: &[Frame], replication: &crate::replication::ReplicationHan
     }
     let username = String::from_utf8_lossy(username).into_owned();
     match replication.acl.set_user(&username, &raw_tokens) {
-        Ok(()) => Frame::Simple("OK".into()),
+        Ok(()) => {
+            // `raw_tokens` can carry ACL SETUSER's `>password` token -- never log it. Only
+            // `username` is safe here; see this plan's CRITICAL SECURITY POINT.
+            tracing::info!(user = %crate::logging::escape_ident(&username), "ACL SETUSER");
+            Frame::Simple("OK".into())
+        }
         Err(e) => Frame::Error(e.to_string()),
     }
 }
@@ -2640,7 +2747,14 @@ fn acl_deluser(items: &[Frame], replication: &crate::replication::ReplicationHan
             Frame::Bulk(b) => Some(b),
             _ => None,
         })
-        .filter(|b| replication.acl.del_user(&String::from_utf8_lossy(b)))
+        .filter(|b| {
+            let username = String::from_utf8_lossy(b);
+            let removed = replication.acl.del_user(&username);
+            if removed {
+                tracing::info!(user = %crate::logging::escape_ident(&username), "ACL DELUSER");
+            }
+            removed
+        })
         .count();
     Frame::Integer(deleted as i64)
 }
@@ -2683,11 +2797,13 @@ fn handle_bgrewriteaof(
     // commit are what two concurrent rewrites collide on, and `start_rewrite`'s own
     // `lock_for_ordering()` is released long before the commit. See `AofWriter::lock_for_rewrite`.
     let _rewrite_guard = aof.lock_for_rewrite();
+    let started = std::time::Instant::now();
 
     let (next_gen, bytes) = match start_rewrite(aof, replication) {
         Ok(r) => r,
         Err(e) => return Frame::Error(format!("ERR failed to start AOF rewrite: {e}")),
     };
+    tracing::info!(generation = next_gen, "aof rewrite starting");
 
     let new_snapshot_path = crate::aof::generation_path(replication.snapshot_path(), next_gen);
     if let Err(e) = write_snapshot_atomically(&new_snapshot_path, &bytes) {
@@ -2710,6 +2826,12 @@ fn handle_bgrewriteaof(
         old_gen,
     ));
 
+    tracing::info!(
+        generation = next_gen,
+        bytes = bytes.len(),
+        elapsed_us = started.elapsed().as_micros() as u64,
+        "aof rewrite finished"
+    );
     Frame::Simple("OK".into())
 }
 
@@ -2730,6 +2852,7 @@ fn handle_save(
     aof: &crate::aof::AofWriter,
     replication: &crate::replication::ReplicationHandle,
 ) -> Frame {
+    let started = std::time::Instant::now();
     // Resolved, never bare: once a rewrite has committed, the manifest names the only
     // snapshot/AOF pair `recover` will ever read, so a `SAVE` written to the bare path would be
     // a permanent no-op that still reports success.
@@ -2744,7 +2867,11 @@ fn handle_save(
         Ok(g) => g,
         Err(e) => return Frame::Error(format!("ERR failed to read AOF generation: {e}")),
     };
-    let path = crate::aof::generation_path(replication.snapshot_path(), gen);
+    let snapshot_path = crate::aof::generation_path(replication.snapshot_path(), gen);
+    // `snapshot_path`, not `path`: one name for the snapshot file across every event that names
+    // it -- `aof.rs`'s recovery events, this pair, and `main.rs`'s config summary -- and the same
+    // name as the config key an operator already knows it by. See the spec's field vocabulary.
+    tracing::info!(snapshot_path = %snapshot_path.display(), "snapshot save starting");
 
     let bytes = {
         let _order_guard = aof.lock_all_shards();
@@ -2755,9 +2882,15 @@ fn handle_save(
         replication.engine().snapshot(offset)
     };
 
-    match write_snapshot_atomically(&path, &bytes) {
+    match write_snapshot_atomically(&snapshot_path, &bytes) {
         Ok(()) => {
             replication.record_save();
+            tracing::info!(
+                snapshot_path = %snapshot_path.display(),
+                bytes = bytes.len(),
+                elapsed_us = started.elapsed().as_micros() as u64,
+                "snapshot save finished"
+            );
             Frame::Simple("OK".into())
         }
         Err(e) => Frame::Error(format!("ERR failed to write snapshot: {e}")),
@@ -2845,6 +2978,9 @@ pub(crate) fn auth_gate(
         } else {
             "NOPERM this user has no permissions to run this command"
         };
+        // `cmd`/`key` are already attached by the enclosing `cmd` span (plan 07) -- see this
+        // plan's Architecture section, so only `user` needs adding here.
+        tracing::warn!(user = %crate::logging::escape_ident(&user.username), "permission denied");
         return Some(Frame::Error(msg.into()));
     }
     None
@@ -2889,6 +3025,91 @@ fn command_key_and_arity(frame: &Frame) -> (Option<Bytes>, usize) {
         _ => None,
     };
     (key, items.len().saturating_sub(1))
+}
+
+/// The key a *log field* should name for `frame`, chosen by the same `key_spec` table
+/// `command_keys` routes cluster traffic on. Deliberately not `command_key_and_arity`'s "first
+/// argument", which is wrong twice over:
+///
+/// * `key_spec` maps `MEMORY`/`OBJECT` to `KeySpec::Second`, so `MEMORY USAGE <key>` and
+///   `OBJECT ENCODING <key>` used to log `key=USAGE`/`key=ENCODING` -- a field confidently
+///   reporting a value that is not a key, which an operator grepping by key never finds.
+/// * `key_spec` maps `PING`, `ECHO` and eighteen other commands (plus every *unknown* command)
+///   to `KeySpec::None`, yet the first argument was rendered anyway. For `ECHO <payload>` and
+///   `PING <message>` that argument is a client-supplied **value**, with no length cap --
+///   `log_value_max_bytes` gates only the trace-level argument line. The spec's invariant is
+///   that logs carry key names and byte lengths, never value contents, and as of the slow log's
+///   `warn!` this field reaches the production default level.
+///
+/// `command_key_and_arity` is left alone on purpose: it also feeds the *stored* `SlowLogEntry`,
+/// which `SLOWLOG GET` exposes to clients. This is a logging fix, not a change to a
+/// client-visible surface.
+///
+/// `name` is `command_name_upper`'s already-uppercased output, which is what `key_spec`'s table
+/// expects; the `""` it yields for a frame that is not a command array falls through to
+/// `KeySpec::None`, i.e. no key -- as does `AUTH`, which must stay keyless.
+///
+/// Called once per command, next to `metric_label`, which already pays the same
+/// `KNOWN_COMMANDS.binary_search` this can fall through to -- so the added cost is of the order
+/// of work this line already does, and cannot be deferred behind a level check: the slow log's
+/// `warn!` needs the result after `frame` has been moved into `dispatch_and_log_inner`.
+fn logged_key(frame: &Frame, name: &str) -> Option<Bytes> {
+    let index = match key_spec(name) {
+        KeySpec::None => return None,
+        KeySpec::Second => 2,
+        // `First`, `All` and `EveryOther` all name argument 1 as their first key.
+        KeySpec::First | KeySpec::All | KeySpec::EveryOther => 1,
+    };
+    let Frame::Array(items) = frame else {
+        return None;
+    };
+    match items.get(index) {
+        Some(Frame::Bulk(b)) => Some(b.clone()), // one refcount bump, no data copy
+        _ => None,
+    }
+}
+
+/// The `reply` field for the per-command `debug!` line: `"error"` for an error reply, `"ok"`
+/// for every other frame shape.
+///
+/// The same `matches!(reply, Frame::Error(_))` split `dispatch_and_log` already uses to
+/// increment `rocket_mem_command_errors_total`, deliberately reused rather than restated, so
+/// the log and the error-rate metric can never disagree about what an error is. A `Frame::Null`
+/// is a successful `SET ... NX` no-op, not a failure, and is reported as `"ok"` by both.
+///
+/// Returns `&'static str`, never a formatted `String`: this is evaluated once per command
+/// whenever `debug` is enabled.
+fn reply_kind(reply: &Frame) -> &'static str {
+    if matches!(reply, Frame::Error(_)) {
+        "error"
+    } else {
+        "ok"
+    }
+}
+
+/// The command's arguments, excluding the command name -- the same slice `dispatch` calls
+/// `rest`, and the shape `logging::redact_args` expects.
+///
+/// Allocates a `Vec` and bumps one `Bytes` refcount per argument (no data is copied). That cost
+/// is why the only caller guards this behind `tracing::enabled!(Level::TRACE)`: unlike a
+/// `tracing` macro's field expressions, ordinary code before the macro is not lazy, and calling
+/// this unconditionally would allocate on every command at every level.
+///
+/// Non-`Bulk` arguments are skipped rather than rendered: a client can legally frame an integer
+/// where a bulk string belongs, `dispatch` rejects it a moment later, and the log renderer must
+/// not be what falls over on it first.
+fn command_args(frame: &Frame) -> Vec<Bytes> {
+    let Frame::Array(items) = frame else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .skip(1)
+        .filter_map(|f| match f {
+            Frame::Bulk(b) => Some(b.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The `cmd` label value for a command name: its lowercase form if we know the command, the
@@ -3025,7 +3246,61 @@ pub fn dispatch_and_log(
     let name = command_name_upper(&frame); // read before `frame` is moved into the inner call
     let name = name.as_ref().map(|n| n.as_str()).unwrap_or("");
     let (first_key, arg_count) = command_key_and_arity(&frame);
+    // The key the *log* fields name, which is not always `first_key` -- see `logged_key` for the
+    // two ways the frame's first argument gets that wrong. `first_key` still feeds the stored
+    // `SlowLogEntry` unchanged, because `SLOWLOG GET` exposes it to clients.
+    let log_key = logged_key(&frame, name);
     let label = metric_label(name);
+
+    // The `cmd` span. `cmd` and `argc` are values this function already computed for the metrics
+    // and slow-log paths just above. `key` is not: `logged_key` above is computed for the span
+    // and for the slow-log `warn!`, and nothing else needs it.
+    //
+    // That selection is EAGER -- it runs on every command at `info`, outside the span's level
+    // check -- and it cannot be made lazy, because the slow-log `warn!` fires at the production
+    // default and needs the same value after `frame` has been moved into
+    // `dispatch_and_log_inner`. Its cost is a `key_spec` match plus at most one `Bytes` refcount
+    // bump. Do not "fix" this by moving `logged_key` inside the span macro: the `warn!` would
+    // then have no key at the level operators actually run.
+    //
+    // DEBUG, not INFO, and that is the load-bearing choice: `tracing`'s span macros evaluate
+    // their field expressions only when the callsite is enabled, so at the production default
+    // of `info` `key_field`'s UTF-8 validation never runs -- verified by probe, not assumed:
+    // a `panic!` planted in `key_field` leaves the info-level test passing and fires only at
+    // `debug`. An `info_span!` here would run that validation on every command in production.
+    //
+    // `key` goes through `key_field`, never `?first_key`: `Bytes`'s Debug impl renders
+    // byte-by-byte. See this plan's Architecture section.
+    //
+    // The guard must be bound to a *named* variable. `let _ = ....entered()` drops the
+    // `EnteredSpan` immediately and the span closes before `dispatch_and_log_inner` is even
+    // called, silently losing every nested field.
+    let _cmd_span = tracing::debug_span!(
+        "cmd",
+        cmd = %crate::logging::escape_ident(name),
+        key = %crate::logging::key_field(log_key.as_ref()),
+        argc = arg_count,
+    )
+    .entered();
+
+    // Read before `frame` is moved into the inner call below -- the same constraint the `name`
+    // binding at the top of this function carries, for the same reason: `dispatch_and_log_inner`
+    // consumes the frame.
+    //
+    // The `enabled!` guard is not an optimization, it is the point. `command_args` allocates a
+    // `Vec` and bumps a refcount per argument; a `tracing` macro would never evaluate its field
+    // expressions at a disabled level, but this extraction has to happen *outside* the macro to
+    // beat the move, and ordinary code is not lazy. `enabled!` is the same relaxed atomic load
+    // and branch the macro's own check performs, so at the production default of `info` this
+    // whole block costs one branch and allocates nothing.
+    if tracing::enabled!(tracing::Level::TRACE) {
+        let args = command_args(&frame);
+        tracing::trace!(
+            args = %crate::logging::redact_args(name, &args, replication.log_value_max_bytes()),
+            "command arguments"
+        );
+    }
+
     let started = std::time::Instant::now();
 
     let reply = dispatch_and_log_inner(engine, aof, replication, frame, session, client_id);
@@ -3040,7 +3315,21 @@ pub fn dispatch_and_log(
     }
     replication
         .slowlog
-        .maybe_record(name, first_key, arg_count, elapsed);
+        .maybe_record(name, first_key, arg_count, elapsed, log_key.as_ref());
+
+    // The per-command line. `cmd`, `key`, and `argc` are not repeated here -- they are on the
+    // `cmd` span this event is emitted inside, so the subscriber renders them as span context.
+    //
+    // `elapsed` is the same `Duration` the metrics histogram and the slow log were just handed;
+    // `as_micros()` is a division on an already-materialized value, and `u128` is recorded
+    // natively by `tracing-core` (`record_u128`), so neither field allocates. Both fields are
+    // evaluated only when the callsite is enabled, which at the default `info` it is not.
+    tracing::debug!(
+        elapsed_us = elapsed.as_micros(),
+        reply = reply_kind(&reply),
+        "command dispatched"
+    );
+
     reply
 }
 
@@ -3419,6 +3708,241 @@ mod tests {
         )
     }
 
+    /// Runs `f` with a `tracing` subscriber installed (scoped to the current thread only, via
+    /// `tracing::subscriber::with_default`) that writes formatted log lines into an in-memory
+    /// buffer (`crate::logging::test_support::CapturedLogs`), and returns everything it wrote as
+    /// a `String`. This lets plan 10's tests assert on log *content*, not just on the unchanged
+    /// `Frame` reply, without a second ad-hoc capture harness -- the shared one lives in
+    /// `logging.rs` because a helper under `tests/` compiles as a separate crate and cannot be
+    /// imported from a unit test module in `src/`.
+    fn capture_logs_at<F: FnOnce()>(level: tracing::Level, f: F) -> String {
+        let writer = crate::logging::test_support::CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(writer.clone())
+            .with_max_level(level)
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        writer.text()
+    }
+
+    #[test]
+    fn try_authenticate_logs_success_at_info_naming_the_user() {
+        let replication = ReplicationHandle::default();
+        replication
+            .acl
+            .set_user(
+                "app",
+                &[Bytes::from_static(b"on"), Bytes::from_static(b">hunter2")],
+            )
+            .unwrap();
+        let log = capture_logs_at(tracing::Level::INFO, || {
+            let result = try_authenticate(&replication, "app", b"hunter2");
+            assert!(result.is_ok());
+        });
+        assert!(
+            log.contains("app"),
+            "expected the username in the event, got: {log}"
+        );
+        assert!(
+            !log.contains("hunter2"),
+            "the password must never be logged, got: {log}"
+        );
+    }
+
+    #[test]
+    fn try_authenticate_logs_failure_at_warn_naming_the_user_never_the_password() {
+        let replication = ReplicationHandle::default();
+        replication
+            .acl
+            .set_user(
+                "app",
+                &[Bytes::from_static(b"on"), Bytes::from_static(b">hunter2")],
+            )
+            .unwrap();
+        let log = capture_logs_at(tracing::Level::WARN, || {
+            let result = try_authenticate(&replication, "app", b"wrong-password");
+            assert!(result.is_err());
+        });
+        assert!(
+            log.contains("app"),
+            "expected the username in the event, got: {log}"
+        );
+        assert!(
+            !log.contains("wrong-password"),
+            "the password must never be logged, got: {log}"
+        );
+    }
+
+    #[test]
+    fn require_args_arity_failure_logs_a_debug_event_with_command_and_counts() {
+        let engine = Engine::new();
+        let log = capture_logs_at(tracing::Level::DEBUG, || {
+            let reply = dispatch(&engine, cmd(&[b"GET"]), &mut Protocol::default(), 1);
+            assert_eq!(
+                reply,
+                Frame::Error("ERR wrong number of arguments for 'get' command".into())
+            );
+        });
+        assert!(log.contains("wrong number of arguments"), "got: {log}");
+        assert!(
+            log.contains("get"),
+            "expected the command name in the event, got: {log}"
+        );
+    }
+
+    #[test]
+    fn unknown_command_from_the_catchall_match_arm_logs_a_debug_event() {
+        let engine = Engine::new();
+        let log = capture_logs_at(tracing::Level::DEBUG, || {
+            let reply = dispatch(&engine, cmd(&[b"NOPE"]), &mut Protocol::default(), 1);
+            assert_eq!(reply, Frame::Error("ERR unknown command 'NOPE'".into()));
+        });
+        assert!(
+            log.contains("unknown command"),
+            "expected an unknown-command event, got: {log}"
+        );
+        assert!(
+            log.contains("NOPE"),
+            "expected the command name in the event, got: {log}"
+        );
+    }
+
+    #[test]
+    fn engine_error_to_frame_logs_a_debug_event_naming_the_error_variant() {
+        let engine = Engine::new();
+        engine.set(Bytes::from_static(b"k"), Value::List(Default::default()));
+        let log = capture_logs_at(tracing::Level::DEBUG, || {
+            // GET against a List-typed key is the simplest reliable way to reach
+            // engine_error_to_frame with a real WrongType error.
+            let reply = dispatch(&engine, cmd(&[b"GET", b"k"]), &mut Protocol::default(), 1);
+            assert_eq!(
+                reply,
+                Frame::Error(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".into()
+                )
+            );
+        });
+        assert!(
+            log.contains("WrongType"),
+            "expected the error variant name, got: {log}"
+        );
+    }
+
+    #[test]
+    fn unknown_command_from_the_malformed_name_cold_path_logs_a_debug_event() {
+        let engine = Engine::new();
+        // Longer than MAX_COMMAND_NAME_LEN (32) so `upper_name` returns `None` and `dispatch`
+        // takes the cold path at line 193, not the catch-all match arm at line 1129.
+        let too_long = b"A".repeat(MAX_COMMAND_NAME_LEN + 1);
+        let log = capture_logs_at(tracing::Level::DEBUG, || {
+            let reply = dispatch(&engine, cmd(&[&too_long]), &mut Protocol::default(), 1);
+            assert!(matches!(reply, Frame::Error(_)));
+        });
+        assert!(
+            log.contains("unknown command"),
+            "expected an unknown-command event, got: {log}"
+        );
+    }
+
+    #[test]
+    fn reply_kind_reports_error_replies_as_errors() {
+        assert_eq!(
+            reply_kind(&Frame::Error("ERR unknown command 'nope'".into())),
+            "error"
+        );
+        assert_eq!(
+            reply_kind(&Frame::Error("WRONGTYPE Operation against a key".into())),
+            "error"
+        );
+    }
+
+    #[test]
+    fn reply_kind_reports_every_other_reply_shape_as_ok() {
+        // Deliberately the same two-way split `dispatch_and_log` already uses for its
+        // `rocket_mem_command_errors_total` counter -- one classification, not two that can
+        // drift apart. A Null reply is a successful NX/XX no-op, not an error.
+        assert_eq!(reply_kind(&Frame::Simple("OK".into())), "ok");
+        assert_eq!(reply_kind(&Frame::Integer(1)), "ok");
+        assert_eq!(reply_kind(&Frame::Bulk(Bytes::from_static(b"v"))), "ok");
+        assert_eq!(reply_kind(&Frame::Null), "ok");
+        assert_eq!(reply_kind(&Frame::Array(vec![])), "ok");
+        assert_eq!(reply_kind(&Frame::Map(vec![])), "ok");
+    }
+
+    #[test]
+    fn reply_kind_returns_a_static_str_so_the_debug_line_allocates_nothing() {
+        // The field must be a `&'static str`, not a formatted String: this runs once per
+        // command whenever `debug` is on, and a per-command allocation there is exactly the
+        // kind of cost the benchmark gate exists to catch.
+        let kind: &'static str = reply_kind(&Frame::Null);
+        assert_eq!(kind, "ok");
+    }
+
+    #[test]
+    fn command_args_excludes_the_command_name() {
+        assert_eq!(
+            command_args(&cmd(&[b"SET", b"k", b"v"])),
+            vec![Bytes::from_static(b"k"), Bytes::from_static(b"v")]
+        );
+        assert_eq!(command_args(&cmd(&[b"PING"])), Vec::<Bytes>::new());
+    }
+
+    #[test]
+    fn command_args_of_a_non_array_frame_is_empty() {
+        assert_eq!(
+            command_args(&Frame::Simple("PONG".into())),
+            Vec::<Bytes>::new()
+        );
+        assert_eq!(command_args(&Frame::Array(vec![])), Vec::<Bytes>::new());
+    }
+
+    #[test]
+    fn command_args_skips_non_bulk_arguments_rather_than_panicking() {
+        // A client can send `*3\r\n$3\r\nSET\r\n:1\r\n$1\r\nv\r\n`. `dispatch` rejects it later;
+        // the log renderer must not be the thing that falls over on it first.
+        let frame = Frame::Array(vec![
+            Frame::Bulk(Bytes::from_static(b"SET")),
+            Frame::Integer(1),
+            Frame::Bulk(Bytes::from_static(b"v")),
+        ]);
+        assert_eq!(command_args(&frame), vec![Bytes::from_static(b"v")]);
+    }
+
+    #[test]
+    fn the_trace_argument_line_never_renders_an_auth_password() {
+        // Composed exactly as `dispatch_and_log` composes it, so this covers the wiring and not
+        // just `redact_args` in isolation.
+        for frame in [
+            cmd(&[b"AUTH", b"hunter2"]),
+            cmd(&[b"AUTH", b"alice", b"hunter2"]),
+            cmd(&[b"HELLO", b"3", b"AUTH", b"alice", b"hunter2"]),
+            cmd(&[b"ACL", b"SETUSER", b"alice", b">hunter2"]),
+        ] {
+            let name = command_name_upper(&frame).unwrap();
+            let args = command_args(&frame);
+            let rendered = crate::logging::redact_args(name.as_str(), &args, 128);
+            assert_eq!(
+                rendered,
+                "<redacted>",
+                "leaked for {name:?}",
+                name = name.as_str()
+            );
+            assert!(!rendered.contains("hunter2"));
+        }
+    }
+
+    #[test]
+    fn the_trace_argument_line_renders_an_ordinary_command_in_full() {
+        let frame = cmd(&[b"SET", b"k", b"v"]);
+        let name = command_name_upper(&frame).unwrap();
+        let args = command_args(&frame);
+        assert_eq!(
+            crate::logging::redact_args(name.as_str(), &args, 128),
+            "k v"
+        );
+    }
+
     #[test]
     fn a_new_session_is_unauthenticated_with_default_protocol() {
         let session = Session::new();
@@ -3509,6 +4033,97 @@ mod tests {
             enabled: true,
             rules,
         })
+    }
+
+    #[test]
+    fn auth_gate_logs_permission_denied_at_warn_naming_the_user() {
+        let replication = ReplicationHandle::default();
+        replication
+            .acl
+            .set_user(
+                "app",
+                &[
+                    Bytes::from_static(b"on"),
+                    Bytes::from_static(b"+get"),
+                    Bytes::from_static(b"~*"),
+                ],
+            )
+            .unwrap();
+        let session = Session::new();
+        session.set_authenticated_user(Some(acl_user(vec![
+            crate::acl::AclRule::AllowCommand("GET".to_string()),
+            crate::acl::AclRule::AllKeys,
+        ])));
+        let frame = Frame::Array(vec![
+            Frame::Bulk(Bytes::from_static(b"SET")),
+            Frame::Bulk(Bytes::from_static(b"k")),
+            Frame::Bulk(Bytes::from_static(b"v")),
+        ]);
+        let log = capture_logs_at(tracing::Level::WARN, || {
+            let reply = auth_gate(&replication, &session, &frame).unwrap();
+            assert_eq!(
+                reply,
+                Frame::Error("NOPERM this user has no permissions to run this command".into())
+            );
+        });
+        assert!(
+            log.contains("app"),
+            "expected the username in the event, got: {log}"
+        );
+        assert!(log.contains("permission denied"), "got: {log}");
+    }
+
+    #[test]
+    fn handle_hello_logs_a_debug_event_on_resp3_upgrade() {
+        let replication = ReplicationHandle::default();
+        let session = Session::new();
+        let frame = cmd(&[b"HELLO", b"3"]);
+        let log = capture_logs_at(tracing::Level::DEBUG, || {
+            let reply = handle_hello(&frame, &session, 1, &replication);
+            assert!(reply.is_some());
+        });
+        assert_eq!(session.protocol(), Protocol::Resp3);
+        assert!(log.contains("HELLO protocol negotiated"), "got: {log}");
+        assert!(
+            log.contains('3'),
+            "expected the negotiated version in the event, got: {log}"
+        );
+    }
+
+    #[test]
+    fn acl_setuser_logs_an_info_event_naming_the_user_never_the_password_token() {
+        let replication = ReplicationHandle::default();
+        let frame = cmd(&[b"ACL", b"SETUSER", b"alice", b"on", b">hunter2"]);
+        let log = capture_logs_at(tracing::Level::INFO, || {
+            let reply = handle_acl(&frame, &Session::new(), &replication);
+            assert_eq!(reply, Some(Frame::Simple("OK".into())));
+        });
+        assert!(
+            log.contains("alice"),
+            "expected the username in the event, got: {log}"
+        );
+        assert!(
+            !log.contains("hunter2"),
+            "the ACL SETUSER password token must never be logged, got: {log}"
+        );
+    }
+
+    #[test]
+    fn acl_deluser_logs_an_info_event_naming_the_deleted_user() {
+        let replication = ReplicationHandle::default();
+        replication
+            .acl
+            .set_user("alice", &[Bytes::from_static(b"on")])
+            .unwrap();
+        let frame = cmd(&[b"ACL", b"DELUSER", b"alice"]);
+        let log = capture_logs_at(tracing::Level::INFO, || {
+            let reply = handle_acl(&frame, &Session::new(), &replication);
+            assert_eq!(reply, Some(Frame::Integer(1)));
+        });
+        assert!(
+            log.contains("alice"),
+            "expected the deleted username in the event, got: {log}"
+        );
     }
 
     #[test]
@@ -4315,6 +4930,58 @@ mod tests {
             command_key_and_arity(&cmd(&[b"auth", b"somepassword"])),
             (None, 1)
         );
+    }
+
+    /// `logged_key` is the key-spec-aware rendering the *log* fields use, and it deliberately
+    /// disagrees with `command_key_and_arity` (which still feeds the stored `SlowLogEntry`) in
+    /// exactly the two places the first argument is not a key.
+    #[test]
+    fn logged_key_follows_the_key_spec_rather_than_the_first_argument() {
+        // KeySpec::First / All / EveryOther: argument 1, the same answer as before.
+        assert_eq!(
+            logged_key(&cmd(&[b"SET", b"k", b"v"]), "SET"),
+            Some(Bytes::from_static(b"k"))
+        );
+        assert_eq!(
+            logged_key(&cmd(&[b"DEL", b"a", b"b"]), "DEL"),
+            Some(Bytes::from_static(b"a"))
+        );
+        assert_eq!(
+            logged_key(&cmd(&[b"MSET", b"k1", b"v1", b"k2", b"v2"]), "MSET"),
+            Some(Bytes::from_static(b"k1"))
+        );
+        // KeySpec::Second: the subcommand is not the key.
+        assert_eq!(
+            logged_key(&cmd(&[b"MEMORY", b"USAGE", b"k"]), "MEMORY"),
+            Some(Bytes::from_static(b"k"))
+        );
+        assert_eq!(
+            logged_key(&cmd(&[b"OBJECT", b"ENCODING", b"k"]), "OBJECT"),
+            Some(Bytes::from_static(b"k"))
+        );
+        // A short form of a KeySpec::Second command has no key at all, rather than a subcommand.
+        assert_eq!(logged_key(&cmd(&[b"MEMORY", b"DOCTOR"]), "MEMORY"), None);
+    }
+
+    /// The leak this fixes: a keyless command's first argument is a client-supplied *value*, and
+    /// the log fields apply no length cap to a key. AUTH stays keyless, as it already was.
+    #[test]
+    fn logged_key_is_none_for_every_keyless_command() {
+        assert_eq!(logged_key(&cmd(&[b"ECHO", b"payload"]), "ECHO"), None);
+        assert_eq!(logged_key(&cmd(&[b"PING", b"message"]), "PING"), None);
+        assert_eq!(logged_key(&cmd(&[b"AUTH", b"somepassword"]), "AUTH"), None);
+        assert_eq!(
+            logged_key(&cmd(&[b"ACL", b"SETUSER", b"alice", b">pw"]), "ACL"),
+            None
+        );
+        // An unknown command's arguments are not keys either, and the same no-cap argument
+        // applies to them.
+        assert_eq!(
+            logged_key(&cmd(&[b"NOTACOMMAND", b"arg"]), "NOTACOMMAND"),
+            None
+        );
+        // `command_name_upper` yields "" for a frame that is not a command array.
+        assert_eq!(logged_key(&Frame::Simple("x".into()), ""), None);
     }
 
     #[test]

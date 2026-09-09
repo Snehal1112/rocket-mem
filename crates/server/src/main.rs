@@ -96,15 +96,66 @@ async fn main() -> std::io::Result<()> {
     let log_color = std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none();
     let color = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
 
-    let filter = tracing_subscriber::EnvFilter::new(
-        rocket_mem::config::resolve_log_filter_directive(&config.log_level),
-    );
+    // Hoisted out of the `EnvFilter::new(...)` call so the config summary below can log the
+    // directive that is actually in force. `config.log_level` is only the fallback -- `RUST_LOG`
+    // wins (see `resolve_log_filter_directive`) -- so logging the config field would have the
+    // summary claim `info` while the process emits `debug` lines.
+    let log_filter_directive = rocket_mem::config::resolve_log_filter_directive(&config.log_level);
+    let filter = tracing_subscriber::EnvFilter::new(&log_filter_directive);
     tracing_subscriber::fmt()
         .with_ansi(log_color)
         .with_writer(std::io::stderr)
         .with_env_filter(filter)
         .init();
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "rocket-mem starting");
+
+    // The machine-readable counterpart to the boxed startup banner printed further down this
+    // function, not a replacement for it -- see the verbose logging spec's "Decision: the
+    // startup banner stays separate".
+    //
+    // This lands at `info`, so it reaches every operator's log file and every log aggregator.
+    // `Config` transitively holds credential material -- `acl.users` carries plaintext
+    // passwords and rule tokens, `replicaof_auth_password` is the leader's plaintext password,
+    // and the TLS cert/key/CA paths name private key material on disk -- so every field below is
+    // enumerated by hand and each is either a bind address, a non-credential path, a level
+    // string, or a plain boolean derived from a secret-bearing field's *presence*.
+    //
+    // The *credential* half of that rule is now structural rather than a call-site convention:
+    // `acl::AclUser`, `config::AclUserConfig` and `config::Config` all have hand-written
+    // redacting `Debug` impls, so a `{:?}` of the whole `Config` anywhere in the crate can no
+    // longer print a plaintext password or a raw rule token. `Config`'s impl is destructuring and
+    // therefore exhaustive at compile time -- a new field cannot slip past it unconsidered.
+    // What those impls still render, deliberately, is the residue: the ACL usernames,
+    // `replicaof_auth_username`, and the TLS cert/key/CA paths. So enumerating fields by hand
+    // remains the rule here even though a `?config` would no longer leak a secret. Deliberately
+    // absent: `tls_cert_path`, `tls_key_path`, `tls_ca_path` (summarised only as the two
+    // `tls_*_enabled` booleans) and every `acl.users` field (summarised only as
+    // `acl_enabled`/`acl_user_count`).
+    // `startup_logging.rs`'s `secret_bearing_config_is_never_rendered_into_the_summary` is the
+    // regression guard for all of that -- it starts the binary with a real-shaped ACL user, a
+    // real `replicaof_auth_password` and TLS material, and fails if any of it reaches stderr.
+    //
+    // `tls_enabled` means "this process is serving TLS listeners", derived from the addresses
+    // rather than from cert/key presence: cert and key set with no `tls_*_addr` binds no TLS
+    // listener at all, and `validate_tls` already rejects the reverse, so the addresses are the
+    // honest signal. TLS *replication* is a separate switch (`tls_ca_path`) that turns on no
+    // listener, so it gets its own field instead of being folded into this one.
+    tracing::info!(
+        addr = %config.addr,
+        rmp_addr = %config.rmp_addr,
+        metrics_addr = %config.metrics_addr,
+        aof_path = %config.aof_path,
+        snapshot_path = %config.snapshot_path,
+        log_filter = %log_filter_directive,
+        log_value_max_bytes = config.log_value_max_bytes,
+        slowlog_threshold_micros = config.slowlog_threshold_micros,
+        cluster_mode = config.cluster_config.is_some(),
+        acl_enabled = !config.acl.users.is_empty(),
+        acl_user_count = config.acl.users.len(),
+        tls_enabled = config.tls_resp_addr.is_some() || config.tls_rmp_addr.is_some(),
+        tls_replication_enabled = config.tls_ca_path.is_some(),
+        "resolved config summary"
+    );
 
     let metrics_handle = rocket_mem::metrics::recorder_handle();
 
@@ -245,6 +296,7 @@ async fn main() -> std::io::Result<()> {
     .with_aof(Arc::clone(&aof))
     .with_own_addr(config.addr.clone())
     .with_slowlog_threshold(slowlog_threshold)
+    .with_log_value_max_bytes(config.log_value_max_bytes)
     .with_acl_bootstrap(acl_users);
     if let Some(cluster) = cluster {
         handle = handle.with_cluster(cluster);
@@ -275,10 +327,18 @@ async fn main() -> std::io::Result<()> {
     replication.start_replicating_from_config(&config);
 
     let metrics_listener = tokio::net::TcpListener::bind(&config.metrics_addr).await?;
-    listeners.push((
-        "metrics",
-        format!("http://{}/metrics", metrics_listener.local_addr()?),
-    ));
+    // Each listener site below resolves its address string once and both logs and pushes it,
+    // rather than calling `local_addr()` twice. The `protocol` label is the very same `&str`
+    // the banner's `listeners` block uses, so the log and the banner can never disagree about
+    // a listener's name. Both are rendered with `%` so the field lands unquoted and greppable,
+    // matching the rest of this series' fields -- and, since the field-consistency sweep, the
+    // `protocol` field on `connection.rs`'s and `rmp_connection.rs`'s connection spans too, which
+    // used to render `protocol="resp"`/`protocol="rmp"` against these unquoted uppercase ones.
+    // `metrics` stays lowercase: it names this HTTP endpoint, not one of the two wire protocols
+    // the project spells RESP and RMP everywhere else, and only this one site ever emits it.
+    let metrics_addr_str = format!("http://{}/metrics", metrics_listener.local_addr()?);
+    tracing::info!(protocol = %"metrics", addr = %metrics_addr_str, "listener bound");
+    listeners.push(("metrics", metrics_addr_str));
     tokio::spawn(rocket_mem::metrics::serve_metrics(
         metrics_listener,
         metrics_handle,
@@ -287,7 +347,9 @@ async fn main() -> std::io::Result<()> {
     ));
 
     let rmp_listener = tokio::net::TcpListener::bind(&config.rmp_addr).await?;
-    listeners.push(("RMP", rmp_listener.local_addr()?.to_string()));
+    let rmp_addr_str = rmp_listener.local_addr()?.to_string();
+    tracing::info!(protocol = %"RMP", addr = %rmp_addr_str, "listener bound");
+    listeners.push(("RMP", rmp_addr_str));
     tokio::spawn(rocket_mem::rmp_connection::serve(
         rmp_listener,
         Arc::clone(&engine),
@@ -305,7 +367,9 @@ async fn main() -> std::io::Result<()> {
             std::path::Path::new(key),
         )?;
         let tls_listener = tokio::net::TcpListener::bind(tls_addr).await?;
-        listeners.push(("RESP+TLS", tls_listener.local_addr()?.to_string()));
+        let tls_addr_str = tls_listener.local_addr()?.to_string();
+        tracing::info!(protocol = %"RESP+TLS", addr = %tls_addr_str, "listener bound");
+        listeners.push(("RESP+TLS", tls_addr_str));
         tokio::spawn(rocket_mem::serve_tls(
             tls_listener,
             tls_config,
@@ -325,7 +389,9 @@ async fn main() -> std::io::Result<()> {
             std::path::Path::new(key),
         )?;
         let tls_rmp_listener = tokio::net::TcpListener::bind(tls_rmp_addr).await?;
-        listeners.push(("RMP+TLS", tls_rmp_listener.local_addr()?.to_string()));
+        let tls_rmp_addr_str = tls_rmp_listener.local_addr()?.to_string();
+        tracing::info!(protocol = %"RMP+TLS", addr = %tls_rmp_addr_str, "listener bound");
+        listeners.push(("RMP+TLS", tls_rmp_addr_str));
         tokio::spawn(rocket_mem::rmp_connection::serve_tls(
             tls_rmp_listener,
             tls_config,
@@ -336,7 +402,9 @@ async fn main() -> std::io::Result<()> {
     }
 
     let listener = tokio::net::TcpListener::bind(&config.addr).await?;
-    listeners.push(("RESP", listener.local_addr()?.to_string()));
+    let resp_addr_str = listener.local_addr()?.to_string();
+    tracing::info!(protocol = %"RESP", addr = %resp_addr_str, "listener bound");
+    listeners.push(("RESP", resp_addr_str));
 
     let title = paint(
         "1;36",
@@ -403,6 +471,13 @@ async fn main() -> std::io::Result<()> {
     }
     print_banner(&title, &body, color);
 
+    // No `shutdown (info)` event: the spec's Startup catalogue row names one, but there is
+    // nothing to log it from -- `rocket_mem::serve` is an unconditional `loop` (connection.rs)
+    // with no break, and this binary installs no `tokio::signal` handler anywhere in the
+    // crate, so a SIGTERM/SIGKILL ends the process before any Rust code, including a line
+    // here, would run. Logging a shutdown event requires adding real signal handling first,
+    // which is a graceful-shutdown feature in its own right, not a logging change --
+    // deferred, and marked as such in the spec's event catalogue.
     rocket_mem::serve(listener, engine, aof, replication).await;
     Ok(())
 }

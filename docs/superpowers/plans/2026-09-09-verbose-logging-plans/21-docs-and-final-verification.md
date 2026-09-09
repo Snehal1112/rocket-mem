@@ -154,10 +154,10 @@ inventing its own names, specifically so a single `grep` follows an activity end
 
 At `trace`, rocket-mem logs command arguments and value contents (truncated by
 `log_value_max_bytes` — see the [Configuration](#configuration) table). Credentials are
-always redacted (`AUTH`, `HELLO ... AUTH`, `ACL SETUSER`, `ACL GETUSER` render `<redacted>`
-at every level, not just `trace`), but ordinary keys and values are not. Treat a
-`trace`-level log file with the same retention and access controls as the dataset itself —
-the full warning and the `log_value_max_bytes` field are documented in
+always redacted (`AUTH`, `HELLO ... AUTH`, `ACL SETUSER`, `ACL GETUSER`, `REPLICAOF ... AUTH`
+render `<redacted>` at every level, not just `trace`), but ordinary keys and values are not.
+Treat a `trace`-level log file with the same retention and access controls as the dataset
+itself — the full warning and the `log_value_max_bytes` field are documented in
 [`docs/config-reference.md`](docs/config-reference.md#fields).
 ```
 

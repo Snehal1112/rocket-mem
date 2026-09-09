@@ -91,8 +91,11 @@ fn check_aof_intact(aof: &AofWriter) {
         Ok(true) => ::metrics::gauge!("rocket_mem_aof_file_intact").set(1.0),
         Ok(false) => {
             ::metrics::gauge!("rocket_mem_aof_file_intact").set(0.0);
+            // `aof_path`, not `path`: this names the same file every event in `aof.rs` calls
+            // `aof_path`, and the same file the `aof_path` config key configures. A lone `path`
+            // here made `grep aof_path` miss the one event that says the file is gone.
             tracing::error!(
-                path = %aof.path().display(),
+                aof_path = %aof.path().display(),
                 "AOF file has no directory entry at its configured path -- it was deleted or \
                  replaced while this process is still writing to it; every byte written since \
                  will be lost on the next restart unless this is fixed now"
@@ -185,6 +188,51 @@ impl Drop for ClientGuard {
     }
 }
 
+/// Tracks one RESP connection's lifetime state for the connection-closed log event: how long
+/// it was open and how many commands it served. Emits that event from `Drop` so every one of
+/// `handle_connection`'s several return paths -- decode error, clean EOF, feed failure, flush
+/// failure, and the `serve_replica` hand-off, which never returns normally -- gets it exactly
+/// once, without each of them having to remember. Mirrors `ClientGuard` just above, which
+/// solves the identical problem for the connected-clients counter.
+struct ConnectionStats {
+    started_at: std::time::Instant,
+    commands_served: u64,
+}
+
+impl ConnectionStats {
+    fn new() -> Self {
+        Self {
+            started_at: std::time::Instant::now(),
+            commands_served: 0,
+        }
+    }
+
+    fn record_command(&mut self) {
+        self.commands_served += 1;
+    }
+}
+
+impl Drop for ConnectionStats {
+    fn drop(&mut self) {
+        tracing::info!(
+            elapsed_us = self.started_at.elapsed().as_micros().min(u64::MAX as u128) as u64,
+            commands_served = self.commands_served,
+            "connection closed"
+        );
+    }
+}
+
+// `protocol = %"RESP"`, not `protocol = "resp"`. A bare `&str` field records through `Debug`, so
+// the plain literal rendered `protocol="resp"` -- quoted, and the only quoted field on a line
+// whose neighbours read `conn_id=1 peer=127.0.0.1:60768 tls=false`. `main.rs`'s "listener bound"
+// events already spell the same field `protocol=RESP`, unquoted and uppercase, and the spec's
+// reason for a fixed field vocabulary is that a single `grep` follows an activity end to end --
+// which `protocol=RESP` here and `protocol="resp"` there defeated.
+// `name = "conn"` is not cosmetic: without it the span takes the function's name, so every log
+// line on a connection renders as `handle_connection{...}` and the spec's three-span vocabulary
+// (`conn`/`cmd`/`repl`) matches only two of its three names. `serve_replica` below already names
+// its span `repl` for the same reason.
+#[tracing::instrument(name = "conn", skip_all, fields(conn_id = client_id, %peer, protocol = %"RESP", %tls))]
 async fn handle_connection<S>(
     socket: S,
     peer: std::net::SocketAddr,
@@ -196,9 +244,10 @@ async fn handle_connection<S>(
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    tracing::info!(%peer, protocol = "resp", tls, "connection accepted");
+    tracing::info!("connection accepted");
     replication.connection_opened();
     let _client_guard = ClientGuard(Arc::clone(&replication));
+    let mut conn_stats = ConnectionStats::new();
     let mut framed = Framed::new(socket, RespCodec::default());
     let session = dispatcher::Session::with_peer_addr(peer);
     // Carries a frame pulled ahead by the pipelining peek below, so it isn't re-read.
@@ -253,6 +302,7 @@ async fn handle_connection<S>(
         }
         let response =
             dispatcher::dispatch_and_log(&engine, &aof, &replication, frame, &session, client_id);
+        conn_stats.record_command();
         framed.codec_mut().protocol = session.protocol(); // sync BEFORE sending this reply
                                                           // Buffer without flushing -- a flush is a write syscall, and flushing after
                                                           // every single response is what turned client-side pipelining into a
@@ -302,6 +352,27 @@ fn psync_advertised_addr(frame: &protocol::Frame) -> Option<String> {
 /// Takes ownership of `framed`'s underlying socket and never returns until the replica
 /// connection dies. `PSYNC` has no reply frame of its own — the length-prefixed snapshot blob
 /// (not a RESP value) stands in for one.
+///
+/// The `repl` span is the correlation backbone for every replication log line on the leader
+/// side, matching `replication.rs`'s follower-side span of the same name. `host_port` is the
+/// address this replica advertised in its own `PSYNC <addr>` frame, or the fixed sentinel
+/// `"unknown"` for a bare `PSYNC` (an old client, or a test) — see `psync_advertised_addr`'s
+/// doc comment. This span is reached from `handle_connection`'s own already-open span (which
+/// carries `conn_id`/`peer`/`protocol`/`tls`), so it deliberately does not re-log any of those --
+/// only the one field neither ancestor span already has. See
+/// ../../../docs/superpowers/specs/2026-09-09-verbose-logging-design.md's span table.
+///
+/// `host_port` goes through `logging::escape_ident`. It is a raw client bulk, and `PSYNC` clears
+/// `auth_gate` even on a server with no ACLs configured, which makes this the one field an
+/// *unauthenticated* remote party can put arbitrary bytes into at `info` -- the level every
+/// production node runs at. Unescaped it forges log records; uncapped it forges long ones.
+#[tracing::instrument(
+    name = "repl",
+    skip_all,
+    fields(host_port = %crate::logging::escape_ident(
+        advertised_addr.as_deref().unwrap_or("unknown")
+    ))
+)]
 async fn serve_replica<S>(
     framed: Framed<S, RespCodec>,
     aof: &AofWriter,
@@ -333,7 +404,11 @@ async fn serve_replica<S>(
         let handoff_offset = replication.master_repl_offset();
         let bytes = replication.engine().snapshot(handoff_offset);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<bytes::Bytes>();
+        let host_port = advertised_addr
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
         replication.registry.register(advertised_addr, tx);
+        tracing::info!(host_port = %crate::logging::escape_ident(&host_port), "replica registered");
         (bytes, rx)
     };
 
@@ -393,6 +468,15 @@ mod tests {
     /// It does not prove those loops call it: each moves its accepted socket straight into a
     /// connection task, so no test holds a handle on the server side of the connection. Nagle is
     /// on by default, so observing `nodelay() == true` here means the call really flipped it.
+    #[test]
+    fn connection_stats_counts_each_recorded_command() {
+        let mut stats = ConnectionStats::new();
+        stats.record_command();
+        stats.record_command();
+        stats.record_command();
+        assert_eq!(stats.commands_served, 3);
+    }
+
     #[tokio::test]
     async fn disable_nagle_sets_tcp_nodelay_on_an_accepted_socket() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -840,6 +924,8 @@ mod tests {
         );
     }
 
+    use crate::logging::test_support::CapturedLogs;
+
     /// The snapshot's own 8-byte header carries the leader's live replication offset to a
     /// newly-attaching follower. This is not a wire-format change: the field has always been
     /// transmitted on this path, it was just always zero.
@@ -910,4 +996,68 @@ mod tests {
             "the PSYNC snapshot header must carry the leader's live replication offset"
         );
     }
+
+    #[tokio::test]
+    async fn serve_replica_opens_a_repl_span_naming_the_advertised_host_port() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let engine = Arc::new(Engine::new());
+        let (_dir, aof) = test_aof();
+        let replication = Arc::new(crate::replication::ReplicationHandle::new(
+            Arc::clone(&engine),
+            std::env::temp_dir().join("repl-span-test.snapshot"),
+        ));
+        tokio::spawn(serve(
+            listener,
+            Arc::clone(&engine),
+            Arc::clone(&aof),
+            Arc::clone(&replication),
+        ));
+
+        let captured = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::NEW)
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let mut framed = Framed::new(stream, RespCodec::default());
+        framed
+            .send(Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"PSYNC")),
+                Frame::Bulk(Bytes::from_static(b"127.0.0.1:9999")),
+            ]))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await; // let serve_replica open its span
+
+        drop(_guard);
+        let text = captured.text();
+        assert!(
+            // `repl{host_port=`, not `repl` and `host_port` separately: `serve_replica`'s own
+            // name contains `repl`, so the separate form would have passed under
+            // `#[instrument]`'s default name too. Same reasoning as the span-name section at
+            // the bottom of `tests/logging.rs`.
+            text.contains("repl{host_port=") && text.contains("127.0.0.1:9999"),
+            "expected a new `repl` span carrying host_port=\"127.0.0.1:9999\", got:\n{text}"
+        );
+    }
+
+    // `a_replica_registering_and_being_pruned_are_both_logged_at_info` used to live here,
+    // asserting on captured `INFO` output from a real PSYNC round-trip. It flaked: `tracing`
+    // caches callsite `Interest` per callsite, process-globally, the first time a callsite is
+    // reached -- and this unit-test binary runs ~575 tests whose subscribers install and drop
+    // constantly, so whichever test hit the register/prune callsites first (often with no
+    // subscriber at all) could poison them for the rest of the process, including this test's
+    // own later `INFO` subscriber. It had no assertions beyond the captured text --
+    // `psync_with_an_advertised_address_registers_it_on_the_leader` and
+    // `a_registered_replica_is_pruned_after_its_connection_drops` above already cover the
+    // behavioural side (registration observable via `replication.registry.addrs()`, and the
+    // server staying alive and answering after a prune) -- so it was moved wholesale to
+    // `crates/server/tests/logging.rs`, a separate integration-test binary with far fewer
+    // tests/callsites where capture assertions have never flaked, driving the same scenario
+    // through the public `rocket_mem::serve`. Do not re-add a capture assertion here.
 }

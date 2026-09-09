@@ -152,8 +152,9 @@ Then add this warning as a short prose paragraph directly beneath that table:
 > **`trace` writes your data to disk.** At `trace`, rocket-mem logs command arguments and
 > value contents, so a trace-level log file is a plaintext copy of the dataset and every
 > mutation applied to it, capped per value by `log_value_max_bytes`. Credentials are always
-> redacted (`AUTH`, `HELLO ... AUTH`, `ACL SETUSER`, `ACL GETUSER`), but ordinary values are
-> not. Treat a trace log with the same retention and access controls as the data itself.
+> redacted (`AUTH`, `HELLO ... AUTH`, `ACL SETUSER`, `ACL GETUSER`, `REPLICAOF ... AUTH`), but
+> ordinary values are not. Treat a trace log with the same retention and access controls as
+> the data itself.
 ```
 
 - [ ] **Step 2: Add the row to `README.md`**

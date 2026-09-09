@@ -33,6 +33,15 @@ Five crates under `crates/`:
 - **`server`** — the binary (package name `rocket-mem`): dual RESP/RMP accept loops, the shared command dispatcher every protocol calls, AOF, snapshotting, replication, cluster routing, Prometheus metrics, and the slow log.
 - **`rmp-client`** — a minimal async Rust client for RMP.
 
+**Logging is the one permitted cross-cutting dependency.** `engine` and `protocol` both
+depend on `tracing` (since 2026-09-09). This does not weaken the protocol-agnostic rule:
+`tracing` is a facade crate with no runtime of its own, its macros compile to a level check
+that is never true when no subscriber is installed, and an instrumented engine still knows
+nothing about RESP or RMP. Redaction policy deliberately does *not* live here — `engine` and
+`protocol` log key names and byte lengths only, never value contents, so
+`crates/server/src/logging.rs` stays the single auditable place a secret could reach a log.
+See [the verbose logging spec](docs/superpowers/specs/2026-09-09-verbose-logging-design.md).
+
 This is the three-layer architecture (Protocol → Command Dispatcher → Storage Engine) the production plan targeted from the start, now fully built: the engine stayed protocol-agnostic throughout, which is exactly what let RMP (Sprint 7) sit on top of the same dispatcher RESP already used, without touching engine code.
 
 ## Engine internals (`crates/engine/src`)

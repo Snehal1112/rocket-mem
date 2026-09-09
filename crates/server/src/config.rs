@@ -4,7 +4,8 @@
 ///
 /// `#[serde(default)]` on the struct means a partial TOML file (or one missing entirely) still
 /// deserializes -- any field it doesn't mention falls back to `Config::default()`'s value for it.
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+/// `Debug` is hand-written below, not derived -- this struct holds a plaintext leader password.
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct Config {
     pub addr: String,
@@ -42,6 +43,10 @@ pub struct Config {
     /// `resolve_log_filter_directive` below); this field is the *default* for a deployment
     /// that doesn't set RUST_LOG, not a competing source of truth.
     pub log_level: String,
+    /// Maximum bytes of a value or argument rendered into a `trace`-level log line before
+    /// truncation. Only consulted at `trace` -- lower it to keep trace logs readable, raise
+    /// it to see whole values. See `logging::fmt_value`.
+    pub log_value_max_bytes: u64,
 }
 
 impl Default for Config {
@@ -67,7 +72,82 @@ impl Default for Config {
             replicaof_auth_password: None,
             acl: AclBootstrapConfig::default(),
             log_level: "info".to_string(),
+            log_value_max_bytes: 128,
         }
+    }
+}
+
+impl std::fmt::Debug for Config {
+    /// Hand-written rather than derived, because `replicaof_auth_password` is a plaintext leader
+    /// credential (see its own doc comment) and a derived `Debug` would render it in full from any
+    /// `?config` call site. The decision recorded in the verbose-logging spec used to be the
+    /// opposite -- leave it derived -- on the reasoning that the only residue was ACL *usernames*
+    /// and TLS *paths*, which are not key material. That reasoning stopped holding the moment
+    /// `replicaof_auth_password` landed.
+    ///
+    /// **The destructuring is the point, not decoration.** `let Config { .. } = self` with no
+    /// `..` rest pattern is exhaustive: adding a field to `Config` makes this function fail to
+    /// compile with "pattern does not mention field `x`", forcing whoever adds it to decide here
+    /// whether it renders or is redacted. That compile-time check is exactly what the earlier
+    /// decision assumed a hand-written impl could not have -- "no compile-time check for a field
+    /// someone forgets to add, so it would silently start omitting new configuration while looking
+    /// exhaustive". It is available, and it also covers the failure mode that decision did not
+    /// consider: a future field that is itself a secret. Never add a `..` to the pattern below.
+    ///
+    /// What still renders, deliberately: the ACL usernames (via `AclUserConfig`'s own redacting
+    /// `Debug`), `replicaof_auth_username`, and the TLS cert/key/CA *paths*. A filename is not key
+    /// material, and hiding it would only make a TLS misconfiguration harder to diagnose. That is
+    /// the residue, and it is the same residue the spec has always named -- minus the password.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Config {
+            addr,
+            rmp_addr,
+            metrics_addr,
+            aof_path,
+            snapshot_path,
+            slowlog_threshold_micros,
+            cluster_config,
+            cluster_node_id,
+            tls_resp_addr,
+            tls_rmp_addr,
+            tls_cert_path,
+            tls_key_path,
+            tls_ca_path,
+            replicaof,
+            replicaof_auth_username,
+            replicaof_auth_password,
+            acl,
+            log_level,
+            log_value_max_bytes,
+        } = self;
+
+        // `Option<&str>`, not a bare marker string, so the field keeps its `Some`/`None` shape:
+        // "a leader password is configured" is a routine, non-secret operational fact, and
+        // collapsing it with "none configured" would only make an auth misconfiguration harder to
+        // spot -- the same reasoning `AclUserConfig`'s `<nopass>` rests on.
+        let replicaof_auth_password = replicaof_auth_password.as_ref().map(|_| "<redacted>");
+
+        f.debug_struct("Config")
+            .field("addr", addr)
+            .field("rmp_addr", rmp_addr)
+            .field("metrics_addr", metrics_addr)
+            .field("aof_path", aof_path)
+            .field("snapshot_path", snapshot_path)
+            .field("slowlog_threshold_micros", slowlog_threshold_micros)
+            .field("cluster_config", cluster_config)
+            .field("cluster_node_id", cluster_node_id)
+            .field("tls_resp_addr", tls_resp_addr)
+            .field("tls_rmp_addr", tls_rmp_addr)
+            .field("tls_cert_path", tls_cert_path)
+            .field("tls_key_path", tls_key_path)
+            .field("tls_ca_path", tls_ca_path)
+            .field("replicaof", replicaof)
+            .field("replicaof_auth_username", replicaof_auth_username)
+            .field("replicaof_auth_password", &replicaof_auth_password)
+            .field("acl", acl)
+            .field("log_level", log_level)
+            .field("log_value_max_bytes", log_value_max_bytes)
+            .finish()
     }
 }
 
@@ -79,7 +159,7 @@ pub struct AclBootstrapConfig {
     pub users: Vec<AclUserConfig>,
 }
 
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
 pub struct AclUserConfig {
     pub username: String,
     /// Plaintext in the TOML file, hashed once at load time by plan 04's bootstrap conversion.
@@ -90,6 +170,37 @@ pub struct AclUserConfig {
     /// Raw rule tokens, parsed the same way `ACL SETUSER`'s tokens are (plan 03).
     #[serde(default)]
     pub rules: Vec<String>,
+}
+
+impl std::fmt::Debug for AclUserConfig {
+    /// Hand-written rather than derived, for the same reason `acl::AclUser`'s `Debug` is: a
+    /// derived one would route around `crate::logging`'s redaction policy from any
+    /// `?`-formatted call site. This struct is the stronger case of the two -- `AclUser` holds
+    /// only a password *hash*, while this one holds the operator's plaintext password straight
+    /// out of the TOML file, and it is what `Config`'s own derived `Debug` reaches through.
+    ///
+    /// `None` still renders as `"<nopass>"` rather than the same marker as `Some(_)`, exactly as
+    /// in `acl::AclUser`: knowing a user has no password at all is a routine ACL fact, not a
+    /// secret, and hiding it would only make debugging auth issues harder.
+    ///
+    /// `rules` renders as a count, not verbatim -- unlike `AclUser::rules`, these are *raw*
+    /// `ACL SETUSER` tokens, and a `>password` token is a plaintext credential. The count keeps
+    /// the field's one operational use (did this user's rules load at all?) without rendering
+    /// any token's contents. `username` and `enabled` are non-secret and stay readable, matching
+    /// `acl::AclUser`; a deployment treating usernames as sensitive would have to redact both
+    /// impls together.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let password: &dyn std::fmt::Debug = match &self.password {
+            Some(_) => &"<redacted>",
+            None => &"<nopass>",
+        };
+        f.debug_struct("AclUserConfig")
+            .field("username", &self.username)
+            .field("password", password)
+            .field("enabled", &self.enabled)
+            .field("rules", &self.rules.len())
+            .finish()
+    }
 }
 
 fn default_true() -> bool {
@@ -127,7 +238,16 @@ pub fn load_layered(toml_path: Option<&std::path::Path>) -> Result<Config, figme
 // Adding a new field to `Config` also requires adding it here and to `cli_overrides`'s `set!`
 // calls -- there's no compile-time check that catches a forgotten one.
 /// A RESP-compatible in-memory data store.
-#[derive(clap::Parser, Debug)]
+//
+// **No `Debug`, deliberately.** `--replicaof-auth-password` puts a plaintext leader credential in
+// this struct, *earlier* than `Config` sees it, so a derived `Debug` here is the same hazard
+// `Config`'s hand-written impl above exists to close -- and closing only `Config`'s half would
+// leave the CLI layer leaking. Nothing in the workspace formats a `Cli`, and nothing should: it is
+// a transient parse artifact whose every value ends up in `Config`, which *is* debuggable. Not
+// having the impl at all is the stronger guard, because a `?cli` does not compile rather than
+// merely being discouraged. `clap::Parser` does not require `Debug`; if a future need for one is
+// real, hand-write it exhaustively the way `Config`'s is, never derive it.
+#[derive(clap::Parser)]
 #[command(name = "rocket-mem", version)]
 pub struct Cli {
     /// Path to a TOML config file. Not read via env/CLI layering itself -- it names which file
@@ -187,6 +307,9 @@ pub struct Cli {
     /// Log level filter, e.g. "info", "debug", "rocket_mem=debug,warn" [default: info]
     #[arg(long)]
     pub log_level: Option<String>,
+    /// Max bytes of a value rendered into a trace-level log line [default: 128]
+    #[arg(long)]
+    pub log_value_max_bytes: Option<u64>,
 }
 
 /// `Serialized::defaults` embeds every field including the unset `None`s, which would make an
@@ -234,6 +357,9 @@ fn cli_overrides(
     set!(log_level);
     if let Some(v) = cli.slowlog_threshold_micros {
         map.insert("slowlog_threshold_micros", Value::from(v));
+    }
+    if let Some(v) = cli.log_value_max_bytes {
+        map.insert("log_value_max_bytes", Value::from(v));
     }
     Serialized::defaults(map)
 }
@@ -443,6 +569,170 @@ mod tests {
         });
     }
 
+    /// Makes the leak structurally impossible rather than merely forbidden at the one call site
+    /// that formats a `Config` today. `startup_logging.rs`'s
+    /// `secret_bearing_config_is_never_rendered_into_the_summary` guards that call site; this
+    /// guards every present and future one, since `Config`'s derived `Debug` reaches the
+    /// plaintext password only through this struct.
+    #[test]
+    fn acl_user_config_debug_redacts_the_password_and_the_rule_tokens() {
+        let user = AclUserConfig {
+            username: "admin".to_string(),
+            password: Some("zzsecret".to_string()),
+            enabled: true,
+            rules: vec!["allcommands".to_string(), ">zzrulepassword".to_string()],
+        };
+        let rendered = format!("{user:?}");
+
+        assert!(
+            !rendered.contains("zzsecret"),
+            "the plaintext password must never render, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("zzrulepassword") && !rendered.contains("allcommands"),
+            "raw rule tokens can carry a >password, so none may render, got: {rendered}"
+        );
+        assert!(rendered.contains("<redacted>"), "got: {rendered}");
+        assert!(
+            rendered.contains("rules: 2"),
+            "the rule count is the non-secret part worth keeping, got: {rendered}"
+        );
+        // Non-secret fields stay readable, matching `acl::AclUser`'s precedent.
+        assert!(rendered.contains("admin") && rendered.contains("enabled: true"));
+    }
+
+    /// `None` is `nopass`, an operationally useful and non-secret fact, so it must stay
+    /// distinguishable from a redacted real password -- same rule as `acl::AclUser`'s `Debug`.
+    #[test]
+    fn acl_user_config_debug_shows_nopass_distinguishably_from_a_redacted_password() {
+        let user = AclUserConfig {
+            username: "readonly".to_string(),
+            password: None,
+            enabled: true,
+            rules: Vec::new(),
+        };
+        let rendered = format!("{user:?}");
+        assert!(rendered.contains("<nopass>"), "got: {rendered}");
+        assert!(!rendered.contains("<redacted>"), "got: {rendered}");
+    }
+
+    /// The reason the impl above matters: `Config` derives `Debug`, so anything formatting a
+    /// whole config with `{:?}` reaches `acl.users` transitively.
+    #[test]
+    fn config_debug_does_not_leak_an_acl_password_through_the_nested_users() {
+        let cfg = Config {
+            acl: AclBootstrapConfig {
+                users: vec![AclUserConfig {
+                    username: "admin".to_string(),
+                    password: Some("zzsecret".to_string()),
+                    enabled: true,
+                    rules: vec![">zzrulepassword".to_string()],
+                }],
+            },
+            ..Config::default()
+        };
+        let rendered = format!("{cfg:?}");
+        assert!(
+            !rendered.contains("zzsecret") && !rendered.contains("zzrulepassword"),
+            "got: {rendered}"
+        );
+        assert!(rendered.contains("<redacted>"), "got: {rendered}");
+    }
+
+    /// The hazard `Config`'s hand-written `Debug` closes: `replicaof_auth_password` is a plaintext
+    /// leader credential, and until this impl existed the derived `Debug` rendered it in full.
+    ///
+    /// Mutation-checked, per the spec's "Redaction tests must be mutation-checked" rule: the
+    /// fixture below genuinely carries `zzleaderpassword`, and replacing the `map(|_| ...)` in the
+    /// impl with `.map(|p| p.as_str())` makes this test -- and only this test plus
+    /// `config_debug_still_renders_every_non_secret_field` -- fail on the first assertion.
+    #[test]
+    fn config_debug_redacts_the_replicaof_auth_password() {
+        let cfg = Config {
+            replicaof: Some("127.0.0.1:6400".to_string()),
+            replicaof_auth_username: Some("app".to_string()),
+            replicaof_auth_password: Some("zzleaderpassword".to_string()),
+            ..Config::default()
+        };
+        let rendered = format!("{cfg:?}");
+
+        assert!(
+            !rendered.contains("zzleaderpassword"),
+            "the plaintext leader password must never render, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("replicaof_auth_password: Some(\"<redacted>\")"),
+            "got: {rendered}"
+        );
+        // "a password is configured" is a non-secret operational fact and must stay
+        // distinguishable from "none configured", so the `Option` shape survives redaction.
+        let none = format!("{:?}", Config::default());
+        assert!(
+            none.contains("replicaof_auth_password: None"),
+            "got: {none}"
+        );
+    }
+
+    /// The other half of a hand-written `Debug`'s risk: silently *dropping* a field while looking
+    /// exhaustive. The destructuring in the impl makes a forgotten field a compile error, but
+    /// nothing stops a field being destructured and then not passed to `debug_struct`, so this
+    /// pins the rendered output too. It also fixes the residue the spec records as still visible.
+    #[test]
+    fn config_debug_still_renders_every_non_secret_field() {
+        let cfg = Config {
+            addr: "1.1.1.1:1".to_string(),
+            rmp_addr: "1.1.1.1:2".to_string(),
+            metrics_addr: "1.1.1.1:3".to_string(),
+            aof_path: "/zz/a.aof".to_string(),
+            snapshot_path: "/zz/s.snap".to_string(),
+            slowlog_threshold_micros: 4321,
+            cluster_config: Some("/zz/cluster.conf".to_string()),
+            cluster_node_id: Some("zznode".to_string()),
+            tls_resp_addr: Some("1.1.1.1:4".to_string()),
+            tls_rmp_addr: Some("1.1.1.1:5".to_string()),
+            tls_cert_path: Some("/zz/cert.pem".to_string()),
+            tls_key_path: Some("/zz/key.pem".to_string()),
+            tls_ca_path: Some("/zz/ca.pem".to_string()),
+            replicaof: Some("1.1.1.1:6".to_string()),
+            replicaof_auth_username: Some("zzuser".to_string()),
+            replicaof_auth_password: Some("zzleaderpassword".to_string()),
+            acl: AclBootstrapConfig::default(),
+            log_level: "zzlevel".to_string(),
+            log_value_max_bytes: 4322,
+        };
+        let rendered = format!("{cfg:?}");
+
+        for expected in [
+            "1.1.1.1:1",
+            "1.1.1.1:2",
+            "1.1.1.1:3",
+            "/zz/a.aof",
+            "/zz/s.snap",
+            "4321",
+            "/zz/cluster.conf",
+            "zznode",
+            "1.1.1.1:4",
+            "1.1.1.1:5",
+            // The TLS paths and the replication username are the residue this impl deliberately
+            // keeps: a filename is not key material, and hiding it makes a TLS or auth
+            // misconfiguration harder to diagnose, not safer.
+            "/zz/cert.pem",
+            "/zz/key.pem",
+            "/zz/ca.pem",
+            "1.1.1.1:6",
+            "zzuser",
+            "acl",
+            "zzlevel",
+            "4322",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "a hand-written Debug must not silently drop {expected:?}, got: {rendered}"
+            );
+        }
+        assert!(!rendered.contains("zzleaderpassword"), "got: {rendered}");
+    }
+
     #[test]
     fn cli_flag_overrides_env_var_overrides_file_overrides_default() {
         figment::Jail::expect_with(|jail| {
@@ -552,6 +842,39 @@ mod tests {
             ]);
             let cfg = load_with_cli(cli).unwrap();
             assert_eq!(cfg.log_level, "error");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn log_value_max_bytes_defaults_to_128() {
+        figment::Jail::expect_with(|_jail| {
+            let cfg = load_layered(None).unwrap();
+            assert_eq!(cfg.log_value_max_bytes, 128);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn log_value_max_bytes_is_layered_like_every_other_numeric_field() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("rocket-mem.toml", "log_value_max_bytes = 64\n")?;
+            let cfg = load_layered(Some(std::path::Path::new("rocket-mem.toml"))).unwrap();
+            assert_eq!(cfg.log_value_max_bytes, 64);
+
+            jail.set_env("ROCKET_MEM_LOG_VALUE_MAX_BYTES", "32"); // env beats file
+            let cfg = load_layered(Some(std::path::Path::new("rocket-mem.toml"))).unwrap();
+            assert_eq!(cfg.log_value_max_bytes, 32);
+
+            let cli = Cli::parse_from([
+                "rocket-mem",
+                "--config",
+                "rocket-mem.toml",
+                "--log-value-max-bytes",
+                "16", // CLI beats env
+            ]);
+            let cfg = load_with_cli(cli).unwrap();
+            assert_eq!(cfg.log_value_max_bytes, 16);
             Ok(())
         });
     }

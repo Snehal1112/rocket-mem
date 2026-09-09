@@ -84,7 +84,9 @@ Instead, exactly three spans carry the correlation, and everything nested inheri
 | `cmd` | opened inside `dispatcher.rs`'s `dispatch_and_log` | `cmd`, `key`, `argc` |
 | `repl` | replication client loop, and `connection.rs`'s `serve_replica` | `host_port` |
 
-`dispatch_and_log` is the right home for the `cmd` span because it is already the single choke point every command passes through, and it already computes `name`, `first_key`, `arg_count`, and `elapsed` for the metrics and slowlog paths. The span's fields are values that exist at that point regardless — the span adds correlation, not computation.
+`dispatch_and_log` is the right home for the `cmd` span because it is already the single choke point every command passes through, and it already computes `name`, `first_key`, `arg_count`, and `elapsed` for the metrics and slowlog paths.
+
+**Corrected on 2026-09-09 (plan 22).** This paragraph originally continued "the span's fields are values that exist at that point regardless — the span adds correlation, not computation", and that is no longer true of `key`. The key a log field names is not always the frame's first argument (`MEMORY USAGE <key>` would report `USAGE`; `ECHO <payload>` would report a client-supplied value), so `logged_key` selects it through the same `key_spec` table the cluster router uses — a genuine per-command computation that exists only for logging. It is also **eager**, not deferred behind the span's level check, because the slowlog `warn!` needs the same value after `frame` has been moved into `dispatch_and_log_inner`. What *is* lazy is the rendering: `key_field`'s O(len) UTF-8 pass runs inside the `debug_span!`'s field list and therefore never at the `info` default, which plan 22 established by probe rather than by argument. `cmd`, `argc` and `elapsed` are unchanged — those really are values the function computes regardless.
 
 ### Field vocabulary
 
@@ -93,6 +95,35 @@ One fixed set of field names across every crate and subsystem, so a single `grep
 `conn_id`, `peer`, `cmd`, `key`, `argc`, `user`, `error`, `elapsed_us`, `shard`, `offset`, `bytes`, `commands_served`.
 
 `commands_served` was added during planning: the connection-closed event needs to report how much work a connection did before it went away, and none of the other names carried that meaning. Any further addition goes through the same route — extend this list rather than inventing a synonym at a call site, since the value of a fixed vocabulary is entirely in its being exhaustive.
+
+#### Names added during execution
+
+The list above is the planning-time vocabulary and stopped being exhaustive almost immediately. The rest of the names below were added by the implementation plans and are recorded here so the "exhaustive" claim means something again. **They were re-derived from the code on 2026-09-09 (plan 23), by walking every `tracing::` call site and every span's `fields(...)`, not collected from the plans' own reports.** The difference is not academic: the report-assembled draft covered only plans 18 and 20, and even inside that scope it missed `last_slot` and `version` and described `protocol` as an event field when it is also a span field.
+
+| Group | Names | Where |
+|---|---|---|
+| Spans | `protocol`, `tls`, `host_port` | the `conn` and `repl` spans (`connection.rs`, `rmp_connection.rs`, `replication.rs`) |
+| Startup | `version`, `addr`, `rmp_addr`, `metrics_addr`, `aof_path`, `snapshot_path`, `log_filter`, `log_value_max_bytes`, `slowlog_threshold_micros`, `cluster_mode`, `acl_enabled`, `acl_user_count`, `tls_enabled`, `tls_replication_enabled` | `main.rs`'s "rocket-mem starting", "resolved config summary" and "listener bound" |
+| Cluster | `node_id`, `first_slot`, `last_slot`, `node_count`; `slot`, `target` | `cluster.rs`'s topology-loaded; `dispatcher.rs`'s MOVED redirect |
+| Dispatch | `args`, `reply`, `want`, `got`, `resp_version` | argument trace, per-command line, arity error, `HELLO` upgrade |
+| Engine | `reason`, `evicted`, `evicted_total`, `removed` | eviction (per key, per cycle, and the rate-limited pressure roll-up), active-expire cycle |
+| Protocol | `kind`, `len`, `buffered`, `needed` | frame decoded, split-read reassembly |
+| AOF / snapshot | `aof_path`, `snapshot_path` (the same two names the Startup row uses), `generation`, `commands`, `aof_len` | snapshot save/load, rewrite, recovery replay summary and its failure paths |
+| Replication | `source`, `auth` | the `REPLICAOF` role-transition events (`replication.rs`'s `start_replicating_inner`) |
+
+Three notes on names the reports got wrong or left out:
+
+- **`log_filter`, not `log_level`.** The field renders the resolved filter *directive* (`RUST_LOG` wins, `log_level` is the fallback — `config::resolve_log_filter_directive`), which is not the same thing as the configured level, and was renamed to say so. The *config key* is still `log_level`.
+- **`protocol` and `host_port` are both span fields *and* event fields**, not span-only as the Spans row above may suggest. `main.rs`'s "listener bound" events and both connection spans emit `protocol`, and since plan 22 all of them render it through `%` as unquoted uppercase (`RESP`, `RMP`, `RESP+TLS`, `RMP+TLS`) so one grep matches every site; the single exception is `metrics`, lowercase, which names an HTTP endpoint rather than one of the two wire protocols. `host_port` is on the `repl` span (`replication.rs`'s `#[instrument]`) and also on its own reconnect events. Of the three names in the Spans row, only `tls` is genuinely span-only.
+- **`source` and `auth` are the two names added on 2026-09-10**, both on the `REPLICAOF` transition event. `source` is a fixed two-value vocabulary — `command` (a client sent `REPLICAOF`) or `config` (the startup auto-connect from `Config::replicaof`) — and renders unquoted through `%`, matching `protocol` and every other fixed-vocabulary field rather than the Debug-quoted `reply="ok"` shape a bare `&str` field would produce. `auth` is a **boolean**, never the credential: it reports only whether an AUTH clause is configured, which is operationally useful and not a secret. No `user` field is emitted there — the username adds nothing an operator cannot read out of the config, and omitting it keeps the event's credential surface at zero.
+
+- **`path` is gone — collapsed onto `aof_path`/`snapshot_path` on 2026-09-10.** It had been a genuine inconsistency against *two* other names rather than a distinction, and this entry recorded it as an open split for a future sweep to close. That sweep is this one; the entry now records the resolution, so nothing here still describes an unresolved problem.
+
+  Four call sites were renamed. Three named the snapshot file and became `snapshot_path`: `aof.rs`'s "snapshot loaded", and `dispatcher.rs`'s "snapshot save starting"/"snapshot save finished" (whose local `path` binding was renamed too, so the field and the variable read alike). One named the AOF file and became `aof_path`: `connection.rs`'s "AOF file has no directory entry" warning. No other call site in the workspace used a bare `path` field.
+
+  The worst of the split was inside a single function: four events in `recover` said `snapshot_path` while the fifth — "snapshot loaded", the single most important snapshot event on the recovery path — said `path`, so `grep snapshot_path` returned every failure and never the success. Two names rather than one shared `path` because the two files are different files and an operator chasing a recovery problem needs to know which one an event is about; and these two specifically because they are already the names of the config keys that set them (`docs/config-reference.md`), so a reader needs no second vocabulary.
+
+  The counter-argument this entry originally rested on — that renaming a shipped field breaks a runbook grepping for it — is why the rename happened *now*: none of these events has ever appeared in a tagged release, no operator doc names a log field, and no test asserted on `path=`. The cost only grows from here.
 
 ## Decision: log content — values at `trace`, secrets never
 
@@ -104,7 +135,9 @@ This is a deliberate trade: a `trace`-level log file is a complete plaintext cop
 
 Two pure functions, which are real logic and therefore genuinely worth testing:
 
-- **`redact_args(cmd, args)`** — yields `<redacted>` in place of the entire argument list for `AUTH`, `HELLO` when it carries an `AUTH` clause, and `ACL SETUSER` / `ACL GETUSER`. Applied both at `cmd`-span creation and at every `trace`-level argument site. `dispatcher.rs` already special-cases `AUTH` and `HELLO` in `command_key_and_arity`, and `key_spec`'s comment at `dispatcher.rs:1423` already names the `AUTH` plaintext password and the `ACL SETUSER` rule token as values that must not be treated as ordinary key bytes — so the command-shape knowledge this needs already exists in the file.
+- **`redact_args(cmd, args)`** — yields `<redacted>` in place of the entire argument list for `AUTH`, `HELLO` when it carries an `AUTH` clause, `ACL SETUSER` / `ACL GETUSER`, and `REPLICAOF` when it carries an `AUTH` clause. Applied both at `cmd`-span creation and at every `trace`-level argument site. `dispatcher.rs` already special-cases `AUTH` and `HELLO` in `command_key_and_arity`, and `key_spec`'s comment at `dispatcher.rs:1423` already names the `AUTH` plaintext password and the `ACL SETUSER` rule token as values that must not be treated as ordinary key bytes — so the command-shape knowledge this needs already exists in the file.
+
+  **`REPLICAOF` was missed in this spec's first draft** and added on 2026-09-09 after a task review caught it. Its six-token form, `REPLICAOF <host> <port> AUTH <username> <password>` (parsed at `dispatcher.rs:1548-1560`, password at `items[5]`, exercised by the existing test at `dispatcher.rs:9292`), carries a plaintext password through the same `dispatch_and_log` entry point every other command uses. Without an arm it would have been rendered verbatim at `trace`. Recorded here rather than quietly fixed because it is the instructive case: the audit point is only as good as the command list it was built from, and that list came from reasoning about which commands *sound* credential-shaped rather than from reading the dispatcher's actual argument parsing. Any future command that accepts a secret must be added here at the same time it is added to the dispatcher.
 
   `CONFIG` is deliberately **not** on the redaction list: rocket-mem's `CONFIG` surface exposes no credential parameter (there is no `requirepass` or `masterauth`), so redacting it today would guard nothing. `redact_args` is written as a per-command match so adding one is a single arm if that changes.
 - **`fmt_value(bytes, cap)`** — lossy-UTF8 rendering with non-printable bytes escaped, truncated at `cap` with a trailing `…(N more)` marker.
@@ -117,18 +150,59 @@ Every existing call site keeps its current level and trigger condition; this tab
 
 | Subsystem | File(s) | New events (level) |
 |---|---|---|
-| Startup | `server/main.rs` | resolved config summary (info); listener bound, per protocol (info); shutdown (info) |
+| Startup | `server/main.rs` | resolved config summary (info); listener bound, per protocol (info); shutdown (info) — **deferred**, see below |
 | Connection | `server/connection.rs`, `server/rmp_connection.rs` | `HELLO`/RESP3 protocol upgrade (debug); clean close and EOF with duration + command count (info) |
 | Dispatch | `server/dispatcher.rs` | per-command `cmd`/`key`/`argc`/`elapsed_us`/reply kind (debug); full arguments, capped and redacted (trace); unknown command, WRONGTYPE, and arity errors (debug) |
 | ACL | `server/acl.rs` | auth success with `user` (info); auth failure with `user` + `peer`, never the secret (warn); permission denied with `user`/`cmd`/`key` (warn); `SETUSER`/`DELUSER` (info) |
-| Engine | `engine/engine.rs`, `engine/shard.rs`, `engine/store.rs` | shard routing, `key` → `shard` (trace); mutation byte delta (trace); per-key TTL expiry (trace); active-expire cycle key count (debug); eviction with `key` + bytes freed + reason (warn) |
+| Engine | `engine/engine.rs`, `engine/shard.rs`, `engine/store.rs` | shard routing, `key` → `shard` (trace); mutation byte delta (trace); per-key TTL expiry (trace); active-expire cycle key count (debug); eviction, as three events — per evicted `key` with `bytes` + `reason` (debug), per-cycle summary with `evicted` + `bytes` + `reason` (debug), and a rate-limited pressure roll-up with `evicted_total` (warn) |
 | Protocol | `protocol/codec.rs`, `protocol/rmp.rs` | frame decoded, kind + length (trace); split-read reassembly (trace); protocol error (warn) |
-| AOF | `server/aof.rs` | append `offset`/`bytes` (trace); fsync (debug); rewrite start/finish with generation + size (info); recovery replay summary — commands, bytes, duration (info) |
+| AOF | `server/aof.rs` | append `offset`/`bytes` (trace); fsync (debug); rewrite start/finish with generation + size (info); recovery replay summary — commands, bytes, duration (info); recovery failure with the failing path + `error` (error — it aborts startup); discarded AOF tail with `offset` + `aof_len`, never the bytes (warn — recovery survives it) |
 | Snapshot | `engine/snapshot.rs`, `server/aof.rs` | save start/finish with path + bytes + duration (info); load (info) |
-| Replication | `server/replication.rs` | PSYNC handshake steps (debug); replica register/prune with addr (info); offset progress (trace); per-command apply (debug) |
+| Replication | `server/replication.rs` | PSYNC handshake steps (debug); replica register/prune with addr (info); offset progress (trace); per-command apply (debug); `REPLICAOF` role transitions with `host_port`/`auth`/`source` (info); follower reaching in-sync (info) |
 | Cluster | `server/cluster.rs`, `server/dispatcher.rs` | topology loaded (info); MOVED redirect with `key`/slot/target node (debug) |
 | Slowlog | `server/slowlog.rs` | entry recorded, `cmd`/`key`/`elapsed_us` (warn — the threshold is operator-set, so crossing it is by definition notable) |
 | Metrics | `server/metrics.rs` | scrape served (trace) |
+
+**Startup's `shutdown (info)` event is deferred, not dropped.** There is no reachable code
+path to log it from: `rocket_mem::serve` (`server/connection.rs`) is an unconditional `loop`
+with no `break`, so it never returns to `main`, and the crate installs no `tokio::signal`
+handler anywhere — a `SIGTERM`/`SIGKILL` therefore ends the process before any Rust code,
+`tracing` included, would run. Emitting the event first requires adding real signal handling,
+which is a graceful-shutdown feature in its own right and well outside a logging change's
+scope. Recorded here rather than quietly deleted from the row, so the gap stays visible and
+so no future contributor bolts a shutdown subsystem onto a logging-scoped plan to justify one
+log line. The same note sits at the call site in `server/main.rs`, above the final `serve`
+call.
+
+**Engine's `per-key TTL expiry (trace)` event is deferred too** — recorded here on 2026-09-09
+by plan 21's closing audit, which found it to be the catalogue's one unbuilt row. The reason
+is [plan 13](../plans/2026-09-09-verbose-logging-plans/13-engine-expiry-and-eviction.md)'s:
+the only place it could fire is `Shard::get`/`with_ref`/`with_mut` discovering
+`entry.is_expired()` on *passive* expiry, which is deeper inside the per-read/write hot path
+than `Store::shard_index` — the placement plan 12 identified as the riskiest in the series and
+deliberately avoided by instrumenting the `Engine` facade instead. It needs its own plan with
+its own benchmark gate, not a line folded into a plan that changes other things at the same
+time. Everything else in the Engine row shipped, including eviction — whose row above now
+describes the three events as built, so only the *reasoning* for the shape remains here.
+
+The row originally promised a single `warn!` per eviction. That survives neither of the two
+volume axes. Within one cycle, `MAX_EVICTION_ATTEMPTS` is 1000, so a `warn` per key could be
+1000 lines from one call. Across cycles, `maybe_evict` runs after *every* mutation, so at
+`maxmemory` every write evicts and even a per-cycle `warn` is a per-write `warn` — the loudest
+line in such a deployment's log. Hence both per-eviction events at `debug`. What an operator
+actually needs at the default level is "this node is evicting", so that is what the `warn`
+roll-up says (`maxmemory eviction active`), immediately on the first eviction and at most once
+a minute after: its volume is a function of wall time, never of the write rate.
+
+**The File column names the subsystem, not always the file the event landed in.** The audit
+found five rows whose event exists but lives elsewhere, in every case because the value the
+event reports is only in scope at the dispatcher: the `HELLO`/RESP3 upgrade (Connection row →
+`dispatcher.rs`), all four ACL events (ACL row → `dispatcher.rs`; `acl.rs` has no call site of
+its own), AOF rewrite start/finish (AOF row → `dispatcher.rs`), snapshot save start/finish
+(Snapshot row → `dispatcher.rs`; `engine/snapshot.rs` has no call site either), and replica
+registration (Replication row → `connection.rs`, next to the `PSYNC` interception that
+performs it; the matching *prune* event is in `replication.rs` as the row says). Read the
+column as "which subsystem", and `grep` for the message rather than opening the named file.
 
 ## Configuration
 
@@ -151,11 +225,77 @@ The reasoning from the previous spec still holds: log statements added alongside
 
 Three things here *are* real logic and are tested:
 
-1. **`redact_args`** — unit tests asserting `AUTH`, `HELLO ... AUTH`, `ACL SETUSER`, and `ACL GETUSER` argument lists never render their secret, at any level.
-2. **`fmt_value`** — unit tests for the cap boundary, the `…(N more)` marker, and binary-safe escaping of non-printable bytes.
+1. **`redact_args`** — unit tests asserting `AUTH`, `HELLO ... AUTH`, `ACL SETUSER`, `ACL GETUSER`, and `REPLICAOF ... AUTH` argument lists never render their secret, at any level. This list must stay identical to `is_sensitive`'s match arms; when they drift, the arms are the authority and this line is the bug.
+2. **`fmt_value`** — unit tests for the cap boundary, the `…(N more)` marker, and binary-safe escaping of non-printable bytes — including Unicode `Zl`/`Zp` (U+2028/U+2029), which `char::is_control()` does *not* cover.
 3. **Level separation** — one integration test asserting that a subscriber at `info` emits no per-command lines while the same workload at `debug` does. This guards against a level regression silently enabling the firehose in production, which is the failure mode with the worst consequences here.
 
 Everything else is verified as the previous round was: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, then a live server run inspected by eye at each of `info`, `debug`, and `trace`.
+
+## Decisions established during execution
+
+Everything below was settled empirically while the plans ran, and existed only in commit messages and review reports. Recorded here so it is not re-litigated by the next reader of this spec.
+
+### Span-field duplication is only real when the span is enabled
+
+An event nested inside a span inherits that span's fields, so repeating `cmd`/`key` on the event looks like duplication to delete. It is only duplication when **the event's level is at or below the span's level**. The `cmd` span is a `debug_span!`; at this project's production default of `info` it is never entered, and a nested `warn!` inherits nothing from it — there is no ambient context to defer to. An event at `info`/`warn`/`error` inside a `debug_span!` must therefore carry its own `cmd`/`key`, or it will name no command at all in exactly the deployment an operator is reading.
+
+The worked example is plan 19's slowlog event (`slowlog.rs`'s `slow command recorded`): it fires at `warn`, which is visible at the default, from inside the `debug_span!`, which is not. Verified empirically under both `with_max_level` and `EnvFilter`, not argued from the docs.
+
+**The qualification that makes this rule safe (plan 22).** The level test has an unstated premise: that the span exists at all. `dispatch` has three non-test callers, and only `dispatch_and_log` opens the `cmd` span — `aof.rs`'s `replay_with_stats` (AOF recovery replay) and `replication.rs`'s `sync_once` (the follower apply loop) call `dispatch` directly, with no `cmd` span anywhere on the stack. On those two paths an event's own fields are the *only* record of which command it concerned, at every level. Stated without this caveat, the rule would license deleting fields that are load-bearing on both.
+
+### Redaction: what is structural, and what is residue
+
+`acl::AclUser`, `config::AclUserConfig` and `config::Config` all have hand-written redacting `Debug` impls, so a `{:?}` anywhere in the codebase cannot print credential material — that half of the policy is structural, not merely a call-site rule. The three impls differ deliberately:
+
+- `AclUser::rules` is `Vec<AclRule>`, a **parsed enum** that structurally cannot hold a credential, so it renders verbatim — useful for debugging, and safe by construction.
+- `AclUserConfig::rules` is `Vec<String>` of **raw `ACL SETUSER` tokens**, where `>password` is a plaintext secret, so it renders as a count. The count preserves the field's one operational use ("did this user's rules load at all?") without rendering any token.
+- `Config::replicaof_auth_password` renders as `Some("<redacted>")` / `None`. The `Option` shape survives redaction because "a leader password is configured" is a routine, non-secret operational fact, and collapsing it with "none configured" would only make an auth misconfiguration harder to spot — the same reasoning `AclUserConfig`'s `<nopass>` rests on.
+
+**`Config`'s own `Debug` was hand-written on 2026-09-10, reversing this section's original decision.** It previously read: *"`Config`'s own `Debug` stays derived, on purpose. A hand-written impl over a struct with this many fields has no compile-time check for a field someone forgets to add, so it would silently start omitting new configuration while looking exhaustive; and a cert/key path is a filename, not key material."* Both halves of that stopped holding:
+
+- The **premise** failed first. The `replicaof` config-file work added `replicaof_auth_password`, a *plaintext leader credential*, to `Config`. The original reasoning explicitly rested on the residue being usernames and filenames; it never contemplated a secret sitting directly on the struct behind a derived `Debug`. The leak was latent, not active — no call site passed `Config` to a `?` sigil, and `main.rs`'s summary enumerates fields by hand — but the guard had degraded from structure to discipline.
+- The **objection** turned out to be answerable. A hand-written `Debug` that opens with `let Config { addr, rmp_addr, … } = self;` and **no `..` rest pattern** is exhaustive at compile time: adding a field to `Config` makes the impl fail to compile with *"pattern does not mention field `x`"*. So the "no compile-time check for a forgotten field" objection is a property of the *field-by-field `debug_struct` chain*, not of hand-writing the impl. Destructuring removes it — and covers the failure mode the original decision did not consider, a future field that is itself a secret, by forcing a decision on every new field at the one place a doc comment explains the policy.
+
+The alternative considered and rejected was a `SecretString` newtype with a redacting `Debug` and transparent `serde` impls. It is compile-time safe for the field it wraps and would have covered `Cli` too, but it protects only fields whose author reaches for the type — a future `Option<String>` secret would leak exactly as this one did — while changing a field type in freshly-merged code, touching figment layering, `validate_replicaof`, `replicaof_auth`, and every test constructing the field. The destructured impl is a strict superset *within `Config`*, at zero blast radius, and matches the pattern the two ACL impls already established.
+
+`config::Cli` **lost its derived `Debug` entirely** in the same change. It holds the same plaintext password, earlier than `Config` sees it, so fixing only `Config` would have left the CLI layer leaking. Nothing in the workspace formats a `Cli`; removing the impl is the stronger guard, because `?cli` then fails to compile rather than merely being discouraged.
+
+Residue, recorded honestly rather than papered over: a `?config` still renders the ACL **usernames**, `replicaof_auth_username`, and the TLS cert/key/CA **paths**. That is deliberate — a filename is not key material, and hiding it would only make a TLS or auth misconfiguration harder to diagnose. What is no longer residue is any password. The standing call-site rule survives unchanged for that reason — enumerate the fields explicitly, never `?config` — and `main.rs`'s config-summary event still carries a comment saying so directly above it.
+
+### `REPLICAOF` transitions log at the handle, not at the command
+
+The `info` row's "`REPLICAOF` transitions" was promised from the first draft of this spec and **was never built** — `handle_replicaof`, `start_replicating_with_auth` and `stop_replicating` carried no `tracing::` call at any level until 2026-09-10, so promotion and demotion, the state change most asked about during an incident, were silent. The `replicaof` config-file work then added a third way to become a follower (the startup auto-connect), which was silent too.
+
+All three now emit **one** event, and it lives at the `ReplicationHandle` choke points — a private `start_replicating_inner` that both public start methods funnel through, and `stop_replicating` — rather than at each call site. The reason is the same one that motivated the redacting `Debug` impls: a call-site rule can be lost by whoever adds a fourth entry point, while a choke point cannot. `dispatcher.rs`'s `handle_replicaof` therefore has no `tracing::` call of its own and carries a comment saying where the event lives and why, so its absence reads as a decision rather than an omission.
+
+The one thing the entry points know that the handle cannot derive is what triggered the transition, so that — and only that — is passed down, as `source`. An operator has to be able to tell "a client told this node to follow" from "this node started up already following"; the two have different causes and different fixes, and without the field they render identically.
+
+Two events, not one, on the stop path: `REPLICAOF NO ONE` against a node that was never a follower is a no-op, so it logs at `debug` ("stop requested, but node was not a follower") instead of claiming a promotion that did not happen. An operator reading "promoted to leader" during a failover has to be able to trust it.
+
+### `snapshot loaded` was two different events sharing one message
+
+`replication.rs`'s `debug!("snapshot loaded")` sits immediately before `link_up.store(true)` — it *is* the moment a follower becomes in-sync. At `info` that made a synced follower and one still stuck in the reconnect loop emit identical output: nothing. It is now `info!(bytes, "follower in sync with leader")`.
+
+The rename is not cosmetic. `aof.rs` already had an `info`-level `snapshot loaded` on the **recovery** path, so both events would have been visible at the production default under one message meaning opposite things — "this node restored its own state" versus "this node took the leader's state". This is the same defect the `path` → `aof_path`/`snapshot_path` entry above records, one level up: there the *field* name conflated two files, here the *message* conflated two events. The message is the primary grep key, so a collision there is the worse of the two.
+
+`host_port` is not repeated on the event: the enclosing `repl` span is `#[instrument]`'s default `info` level and is therefore entered at the production default, so the field is inherited. That is the span-field-duplication rule above applied in the direction that *permits* omission — the rule only forbids relying on a span whose level is below the event's.
+
+### Redaction tests must be mutation-checked
+
+An absence assertion is only as strong as its fixture: `assert!(!rendered.contains("password"))` against a config that contains no password proves nothing and passes forever. This was a real defect, caught in plan 20's review, not a hypothetical. Any test asserting a secret is *absent* must be run once against a fixture that genuinely contains that secret, and must be seen to fail when the redaction is removed.
+
+### Known, deliberate non-fix: `SLOWLOG GET` still exposes a keyless command's first argument
+
+Plan 22 closed the `ECHO`/`PING` value leak in the **log fields** (`logged_key` reports those commands as keyless) but not in `SlowLogEntry.key`, which still stores the command's first argument. `SLOWLOG GET` therefore hands an uncapped client-supplied payload to any client permitted to run `SLOWLOG` — the same leak as the log one, on a surface that needs no filesystem access to read.
+
+The argument for fixing it is the codebase's own: `command_key_and_arity` already special-cases `AUTH` precisely because logging its argument "would leak the password through `SLOWLOG GET`". Extending that reasoning to every `KeySpec::None` command is the obvious next step.
+
+It was **not** done here for two reasons, and neither is a defence of the current behaviour:
+
+1. It changes a client-visible surface, which is outside this series' scope. The constraint that protected it during plan 22 was a scope guard, nothing more.
+2. rocket-mem's slowlog stores key + arity rather than Redis's full argument list, so "what should a keyless command's slowlog entry show" is a design question with more than one defensible answer — not a cleanup.
+
+The natural home is **Sprint 8's ACL work**, which is already reasoning about what a permitted client may see.
 
 ## Out of scope
 
