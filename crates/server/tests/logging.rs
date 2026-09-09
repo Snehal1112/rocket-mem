@@ -566,3 +566,62 @@ async fn a_replica_registering_and_being_pruned_are_both_logged_at_info() {
         "expected a prune log naming the same address:\n{text}"
     );
 }
+
+/// `SlowLog::maybe_record`'s `warn!` -- lives here rather than as a `#[cfg(test)]` capture
+/// assertion inside `crates/server/src/slowlog.rs` itself, per this file's established rule
+/// (see the comment block above): every other test in that file's own `mod tests` calls
+/// `maybe_record` at or over its threshold with no subscriber installed, which would reach the
+/// new `warn!` callsite first in the ~575-test unit binary that file compiles into and could
+/// permanently decide it's uninteresting before this test's own capture subscriber gets a turn.
+/// This file has nothing else that ever reaches that callsite.
+#[test]
+fn maybe_record_only_warns_when_the_command_actually_gets_recorded() {
+    let log = rocket_mem::slowlog::SlowLog::with_threshold(Duration::from_millis(10));
+
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(BufferWriter(Arc::clone(&buffer)))
+        .with_max_level(tracing::Level::WARN)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    // Under the threshold: the hot path every command takes. Must not log anything at all --
+    // getting this backwards would put a `warn!` on the hottest path in the project.
+    log.maybe_record(
+        "GET",
+        Some(Bytes::from_static(b"fast")),
+        1,
+        Duration::from_micros(50),
+    );
+    let after_fast_command =
+        String::from_utf8(buffer.lock().unwrap_or_else(|e| e.into_inner()).clone())
+            .expect("subscriber output is utf-8");
+    assert!(
+        after_fast_command.is_empty(),
+        "a command under the threshold must not log a warning, got:\n{after_fast_command}"
+    );
+
+    // At/over the threshold: must log, with the command, key, and elapsed microseconds.
+    log.maybe_record(
+        "LRANGE",
+        Some(Bytes::from_static(b"mylist")),
+        3,
+        Duration::from_millis(25),
+    );
+    drop(_guard);
+    let text = String::from_utf8(buffer.lock().unwrap_or_else(|e| e.into_inner()).clone())
+        .expect("subscriber output is utf-8");
+    assert!(
+        text.contains("LRANGE"),
+        "expected the command name in the slowlog warning:\n{text}"
+    );
+    assert!(
+        text.contains("mylist"),
+        "expected the key in the slowlog warning:\n{text}"
+    );
+    assert!(
+        text.contains("25000"),
+        "expected elapsed_us (25000) in the slowlog warning:\n{text}"
+    );
+}

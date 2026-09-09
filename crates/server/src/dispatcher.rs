@@ -2965,7 +2965,13 @@ fn command_key_and_arity(frame: &Frame) -> (Option<Bytes>, usize) {
     (key, items.len().saturating_sub(1))
 }
 
-/// Renders `command_key_and_arity`'s first key for the `cmd` span's `key` field.
+/// Renders `command_key_and_arity`'s first key for a log field -- the `cmd` span's `key` here,
+/// and reused by `SlowLog::maybe_record`'s `warn!` for the same reason (see that fn's doc
+/// comment for why that event needs its own copy of the key rather than leaning on the span).
+///
+/// `pub(crate)` rather than private: `slowlog.rs` needs the same lossy-UTF-8, never-`Debug`
+/// rendering this fn already gives the `cmd` span, and duplicating the logic would risk the two
+/// diverging.
 ///
 /// A `Bytes` must never reach a log line through `Debug`: that impl renders byte-by-byte, so a
 /// key logged with `?` comes out unreadable *and* costs O(len) of formatting on the hottest
@@ -2976,7 +2982,7 @@ fn command_key_and_arity(frame: &Frame) -> (Option<Bytes>, usize) {
 /// `None` -- a keyless command such as `PING`, and `AUTH`, which `command_key_and_arity`
 /// deliberately reports as keyless -- renders as the empty string rather than a literal
 /// `"None"`, so a `key=` field is either a real key or visibly absent.
-fn key_field(key: Option<&Bytes>) -> std::borrow::Cow<'_, str> {
+pub(crate) fn key_field(key: Option<&Bytes>) -> std::borrow::Cow<'_, str> {
     match key {
         Some(k) => String::from_utf8_lossy(k),
         None => std::borrow::Cow::Borrowed(""),

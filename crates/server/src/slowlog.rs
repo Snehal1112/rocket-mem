@@ -80,6 +80,29 @@ impl SlowLog {
             .unwrap_or(0);
         let duration_micros = elapsed.as_micros().min(i64::MAX as u128) as i64;
 
+        // Reached only past the early return above -- i.e. only when a command actually
+        // crosses the operator-configured threshold, never on the common under-threshold path
+        // every other command takes (the hottest path in the project). `warn`, not `debug`:
+        // the threshold is operator-configured, so crossing it is by definition something the
+        // operator asked to be told about.
+        //
+        // `cmd`/`key` here duplicate the enclosing `cmd` span's own fields -- but only when
+        // that span happens to be visible. The span is opened with `debug_span!`, so at this
+        // project's documented production default of `info` the span is never entered at all
+        // (verified: a `warn!` nested in a filtered-out `debug_span!` carries none of the
+        // span's fields -- there's no ambient context to omit these in favour of). Since this
+        // event fires at `warn`, which *is* visible at that default, it has to carry `cmd`/
+        // `key` itself, or a production-default deployment's slowlog warning would name no
+        // command and no key at all. `key` goes through `key_field` -- the same lossy-UTF-8
+        // rendering the `cmd` span already uses -- never `?` on the raw `Bytes`, which renders
+        // byte-by-byte.
+        tracing::warn!(
+            cmd = %command,
+            key = %crate::dispatcher::key_field(key.as_ref()),
+            elapsed_us = duration_micros,
+            "slow command recorded"
+        );
+
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let entry = SlowLogEntry {
             id: state.next_id,
@@ -263,4 +286,17 @@ mod tests {
         log.maybe_record("GET", None, 1, Duration::from_millis(10));
         assert_eq!(log.len(), 1);
     }
+
+    // A capture assertion on `maybe_record`'s `warn!` output does not live here. `tracing`
+    // caches callsite `Interest` per callsite, process-globally, the first time that callsite
+    // is reached (see `test(logging): stop asserting on captured logs from unit-test binaries`
+    // for the two tests this bit for real). Every other test above calls `maybe_record` with an
+    // elapsed time at or over its threshold and *no* subscriber installed, which would reach
+    // this file's `warn!` callsite first and could permanently decide it's uninteresting before
+    // a later test's own capture subscriber gets a turn -- in the ~575-test unit binary this
+    // file compiles into, whose subscribers install and drop constantly, that risk is real
+    // rather than theoretical. `maybe_record_only_warns_when_the_command_actually_gets_recorded`
+    // lives in `crates/server/tests/logging.rs` instead, a separate, much smaller integration
+    // binary where this callsite is touched by nothing else. Do not re-add a capture assertion
+    // here.
 }
