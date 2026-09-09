@@ -158,6 +158,11 @@ impl AofWriter {
     /// from. They differ only when opening at a non-zero generation.
     fn open_with_base(path: &Path, base_path: &Path, policy: FsyncPolicy) -> std::io::Result<Self> {
         let file = OpenOptions::new().create(true).append(true).open(path)?;
+        // The writer thread processes `AofMsg`s strictly one at a time, so this plain `u64` —
+        // not an atomic — is the whole cost of tracking the running offset for the trace log
+        // below. No cross-thread synchronization, and `append_encoded`/`fsync` on the calling
+        // side never touch it.
+        let mut offset = file.metadata().map(|m| m.len()).unwrap_or(0);
         let mut writer = BufWriter::new(file);
         let (tx, rx) = mpsc::sync_channel::<AofMsg>(AOF_QUEUE_CAPACITY);
 
@@ -169,8 +174,13 @@ impl AofWriter {
                         // Fire-and-forget: the caller already returned, so stderr is the only
                         // place an error can go.
                         AofMsg::Append(bytes) => {
-                            if let Err(e) = writer.write_all(&bytes) {
-                                tracing::error!(error = %e, "aof append failed");
+                            let len = bytes.len() as u64;
+                            match writer.write_all(&bytes) {
+                                Ok(()) => {
+                                    tracing::trace!(offset, bytes = len, "aof append");
+                                    offset += len;
+                                }
+                                Err(e) => tracing::error!(error = %e, "aof append failed"),
                             }
                         }
                         // The acked variants hand the real I/O result back to the waiting
@@ -178,14 +188,23 @@ impl AofWriter {
                         // write was requested. A failed send just means the caller gave up
                         // waiting; dropping the result is the only sensible response.
                         AofMsg::AppendAndFsync(bytes, ack) => {
+                            let len = bytes.len() as u64;
                             let result = writer
                                 .write_all(&bytes)
                                 .and_then(|_| writer.flush())
                                 .and_then(|_| writer.get_ref().sync_data());
+                            if result.is_ok() {
+                                tracing::trace!(offset, bytes = len, "aof append");
+                                offset += len;
+                                tracing::debug!(offset, "aof fsync");
+                            }
                             let _ = ack.send(result);
                         }
                         AofMsg::Flush(ack) => {
                             let result = writer.flush().and_then(|_| writer.get_ref().sync_data());
+                            if result.is_ok() {
+                                tracing::debug!(offset, "aof fsync");
+                            }
                             let _ = ack.send(result);
                         }
                         AofMsg::CheckIntact(path, ack) => {
@@ -203,6 +222,10 @@ impl AofWriter {
                             });
                             let result = match result {
                                 Ok(file) => {
+                                    // Not always 0: `rotate_to`'s own doc comment notes the new
+                                    // path may already have content from an interrupted previous
+                                    // rewrite, in which case appends resume after it, not at 0.
+                                    offset = file.metadata().map(|m| m.len()).unwrap_or(0);
                                     writer = BufWriter::new(file);
                                     Ok(())
                                 }
