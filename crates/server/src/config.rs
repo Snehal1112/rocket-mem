@@ -286,6 +286,24 @@ pub fn validate_tls(config: &Config) -> Result<(), std::io::Error> {
     Ok(())
 }
 
+/// Enforces "replicaof_auth_username and replicaof_auth_password must both be set, or neither" --
+/// see `docs/superpowers/specs/2026-09-09-replicaof-config-file-spec.md`. Does NOT validate
+/// `replicaof` itself (a missing port, unresolvable host, etc.): that is only discoverable by
+/// actually attempting the connection, exactly like the existing live `REPLICAOF` command already
+/// behaves, so a bad `replicaof` value fails soft (the background reconnect loop retries forever)
+/// rather than blocking startup. `main.rs` calls this before wiring up replication.
+pub fn validate_replicaof(config: &Config) -> Result<(), std::io::Error> {
+    let has_username = config.replicaof_auth_username.is_some();
+    let has_password = config.replicaof_auth_password.is_some();
+    if has_username != has_password {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "replicaof_auth_username and replicaof_auth_password must both be set, or neither",
+        ));
+    }
+    Ok(())
+}
+
 /// Resolves the log filter directive: `RUST_LOG`, when set, wins over `log_level` -- the
 /// standard `tracing` convention of letting an operator's env var override any code- or
 /// config-file-supplied default. Returns a plain `String` (not an `EnvFilter`) so this stays
@@ -605,5 +623,47 @@ mod tests {
     fn validate_tls_accepts_fully_unconfigured_tls() {
         let cfg = Config::default();
         assert!(validate_tls(&cfg).is_ok());
+    }
+
+    #[test]
+    fn validate_replicaof_rejects_username_without_password() {
+        let cfg = Config {
+            replicaof_auth_username: Some("app".to_string()),
+            ..Config::default()
+        };
+        assert!(validate_replicaof(&cfg).is_err());
+    }
+
+    #[test]
+    fn validate_replicaof_rejects_password_without_username() {
+        let cfg = Config {
+            replicaof_auth_password: Some("changeme".to_string()),
+            ..Config::default()
+        };
+        assert!(validate_replicaof(&cfg).is_err());
+    }
+
+    #[test]
+    fn validate_replicaof_accepts_both_set_or_both_unset() {
+        assert!(validate_replicaof(&Config::default()).is_ok());
+        let cfg = Config {
+            replicaof: Some("127.0.0.1:6400".to_string()),
+            replicaof_auth_username: Some("app".to_string()),
+            replicaof_auth_password: Some("changeme".to_string()),
+            ..Config::default()
+        };
+        assert!(validate_replicaof(&cfg).is_ok());
+    }
+
+    #[test]
+    fn validate_replicaof_accepts_no_auth_at_all() {
+        let cfg = Config {
+            replicaof: Some("127.0.0.1:6400".to_string()),
+            ..Config::default()
+        };
+        assert!(
+            validate_replicaof(&cfg).is_ok(),
+            "replicaof with no ACL-protected leader needs no auth fields at all"
+        );
     }
 }
