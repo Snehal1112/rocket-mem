@@ -955,7 +955,11 @@ mod tests {
         drop(_guard);
         let text = captured.text();
         assert!(
-            text.contains("repl") && text.contains("host_port") && text.contains("127.0.0.1:9999"),
+            // `repl{host_port=`, not `repl` and `host_port` separately: `serve_replica`'s own
+            // name contains `repl`, so the separate form would have passed under
+            // `#[instrument]`'s default name too. Same reasoning as the span-name section at
+            // the bottom of `tests/logging.rs`.
+            text.contains("repl{host_port=") && text.contains("127.0.0.1:9999"),
             "expected a new `repl` span carrying host_port=\"127.0.0.1:9999\", got:\n{text}"
         );
     }

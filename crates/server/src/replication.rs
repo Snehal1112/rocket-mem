@@ -1695,8 +1695,13 @@ mod tests {
         drop(_guard);
 
         let text = captured.text();
+        // `repl{host_port=`, not `repl` and `host_port` separately: the separate form matched
+        // the function's own name (`replication_client_loop` contains `repl`) and so could not
+        // tell a correctly-named span from `#[instrument]`'s default, which is the exact bug
+        // that went unnoticed on the connection span for ~80 commits. See the span-name section
+        // at the bottom of `tests/logging.rs`.
         assert!(
-            text.contains("repl") && text.contains("host_port") && text.contains(&host_port),
+            text.contains("repl{host_port=") && text.contains(&host_port),
             "expected a new `repl` span carrying host_port={host_port:?}, got:\n{text}"
         );
     }

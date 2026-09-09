@@ -1166,3 +1166,90 @@ fn an_unbounded_username_is_capped_before_it_reaches_the_log() {
         output.len()
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// Span *names*, as they render.
+//
+// The spec fixes three span names -- `conn`, `cmd`, `repl` -- and the whole point of fixing them
+// is that an operator greps for them. Every assertion in this file up to here checked span
+// *fields* instead: `a_replica_registering_and_being_pruned_are_both_logged_at_info`'s
+// `protocol=RESP`, `the_span_carries_the_command_name_and_arity`'s `cmd=`/`argc=`. A field
+// assertion passes identically no matter what the span is called, which is exactly how the
+// connection span went ~80 commits rendering as `handle_connection` -- `#[instrument]` defaults
+// the name to the function's -- before anyone noticed.
+//
+// Each assertion below pins one name *together with its first field* (`conn{conn_id=`, not just
+// `conn`), so it matches the rendered span header rather than the same letters appearing
+// anywhere in a message or a target path.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn the_per_command_span_renders_under_the_name_cmd() {
+    let output = capture_at("debug");
+    assert!(
+        output.contains("cmd{cmd="),
+        "the per-command span is not rendering as `cmd`; output was:\n{output}"
+    );
+}
+
+/// `conn` and `repl` in one capture because one PSYNC produces both: `serve_replica`'s `repl`
+/// span opens inside the connection task's already-open `conn` span, so an event from within it
+/// renders the full `conn{…}:repl{…}:` prefix an operator would grep.
+#[tokio::test]
+async fn the_connection_and_replication_spans_render_under_the_names_conn_and_repl() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let engine = Arc::new(engine::Engine::new());
+    let dir = tempfile::tempdir().expect("tempdir");
+    let aof = Arc::new(
+        rocket_mem::aof::AofWriter::open(
+            &dir.path().join("span-names.aof"),
+            rocket_mem::aof::FsyncPolicy::Never,
+        )
+        .expect("open aof"),
+    );
+    let replication = Arc::new(rocket_mem::replication::ReplicationHandle::new(
+        Arc::clone(&engine),
+        dir.path().join("span-names.snapshot"),
+    ));
+    tokio::spawn(rocket_mem::serve(
+        listener,
+        Arc::clone(&engine),
+        Arc::clone(&aof),
+        Arc::clone(&replication),
+    ));
+
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(BufferWriter(Arc::clone(&buffer)))
+        .with_env_filter(EnvFilter::new("info"))
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let mut framed = Framed::new(
+        TcpStream::connect(addr).await.unwrap(),
+        protocol::codec::RespCodec::default(),
+    );
+    framed
+        .send(Frame::Array(vec![
+            Frame::Bulk(Bytes::from_static(b"PSYNC")),
+            Frame::Bulk(Bytes::from_static(b"127.0.0.1:6481")),
+        ]))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await; // let serve_replica register
+
+    drop(_guard);
+    let bytes_out = buffer.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let text = String::from_utf8(bytes_out).expect("subscriber output is utf-8");
+
+    assert!(
+        text.contains("conn{conn_id="),
+        "the connection span is not rendering as `conn`; output was:\n{text}"
+    );
+    assert!(
+        text.contains("repl{host_port="),
+        "the leader-side replication span is not rendering as `repl`; output was:\n{text}"
+    );
+}
