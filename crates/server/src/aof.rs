@@ -1179,6 +1179,88 @@ mod tests {
         }
     }
 
+    /// Job 2: `SAVE` must produce a point-in-time cut of (offset, keyspace). If the offset is read
+    /// at one instant and the walk happens at another, recovery replays commands the snapshot
+    /// already contains -- which double-counts every non-idempotent command. INCR is used
+    /// deliberately: with SET this bug is invisible.
+    #[test]
+    fn a_save_racing_writes_produces_a_replayable_point_in_time_cut() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let aof_path = dir.path().join("cut.aof");
+        let snapshot_path = dir.path().join("cut.snapshot");
+        let aof = Arc::new(AofWriter::open(&aof_path, FsyncPolicy::Never).unwrap());
+        let engine = Arc::new(engine::Engine::new());
+        let replication = Arc::new(crate::replication::ReplicationHandle::new(
+            Arc::clone(&engine),
+            snapshot_path.clone(),
+        ));
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut writers = Vec::new();
+        for w in 0..4 {
+            let engine = Arc::clone(&engine);
+            let aof = Arc::clone(&aof);
+            let replication = Arc::clone(&replication);
+            let stop = Arc::clone(&stop);
+            writers.push(std::thread::spawn(move || {
+                let key = format!("counter{w}");
+                let mut issued = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    let frame = protocol::Frame::Array(vec![
+                        protocol::Frame::Bulk(bytes::Bytes::from_static(b"INCR")),
+                        protocol::Frame::Bulk(bytes::Bytes::from(key.clone())),
+                    ]);
+                    crate::dispatcher::dispatch_and_log(
+                        &engine,
+                        &aof,
+                        &replication,
+                        frame,
+                        &crate::dispatcher::Session::new(),
+                        1,
+                    );
+                    issued += 1;
+                }
+                issued
+            }));
+        }
+
+        // Fire SAVEs while the counters are climbing, so at least one cut is taken mid-flight.
+        for _ in 0..20 {
+            crate::dispatcher::dispatch_and_log(
+                &engine,
+                &aof,
+                &replication,
+                protocol::Frame::Array(vec![protocol::Frame::Bulk(bytes::Bytes::from_static(
+                    b"SAVE",
+                ))]),
+                &crate::dispatcher::Session::new(),
+                1,
+            );
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        for w in writers {
+            w.join().unwrap();
+        }
+        aof.fsync().unwrap();
+
+        // The AOF alone is the reference: every INCR, replayed once. Snapshot-plus-tail must land
+        // on exactly the same counters. A non-atomic cut double-counts and these diverge.
+        let from_aof_only = recover(&aof_path, &dir.path().join("absent.snapshot")).unwrap();
+        let from_snapshot_and_tail = recover(&aof_path, &snapshot_path).unwrap();
+        for w in 0..4 {
+            let key = format!("counter{w}");
+            assert_eq!(
+                from_snapshot_and_tail.get(key.as_bytes()),
+                from_aof_only.get(key.as_bytes()),
+                "snapshot+tail diverged from full replay at {key}"
+            );
+        }
+    }
+
     /// Duplicate indices must not self-deadlock: `MSET k1 v1 k1 v2` and any command whose keys
     /// collide onto one shard reach `lock_shards` with repeats.
     #[test]
