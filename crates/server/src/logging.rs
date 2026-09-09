@@ -61,13 +61,23 @@ pub fn is_sensitive(cmd: &str, args: &[Bytes]) -> bool {
 /// escape (which would repaint the operator's terminal) -- neither may reach the log
 /// verbatim. `cap` is counted against the *stored* bytes, before escaping expands them, so
 /// the dropped-byte count stays a true statement about the value.
+///
+/// The escape set is Unicode category `Cc` (`char::is_control()`: C0 controls, DEL, and C1
+/// controls -- this already covers NEL U+0085 and CSI U+009B) plus `\x7f` DEL itself, plus
+/// categories `Zl`/`Zp` (U+2028 LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR). `Zl`/`Zp` are
+/// not controls and cannot move a terminal cursor, but Unicode-aware log consumers (log
+/// shipper multiline filters, Python's `str.splitlines()`, PCRE's `\R`) treat them as hard
+/// line breaks, so a stored value containing one could forge a second log record downstream
+/// just as `\n` would. Both code points exceed 0xFF, so they render as `\x2028`/`\x2029`
+/// under the same `\xNN` format -- unambiguous, so no second escape format is needed.
 pub fn fmt_value(bytes: &[u8], cap: usize) -> String {
     let shown = &bytes[..cap.min(bytes.len())];
     let mut out = String::with_capacity(shown.len());
     // Decoded lossily first so multi-byte UTF-8 survives as characters rather than being
-    // escaped byte-by-byte; only genuine control characters are then expanded.
+    // escaped byte-by-byte; only genuine control characters (plus the Zl/Zp line-breaking
+    // separators) are then expanded.
     for c in String::from_utf8_lossy(shown).chars() {
-        if c.is_control() || c == '\x7f' {
+        if c.is_control() || c == '\x7f' || c == '\u{2028}' || c == '\u{2029}' {
             out.push_str(&format!("\\x{:02x}", c as u32));
         } else {
             out.push(c);
@@ -313,5 +323,22 @@ mod tests {
         );
         assert_eq!(rendered, "<redacted>");
         assert!(!rendered.contains("changeme"));
+    }
+
+    #[test]
+    fn fmt_value_escapes_unicode_line_and_paragraph_separators() {
+        // U+2028 LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR are not covered by
+        // `char::is_control()` (they are categories Zl/Zp, not Cc), but Unicode-aware log
+        // consumers treat them as hard line breaks, so a stored value containing one could
+        // forge a second log record downstream.
+        assert_eq!(fmt_value("a\u{2028}b".as_bytes(), 128), "a\\x2028b");
+        assert_eq!(fmt_value("a\u{2029}b".as_bytes(), 128), "a\\x2029b");
+    }
+
+    #[test]
+    fn fmt_value_still_keeps_ordinary_multibyte_utf8_unescaped() {
+        // Guards against an overbroad fix that escapes all non-ASCII characters instead of
+        // just the line/paragraph separators.
+        assert_eq!(fmt_value("kéy ok!".as_bytes(), 128), "kéy ok!");
     }
 }
