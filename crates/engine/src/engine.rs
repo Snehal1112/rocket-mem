@@ -182,6 +182,16 @@ impl Engine {
         self.eviction_count.load(Ordering::Relaxed)
     }
 
+    /// The size `maybe_evict` reports as freed when it evicts `key`, matching `Shard`'s own
+    /// `entry_size` formula (`key.len() + value.approx_size()`, see `shard.rs`) -- not a
+    /// store-wide `memory_used()` before/after delta, which a concurrent write on another shard
+    /// could skew arbitrarily (see this change's commit message). Reads the key's own accounted
+    /// size directly, immediately before the caller deletes it.
+    fn evicted_entry_size(&self, key: &[u8]) -> usize {
+        self.store
+            .with_ref(key, |v| v.map_or(0, |v| key.len() + v.approx_size()))
+    }
+
     /// Samples a handful of entries per shard and evicts the one with the oldest recorded
     /// touch, repeating until back under budget or `MAX_EVICTION_ATTEMPTS` is hit — a bounded
     /// loop even if the ceiling is misconfigured smaller than a single entry.
@@ -207,13 +217,7 @@ impl Engine {
             let Some((key, _)) = candidates.into_iter().min_by_key(|(_, tick)| *tick) else {
                 break; // nothing left to evict
             };
-            // The evicted key's own accounted size, matching `Shard`'s own formula
-            // (`key.len() + value.approx_size()`, see `shard.rs`'s `entry_size`) -- not a
-            // store-wide before/after delta, which a concurrent write on another shard could
-            // skew arbitrarily (see this change's commit message).
-            let freed = self
-                .store
-                .with_ref(&key, |v| v.map_or(0, |v| key.len() + v.approx_size()));
+            let freed = self.evicted_entry_size(&key);
             self.store.del(&key);
             total_freed += freed;
             tracing::debug!(
@@ -612,188 +616,28 @@ mod tests {
         assert!(engine.memory_used() <= 300);
     }
 
-    /// Regression test for the bug this change fixes: `maybe_evict`'s per-key `bytes` field must
-    /// be the evicted key's own accounted size (`key.len() + value.approx_size()`, `shard.rs`'s
-    /// `entry_size` formula), never a store-wide `memory_used()` before/after delta. The old
-    /// delta approach was provably wrong under concurrent writes on OTHER shards: a background
-    /// writer changes the store-wide total in the gap between the two `memory_used()` reads, so
-    /// the "freed" figure it computed was really "net store-wide change", not "this key's size".
-    ///
-    /// To demonstrate that, this test hammers the store from background threads (via `Store::set`
-    /// directly, bypassing `maybe_evict` so the writers' own traffic doesn't add competing
-    /// eviction log lines) while the main thread drives evictions of keys of a known, fixed size.
-    /// The noise keys are kept continuously *fresher* than the `keyNNN` keys by advancing the
-    /// shared recency clock once per `keyNNN` insert -- every noise overwrite picks up whatever
-    /// tick is current, but a `keyNNN` entry's tick is fixed at insert time and only gets older
-    /// relative to the noise traffic from then on. That keeps `sample_for_eviction`'s
-    /// least-recently-touched pick landing on a `keyNNN` entry, not a noise entry, which matters
-    /// here for a reason unrelated to this bug: a noise entry can be concurrently deleted by
-    /// eviction on the very same shard its own writer thread is mid-overwrite of, and `Shard`'s
-    /// byte accounting (map mutation under lock, `bytes_used` adjusted just after releasing it)
-    /// is not itself race-free against that -- a separate, pre-existing gap this test is not
-    /// about and must not trip over.
-    ///
-    /// Every `keyNNN`-prefixed "evicted key" debug line must report exactly that key's own
-    /// accounted size -- a property the fix guarantees unconditionally (it never reads
-    /// `memory_used()` for the per-key figure), and the old code could violate under the
-    /// concurrent noise below.
+    /// Regression test for the bug fixed alongside this change: `maybe_evict`'s per-key `bytes`
+    /// figure must be the evicted key's own accounted size, never a store-wide `memory_used()`
+    /// before/after delta (which a concurrent write on another shard could skew arbitrarily).
+    /// `evicted_entry_size` is the whole of that computation now, so pinning it directly --
+    /// against `shard.rs`'s own `entry_size` formula -- covers the regression deterministically,
+    /// with no threads, no log capture, and nothing to race.
     #[test]
-    fn evicted_key_reports_its_own_size_not_a_store_wide_delta_under_concurrent_writes() {
-        use std::io;
-        use std::sync::{Arc, Mutex};
-        use tracing_subscriber::fmt::MakeWriter;
-        use tracing_subscriber::EnvFilter;
+    fn evicted_entry_size_matches_shards_own_entry_size_formula() {
+        let engine = Engine::new();
+        let value = Value::String(Bytes::from_static(b"a payload of known size"));
+        engine.set(Bytes::from_static(b"some-key"), value.clone());
 
-        #[derive(Clone)]
-        struct BufferWriter(Arc<Mutex<Vec<u8>>>);
-        impl io::Write for BufferWriter {
-            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-                self.0
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
-        impl<'a> MakeWriter<'a> for BufferWriter {
-            type Writer = BufferWriter;
-            fn make_writer(&'a self) -> Self::Writer {
-                self.clone()
-            }
-        }
+        // `shard.rs`'s `entry_size` formula, spelled out here rather than imported, so this test
+        // would fail if the two ever diverged instead of silently tracking a shared helper.
+        let expected = b"some-key".len() + value.approx_size();
+        assert_eq!(engine.evicted_entry_size(b"some-key"), expected);
+    }
 
-        let payload = Bytes::from(vec![b'x'; 50]);
-        let expected_size = "key000".len() + Value::String(payload.clone()).approx_size();
-
-        let buffer = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = tracing_subscriber::fmt()
-            .with_ansi(false)
-            .with_writer(BufferWriter(Arc::clone(&buffer)))
-            .with_env_filter(EnvFilter::new("debug"))
-            .finish();
-        // `with_default` builds a fresh `Dispatch` internally; keep our own handle to that exact
-        // `Dispatch` (it's `Arc`-backed and `Clone`) so a second thread can install the *same*
-        // dispatch as its own thread-local default -- see the healer thread below for why that
-        // matters.
-        let dispatch = tracing::Dispatch::new(subscriber);
-
-        // A generous ceiling: the noise writers keep a small, bounded pool of keys alive (see
-        // below), so their own footprint never dominates it, and each `keyNNN` insert past
-        // capacity still needs only about one eviction to get back under -- not up to
-        // `MAX_EVICTION_ATTEMPTS`, which under real concurrent write pressure across 16 shards'
-        // locks would make this test pathologically slow.
-        let engine = Arc::new(Engine::with_maxmemory(5_000));
-        // A stop flag, not a metric -- it exists only so the writer/healer threads keep running
-        // for the *entire* span the main thread spends evicting, instead of racing to finish
-        // early and then sitting idle for the rest of the test.
-        let stop = std::sync::atomic::AtomicBool::new(false);
-        let stop = Arc::new(stop);
-
-        tracing::dispatcher::with_default(&dispatch, || {
-            // `tracing`'s callsite `Interest` is cached process-wide the first time each
-            // callsite fires, based on whichever thread happens to trigger it -- and other tests
-            // in this binary trigger the very same "evicted key"/"maxmemory eviction cycle"
-            // callsites with no subscriber installed at all. If one of those wins the race to
-            // register the callsite first, on ITS thread (where the ambient default resolves to
-            // the process-wide no-op), the callsite is cached disabled *for every thread*,
-            // including this one, and a single `rebuild_interest_cache()` call here only fixes
-            // that up to the moment it runs -- a later registration from one of those other
-            // threads can re-poison it seconds later. This healer thread keeps re-registering
-            // interest from *inside* a scope where this exact `dispatch` is the thread-local
-            // default (so the registration resolves to our real subscriber, not the ambient
-            // no-op), for as long as the main thread below is still evicting, to keep closing
-            // that window.
-            let healer = {
-                let dispatch = dispatch.clone();
-                let stop = Arc::clone(&stop);
-                std::thread::spawn(move || {
-                    tracing::dispatcher::with_default(&dispatch, || {
-                        while !stop.load(Ordering::Relaxed) {
-                            tracing::callsite::rebuild_interest_cache();
-                            std::thread::yield_now();
-                        }
-                    });
-                })
-            };
-
-            let writers: Vec<_> = (0..2)
-                .map(|t| {
-                    let writer_engine = Arc::clone(&engine);
-                    let stop = Arc::clone(&stop);
-                    std::thread::spawn(move || {
-                        let mut i = 0usize;
-                        while !stop.load(Ordering::Relaxed) {
-                            // A bounded pool of 5 keys per writer, repeatedly overwritten with a
-                            // varying size -- each overwrite still perturbs `memory_used()` on
-                            // whatever shard that key landed on (see `Shard::set`'s old/new size
-                            // reaccounting), without letting the noise footprint grow forever, and
-                            // keeps refreshing that key's recency tick to the current clock value.
-                            writer_engine.store.set(
-                                Bytes::from(format!("noise-{t}-{}", i % 5)),
-                                Value::String(Bytes::from(vec![b'y'; (i % 40) + 1])),
-                            );
-                            i += 1;
-                        }
-                    })
-                })
-                .collect();
-
-            for i in 0..100 {
-                engine.set(
-                    Bytes::from(format!("key{i:03}")),
-                    Value::String(payload.clone()),
-                );
-                // Ages every already-inserted keyNNN (and every noise key not touched since) by
-                // one tick, so the next insert's eviction victim is reliably the oldest keyNNN,
-                // not a noise key the writer threads keep refreshing to the newest tick.
-                engine.advance_recency_clock();
-            }
-
-            stop.store(true, Ordering::Relaxed);
-            for writer in writers {
-                writer.join().expect("writer thread panicked");
-            }
-            healer.join().expect("healer thread panicked");
-        });
-
-        let output = String::from_utf8(buffer.lock().unwrap_or_else(|e| e.into_inner()).clone())
-            .expect("subscriber output is utf-8");
-
-        let mut checked = 0;
-        for line in output.lines().filter(|l| l.contains("evicted key")) {
-            let key_field = line
-                .split("key=")
-                .nth(1)
-                .and_then(|rest| rest.split_whitespace().next())
-                .expect("evicted key line missing a key field");
-            if !key_field.starts_with("key") {
-                continue; // a noise-* key sampled for eviction -- not what this test checks
-            }
-            let bytes_field = line
-                .split("bytes=")
-                .nth(1)
-                .and_then(|rest| rest.split_whitespace().next())
-                .expect("evicted key line missing a bytes field");
-            let reported: usize = bytes_field
-                .parse()
-                .expect("bytes field must render as a plain number");
-            assert_eq!(
-                reported, expected_size,
-                "evicted key {key_field} reported {reported} bytes, expected its own accounted \
-                 size {expected_size}; full line: {line}"
-            );
-            checked += 1;
-        }
-        assert!(
-            checked > 0,
-            "test setup did not evict any keyNNN entries -- memory_used={} eviction_count={} \
-             full output:\n{output}",
-            engine.memory_used(),
-            engine.eviction_count()
-        );
+    #[test]
+    fn evicted_entry_size_of_a_missing_key_is_zero() {
+        let engine = Engine::new();
+        assert_eq!(engine.evicted_entry_size(b"missing"), 0);
     }
 
     #[test]
