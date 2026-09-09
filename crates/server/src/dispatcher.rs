@@ -2083,6 +2083,7 @@ fn handle_hello(
                     return Some(Frame::Error("NOAUTH Authentication required.".into()));
                 }
                 session.set_protocol(Protocol::Resp2);
+                tracing::debug!(resp_version = %2, "HELLO protocol negotiated");
                 hello_reply(session.protocol(), client_id, role, mode)
             }
             b"3" => {
@@ -2096,6 +2097,7 @@ fn handle_hello(
                     return Some(Frame::Error("NOAUTH Authentication required.".into()));
                 }
                 session.set_protocol(Protocol::Resp3);
+                tracing::debug!(resp_version = %3, "HELLO protocol negotiated");
                 hello_reply(session.protocol(), client_id, role, mode)
             }
             _ => Frame::Error("NOPROTO unsupported protocol version".into()),
@@ -2643,7 +2645,12 @@ fn acl_setuser(items: &[Frame], replication: &crate::replication::ReplicationHan
     }
     let username = String::from_utf8_lossy(username).into_owned();
     match replication.acl.set_user(&username, &raw_tokens) {
-        Ok(()) => Frame::Simple("OK".into()),
+        Ok(()) => {
+            // `raw_tokens` can carry ACL SETUSER's `>password` token -- never log it. Only
+            // `username` is safe here; see this plan's CRITICAL SECURITY POINT.
+            tracing::info!(user = %username, "ACL SETUSER");
+            Frame::Simple("OK".into())
+        }
         Err(e) => Frame::Error(e.to_string()),
     }
 }
@@ -2658,7 +2665,14 @@ fn acl_deluser(items: &[Frame], replication: &crate::replication::ReplicationHan
             Frame::Bulk(b) => Some(b),
             _ => None,
         })
-        .filter(|b| replication.acl.del_user(&String::from_utf8_lossy(b)))
+        .filter(|b| {
+            let username = String::from_utf8_lossy(b);
+            let removed = replication.acl.del_user(&username);
+            if removed {
+                tracing::info!(user = %username, "ACL DELUSER");
+            }
+            removed
+        })
         .count();
     Frame::Integer(deleted as i64)
 }
@@ -3957,6 +3971,59 @@ mod tests {
             "expected the username in the event, got: {log}"
         );
         assert!(log.contains("permission denied"), "got: {log}");
+    }
+
+    #[test]
+    fn handle_hello_logs_a_debug_event_on_resp3_upgrade() {
+        let replication = ReplicationHandle::default();
+        let session = Session::new();
+        let frame = cmd(&[b"HELLO", b"3"]);
+        let log = capture_logs_at(tracing::Level::DEBUG, || {
+            let reply = handle_hello(&frame, &session, 1, &replication);
+            assert!(reply.is_some());
+        });
+        assert_eq!(session.protocol(), Protocol::Resp3);
+        assert!(log.contains("HELLO protocol negotiated"), "got: {log}");
+        assert!(
+            log.contains('3'),
+            "expected the negotiated version in the event, got: {log}"
+        );
+    }
+
+    #[test]
+    fn acl_setuser_logs_an_info_event_naming_the_user_never_the_password_token() {
+        let replication = ReplicationHandle::default();
+        let frame = cmd(&[b"ACL", b"SETUSER", b"alice", b"on", b">hunter2"]);
+        let log = capture_logs_at(tracing::Level::INFO, || {
+            let reply = handle_acl(&frame, &Session::new(), &replication);
+            assert_eq!(reply, Some(Frame::Simple("OK".into())));
+        });
+        assert!(
+            log.contains("alice"),
+            "expected the username in the event, got: {log}"
+        );
+        assert!(
+            !log.contains("hunter2"),
+            "the ACL SETUSER password token must never be logged, got: {log}"
+        );
+    }
+
+    #[test]
+    fn acl_deluser_logs_an_info_event_naming_the_deleted_user() {
+        let replication = ReplicationHandle::default();
+        replication
+            .acl
+            .set_user("alice", &[Bytes::from_static(b"on")])
+            .unwrap();
+        let frame = cmd(&[b"ACL", b"DELUSER", b"alice"]);
+        let log = capture_logs_at(tracing::Level::INFO, || {
+            let reply = handle_acl(&frame, &Session::new(), &replication);
+            assert_eq!(reply, Some(Frame::Integer(1)));
+        });
+        assert!(
+            log.contains("alice"),
+            "expected the deleted username in the event, got: {log}"
+        );
     }
 
     #[test]
