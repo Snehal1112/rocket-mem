@@ -665,48 +665,57 @@ pub fn recover(aof_path: &Path, snapshot_path: &Path) -> std::io::Result<engine:
 
     let engine = engine::Engine::new();
     let start_at = match std::fs::read(snapshot_path) {
-        Ok(bytes) => match engine.load_snapshot(&bytes) {
-            Ok(offset) => {
-                // A missing AOF is distinct from a zero-length one: the former means the
-                // snapshot alone is the recovered state (per the spec's hybrid-recovery
-                // decision), the latter means the offset genuinely overshoots and the
-                // snapshot/AOF pair has diverged.
-                let aof_len = match std::fs::metadata(aof_path) {
-                    Ok(m) => Some(m.len()),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-                    Err(e) => return Err(e),
-                };
-                match aof_len {
-                    None => return Ok(engine),
-                    Some(len) if offset > len => {
-                        tracing::warn!(
-                            snapshot_path = %snapshot_path.display(),
-                            offset,
-                            aof_len = len,
-                            "snapshot offset past end of AOF; discarding snapshot and replaying full AOF"
-                        );
-                        let fresh = engine::Engine::new();
-                        let stats = replay_with_stats(aof_path, &fresh, 0)?;
-                        tracing::info!(
-                            commands = stats.commands,
-                            bytes = stats.bytes,
-                            elapsed_us = stats.elapsed.as_micros() as u64,
-                            "aof recovery replay complete"
-                        );
-                        return Ok(fresh);
+        Ok(bytes) => {
+            let load_started = std::time::Instant::now();
+            match engine.load_snapshot(&bytes) {
+                Ok(offset) => {
+                    tracing::info!(
+                        path = %snapshot_path.display(),
+                        bytes = bytes.len(),
+                        elapsed_us = load_started.elapsed().as_micros() as u64,
+                        "snapshot loaded"
+                    );
+                    // A missing AOF is distinct from a zero-length one: the former means the
+                    // snapshot alone is the recovered state (per the spec's hybrid-recovery
+                    // decision), the latter means the offset genuinely overshoots and the
+                    // snapshot/AOF pair has diverged.
+                    let aof_len = match std::fs::metadata(aof_path) {
+                        Ok(m) => Some(m.len()),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                        Err(e) => return Err(e),
+                    };
+                    match aof_len {
+                        None => return Ok(engine),
+                        Some(len) if offset > len => {
+                            tracing::warn!(
+                                snapshot_path = %snapshot_path.display(),
+                                offset,
+                                aof_len = len,
+                                "snapshot offset past end of AOF; discarding snapshot and replaying full AOF"
+                            );
+                            let fresh = engine::Engine::new();
+                            let stats = replay_with_stats(aof_path, &fresh, 0)?;
+                            tracing::info!(
+                                commands = stats.commands,
+                                bytes = stats.bytes,
+                                elapsed_us = stats.elapsed.as_micros() as u64,
+                                "aof recovery replay complete"
+                            );
+                            return Ok(fresh);
+                        }
+                        Some(_) => offset,
                     }
-                    Some(_) => offset,
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        snapshot_path = %snapshot_path.display(),
+                        error = %e,
+                        "snapshot unreadable; falling back to full AOF replay"
+                    );
+                    0
                 }
             }
-            Err(e) => {
-                tracing::warn!(
-                    snapshot_path = %snapshot_path.display(),
-                    error = %e,
-                    "snapshot unreadable; falling back to full AOF replay"
-                );
-                0
-            }
-        },
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
         Err(e) => return Err(e),
     };
