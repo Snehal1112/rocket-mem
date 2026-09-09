@@ -444,6 +444,13 @@ async fn main() -> std::io::Result<()> {
     }
     print_banner(&title, &body, color);
 
+    // No `shutdown (info)` event: the spec's Startup catalogue row names one, but there is
+    // nothing to log it from -- `rocket_mem::serve` is an unconditional `loop` (connection.rs)
+    // with no break, and this binary installs no `tokio::signal` handler anywhere in the
+    // crate, so a SIGTERM/SIGKILL ends the process before any Rust code, including a line
+    // here, would run. Logging a shutdown event requires adding real signal handling first,
+    // which is a graceful-shutdown feature in its own right, not a logging change --
+    // deferred, and marked as such in the spec's event catalogue.
     rocket_mem::serve(listener, engine, aof, replication).await;
     Ok(())
 }

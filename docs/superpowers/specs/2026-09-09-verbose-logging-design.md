@@ -119,7 +119,7 @@ Every existing call site keeps its current level and trigger condition; this tab
 
 | Subsystem | File(s) | New events (level) |
 |---|---|---|
-| Startup | `server/main.rs` | resolved config summary (info); listener bound, per protocol (info); shutdown (info) |
+| Startup | `server/main.rs` | resolved config summary (info); listener bound, per protocol (info); shutdown (info) — **deferred**, see below |
 | Connection | `server/connection.rs`, `server/rmp_connection.rs` | `HELLO`/RESP3 protocol upgrade (debug); clean close and EOF with duration + command count (info) |
 | Dispatch | `server/dispatcher.rs` | per-command `cmd`/`key`/`argc`/`elapsed_us`/reply kind (debug); full arguments, capped and redacted (trace); unknown command, WRONGTYPE, and arity errors (debug) |
 | ACL | `server/acl.rs` | auth success with `user` (info); auth failure with `user` + `peer`, never the secret (warn); permission denied with `user`/`cmd`/`key` (warn); `SETUSER`/`DELUSER` (info) |
@@ -131,6 +131,17 @@ Every existing call site keeps its current level and trigger condition; this tab
 | Cluster | `server/cluster.rs`, `server/dispatcher.rs` | topology loaded (info); MOVED redirect with `key`/slot/target node (debug) |
 | Slowlog | `server/slowlog.rs` | entry recorded, `cmd`/`key`/`elapsed_us` (warn — the threshold is operator-set, so crossing it is by definition notable) |
 | Metrics | `server/metrics.rs` | scrape served (trace) |
+
+**Startup's `shutdown (info)` event is deferred, not dropped.** There is no reachable code
+path to log it from: `rocket_mem::serve` (`server/connection.rs`) is an unconditional `loop`
+with no `break`, so it never returns to `main`, and the crate installs no `tokio::signal`
+handler anywhere — a `SIGTERM`/`SIGKILL` therefore ends the process before any Rust code,
+`tracing` included, would run. Emitting the event first requires adding real signal handling,
+which is a graceful-shutdown feature in its own right and well outside a logging change's
+scope. Recorded here rather than quietly deleted from the row, so the gap stays visible and
+so no future contributor bolts a shutdown subsystem onto a logging-scoped plan to justify one
+log line. The same note sits at the call site in `server/main.rs`, above the final `serve`
+call.
 
 ## Configuration
 
