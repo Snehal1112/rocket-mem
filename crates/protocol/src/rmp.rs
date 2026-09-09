@@ -235,6 +235,13 @@ impl Decoder for RmpCodec {
 
     fn decode(&mut self, src: &mut BytesMut) -> io::Result<Option<RmpMessage>> {
         if src.len() < HEADER_LEN {
+            if !src.is_empty() {
+                tracing::trace!(
+                    buffered = src.len(),
+                    needed = HEADER_LEN,
+                    "split-read reassembly: awaiting rmp header"
+                );
+            }
             return Ok(None);
         }
         if src[0..2] != MAGIC {
@@ -251,6 +258,11 @@ impl Decoder for RmpCodec {
         }
         let total_len = HEADER_LEN + payload_len as usize;
         if src.len() < total_len {
+            tracing::trace!(
+                buffered = src.len(),
+                needed = total_len,
+                "split-read reassembly: awaiting rmp payload"
+            );
             src.reserve(total_len - src.len());
             return Ok(None);
         }

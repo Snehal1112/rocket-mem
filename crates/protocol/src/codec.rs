@@ -175,7 +175,19 @@ impl Decoder for RespCodec {
                 tracing::trace!(kind = frame.kind(), len = frame.log_len(), "frame decoded");
                 Ok(Some(frame))
             }
-            None => Ok(None),
+            None => {
+                if !src.is_empty() {
+                    // A genuine split read: some bytes have arrived but not enough to complete
+                    // a frame yet. An empty buffer (nothing arrived at all) is not reassembly in
+                    // progress, so it stays silent -- otherwise every idle connection between
+                    // commands would trace on every poll.
+                    tracing::trace!(
+                        buffered = src.len(),
+                        "split-read reassembly: awaiting more bytes"
+                    );
+                }
+                Ok(None)
+            }
         }
     }
 }
