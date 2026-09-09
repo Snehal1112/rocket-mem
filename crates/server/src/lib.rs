@@ -4,6 +4,7 @@ pub mod cluster;
 pub mod config;
 pub mod connection;
 pub mod dispatcher;
+pub mod logging;
 pub mod metrics;
 pub mod replication;
 pub mod rmp_connection;
