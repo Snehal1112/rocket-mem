@@ -1,7 +1,9 @@
 # Per-Shard AOF Ordering Locks: Spec & Design
 
 **Date:** 2026-09-08
-**Status:** Proposed — not yet approved
+**Status:** Implemented — 2026-09-09. The per-shard locking mechanism (`Vec<Mutex<()>>`,
+`lock_shards`, `shard_index`, and every call site) landed before this plan was written; Tasks 1-4
+added the tests proving each of its three guarantees, and Task 5 measures the result below.
 **Scope:** `crates/server/src/aof.rs`, `crates/server/src/dispatcher.rs`,
 `crates/server/src/connection.rs`, `crates/server/src/replication.rs`,
 `crates/engine/src/store.rs`, `crates/engine/src/engine.rs`.
@@ -136,6 +138,45 @@ Recovering most of the 3.10x measured on many-key writes would move pipelined 3B
 to roughly 1.0–1.3x of `redis-server`, and pipelined 1KB `SET` from 2.18x similarly. It will
 **not** improve a single-key benchmark: one key is one shard, so sixteen guards and one guard are
 the same guard. Anyone re-measuring must use `scripts/benchmark.sh`, which passes `-r`.
+
+## Measured result
+
+Measured 2026-09-09 with `./scripts/benchmark.sh` (the only script this spec's methodology
+sanctions — see "Expected result" above), median of four runs, on the same host used for the
+original evidence. The host was not idle: a 3-node rocket-mem cluster was running throughout, and
+`uptime` load average was 1.36, 2.44, 2.00 immediately before the first run and 2.30, 2.53, 2.08
+immediately after the fourth. Because of that, the ratio against `redis-server` (both sides
+measured back-to-back on the same loaded host) is the primary result below; the absolute
+requests-per-second figures are secondary and would be higher on an idle machine.
+
+| Row | prior ratio (redis/rocket) | measured ratio (redis/rocket) | redis-server (median rps) | rocket-mem (median rps) |
+|---|---:|---:|---:|---:|
+| pipelined 3B `SET` | 2.78x | **1.01x** | 709,256 | 702,455 |
+| pipelined 1KB `SET` | 2.18x | **0.75x** | 350,168 | 465,116 |
+| pipelined 3B `GET` (control) | ~0.90–1.15x | 1.23x | 1,324,561 | 1,078,386 |
+| pipelined 1KB `GET` (control) | ~0.90–1.15x | 1.14x | 754,610 | 662,513 |
+
+Ratio convention matches the rest of this spec: `redis-server` throughput divided by rocket-mem
+throughput, so above 1x means redis-server is faster and below 1x means rocket-mem is faster.
+
+**The 1.0–1.3x prediction held for pipelined 3B `SET`:** 1.01x, at the low end of the predicted
+band.
+
+**It did not hold for pipelined 1KB `SET` — rocket-mem overshot the prediction, in the good
+direction.** The ratio moved to 0.75x: rocket-mem's pipelined 1KB `SET` throughput is now measurably
+*higher* than redis-server's (about 1.33x), not merely at parity with it. That is better than the
+top of the predicted 1.0–1.3x band, not worse, so it should be reported plainly as a prediction miss
+rather than folded into "the prediction held": the predicted floor was 1.0x and the measured value
+is 0.75x, roughly 25 percentage points past even the optimistic edge of the prediction. This result
+was consistent in all four individual runs (rocket-mem's 1KB pipelined `SET` beat redis-server's in
+every run, not just in the median), so it is not an artifact of taking the median.
+
+**Control (`GET`, which never takes the ordering guard):** 3B moved to 1.23x and 1KB to 1.14x,
+against the prior general band of roughly 0.90x–1.15x for non-`SET` rows. The 1KB row sits inside
+that band; the 3B row sits slightly above it. Neither shows anything close to the multi-x swing the
+`SET` rows show, which is consistent with the mechanism affecting only writes — but the 3B row's
+modest rise is a reminder that these are not clean-room numbers, measured as they were on a loaded
+host.
 
 ## Out of scope
 
