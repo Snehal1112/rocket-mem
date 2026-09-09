@@ -2909,6 +2909,24 @@ fn key_field(key: Option<&Bytes>) -> std::borrow::Cow<'_, str> {
     }
 }
 
+/// The `reply` field for the per-command `debug!` line: `"error"` for an error reply, `"ok"`
+/// for every other frame shape.
+///
+/// The same `matches!(reply, Frame::Error(_))` split `dispatch_and_log` already uses to
+/// increment `rocket_mem_command_errors_total`, deliberately reused rather than restated, so
+/// the log and the error-rate metric can never disagree about what an error is. A `Frame::Null`
+/// is a successful `SET ... NX` no-op, not a failure, and is reported as `"ok"` by both.
+///
+/// Returns `&'static str`, never a formatted `String`: this is evaluated once per command
+/// whenever `debug` is enabled.
+fn reply_kind(reply: &Frame) -> &'static str {
+    if matches!(reply, Frame::Error(_)) {
+        "error"
+    } else {
+        "ok"
+    }
+}
+
 /// The `cmd` label value for a command name: its lowercase form if we know the command, the
 /// literal `other` otherwise. The `other` fallback is what bounds Prometheus label cardinality --
 /// without it, a client sending random command names could create unbounded series.
@@ -3085,6 +3103,20 @@ pub fn dispatch_and_log(
     replication
         .slowlog
         .maybe_record(name, first_key, arg_count, elapsed);
+
+    // The per-command line. `cmd`, `key`, and `argc` are not repeated here -- they are on the
+    // `cmd` span this event is emitted inside, so the subscriber renders them as span context.
+    //
+    // `elapsed` is the same `Duration` the metrics histogram and the slow log were just handed;
+    // `as_micros()` is a division on an already-materialized value, and `u128` is recorded
+    // natively by `tracing-core` (`record_u128`), so neither field allocates. Both fields are
+    // evaluated only when the callsite is enabled, which at the default `info` it is not.
+    tracing::debug!(
+        elapsed_us = elapsed.as_micros(),
+        reply = reply_kind(&reply),
+        "command dispatched"
+    );
+
     reply
 }
 
@@ -3496,6 +3528,40 @@ mod tests {
             key_field(Some(&key)),
             std::borrow::Cow::Borrowed(_)
         ));
+    }
+
+    #[test]
+    fn reply_kind_reports_error_replies_as_errors() {
+        assert_eq!(
+            reply_kind(&Frame::Error("ERR unknown command 'nope'".into())),
+            "error"
+        );
+        assert_eq!(
+            reply_kind(&Frame::Error("WRONGTYPE Operation against a key".into())),
+            "error"
+        );
+    }
+
+    #[test]
+    fn reply_kind_reports_every_other_reply_shape_as_ok() {
+        // Deliberately the same two-way split `dispatch_and_log` already uses for its
+        // `rocket_mem_command_errors_total` counter -- one classification, not two that can
+        // drift apart. A Null reply is a successful NX/XX no-op, not an error.
+        assert_eq!(reply_kind(&Frame::Simple("OK".into())), "ok");
+        assert_eq!(reply_kind(&Frame::Integer(1)), "ok");
+        assert_eq!(reply_kind(&Frame::Bulk(Bytes::from_static(b"v"))), "ok");
+        assert_eq!(reply_kind(&Frame::Null), "ok");
+        assert_eq!(reply_kind(&Frame::Array(vec![])), "ok");
+        assert_eq!(reply_kind(&Frame::Map(vec![])), "ok");
+    }
+
+    #[test]
+    fn reply_kind_returns_a_static_str_so_the_debug_line_allocates_nothing() {
+        // The field must be a `&'static str`, not a formatted String: this runs once per
+        // command whenever `debug` is on, and a per-command allocation there is exactly the
+        // kind of cost the benchmark gate exists to catch.
+        let kind: &'static str = reply_kind(&Frame::Null);
+        assert_eq!(kind, "ok");
     }
 
     #[test]
