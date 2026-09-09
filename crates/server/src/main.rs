@@ -304,10 +304,14 @@ async fn main() -> std::io::Result<()> {
     replication.start_replicating_from_config(&config);
 
     let metrics_listener = tokio::net::TcpListener::bind(&config.metrics_addr).await?;
-    listeners.push((
-        "metrics",
-        format!("http://{}/metrics", metrics_listener.local_addr()?),
-    ));
+    // Each listener site below resolves its address string once and both logs and pushes it,
+    // rather than calling `local_addr()` twice. The `protocol` label is the very same `&str`
+    // the banner's `listeners` block uses, so the log and the banner can never disagree about
+    // a listener's name. Both are rendered with `%` so the field lands unquoted and greppable,
+    // matching the rest of this series' fields.
+    let metrics_addr_str = format!("http://{}/metrics", metrics_listener.local_addr()?);
+    tracing::info!(protocol = %"metrics", addr = %metrics_addr_str, "listener bound");
+    listeners.push(("metrics", metrics_addr_str));
     tokio::spawn(rocket_mem::metrics::serve_metrics(
         metrics_listener,
         metrics_handle,
@@ -316,7 +320,9 @@ async fn main() -> std::io::Result<()> {
     ));
 
     let rmp_listener = tokio::net::TcpListener::bind(&config.rmp_addr).await?;
-    listeners.push(("RMP", rmp_listener.local_addr()?.to_string()));
+    let rmp_addr_str = rmp_listener.local_addr()?.to_string();
+    tracing::info!(protocol = %"RMP", addr = %rmp_addr_str, "listener bound");
+    listeners.push(("RMP", rmp_addr_str));
     tokio::spawn(rocket_mem::rmp_connection::serve(
         rmp_listener,
         Arc::clone(&engine),
@@ -334,7 +340,9 @@ async fn main() -> std::io::Result<()> {
             std::path::Path::new(key),
         )?;
         let tls_listener = tokio::net::TcpListener::bind(tls_addr).await?;
-        listeners.push(("RESP+TLS", tls_listener.local_addr()?.to_string()));
+        let tls_addr_str = tls_listener.local_addr()?.to_string();
+        tracing::info!(protocol = %"RESP+TLS", addr = %tls_addr_str, "listener bound");
+        listeners.push(("RESP+TLS", tls_addr_str));
         tokio::spawn(rocket_mem::serve_tls(
             tls_listener,
             tls_config,
@@ -354,7 +362,9 @@ async fn main() -> std::io::Result<()> {
             std::path::Path::new(key),
         )?;
         let tls_rmp_listener = tokio::net::TcpListener::bind(tls_rmp_addr).await?;
-        listeners.push(("RMP+TLS", tls_rmp_listener.local_addr()?.to_string()));
+        let tls_rmp_addr_str = tls_rmp_listener.local_addr()?.to_string();
+        tracing::info!(protocol = %"RMP+TLS", addr = %tls_rmp_addr_str, "listener bound");
+        listeners.push(("RMP+TLS", tls_rmp_addr_str));
         tokio::spawn(rocket_mem::rmp_connection::serve_tls(
             tls_rmp_listener,
             tls_config,
@@ -365,7 +375,9 @@ async fn main() -> std::io::Result<()> {
     }
 
     let listener = tokio::net::TcpListener::bind(&config.addr).await?;
-    listeners.push(("RESP", listener.local_addr()?.to_string()));
+    let resp_addr_str = listener.local_addr()?.to_string();
+    tracing::info!(protocol = %"RESP", addr = %resp_addr_str, "listener bound");
+    listeners.push(("RESP", resp_addr_str));
 
     let title = paint(
         "1;36",

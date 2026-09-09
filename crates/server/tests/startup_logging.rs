@@ -99,3 +99,56 @@ fn resolved_config_summary_is_logged_at_startup() {
         "config summary must never log credential material, got:\n{stderr}"
     );
 }
+
+#[test]
+fn listener_bound_is_logged_for_the_always_on_listeners() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // The three lines above plus one `listener bound` per always-on listener.
+    let stderr = spawn_and_capture_stderr(dir.path(), &[], 6);
+
+    // `addr=` terminates each match so `protocol=RESP` cannot be satisfied by the
+    // `protocol=RESP+TLS` line, which shares its prefix.
+    for protocol in ["metrics", "RMP", "RESP"] {
+        assert!(
+            stderr.contains(&format!("protocol={protocol} addr=")),
+            "expected a 'listener bound' line for protocol={protocol}, got:\n{stderr}"
+        );
+    }
+    assert_eq!(
+        stderr.matches("listener bound").count(),
+        3,
+        "expected exactly 3 listener-bound lines with no TLS configured, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn listener_bound_is_logged_for_tls_listeners_when_configured() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let cert = fixtures.join("test-cert.pem");
+    let key = fixtures.join("test-key.pem");
+
+    let stderr = spawn_and_capture_stderr(
+        dir.path(),
+        &[
+            ("ROCKET_MEM_TLS_RESP_ADDR", "127.0.0.1:0"),
+            ("ROCKET_MEM_TLS_RMP_ADDR", "127.0.0.1:0"),
+            ("ROCKET_MEM_TLS_CERT_PATH", cert.to_str().unwrap()),
+            ("ROCKET_MEM_TLS_KEY_PATH", key.to_str().unwrap()),
+        ],
+        8,
+    );
+
+    for protocol in ["metrics", "RMP", "RESP+TLS", "RMP+TLS", "RESP"] {
+        assert!(
+            stderr.contains(&format!("protocol={protocol} addr=")),
+            "expected a 'listener bound' line for protocol={protocol}, got:\n{stderr}"
+        );
+    }
+    assert_eq!(
+        stderr.matches("listener bound").count(),
+        5,
+        "expected exactly 5 listener-bound lines with TLS configured, got:\n{stderr}"
+    );
+}
