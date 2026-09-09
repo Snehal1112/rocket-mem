@@ -229,6 +229,24 @@ async fn handle_connection<S>(
                 }
                 continue; // let the client retry after AUTH/HELLO ... AUTH, or give up
             }
+            // Chaining (leader -> follower -> sub-replica) doesn't work: a follower applies
+            // replicated frames via plain `dispatch`, never `dispatch_and_log`, so it never
+            // calls `ReplicaRegistry::broadcast` -- a sub-replica would get a one-time snapshot
+            // here and then silently never see another write. Refuse outright instead of
+            // leaving that trap in place.
+            if replication
+                .is_replica
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                let reply = protocol::Frame::Error(
+                    "ERR PSYNC refused: this node is itself a replica; chaining is not supported"
+                        .into(),
+                );
+                if framed.send(reply).await.is_err() {
+                    return; // client went away
+                }
+                continue;
+            }
             let advertised_addr = psync_advertised_addr(&frame);
             serve_replica(framed, &aof, &replication, advertised_addr).await;
             return; // serve_replica never returns until the replica connection dies

@@ -1,3 +1,4 @@
+use futures_util::{SinkExt, StreamExt};
 use redis::AsyncCommands;
 use std::sync::Arc;
 use std::time::Instant;
@@ -328,6 +329,46 @@ async fn a_follower_rejects_client_writes_over_a_real_connection_and_keeps_its_a
     f_aof.fsync().unwrap();
     let f_aof_len_after_write = std::fs::metadata(&f_aof_path).unwrap().len();
     assert_eq!(f_aof_len_after_write, f_aof_len_before_write);
+}
+
+/// Chaining (leader -> follower -> sub-replica) is not supported: a follower's own
+/// replication-apply loop applies frames via plain `dispatch`, never `dispatch_and_log`, so it
+/// never calls `ReplicaRegistry::broadcast` -- a sub-replica PSYNCing off a follower would get a
+/// one-time snapshot and then silently never see another write. Rather than allow that trap,
+/// PSYNC against a node that is itself currently a replica must be refused outright.
+#[tokio::test]
+async fn a_node_that_is_itself_a_replica_refuses_an_incoming_psync() {
+    let (_leader_dir, _leader_engine, _leader_aof, _leader_replication, leader_addr) =
+        spawn_node().await;
+    let (_f_dir, _f_engine, _f_aof, f_replication, f_addr) = spawn_node().await;
+
+    f_replication.start_replicating(leader_addr.clone());
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !f_replication.link_up() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "follower never linked up against the leader"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    // A third node attempting to chain off the follower, as if it were a leader.
+    let stream = tokio::net::TcpStream::connect(&f_addr).await.unwrap();
+    let mut framed = tokio_util::codec::Framed::new(stream, protocol::codec::RespCodec::default());
+    framed
+        .send(protocol::Frame::Array(vec![protocol::Frame::Bulk(
+            bytes::Bytes::from_static(b"PSYNC"),
+        )]))
+        .await
+        .unwrap();
+
+    let reply = framed.next().await.unwrap().unwrap();
+    assert_eq!(
+        reply,
+        protocol::Frame::Error(
+            "ERR PSYNC refused: this node is itself a replica; chaining is not supported".into()
+        )
+    );
 }
 
 fn fixture(name: &str) -> std::path::PathBuf {
