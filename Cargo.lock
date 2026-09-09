@@ -371,6 +371,7 @@ dependencies = [
  "rand 0.8.8",
  "serde",
  "thiserror 1.0.69",
+ "tracing",
 ]
 
 [[package]]
@@ -1056,6 +1057,7 @@ version = "0.1.4"
 dependencies = [
  "bytes",
  "tokio-util",
+ "tracing",
 ]
 
 [[package]]
