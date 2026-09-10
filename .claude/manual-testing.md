@@ -659,6 +659,55 @@ the TLS transport the connection actually used. Leaving it unset on a TLS follow
 prints one `WARN` at startup naming the plaintext address it's about to announce -- see
 `docs/superpowers/specs/2026-09-10-replica-announce-addr-spec.md`.
 
+## Replica fencing (`min-replicas-to-write`)
+
+`min_replicas_to_write`/`min_replicas_max_lag_secs` make a leader refuse client writes with a
+`NOREPLICAS` error unless enough replicas have acked recently enough. Disabled by default
+(`min_replicas_to_write=0`) -- every command below except the last one only changes what happens
+once you opt in.
+
+```bash
+# leader, fencing enabled: needs at least 1 replica acked within the last 10s to accept writes
+ROCKET_MEM_ADDR=127.0.0.1:6400 ROCKET_MEM_AOF_PATH=/tmp/rm-leader.aof \
+ROCKET_MEM_SNAPSHOT_PATH=/tmp/rm-leader.snap ROCKET_MEM_METRICS_ADDR=127.0.0.1:9200 \
+ROCKET_MEM_RMP_ADDR=127.0.0.1:6480 \
+ROCKET_MEM_MIN_REPLICAS_TO_WRITE=1 ROCKET_MEM_MIN_REPLICAS_MAX_LAG_SECS=10 \
+  ./target/release/rocket-mem &
+
+redis-cli -p 6400 set k v                # -> (error) NOREPLICAS Not enough good replicas to write.
+
+# follower
+ROCKET_MEM_ADDR=127.0.0.1:6401 ROCKET_MEM_AOF_PATH=/tmp/rm-follower.aof \
+ROCKET_MEM_SNAPSHOT_PATH=/tmp/rm-follower.snap ROCKET_MEM_METRICS_ADDR=127.0.0.1:9201 \
+ROCKET_MEM_RMP_ADDR=127.0.0.1:6481 \
+  ./target/release/rocket-mem &
+
+redis-cli -p 6401 replicaof 127.0.0.1 6400
+sleep 2                                   # let it connect and send its first REPLCONF ACK
+
+redis-cli -p 6400 set k v                # -> OK, now that a replica has acked within the lag window
+redis-cli -p 6400 info replication       # slave0:...,offset=<n>,lag=<secs>
+
+curl -s http://127.0.0.1:9200/metrics | grep -E 'rocket_mem_good_replicas|rocket_mem_writes_rejected_no_replicas_total'
+
+kill %1 %2
+```
+
+The leader's stderr shows the fenced-state transitions: a `WARN ... entering fenced state` line
+right after startup (before the follower has acked), and an `INFO ... leaving fenced state` line
+once the first ack arrives -- exactly one of each, not one per rejected `SET`. Set
+`RUST_LOG=rocket_mem=info` (or `debug`) when starting the leader if you don't see them at the
+default filter.
+
+The zero-lag startup guard from `07-fencing-config.md` rejects a config that could never satisfy
+itself:
+
+```bash
+ROCKET_MEM_MIN_REPLICAS_TO_WRITE=1 ROCKET_MEM_MIN_REPLICAS_MAX_LAG_SECS=0 ./target/release/rocket-mem
+# -> config error: min_replicas_to_write is set but min_replicas_max_lag_secs is 0 -- no replica
+#    could ever qualify, so every write would be refused forever
+```
+
 ## Cluster mode
 
 Needs a topology file — the one real "config file" this project has. Plain text,
