@@ -495,11 +495,20 @@ Stated plainly, so they are not discovered in production:
 
 - **No failover and no live resharding.** Slot ownership is fixed at process start;
   `CLUSTER SETSLOT`, `MIGRATE`, and `ASK` redirection do not exist.
-- **No cluster bus or gossip.** Nodes never talk to each other, so `CLUSTER NODES` reports every
-  configured node as connected and `cluster_state` is always `ok`.
+- **No cluster bus or gossip.** Nodes never agree with each other on anything, so
+  `cluster_slots_fail` is structurally always `0` and one node's suspicion of a dead peer can
+  never be promoted to an agreed failure. Each node does directly probe its peers, though, so
+  `CLUSTER NODES` reports a peer that stops answering as `disconnected`/`master,fail?` and
+  `cluster_state` flips to `fail`, based purely on that node's own observation.
+  `cluster_state:fail` is report-only: this node keeps serving its own slots and a `-MOVED` reply
+  still points at the configured (possibly dead) owner, since picking a different owner is a
+  topology decision nothing here can agree on.
 - **No request forwarding.** A `-MOVED` requires the client to reconnect.
-- **Full resync only.** A dropped follower connection triggers a complete resnapshot; there are
-  no replication offsets, and therefore no true replication-lag metric.
+- **Full resync only.** A dropped follower connection triggers a complete resnapshot; there is no
+  partial resync and no cross-restart offset persistence. Replication offsets do exist, though —
+  `INFO REPLICATION` reports `master_repl_offset`/`slave_repl_offset` plus each replica's acked
+  offset and lag, and Prometheus exports `rocket_mem_master_repl_offset`,
+  `rocket_mem_slave_repl_offset`, and `rocket_mem_good_replicas`.
 - **ACL state is in-memory and leader-local.** A runtime `ACL SETUSER` is lost on restart unless
   the user is also in the bootstrap config, and ACL changes never reach followers.
 - **No `@category` ACL grants** — only explicit `+CMD`/`-CMD` plus `allcommands`/`nocommands`.
