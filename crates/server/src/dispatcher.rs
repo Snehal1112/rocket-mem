@@ -3147,7 +3147,14 @@ pub(crate) fn auth_gate(
 /// unauthenticated client must not be able to open or feed a transaction, but nothing else
 /// (cluster redirect, READONLY, fencing) is checked until `EXEC` actually runs each queued
 /// command, per the spec's "Gate timing" section.
-fn intercept_for_transaction(frame: &Frame, session: &Session) -> Option<Frame> {
+fn intercept_for_transaction(
+    frame: &Frame,
+    session: &Session,
+    engine: &Engine,
+    aof: &crate::aof::AofWriter,
+    replication: &crate::replication::ReplicationHandle,
+    client_id: u64,
+) -> Option<Frame> {
     let Frame::Array(items) = frame else {
         return None;
     };
@@ -3158,7 +3165,7 @@ fn intercept_for_transaction(frame: &Frame, session: &Session) -> Option<Frame> 
     match name.as_str() {
         "MULTI" => Some(handle_multi(session)),
         "DISCARD" => Some(handle_discard(session)),
-        "EXEC" => Some(Frame::Error("ERR EXEC without MULTI".into())), // Plan 02 replaces this arm
+        "EXEC" => Some(handle_exec(engine, aof, replication, session, client_id)),
         _ => {
             // Fast path: an ordinary connection that never opens a transaction never locks
             // `tx`. See the spec's "Performance" section.
@@ -3220,6 +3227,82 @@ fn handle_discard(session: &Session) -> Frame {
         .in_transaction
         .store(false, std::sync::atomic::Ordering::Relaxed);
     Frame::Simple("OK".into())
+}
+
+/// `EXEC`: runs every queued command as one writers-only-isolated unit (spec "Decision"
+/// section), or replies `EXECABORT` without running anything if any queued command was rejected
+/// at queue time.
+///
+/// The batch-wide guard is `aof.lock_shards` widened to the union of every queued command's
+/// touched shards -- the same primitive `dispatch_and_log_gated`'s own per-command `_order_guard`
+/// uses, just held across every queued command's execution instead of one. An empty union (every
+/// queued command was keyless, or the queue itself was empty) falls back to
+/// `aof.lock_all_shards()`, matching the single-command precedent for "could not enumerate any
+/// keys" exactly.
+fn handle_exec(
+    engine: &Engine,
+    aof: &crate::aof::AofWriter,
+    replication: &crate::replication::ReplicationHandle,
+    session: &Session,
+    client_id: u64,
+) -> Frame {
+    let queued = {
+        let mut state = session.tx.lock().unwrap_or_else(|e| e.into_inner());
+        let TransactionState::Queuing { commands, dirty } = &*state else {
+            return Frame::Error("ERR EXEC without MULTI".into());
+        };
+        if *dirty {
+            tracing::debug!(queued_count = commands.len(), "transaction execaborted");
+            *state = TransactionState::Idle;
+            session
+                .in_transaction
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            return Frame::Error(
+                "EXECABORT Transaction discarded because of previous errors".into(),
+            );
+        }
+        let queued = commands.clone();
+        *state = TransactionState::Idle;
+        queued
+    };
+    session
+        .in_transaction
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+
+    let started = std::time::Instant::now();
+    let shard_set: std::collections::HashSet<usize> = queued
+        .iter()
+        .flat_map(command_keys)
+        .map(|k| engine.shard_index(k))
+        .collect();
+    let shards: Vec<usize> = shard_set.into_iter().collect();
+    let _batch_guard = if shards.is_empty() {
+        aof.lock_all_shards()
+    } else {
+        aof.lock_shards(&shards)
+    };
+
+    let mut replies = Vec::with_capacity(queued.len());
+    for queued_frame in queued.iter() {
+        replies.push(dispatch_and_log_gated(
+            engine,
+            aof,
+            replication,
+            queued_frame.clone(),
+            session,
+            client_id,
+            false,
+        ));
+    }
+    drop(_batch_guard);
+
+    tracing::debug!(
+        queued_count = replies.len(),
+        shard_count = shards.len(),
+        elapsed_us = started.elapsed().as_micros(),
+        "transaction executed"
+    );
+    Frame::Array(replies)
 }
 
 /// The uppercased command name, or `None` for a frame that isn't a command array. Cheap enough to
@@ -3586,11 +3669,30 @@ fn dispatch_and_log_inner(
     if let Some(reply) = auth_gate(replication, session, &frame) {
         return reply;
     }
-
-    if let Some(reply) = intercept_for_transaction(&frame, session) {
+    if let Some(reply) =
+        intercept_for_transaction(&frame, session, engine, aof, replication, client_id)
+    {
         return reply;
     }
+    dispatch_and_log_gated(engine, aof, replication, frame, session, client_id, true)
+}
 
+/// The post-auth, post-transaction-interception body of `dispatch_and_log_inner` -- unchanged
+/// logic, just parameterized on whether it should take its own per-command `aof.lock_shards`
+/// guard. Ordinary top-level dispatch (`take_own_guard: true`) behaves exactly as it always has.
+/// `EXEC` (`handle_exec`) calls this once per queued frame with `take_own_guard: false`, since it
+/// already holds one guard spanning the whole batch -- every gate below (cluster redirect,
+/// READONLY, fencing, ACL, etc.) still re-runs per queued command "for free," per the spec's
+/// "Gate timing" section.
+fn dispatch_and_log_gated(
+    engine: &Engine,
+    aof: &crate::aof::AofWriter,
+    replication: &crate::replication::ReplicationHandle,
+    frame: Frame,
+    session: &Session,
+    client_id: u64,
+    take_own_guard: bool,
+) -> Frame {
     // Checked before everything else, including the -READONLY gate below: a redirect says which
     // node should handle this key at all, and it must land before any lock is taken or any
     // interception runs. See ../../docs/superpowers/specs/2026-08-30-sprint-6-spec.md for the
@@ -3702,17 +3804,21 @@ fn dispatch_and_log_inner(
     // table and `key_spec` derive their answers independently, so nothing structurally forces
     // them to agree); falling back to every shard degrades to the old global-guard behaviour,
     // which is the safe direction.
-    let _order_guard = write_name.as_ref().map(|_| {
-        let shards: Vec<usize> = command_keys(&frame)
-            .iter()
-            .map(|k| engine.shard_index(k))
-            .collect();
-        if shards.is_empty() {
-            aof.lock_all_shards()
-        } else {
-            aof.lock_shards(&shards)
-        }
-    });
+    let _order_guard = if take_own_guard {
+        write_name.as_ref().map(|_| {
+            let shards: Vec<usize> = command_keys(&frame)
+                .iter()
+                .map(|k| engine.shard_index(k))
+                .collect();
+            if shards.is_empty() {
+                aof.lock_all_shards()
+            } else {
+                aof.lock_shards(&shards)
+            }
+        })
+    } else {
+        None
+    };
 
     // `dispatch`'s `_protocol` parameter is frozen for this sprint (see Global Constraints in
     // ../../docs/superpowers/plans/2026-08-31-sprint-8-plans/05-session-type-and-resp-wiring.md)
@@ -4423,6 +4529,150 @@ mod tests {
         );
         assert_eq!(reply, Frame::Simple("OK".into()));
         assert_eq!(session.tx_state_for_test(), TransactionState::Idle);
+    }
+
+    #[test]
+    fn exec_without_multi_errors() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let replication = ReplicationHandle::default();
+        let session = Session::new();
+        let reply = dispatch_and_log(&engine, &aof, &replication, cmd(&[b"EXEC"]), &session, 1);
+        assert_eq!(reply, Frame::Error("ERR EXEC without MULTI".into()));
+    }
+
+    #[test]
+    fn exec_with_no_queued_commands_returns_an_empty_array() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let replication = ReplicationHandle::default();
+        let session = Session::new();
+        dispatch_and_log(&engine, &aof, &replication, cmd(&[b"MULTI"]), &session, 1);
+        let reply = dispatch_and_log(&engine, &aof, &replication, cmd(&[b"EXEC"]), &session, 1);
+        assert_eq!(reply, Frame::Array(vec![]));
+        assert_eq!(session.tx_state_for_test(), TransactionState::Idle);
+    }
+
+    #[test]
+    fn a_dirty_transaction_execaborts_and_runs_nothing() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let replication = ReplicationHandle::default();
+        let session = Session::new();
+        dispatch_and_log(&engine, &aof, &replication, cmd(&[b"MULTI"]), &session, 1);
+        dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"SET", b"k", b"v"]),
+            &session,
+            1,
+        );
+        dispatch_and_log(&engine, &aof, &replication, cmd(&[b"NOPE"]), &session, 1); // marks dirty
+        let reply = dispatch_and_log(&engine, &aof, &replication, cmd(&[b"EXEC"]), &session, 1);
+        assert_eq!(
+            reply,
+            Frame::Error("EXECABORT Transaction discarded because of previous errors".into())
+        );
+        assert_eq!(
+            engine.get(b"k"),
+            None,
+            "a dirty transaction must run nothing, not even the good commands"
+        );
+        assert_eq!(session.tx_state_for_test(), TransactionState::Idle);
+    }
+
+    #[test]
+    fn exec_runs_every_queued_command_in_order_and_returns_their_replies() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let replication = ReplicationHandle::default();
+        let session = Session::new();
+        dispatch_and_log(&engine, &aof, &replication, cmd(&[b"MULTI"]), &session, 1);
+        dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"SET", b"k", b"v1"]),
+            &session,
+            1,
+        );
+        dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"SET", b"k", b"v2"]),
+            &session,
+            1,
+        );
+        dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"GET", b"k"]),
+            &session,
+            1,
+        );
+        let reply = dispatch_and_log(&engine, &aof, &replication, cmd(&[b"EXEC"]), &session, 1);
+        assert_eq!(
+            reply,
+            Frame::Array(vec![
+                Frame::Simple("OK".into()),
+                Frame::Simple("OK".into()),
+                Frame::Bulk(Bytes::from_static(b"v2")),
+            ])
+        );
+        assert_eq!(session.tx_state_for_test(), TransactionState::Idle);
+        assert!(!session
+            .in_transaction
+            .load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn a_runtime_error_inside_a_batch_does_not_abort_the_rest_of_it() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let replication = ReplicationHandle::default();
+        let session = Session::new();
+        dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"LPUSH", b"list", b"a"]),
+            &session,
+            1,
+        );
+        dispatch_and_log(&engine, &aof, &replication, cmd(&[b"MULTI"]), &session, 1);
+        // GET on a List key is a real, valid queue-time-known command with correct arity --
+        // it only fails at *runtime*, which is exactly the case EXECABORT must not cover.
+        dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"GET", b"list"]),
+            &session,
+            1,
+        );
+        dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"SET", b"k", b"v"]),
+            &session,
+            1,
+        );
+        let reply = dispatch_and_log(&engine, &aof, &replication, cmd(&[b"EXEC"]), &session, 1);
+        let Frame::Array(replies) = reply else {
+            panic!("EXEC must reply with an array");
+        };
+        assert_eq!(replies.len(), 2);
+        assert!(matches!(&replies[0], Frame::Error(msg) if msg.contains("WRONGTYPE")));
+        assert_eq!(replies[1], Frame::Simple("OK".into()));
+        assert_eq!(
+            engine.get(b"k"),
+            Some(Value::String(Bytes::from_static(b"v"))),
+            "the second command must still have applied despite the first one's runtime error"
+        );
     }
 
     #[test]
