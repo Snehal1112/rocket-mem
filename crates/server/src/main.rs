@@ -294,7 +294,12 @@ async fn main() -> std::io::Result<()> {
         snapshot_path.to_path_buf(),
     )
     .with_aof(Arc::clone(&aof))
-    .with_own_addr(config.addr.clone())
+    // Not `config.addr`: that is the *plaintext* RESP listen address unconditionally, so a TLS
+    // deployment used to advertise a port a TLS peer must not dial. `announce_addr` falls back to
+    // `config.addr` when `replica_announce_addr` is unset, so this is byte-for-byte the old
+    // behaviour for every deployment that does not set the new field. See
+    // docs/superpowers/specs/2026-09-10-replica-announce-addr-spec.md.
+    .with_own_addr(rocket_mem::config::announce_addr(&config))
     .with_slowlog_threshold(slowlog_threshold)
     .with_log_value_max_bytes(config.log_value_max_bytes)
     .with_acl_bootstrap(acl_users);

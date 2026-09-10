@@ -283,9 +283,10 @@ impl ReplicationHandle {
         self
     }
 
-    /// Sets this node's own RESP listen address, advertised on every `PSYNC` this node's
-    /// follower loop sends -- see the `own_addr` field's doc comment. Only `main.rs` calls this,
-    /// with `config.addr`.
+    /// Sets the address this node advertises on every `PSYNC` its follower loop sends -- see the
+    /// `own_addr` field's doc comment. Only `main.rs` calls this, with
+    /// `config::announce_addr(&config)`: `replica_announce_addr` when the operator set one, else
+    /// `config.addr`.
     pub fn with_own_addr(mut self, addr: String) -> Self {
         self.own_addr = Some(addr);
         self
