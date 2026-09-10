@@ -205,8 +205,8 @@ pub struct ReplicationHandle {
     /// received, so it advances even when no replica is connected. Process-local: it resets to 0
     /// on restart, which is safe only because every reconnect is a full resync that re-seeds the
     /// follower from the snapshot header, so a follower can never carry a stale offset across a
-    /// leader restart. An `Arc` for symmetry with the follower-side counter added in
-    /// `03-follower-replication-offset.md`, whose spawned task is `'static`.
+    /// leader restart. An `Arc` for symmetry with the follower-side `slave_repl_offset` below,
+    /// whose spawned task is `'static`.
     master_repl_offset: Arc<AtomicU64>,
     /// Follower side: how far into the leader's replication stream this node has processed.
     /// Seeded by `sync_once` from the snapshot header the leader stamped its own live
@@ -580,8 +580,10 @@ impl ReplicationHandle {
     }
 
     /// Leader side: total replication-stream bytes this node has produced since process start.
-    /// Surfaced as `INFO REPLICATION`'s `master_repl_offset` and the
-    /// `rocket_mem_master_repl_offset` gauge.
+    /// Surfaced as the `rocket_mem_master_repl_offset` gauge, and as `INFO REPLICATION`'s
+    /// `master_repl_offset` **only under `role:master`** -- a follower emits that same key from
+    /// `slave_repl_offset` instead, since this counter is stale or zero there. Reaching for this
+    /// method to render a follower's line is the mistake to avoid.
     pub fn master_repl_offset(&self) -> u64 {
         self.master_repl_offset.load(Ordering::Relaxed)
     }
