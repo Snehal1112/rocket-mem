@@ -375,6 +375,7 @@ Any plan using a different spelling is wrong.
 | Set follower offset | `pub fn set_slave_repl_offset(&self, offset: u64)` |
 | Advance follower offset | `pub fn advance_slave_repl_offset(&self, bytes: u64) -> u64` |
 | Hand the follower slot to the spawned task | `pub fn slave_repl_offset_slot(&self) -> Arc<AtomicU64>` |
+| Fencing thresholds | `pub fn with_min_replicas(self, to_write: u64, max_lag: std::time::Duration) -> Self` |
 
 **The `FollowerStatus` field is named `slave_offset`, not `slave_repl_offset`.** `sync_once` has no
 `ReplicationHandle` — it receives `FollowerStatus`/`FollowerHandles`, whose existing fields are
@@ -384,10 +385,15 @@ keep that spelling. The `slave_repl_offset` name belongs to the `ReplicationHand
 **Note on the two follower mutators:** the spawned follower task is `'static` and cannot borrow
 from `self`, so `sync_once` holds the raw `&AtomicU64` (via `FollowerStatus`, exactly as it already
 does for `last_apply` and `link_up`) and does the real seed/advance with `store`/`fetch_add`.
-`set_slave_repl_offset` / `advance_slave_repl_offset` are real and used by `INFO`, metrics, and
-tests — they are just not the code path that moves the counter. `slave_repl_offset_slot` follows
+`set_slave_repl_offset` / `advance_slave_repl_offset` compile and behave correctly, but **neither
+has a production caller** — as of plan 06 every call site of both is inside a `#[cfg(test)]` module
+(`replication.rs`, `metrics.rs:196`, `dispatcher.rs:5834`). They exist so a test can position the
+counter, and for a future caller that holds a `ReplicationHandle`; they are not the code path that
+moves the counter. **What `INFO` and the metrics exporter actually call is the reader,
+`slave_repl_offset()`** — an earlier revision of this note claimed the mutators were used by `INFO`
+and metrics, which was wrong and is corrected here. Do not infer from this table that a name is
+live in production: the table fixes *spelling*, not reachability. `slave_repl_offset_slot` follows
 the existing `last_apply_slot()` / `link_up_slot()` convention.
-| Fencing thresholds | `pub fn with_min_replicas(self, to_write: u64, max_lag: std::time::Duration) -> Self` |
 
 **`ReplicaRegistry` restructure (plan 05):**
 
@@ -583,6 +589,32 @@ tracks — A must land before 13's offset task.
 parallel load. It is **pre-existing and unrelated** to any plan here. If it fails, re-run the
 suite, or confirm with `cargo test --workspace -- --test-threads=1`. Do not "fix" it as part of
 these plans, and do not treat it as a regression you caused.
+
+---
+
+## 5. Known hazard: the replica output channel is unbounded
+
+Each replica's outbound queue is a `tokio::sync::mpsc::UnboundedSender<Bytes>`
+(`replication.rs:37`). The leader pushes every replicated frame into it and never waits. If a
+replica's socket stalls — a TCP zero-window from a paused or swapping follower, not a
+disconnect — nothing drains that queue and it grows without limit until the **leader** runs out
+of memory. A slow follower can therefore kill the node it replicates from.
+
+Plan 06's periodic ack made this hazard easier to reach: a follower that is alive enough to hold
+its socket open but too slow to drain it now stays attached, where before it was more likely to
+be dropped.
+
+**No plan in this folder fixes it, deliberately.** The fix is not "add a bound" — a bounded
+channel would make the leader's write path block on its slowest follower, converting a replica
+problem into a total write outage, which is strictly worse. The correct shape is Redis's
+`client-output-buffer-limit` for replicas: track each replica's queued bytes, and **disconnect
+the replica** that exceeds a hard limit (or stays over a soft limit for too long). That is a new
+eviction policy with its own config surface and its own tests, and it is orthogonal to failover
+safety.
+
+Recorded here so no later plan mistakes the unbounded channel for a considered choice. Note the
+interaction with §2.5: fencing counts a replica as "good" from its **ack recency**, and a replica
+whose queue is exploding is still acking, so fencing will not detect or protect against this.
 
 ---
 

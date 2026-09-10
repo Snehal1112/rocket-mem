@@ -75,6 +75,11 @@
 # And on the leader side, to see every currently-connected replica:
 #
 #   redis-cli -p <leader's addr port> info replication
-#   # -> role:master / connected_slaves:1 / slave0:ip=<this replica's addr host>,port=<...>,state=online
+#   # -> role:master / connected_slaves:1
+#   # -> slave0:ip=<this replica's addr host>,port=<...>,state=online,offset=<n>,lag=<secs>
+#
+# offset is how many bytes of the replication stream that replica has acknowledged, and lag is how
+# many seconds ago it last acknowledged. A healthy replica shows offset climbing and lag at 0 or 1.
+# A lag of -1 means the replica has never acknowledged anything yet.
 #
 # REPLICAOF NO ONE promotes this node back to normal, writable standalone operation.
