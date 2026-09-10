@@ -1,5 +1,18 @@
 # rocket-mem Manual Failover Runbook
 
+*Last verified: 2026-09-10, full failover-and-restore drill against the numericlabs.lxd
+3-shard deployment (Sections 1-6 exercised end to end, including a live demonstration of
+Section 6's failback hazard using a throwaway marker key). The drill found and fixed three
+inaccuracies: two commands missing required `--user`/`--pass`/`AUTH` flags against this
+ACL-enabled deployment (Sections 1 and 5e's `ping`/`cluster nodes`, and Sections 4/6's
+`REPLICAOF` examples, which otherwise fail with `NOAUTH` — the `REPLICAOF` case fails
+silently, forever retrying rather than erroring visibly), and Section 5b's CLI-flags
+shortcut, which does not unset the config file's `replicaof` field and so re-enslaves the
+promoted node to the dead leader on every restart unless `REPLICAOF NO ONE` is reissued
+afterward or the config is edited instead. See Section 5's note under "The CLI-flags
+shortcut" and Section 6's note under "The `AUTH app changeme` clause is required" for the
+live-verified specifics.*
+
 **Read `docs/superpowers/specs/2026-09-09-sentinel-failover-spec.md` first if you have not.**
 rocket-mem has no automatic failover, no quorum, and no live cluster-topology reload. Every
 step below is something a human runs by hand, in order, using judgment at the points marked
@@ -59,10 +72,13 @@ important step in this runbook — skipping it is how you create split-brain (se
   your own workstation:
   ```bash
   redis-cli --tls --cacert /home/numericlabs/data/tls/root_ca-numericlabs.crt \
-    -h numericlabs.lxd -p 16379 ping
+    --user app --pass changeme -h numericlabs.lxd -p 16379 ping
   ```
-  A `PONG` from anywhere means the leader is alive — stop, do not promote anything. Silence
-  or a connection error from **every** vantage point you can reach is evidence, not proof.
+  A `PONG` — or even a `NOAUTH Authentication required.` if you got the credentials wrong —
+  from anywhere means the leader is alive — stop, do not promote anything. `NOAUTH` still
+  proves life: a dead process cannot answer with anything at all, right or wrong. Only
+  `Connection refused` or silence is a candidate data point for "dead," and even that is
+  evidence, not proof, until it comes from **every** vantage point you can reach.
 - Check the replica's own view: it has been watching the leader continuously and is the one
   component in the system that already knows.
   ```bash
@@ -145,8 +161,13 @@ newly-promoted node instead of the dead leader:
 
 ```bash
 redis-cli --tls --cacert <ca> --user app --pass <pass> -h <survivor> -p <port> \
-  replicaof numericlabs.lxd 16479
+  replicaof numericlabs.lxd 16479 auth app <pass>
 ```
+
+The trailing `auth app <pass>` is required whenever the leader has ACL users configured
+(as every node in this deployment does) — without it, PSYNC is rejected with `NOAUTH`, and
+the replica spins in its reconnect loop instead of ever actually syncing. See Section 6 for
+a live-verified account of exactly this failure mode.
 
 Do this for every remaining replica of the failed shard before moving on — a replica left
 pointed at the dead leader spins in `sync_once`'s 1-second reconnect loop forever, and will
@@ -218,6 +239,18 @@ or pass the equivalent CLI flags on its next start:
   --cluster-node-id shard-a &
 ```
 
+**The CLI-flags shortcut does NOT unset `replicaof` — live-verified, this bites you.**
+`--cluster-config`/`--cluster-node-id` only add cluster fields; they do nothing to the
+config file's `replicaof = "numericlabs.lxd:16379"` line, which is still there and still
+takes effect on every fresh start. The restarted process reconnects as a follower of the
+now-dead old leader (`role:slave`, spamming `replication connection lost, reconnecting`
+in its log), and **every client write is rejected with `READONLY`** until you fix it — the
+in-memory `REPLICAOF NO ONE` from Section 3 applied only to the process you just killed,
+not to this new one. If you use the CLI-flags shortcut instead of editing the config, you
+must immediately re-run Section 3's `replicaof no one` against this node again, and verify
+`role:master`, before trusting it for writes. The config-edit path above avoids this
+entirely, which is why it is the first option, not the second.
+
 **5c. Restart the other cluster members so they pick up the edited `cluster.conf`:**
 
 ```bash
@@ -240,7 +273,7 @@ systemctl --user disable --now rocket-mem-shard-a
 
 ```bash
 redis-cli --tls --cacert /home/numericlabs/data/tls/root_ca-numericlabs.crt \
-  -h numericlabs.lxd -p 16380 cluster nodes
+  --user app --pass changeme -h numericlabs.lxd -p 16380 cluster nodes
 # -> shard-a's slot range (0-5460) shown against numericlabs.lxd:16479, not :16379
 
 redis-cli --tls --cacert /home/numericlabs/data/tls/root_ca-numericlabs.crt \
@@ -258,10 +291,20 @@ routing, not anything `CLUSTER NODES` tells you on its own.
 
 ## 6. Failback hazard — read this before you ever point anything back at a restored original leader
 
-**Do not run `REPLICAOF numericlabs.lxd 16379` against the promoted node
+**Do not run `REPLICAOF numericlabs.lxd 16379 AUTH app changeme` against the promoted node
 (`numericlabs.lxd:16479`) once the original shard-a host comes back, expecting to "restore"
 the old topology. This destroys every write the promoted node has accepted since
 promotion, silently.**
+
+**The `AUTH app changeme` clause is required, not optional, in this deployment.** Every
+node here has ACL enabled, so a bare `REPLICAOF numericlabs.lxd 16379` (no `AUTH`) is
+rejected by the leader's PSYNC handshake with `NOAUTH Authentication required.` — live-
+verified: the follower then spins in its 1-second reconnect loop, forever failing the same
+way, and the resync **never happens at all**. Do not mistake that silence for safety — a
+`REPLICAOF` that never completes looks identical to one you decided not to run, but for the
+wrong reason. Confirm the resync actually completed by checking the promoted node's log for
+`follower in sync with leader`, or by checking `master_link_status:up`, before trusting
+that a failback (deliberate or accidental) either did or did not happen.
 
 The mechanism: `sync_once` performs a full resync unconditionally on every `REPLICAOF`
 connect. It calls `Engine::load_snapshot`, and `Store::load_snapshot_entries` clears all 16 shards
@@ -277,8 +320,9 @@ If you must fail back, treat it as a second, deliberate migration — never a "r
    been the live, accepting-writes side since the incident, and the restored original
    leader's data is frozen at the moment it died.
 3. If the promoted node's data should win: make the *restored old node* a replica of the
-   *promoted node* (`REPLICAOF numericlabs.lxd 16479` run against the restored shard-a, not
-   the other way around), then repeat Section 5's cluster.conf-edit-and-restart-every-node
+   *promoted node* (`REPLICAOF numericlabs.lxd 16479 AUTH app changeme` run against the
+   restored shard-a, not the other way around — remember the `AUTH` clause), then repeat
+   Section 5's cluster.conf-edit-and-restart-every-node
    dance in reverse only once you deliberately decide to switch the "canonical" address
    back — and only if you ever decide to. There is no requirement to ever switch back; the
    promoted node can simply remain shard-a going forward.
@@ -307,3 +351,23 @@ eventual failback decision (Section 6) loses its divergent writes, permanently.
 can't reach it" is a symptom. "It is provably not running" (a `systemctl --user status` on
 its own host showing `inactive (dead)`, or a corroborating loss of `PONG` from every
 vantage point you have) is the bar for promoting anything.
+
+---
+
+## Appendix: a stale-replica-registry false alert, found during verification
+
+If you kill a replica process abruptly (`kill`/`pkill`, not a graceful `REPLICAOF NO ONE`
+followed by a clean shutdown) while it is connected to a leader, `replication-health.sh` can
+keep reporting an `ALERT ... replica <addr> lag=<n>s exceeds max ...` for that dead
+connection indefinitely, with `lag` climbing forever — even after a fresh replica
+reconnects and is itself healthy. The leader's `good_replicas` count reflects this too
+(`good_replicas=1/2` instead of `1/1`): the dead connection's registry entry is not pruned
+by a later write, at least not within the couple of minutes this was observed during the
+live drill above. **This is a characteristic of the current implementation, not something
+this runbook can work around** — fixing the underlying registry-pruning behavior is out of
+this runbook's scope (it lives in `crates/server/src/replication.rs`, not in a Markdown
+file). If you hit this: `systemctl --user restart <the leader's unit>` clears it, since the
+registry is in-memory and rebuilds cleanly from real reconnections. Don't mistake this
+specific alert shape (a *lag* alert for an address you know is dead, alongside otherwise
+healthy nodes) for a *new* problem — check whether it corresponds to a connection you or a
+previous drill run killed abruptly before treating it as a fresh incident.
