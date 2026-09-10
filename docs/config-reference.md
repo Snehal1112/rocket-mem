@@ -29,10 +29,13 @@ want to change from the default.
 | `tls_rmp_addr` | `ROCKET_MEM_TLS_RMP_ADDR` | `--tls-rmp-addr` | unset | TCP address for a TLS-wrapped RMP listener, run alongside the plaintext one at `rmp_addr`. Unset means no TLS RMP listener. Setting this requires `tls_cert_path` and `tls_key_path` — see the TLS note below. |
 | `tls_cert_path` | `ROCKET_MEM_TLS_CERT_PATH` | `--tls-cert-path` | unset | Path to a PEM certificate chain, shared by both TLS listeners. |
 | `tls_key_path` | `ROCKET_MEM_TLS_KEY_PATH` | `--tls-key-path` | unset | Path to a PEM private key, shared by both TLS listeners. |
+| `tls_ca_path` | `ROCKET_MEM_TLS_CA_PATH` | `--tls-ca-path` | unset | Path to a PEM root CA certificate used by follower replication to verify leader TLS certificate. |
 | `replicaof` | `ROCKET_MEM_REPLICAOF` | `--replicaof` | unset | `host:port` of a leader to auto-connect to as a follower on every startup. Unset means standalone (or purely live-`REPLICAOF`-driven) operation. |
 | `replicaof_auth_username` | `ROCKET_MEM_REPLICAOF_AUTH_USERNAME` | `--replicaof-auth-username` | unset | Username sent in `AUTH` before `PSYNC`, when `replicaof`'s leader has ACL users configured. Must be set together with `replicaof_auth_password`, or neither. |
 | `replicaof_auth_password` | `ROCKET_MEM_REPLICAOF_AUTH_PASSWORD` | `--replicaof-auth-password` | unset | Password sent in `AUTH` before `PSYNC`. Plaintext in the TOML file, same as `[[acl.users]]`'s own `password` field. |
 | `replica_announce_addr` | `ROCKET_MEM_REPLICA_ANNOUNCE_ADDR` | `--replica-announce-addr` | `addr` | The `host:port` this node advertises to its leader in `PSYNC`, and which the leader reports in `INFO REPLICATION`'s `slaveN:` lines. Defaults to `addr`. Set it when the address a peer must dial differs from the address this node binds — a TLS deployment, or NAT and container port mapping. |
+| `min_replicas_to_write` | `ROCKET_MEM_MIN_REPLICAS_TO_WRITE` | `--min-replicas-to-write` | `0` | Minimum number of replicas that must have acknowledged within `min_replicas_max_lag_secs` for this leader node to accept write commands (`0` disables write fencing). |
+| `min_replicas_max_lag_secs` | `ROCKET_MEM_MIN_REPLICAS_MAX_LAG_SECS` | `--min-replicas-max-lag-secs` | `10` | Maximum lag in seconds for a replica's last ack to qualify as "good" for `min_replicas_to_write`. |
 | `[[acl.users]]` | *(file-only — no flat env var for an array)* | *(file-only)* | empty | Bootstrap ACL users, loaded once at startup. See "The `[[acl.users]]` array" below. |
 
 > **`trace` writes your data to disk.** At `trace`, rocket-mem logs command arguments and
@@ -83,6 +86,28 @@ Nothing dials this address today: it is reported by `INFO REPLICATION`'s `slaveN
 the `repl` tracing span's `host_port` field, and the startup banner's `slaveN` rows. Future
 failover tooling (see `docs/superpowers/specs/2026-09-09-sentinel-failover-spec.md`) is
 expected to dial it to reach a follower directly.
+
+### Replica fencing (`min_replicas_to_write`) requires a nonzero lag window
+
+`min_replicas_to_write` makes this node refuse client writes with a `NOREPLICAS` error unless at
+least that many replicas have sent a `REPLCONF ACK` within the last `min_replicas_max_lag_secs`
+seconds. It is disabled by
+default (`0`) — every deployment that doesn't set it is completely unaffected, and every write is
+accepted regardless of replica state, exactly as before this field existed.
+
+Setting `min_replicas_to_write` above `0` while leaving `min_replicas_max_lag_secs` at `0` is
+rejected at startup: no replica's ack could ever be recent enough to satisfy a zero-second window,
+so every write would be refused forever — a permanent outage spelled as a config typo, not a real
+deployment intent. `rocket-mem` checks this before any listener binds and aborts immediately if it
+sees that combination, the same way it aborts on a broken `tls_*` or `replicaof_auth_*` pairing.
+
+This gate applies only to this node's own client-originated writes. A replica already rejects
+client writes with `READONLY` regardless of `min_replicas_to_write` — fencing and read-only mode
+are independent gates, and `READONLY` always wins on a replica.
+
+Note that fencing counts a replica as good from the *recency of its ack*, which says the replica is
+keeping up with the stream. It is not a guarantee that any particular write reached that replica
+before the write was acknowledged to the client.
 
 ### Malformed values fail startup, not silently
 
