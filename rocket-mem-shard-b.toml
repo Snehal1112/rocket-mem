@@ -1,31 +1,144 @@
-# Cluster node shard-b — see cluster.conf and rocket-mem.toml (shard-a) for context.
-#
-# cluster.conf advertises this node as numericlabs.lxd:16380, which must therefore be the
-# TLS RESP listener: a client following a MOVED redirect here has to reach the same kind of
-# port on every node, and shard-a advertises its TLS listener. The plaintext ports below stay
-# available for local use, but nothing in the cluster topology points at them.
+# ==============================================================================
+# rocket-mem Configuration: Shard B Leader
+# ==============================================================================
+# Primary leader node for shard-b in the cluster topology (see cluster.conf).
+# Advertised in cluster.conf via its TLS port numericlabs.lxd:16380.
 
+# --- Network Listeners --------------------------------------------------------
+
+# Plaintext TCP address the RESP listener binds to. Any Redis client (redis-cli,
+# redis-py, ioredis, go-redis, ...) connects here for local, non-cluster-aware use.
+# Default: "127.0.0.1:6379"
 addr = "numericlabs.lxd:6380"
+
+# Plaintext TCP address the RMP (rocket-mem's own binary protocol) listener binds
+# to. Reachable only via the rmp-client crate, not redis-cli.
+# Default: "127.0.0.1:6380"
 rmp_addr = "numericlabs.lxd:7380"
+
+# TCP address the Prometheus /metrics HTTP endpoint binds to. Loopback by default
+# because it has no authentication of its own, ACL or not -- bound to the host
+# interface here only because metrics scraping needs to reach it from off-box.
+# Default: "127.0.0.1:9121"
 metrics_addr = "numericlabs.lxd:9122"
 
+# --- TLS Configuration --------------------------------------------------------
+# TLS listeners run *alongside* the plaintext ones above -- they never replace
+# addr/rmp_addr. Setting either of the next two requires both tls_cert_path and
+# tls_key_path to also be set; startup fails hard otherwise, before binding
+# anything. Server-auth only -- no mutual TLS, no client certificate requested.
+
+# TLS-wrapped RESP listener. cluster.conf advertises this node at this address, so
+# a client following a -MOVED redirect here reaches the same kind of port (TLS)
+# every other cluster node also exposes.
+# Default: unset (no TLS RESP listener)
 tls_resp_addr = "numericlabs.lxd:16380"
+
+# TLS-wrapped RMP listener, run alongside the plaintext one at rmp_addr.
+# Default: unset (no TLS RMP listener)
 tls_rmp_addr = "numericlabs.lxd:17380"
+
+# PEM certificate chain, shared by both TLS listeners. Resolved relative to the
+# server's working directory, not to this file -- prefer an absolute path.
+# Default: unset
 tls_cert_path = "/home/numericlabs/data/tls/server.crt"
+
+# PEM private key, shared by both TLS listeners. Same relative-path caveat as above.
+# Default: unset
 tls_key_path = "/home/numericlabs/data/tls/server.key"
 
+# --- Persistence & Durability -------------------------------------------------
+
+# Path to the append-only file used for write-durability and crash recovery.
+# Default: "./appendonly.aof"
 aof_path = "./appendonly-shard-b.aof"
+
+# Path to the point-in-time snapshot file written by SAVE and loaded on startup.
+# Default: "./dump.snapshot"
 snapshot_path = "./dump-shard-b.snapshot"
 
+# Minimum command duration, in microseconds, that gets recorded to the slow log.
+# 0 disables the slow log entirely.
+# Default: 10000 (10ms)
 slowlog_threshold_micros = 0
 
+# --- Logging -----------------------------------------------------------------
+
+# Tracing filter directive (e.g. "info", "debug", "trace", "rocket_mem=debug,warn").
+# Overridden by the RUST_LOG environment variable when set.
+# Default: "info"
+log_level = "debug"
+
+# Maximum bytes of a value or command argument rendered into a `trace`-level log
+# line before truncation. Only consulted when logging at `trace` -- trace-level
+# logging writes your data to disk in plaintext, so treat a trace log file with the
+# same retention and access controls as the dataset itself.
+# Default: 128
+log_value_max_bytes = 128
+
+# --- Replication & Failover Safety -------------------------------------------
+
+# Minimum number of replicas that must have acknowledged within min_replicas_max_lag_secs
+# for this leader node to accept write commands. A leader with fewer than this many
+# recently-acking replicas refuses writes with a NOREPLICAS error instead of silently
+# accepting writes no replica may ever receive.
+# 0 disables write fencing entirely (default behavior).
+# Default: 0
+min_replicas_to_write = 0
+
+# Maximum lag in seconds for a replica's last ack to qualify as "good" for
+# min_replicas_to_write. Ignored when min_replicas_to_write is 0. Setting
+# min_replicas_to_write above 0 while leaving this at 0 is a startup error -- no
+# replica could ever qualify and every write would be refused forever.
+# Default: 10
+min_replicas_max_lag_secs = 10
+
+# --- Cluster Configuration ---------------------------------------------------
+# Both fields are unset by default (standalone mode). Setting one requires the other.
+
+# Path to the cluster topology file: one "<node-id> <host:port> <first-slot> <last-slot>"
+# line per node, covering all 16384 slots exactly once (a gap or overlap is a
+# startup error). Same file, shared verbatim, on every node in the cluster.
+# Default: unset
 cluster_config = "/home/numericlabs/data/rocket/rocket-mem/cluster.conf"
+
+# This node's id, matched against a line in cluster_config's topology file --
+# shard-b here, matching the "shard-b" entry cluster.conf carries for this node.
+# Default: unset
 cluster_node_id = "shard-b"
 
-# Must match shard-a's ACL users: a client redirected here by MOVED re-authenticates
-# against this node, not shard-a.
+# How often, in seconds, the cluster peer prober probes every other node in the
+# topology. Read only in cluster mode -- a standalone node has no peers and never
+# starts a prober. Must be at least 1: a zero value crashes tokio's timer outright.
+# Default: 1
+cluster_probe_interval_secs = 1
+
+# How long, in seconds, a peer may go without answering a probe before this node
+# reports it failed in CLUSTER NODES/SHARDS/INFO. Reporting only -- nothing is
+# promoted, no topology is rewritten, and routing is unchanged. Must be at least 1.
+# Default: 15
+cluster_node_timeout_secs = 15
+
+# --- ACL / User Authentication ------------------------------------------------
+# File-only: there is no flat ROCKET_MEM_* env var that can express an array of
+# tables. Defining even one user here turns authentication ON for the whole server.
+# Must match the SAME username/password on every other cluster node so a client
+# redirected here by a -MOVED reply can authenticate without re-entering credentials.
+#
+# Bootstrap users here live only in memory at runtime: a user added later via the
+# ACL SETUSER command is NOT persisted and is lost on restart unless it's also
+# added to this array.
+
 [[acl.users]]
+# Name of the ACL user, passed to AUTH. Required.
 username = "app"
+# Plaintext password, argon2-hashed once at startup and never written back out in
+# plaintext -- not to the AOF, the snapshot, the slow log, or any error message.
+# Omit this field entirely for nopass (any password, or none, is accepted).
 password = "changeme"
+# Whether the user is active (true) or disabled (false, loaded but AUTH rejects it).
 enabled = true
+# Permissions array: commands (+CMD/-CMD, allcommands/nocommands) and key patterns
+# (~pattern, allkeys). Applied left to right -- a later rule overrides an earlier
+# one where they overlap.
 rules = ["allcommands", "allkeys"]

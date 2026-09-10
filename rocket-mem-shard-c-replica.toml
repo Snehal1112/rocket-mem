@@ -1,45 +1,166 @@
-# Replica of cluster node shard-c. Not a cluster member itself -- no cluster_config/
-# cluster_node_id here. Auto-connects to shard-c and becomes read-only on every startup via
-# replicaof below -- no REPLICAOF command needs to be run by hand. The auth fields are
-# required because shard-c has ACL users configured; without them PSYNC fails with NOAUTH.
+# ==============================================================================
+# rocket-mem Configuration: Shard C Replica
+# ==============================================================================
+# Replica of cluster node shard-c. Not a cluster member itself (no active
+# cluster_config / cluster_node_id). Auto-connects to shard-c and becomes
+# read-only on startup via `replicaof`.
 
+# --- Network Listeners --------------------------------------------------------
+
+# Plaintext TCP address this replica's own RESP listener binds to. Must be
+# distinct from the leader's -- and every other node's -- addr. Clients can read
+# from it directly for a read-only copy of the leader's data; they cannot write
+# to it (replicating gates client writes with a READONLY error).
+# Default: "127.0.0.1:6379"
 addr = "numericlabs.lxd:6481"
+
+# Plaintext TCP address the RMP listener binds to. Same distinctness requirement
+# as addr.
+# Default: "127.0.0.1:6380"
 rmp_addr = "numericlabs.lxd:7481"
+
+# TCP address the Prometheus /metrics HTTP endpoint binds to. Same distinctness
+# requirement -- every node on one machine needs its own value for rmp_addr AND
+# metrics_addr, or the second/third node crashes with AddrInUse even though its
+# RESP port is free. See .claude/manual-testing.md for this exact gotcha.
+# Default: "127.0.0.1:9121"
 metrics_addr = "numericlabs.lxd:9223"
 
+# --- Replication -------------------------------------------------------------
+
+# host:port of the leader to auto-connect to as a follower on every startup
+# (shard-c's TLS RESP address). Setting this closes the "restarted replica
+# silently comes back as standalone" footgun: with it unset, a restarted node
+# forgets it was ever a replica until REPLICAOF is reissued by hand. Not
+# validated at startup beyond being present -- a bad host or unreachable leader
+# fails soft, with a once-a-second background reconnect loop.
+# Default: unset (standalone, or purely live-REPLICAOF-driven)
 replicaof = "numericlabs.lxd:16381"
+
+# Username sent in AUTH before PSYNC, matching the LEADER's [[acl.users]] entry
+# below -- this is not a separate account for the replica, it authenticates the
+# replica's own connection to the leader. Must be set together with
+# replicaof_auth_password, or neither -- rocket-mem checks this at startup,
+# before any listener binds, and aborts if only one is set.
+# Default: unset
 replicaof_auth_username = "app"
+
+# Password sent in AUTH before PSYNC. Plaintext in this file, same as
+# [[acl.users]]'s own password field below.
+# Default: unset
 replicaof_auth_password = "changeme"
 
-# IF YOU PROMOTE THIS NODE, these two lines must be uncommented before it serves traffic.
-# A promoted node without them has no cluster identity, so it never sends -MOVED and will
-# silently accept keys for slots it does not own, while every other node keeps redirecting
-# clients here for shard-c's slots only. Those stray keys are then invisible to the cluster.
-#
-# Full promotion, in order:
-#   1. Comment out the `replicaof*` lines above, or run `REPLICAOF NO ONE`.
-#   2. Uncomment the two lines below.
-#   3. On EVERY node, edit cluster.conf: `shard-c numericlabs.lxd:16381 10923 16383`
-#      becomes `shard-c numericlabs.lxd:16481 10923 16383` (this node's TLS address).
-#   4. Restart EVERY node -- cluster topology is only read at startup.
+# The host:port THIS replica advertises to its leader in PSYNC, and which the
+# leader reports back in INFO REPLICATION's slaveN:ip=...,port=... lines. Left
+# unset, this would default to addr above -- the plaintext RESP listen address --
+# even though replication itself runs over TLS. Explicitly set to this replica's
+# own TLS RESP address so the leader's INFO REPLICATION and the repl tracing span
+# both report a dialable TLS endpoint rather than the plaintext port. Shape-
+# checked at startup (host:port, port must parse as u16), never checked for
+# reachability -- this node cannot know how a peer routes to it.
+# Default: unset (uses addr)
+replica_announce_addr = "numericlabs.lxd:16481"
+
+# --- Cluster Promotion Runbook (Uncomment only upon failover) ------------------
+# If you promote this node to become the shard-c leader:
+#   1. Remove/comment the `replicaof*` lines above or run `REPLICAOF NO ONE`.
+#   2. Uncomment the two cluster lines below.
+#   3. On ALL nodes, update cluster.conf to point shard-c to numericlabs.lxd:16481.
+#   4. Restart all nodes.
 #
 #cluster_config = "/home/numericlabs/data/rocket/rocket-mem/cluster.conf"
 #cluster_node_id = "shard-c"
+# Optional -- both default to 1/15 even if left unset. Uncomment only to tune them.
+#cluster_probe_interval_secs = 1
+#cluster_node_timeout_secs = 15
 
+# --- TLS Configuration --------------------------------------------------------
+# TLS listeners run *alongside* the plaintext ones above -- they never replace
+# addr/rmp_addr. Setting either of the next two requires both tls_cert_path and
+# tls_key_path to also be set; startup fails hard otherwise, before binding
+# anything. Only needed here because this replica also serves TLS-wrapped
+# clients directly; tls_ca_path below (not these listener fields) is what governs
+# this replica's own outgoing replication connection to its leader.
+
+# TLS-wrapped RESP listener. This is also the address replica_announce_addr above
+# advertises to the leader.
+# Default: unset (no TLS RESP listener)
 tls_resp_addr = "numericlabs.lxd:16481"
+
+# TLS-wrapped RMP listener, run alongside the plaintext one at rmp_addr.
+# Default: unset (no TLS RMP listener)
 tls_rmp_addr = "numericlabs.lxd:17481"
+
+# PEM certificate chain, shared by both TLS listeners. Resolved relative to the
+# server's working directory, not to this file -- prefer an absolute path.
+# Default: unset
 tls_cert_path = "/home/numericlabs/data/tls/server.crt"
+
+# PEM private key, shared by both TLS listeners. Same relative-path caveat as above.
+# Default: unset
 tls_key_path = "/home/numericlabs/data/tls/server.key"
+
+# The leader's certificate file, for THIS replica's own replication connection
+# (as a follower, via replicaof above) to verify and pin to when connecting over
+# TLS. Unset means plaintext replication, independent of whether this replica's
+# own listeners above use TLS.
+# Default: unset (plaintext replication)
 tls_ca_path = "/home/numericlabs/data/tls/root_ca-numericlabs.crt"
 
+# --- Persistence & Durability -------------------------------------------------
+# This replica's own AOF/snapshot files. Must not be shared with the leader's or
+# any other node's -- each node's recovery reads only its own files, and paths
+# are resolved relative to whatever directory the process is started from, not
+# to this config file.
+
+# Path to the append-only file used for write-durability and crash recovery.
+# Default: "./appendonly.aof"
 aof_path = "./appendonly-shard-c-replica.aof"
+
+# Path to the point-in-time snapshot file written by SAVE and loaded on startup.
+# Default: "./dump.snapshot"
 snapshot_path = "./dump-shard-c-replica.snapshot"
 
+# Minimum command duration, in microseconds, that gets recorded to the slow log.
+# 0 disables the slow log entirely.
+# Default: 10000 (10ms)
 slowlog_threshold_micros = 0
 
-# Must match shard-c's ACL users to authenticate the replication connection.
+# --- Logging -----------------------------------------------------------------
+
+# Tracing filter directive (e.g. "info", "debug", "trace", "rocket_mem=debug,warn").
+# Overridden by the RUST_LOG environment variable when set.
+# Default: "info"
+log_level = "info"
+
+# Maximum bytes of a value or command argument rendered into a `trace`-level log
+# line before truncation. Only consulted when logging at `trace` -- trace-level
+# logging writes your data to disk in plaintext, so treat a trace log file with the
+# same retention and access controls as the dataset itself.
+# Default: 128
+log_value_max_bytes = 128
+
+# --- ACL / User Authentication ------------------------------------------------
+# Must match the LEADER's [[acl.users]] username/password exactly: replicaof's
+# AUTH clause above authenticates this replica's connection to shard-c's leader
+# with these same credentials -- they are not this replica's own separate
+# account. Defining even one user here also turns authentication ON for this
+# node's own client connections, exactly like any other rocket-mem config.
+#
+# Bootstrap users here live only in memory at runtime: a user added later via the
+# ACL SETUSER command is NOT persisted and is lost on restart unless it's also
+# added to this array.
+
 [[acl.users]]
+# Name of the ACL user, passed to AUTH. Required.
 username = "app"
+# Plaintext password, argon2-hashed once at startup and never written back out in
+# plaintext -- not to the AOF, the snapshot, the slow log, or any error message.
+# Omit this field entirely for nopass (any password, or none, is accepted).
 password = "changeme"
+# Whether the user is active (true) or disabled (false, loaded but AUTH rejects it).
 enabled = true
+# Permissions array: commands (+CMD/-CMD, allcommands/nocommands) and key patterns
+# (~pattern, allkeys). Applied left to right -- a later rule overrides an earlier
+# one where they overlap.
 rules = ["allcommands", "allkeys"]

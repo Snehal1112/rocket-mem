@@ -9,35 +9,66 @@
 
 # TCP address the RESP listener binds to. Any Redis client (redis-cli, redis-py,
 # ioredis, go-redis, ...) connects here.
+# Default: "127.0.0.1:6379"
 addr = "numericlabs.lxd:6379"
 
 # TCP address the RMP (rocket-mem's own binary protocol) listener binds to.
 # Reachable only via the rmp-client crate, not redis-cli.
+# Default: "127.0.0.1:6380"
 rmp_addr = "numericlabs.lxd:7379"
 
 # TCP address the Prometheus /metrics HTTP endpoint binds to. Loopback by default
 # because it has no authentication of its own, ACL or not.
+# Default: "127.0.0.1:9121"
 metrics_addr = "numericlabs.lxd:9121"
 
 # Path to the append-only file used for write-durability and crash recovery.
+# Default: "./appendonly.aof"
 aof_path = "./appendonly.aof"
 
 # Path to the point-in-time snapshot file written by SAVE and loaded on startup.
+# Default: "./dump.snapshot"
 snapshot_path = "./dump.snapshot"
 
 # Minimum command duration, in microseconds, that gets recorded to the slow log.
 # 0 disables the slow log entirely.
+# Default: 10000 (10ms)
 slowlog_threshold_micros = 0
+
+# --- Logging -----------------------------------------------------------------
+# Tracing filter directive (e.g. "info", "debug", "trace", "rocket_mem=debug,warn").
+# Overridden by the RUST_LOG environment variable when set.
+# Default: "info"
+log_level = "debug"
+
+# Maximum bytes of a value or command argument rendered into a `trace`-level log
+# line before truncation. Only consulted when logging at `trace`.
+# Default: 128
+log_value_max_bytes = 128
 
 # --- Cluster mode -----------------------------------------------------------
 # Both fields are unset by default (standalone mode). Setting one requires the other.
 
 # Path to the cluster topology file: one "<node-id> <host:port> <first-slot> <last-slot>"
 # line per node, covering all 16384 slots exactly once.
+# Default: unset
 cluster_config = "/home/numericlabs/data/rocket/rocket-mem/cluster.conf"
 
 # This node's id, matched against a line in cluster_config's topology file.
+# Default: unset
 cluster_node_id = "shard-a"
+
+# How often, in seconds, the cluster peer prober probes every other node in the
+# topology. Read only in cluster mode -- a standalone node has no peers and never
+# starts a prober. Must be at least 1: a zero value crashes tokio's timer outright.
+# Default: 1
+cluster_probe_interval_secs = 1
+
+# How long, in seconds, a peer may go without answering a probe before this node
+# reports it failed in CLUSTER NODES/SHARDS/INFO. Reporting only -- nothing is
+# promoted, no topology is rewritten, and routing is unchanged. Must be at least 1.
+# Default: 15
+cluster_node_timeout_secs = 15
 
 # --- TLS ---------------------------------------------------------------------
 # TLS listeners run *alongside* the plaintext ones — they never replace addr/rmp_addr.
@@ -46,17 +77,68 @@ cluster_node_id = "shard-a"
 # Server-auth only — no mutual TLS, no client certificate is ever requested.
 
 # TLS-wrapped RESP listener, run alongside the plaintext one at `addr`.
+# Default: unset (no TLS RESP listener)
 tls_resp_addr = "numericlabs.lxd:16379"
 
 # TLS-wrapped RMP listener, run alongside the plaintext one at `rmp_addr`.
+# Default: unset (no TLS RMP listener)
 tls_rmp_addr = "numericlabs.lxd:17379"
 
 # PEM certificate chain, shared by both TLS listeners. Resolved relative to the
 # server's working directory, not to this file — prefer an absolute path.
+# Default: unset
 tls_cert_path = "/home/numericlabs/data/tls/server.crt"
 
 # PEM private key, shared by both TLS listeners. Same relative-path caveat as above.
+# Default: unset
 tls_key_path = "/home/numericlabs/data/tls/server.key"
+
+# The leader's certificate file (CA), for a follower's replication connection to
+# verify and pin to when connecting over TLS. Unset means plaintext replication.
+# Default: unset
+# tls_ca_path = "/home/numericlabs/data/tls/root_ca-numericlabs.crt"
+
+# --- Replication & Failover Safety -------------------------------------------
+# Automatically connect as a replica on startup to the leader at host:port. Setting
+# this closes the "restarted follower silently comes back as standalone" footgun --
+# with it unset, a restarted node forgets it was ever a follower until REPLICAOF is
+# reissued by hand. Not validated at startup beyond being present: a bad host or
+# unreachable leader fails soft, with a once-a-second background reconnect loop,
+# exactly like the live REPLICAOF command's own behavior.
+# Default: unset (standalone, or purely live-REPLICAOF-driven)
+# replicaof = "127.0.0.1:6379"
+
+# Username presented in AUTH before PSYNC, when the leader has ACL users configured.
+# Must be set together with replicaof_auth_password, or neither.
+# Default: unset
+# replicaof_auth_username = "app"
+
+# Password presented in AUTH before PSYNC.
+# Default: unset
+# replicaof_auth_password = "changeme"
+
+# The address this node advertises to its leader in PSYNC, and which the leader
+# reports in INFO REPLICATION's `slaveN:` lines.
+# Left unset, defaults to `addr`. Set this when the externally dialable address
+# differs from the bound address (e.g. announce `tls_resp_addr` in TLS setups, or
+# container port mapping / NAT).
+# Default: unset (uses `addr`)
+# replica_announce_addr = "numericlabs.lxd:16379"
+
+# Minimum number of replicas that must have acknowledged within min_replicas_max_lag_secs
+# for this leader node to accept write commands. A leader with fewer than this many
+# recently-acking replicas refuses writes with a NOREPLICAS error instead of silently
+# accepting writes no replica may ever receive.
+# 0 disables write fencing entirely (default behavior).
+# Default: 0
+min_replicas_to_write = 0
+
+# Maximum lag in seconds for a replica's last ack to qualify as "good" for
+# min_replicas_to_write. Ignored when min_replicas_to_write is 0. Setting
+# min_replicas_to_write above 0 while leaving this at 0 is a startup error -- no
+# replica could ever qualify and every write would be refused forever.
+# Default: 10
+min_replicas_max_lag_secs = 10
 
 # --- ACL / authentication -----------------------------------------------------
 # File-only: there is no flat ROCKET_MEM_* env var that can express an array of
@@ -83,11 +165,16 @@ tls_key_path = "/home/numericlabs/data/tls/server.key"
 #                                 rule overrides an earlier one where they overlap.
 
 [[acl.users]]
+# Name of the ACL user, passed to AUTH.
 username = "app"
+# Plaintext password (argon2-hashed once at startup). Omit for nopass.
 password = "changeme"
+# Whether the user is active (true) or disabled (false).
 enabled = true
+# Permissions array: commands (+CMD/-CMD, allcommands/nocommands) and key patterns (~pattern, allkeys).
 rules = ["allcommands", "allkeys"]
 
 # [[acl.users]]
+# # Example read-only user restricted to app:* keys and GET commands
 # username = "readonly"
 # rules = ["~app:*", "+get"]
