@@ -59,6 +59,53 @@ async fn wait_for(engine: &engine::Engine, key: &[u8], value: &[u8]) {
     }
 }
 
+/// Sends one `INFO replication` over raw RESP and returns the bulk body. Raw rather than the
+/// `redis` crate on purpose: the exact `slaveN:` field spelling is what these tests assert, and
+/// the `redis` crate would parse that spelling away. `tests/cluster.rs` uses the same shape for
+/// the same reason.
+async fn info_replication(addr: &str) -> String {
+    let mut framed = tokio_util::codec::Framed::new(
+        tokio::net::TcpStream::connect(addr).await.unwrap(),
+        protocol::codec::RespCodec::default(),
+    );
+    framed
+        .send(protocol::Frame::Array(vec![
+            protocol::Frame::Bulk(bytes::Bytes::from_static(b"INFO")),
+            protocol::Frame::Bulk(bytes::Bytes::from_static(b"replication")),
+        ]))
+        .await
+        .unwrap();
+    match framed.next().await.unwrap().unwrap() {
+        protocol::Frame::Bulk(body) => String::from_utf8_lossy(&body).into_owned(),
+        other => panic!("INFO replied with {other:?}"),
+    }
+}
+
+/// Returns the whole `slave0:` line from an `INFO replication` body, or `None` when the leader
+/// has no replica registered yet. Kept separate from the parser below so a failing test can
+/// print the line verbatim.
+fn slave0_line(info: &str) -> Option<&str> {
+    info.lines().find(|l| l.starts_with("slave0:"))
+}
+
+/// Pulls `offset` and `lag` out of an `INFO replication` body's `slave0:` line. `None` when
+/// there is no such line yet (no replica has attached), or when either field is missing or
+/// unparseable -- which is a failure worth surfacing at the call site rather than defaulting
+/// away to a number that would quietly satisfy an assertion.
+fn slave0_offset_and_lag(info: &str) -> Option<(u64, i64)> {
+    let line = slave0_line(info)?;
+    let mut offset = None;
+    let mut lag = None;
+    for field in line.trim_start_matches("slave0:").split(',') {
+        match field.split_once('=') {
+            Some(("offset", v)) => offset = v.parse().ok(),
+            Some(("lag", v)) => lag = v.parse().ok(),
+            _ => {}
+        }
+    }
+    Some((offset?, lag?))
+}
+
 #[tokio::test]
 async fn snapshot_plus_tail_recovery_reconstructs_identical_state_to_full_aof_replay() {
     let dir = tempfile::tempdir().unwrap();
@@ -680,4 +727,98 @@ async fn a_tls_follower_keeps_receiving_streamed_writes_after_its_resync() {
     let _: () = con.set("streamed-over-tls", "yes").await.unwrap();
 
     wait_for(&follower_engine, b"streamed-over-tls", b"yes").await;
+}
+
+/// Polls a leader's own `INFO replication` until its `slave0:` line reports an offset `accept`
+/// is happy with, then returns that line verbatim alongside the parsed offset and lag. A
+/// bounded poll with an explicit deadline, never a bare sleep: the ack cadence is one second,
+/// so five seconds is generous headroom even for a *second* ack on a loaded box.
+async fn wait_for_slave0_offset(
+    leader_addr: &str,
+    accept: impl Fn(u64) -> bool,
+) -> (String, u64, i64) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let info = info_replication(leader_addr).await;
+        if let Some((offset, lag)) = slave0_offset_and_lag(&info) {
+            if accept(offset) {
+                return (slave0_line(&info).unwrap().to_string(), offset, lag);
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the leader's slave0 offset never reached what this test requires:\n{info}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// The whole chain, end to end, over real sockets. A write on the leader advances its
+/// `master_repl_offset`, is streamed to the follower, is applied there and advances the
+/// follower's `slave_repl_offset`, is acked back up the same connection, is recorded on the
+/// leader's registry entry, and finally shows up in the leader's own `INFO REPLICATION` as a
+/// non-zero `offset` with a small `lag`.
+///
+/// Before this chain, that line read `state=online` with nothing behind it: the leader could not
+/// answer "how caught up is this replica" at all, which is exactly why the spec refused to build
+/// failover on top of it.
+///
+/// Two writes, not one, and the second offset must be strictly greater than the first. A single
+/// snapshot of `INFO` cannot tell an advancing offset from one stuck at whatever value it
+/// happened to reach at sync time, and this chain has already shipped one assertion that passed
+/// vacuously. `lag` is likewise required to be a real small number: `-1` is the "never acked"
+/// sentinel, so an assertion that tolerated it would pass against a follower that never acks at
+/// all -- precisely the state this chain exists to escape.
+#[tokio::test]
+async fn a_leader_reports_its_followers_advancing_offset_and_small_lag_in_info() {
+    let (_leader_dir, _leader_engine, _leader_aof, _leader_replication, leader_addr) =
+        spawn_node().await;
+    let (_f_dir, f_engine, _f_aof, f_replication, _f_addr) = spawn_node().await;
+
+    f_replication.start_replicating(leader_addr.clone());
+    let link_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !f_replication.link_up() {
+        assert!(
+            tokio::time::Instant::now() < link_deadline,
+            "the follower never linked up"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let client = redis::Client::open(format!("redis://{leader_addr}")).unwrap();
+    let mut con = client.get_multiplexed_async_connection().await.unwrap();
+
+    // First write: this is what takes the reported offset off zero at all. The follower attached
+    // to an empty leader, so its snapshot offset was 0 and only a streamed, applied, acked frame
+    // can move it.
+    let _: () = con.set("first", "1").await.unwrap();
+    wait_for(&f_engine, b"first", b"1").await;
+    let (first_line, first_offset, first_lag) =
+        wait_for_slave0_offset(&leader_addr, |offset| offset > 0).await;
+    assert!(
+        (0..=2).contains(&first_lag),
+        "a replica acking every second must report a lag of about 0s, and never the -1 \
+         never-acked sentinel: {first_line}"
+    );
+
+    // Second write: the reported offset must actually move. `first_offset` is captured before
+    // this write is sent, so nothing but a fresh ack can satisfy the predicate below.
+    let _: () = con.set("second", "2").await.unwrap();
+    wait_for(&f_engine, b"second", b"2").await;
+    let (second_line, second_offset, second_lag) =
+        wait_for_slave0_offset(&leader_addr, |offset| offset > first_offset).await;
+    println!("leader rendered: {second_line}");
+
+    assert!(
+        (0..=2).contains(&second_lag),
+        "a replica acking every second must report a lag of about 0s, and never the -1 \
+         never-acked sentinel: {second_line}"
+    );
+    // The follower's own view must agree with what the leader is reporting about it. Both sides
+    // count the same encoded bytes, so a mismatch means the re-encoding invariant is broken.
+    assert_eq!(
+        f_replication.slave_repl_offset(),
+        second_offset,
+        "the leader's recorded ack must match the follower's own position: {second_line}"
+    );
 }
