@@ -349,6 +349,37 @@ fn psync_advertised_addr(frame: &protocol::Frame) -> Option<String> {
     Some(String::from_utf8_lossy(bytes).into_owned())
 }
 
+/// Pulls the offset out of a follower's `REPLCONF ACK <offset>` frame -- the ack shape fixed by
+/// the failover-safety design contract's §2.3, a plain RESP array on the existing replication
+/// socket. `None` for anything else at all: a different frame type, a different arity, a
+/// `REPLCONF` subcommand this leader does not implement, or an offset that is not decimal ASCII.
+/// The caller logs those at `debug` and ignores them -- an unrecognised inbound frame must never
+/// draw an error reply and must never cost the follower its connection.
+fn parse_replconf_ack(frame: &protocol::Frame) -> Option<u64> {
+    let protocol::Frame::Array(items) = frame else {
+        return None;
+    };
+    if items.len() != 3 {
+        return None;
+    }
+    let protocol::Frame::Bulk(name) = &items[0] else {
+        return None;
+    };
+    if !name.eq_ignore_ascii_case(b"REPLCONF") {
+        return None;
+    }
+    let protocol::Frame::Bulk(subcommand) = &items[1] else {
+        return None;
+    };
+    if !subcommand.eq_ignore_ascii_case(b"ACK") {
+        return None;
+    }
+    let protocol::Frame::Bulk(offset) = &items[2] else {
+        return None;
+    };
+    std::str::from_utf8(offset).ok()?.parse().ok()
+}
+
 /// Takes ownership of `framed`'s underlying socket and never returns until the replica
 /// connection dies. `PSYNC` has no reply frame of its own — the length-prefixed snapshot blob
 /// (not a RESP value) stands in for one.
@@ -386,7 +417,7 @@ async fn serve_replica<S>(
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     // ONE critical section: read the offset, snapshot, and register, so no write can slip
     // between them. Taken separately, a write committing after the snapshot walk but before
@@ -401,7 +432,7 @@ async fn serve_replica<S>(
     // there, the order guard for a write's shard(s) is held across both the AOF append and the
     // registry broadcast, for the same reason: neither critical section may release the order
     // guard before it has finished touching the registry.
-    let (snapshot_bytes, mut rx) = {
+    let (snapshot_bytes, mut rx, entry) = {
         let _order_guard = aof.lock_all_shards();
         // The header's stream position, for a PSYNC image, is the leader's replication offset --
         // not an AOF length. See `Engine::snapshot`'s doc comment for the parameter's two
@@ -412,9 +443,11 @@ async fn serve_replica<S>(
         let host_port = advertised_addr
             .clone()
             .unwrap_or_else(|| "unknown".to_string());
-        replication.registry.register(advertised_addr, tx);
+        // The entry, not just a registration: acks arriving below are recorded straight through
+        // this handle, with no registry lookup and no registry lock.
+        let entry = replication.registry.register(advertised_addr, tx);
         tracing::info!(host_port = %crate::logging::escape_ident(&host_port), "replica registered");
-        (bytes, rx)
+        (bytes, rx, entry)
     };
 
     // Reclaim the raw socket and split it, because this connection now reads as well as
@@ -422,11 +455,19 @@ async fn serve_replica<S>(
     // half becomes a RESP frame stream.
     let parts = framed.into_parts();
     let (rd, mut wr) = tokio::io::split(parts.io);
+    // Replay whatever the codec had already read ahead of `PSYNC` before touching the socket
+    // again. Those bytes are gone from the socket, so reading it straight away would silently
+    // swallow anything the follower pipelined behind its PSYNC -- its first ack, most likely.
+    //
+    // Chained in front of the read half, not poked into `FramedRead`'s own buffer with
+    // `read_buffer_mut`. Seeding that buffer keeps the bytes but leaves `FramedRead`'s internal
+    // `is_readable` flag false, so its very first poll reads the socket *before* it decodes what
+    // is already buffered (tokio-util 0.7.19 `codec/framed_impl.rs:183-248`). A pipelined ack
+    // would then sit undecoded until the follower happened to send something else, or until it
+    // hung up. Chaining makes the leftovers ordinary bytes to read, which is what the decoder is
+    // built for. `an_ack_pipelined_behind_psync_is_not_lost` is what pins this down.
+    let rd = std::io::Cursor::new(parts.read_buf).chain(rd);
     let mut inbound = FramedRead::new(rd, RespCodec::default());
-    // Carry over whatever the codec had already read ahead of `PSYNC`. Those bytes are gone
-    // from the socket, so a fresh empty buffer would silently swallow anything the follower
-    // pipelined behind its PSYNC -- its first ack, most likely.
-    *inbound.read_buffer_mut() = parts.read_buf;
 
     // Any bytes already buffered for a reply this connection never got to send (there
     // shouldn't be any at this point -- PSYNC is answered with the blob below, not a normal
@@ -472,20 +513,22 @@ async fn serve_replica<S>(
                 None => return,
             },
             incoming = inbound.next(), if inbound_open => match incoming {
-                // Nothing interprets inbound frames yet, so logging and dropping is the whole
-                // handler for now. That is deliberate: an unrecognised frame must never draw
-                // an error reply and must never cost the follower its connection. Ack
-                // tracking will replace this arm's body with `REPLCONF ACK` parsing. Only the
-                // frame's kind and length are logged, never its contents: a replica's frames
-                // are arbitrary client bytes, and `logging.rs` is the one place that decides
-                // what may be rendered.
-                Some(Ok(frame)) => {
-                    tracing::debug!(
+                // A `REPLCONF ACK <offset>` is recorded straight onto this replica's own entry,
+                // so the ack path takes no registry lock at all.
+                Some(Ok(frame)) => match parse_replconf_ack(&frame) {
+                    Some(offset) => entry.record_ack(offset),
+                    // Logged and dropped, never answered: an unrecognised frame must not draw an
+                    // error reply and must not cost the follower its connection. A follower that
+                    // never sends a recognisable ack stays a replica with no ack information.
+                    // Only the frame's kind and length are logged, never its contents: a
+                    // replica's frames are arbitrary client bytes, and `logging.rs` is the one
+                    // place that decides what may be rendered.
+                    None => tracing::debug!(
                         kind = frame.kind(),
                         len = frame.log_len(),
                         "ignoring inbound frame from a replica"
-                    );
-                }
+                    ),
+                },
                 // The follower sent bytes this codec cannot parse, so the read side is desynced
                 // and can never resynchronise -- `RespCodec::decode` errors on an unknown type
                 // byte without consuming it, so that byte stays at the head of the buffer.
@@ -1126,6 +1169,202 @@ mod tests {
             .await
             .expect("the replica must still be receiving the write stream");
         assert_eq!(streamed, expected);
+    }
+
+    /// The point of making the connection bidirectional: an ack a follower sends up the same
+    /// socket lands on that replica's registry entry, where `INFO` and (later) fencing can read
+    /// it.
+    #[tokio::test]
+    async fn a_replconf_ack_from_a_replica_is_recorded_on_its_registry_entry() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let engine = Arc::new(Engine::new());
+        let (_dir, aof) = test_aof();
+        let replication = Arc::new(crate::replication::ReplicationHandle::new(
+            Arc::clone(&engine),
+            std::env::temp_dir().join("psync-ack-unused.snapshot"),
+        ));
+        tokio::spawn(serve(
+            listener,
+            Arc::clone(&engine),
+            Arc::clone(&aof),
+            Arc::clone(&replication),
+        ));
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let mut framed = Framed::new(stream, RespCodec::default());
+        framed
+            .send(Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"PSYNC")),
+                Frame::Bulk(Bytes::from_static(b"127.0.0.1:6480")),
+            ]))
+            .await
+            .unwrap();
+        let mut parts = framed.into_parts();
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut len_buf = [0u8; 8];
+        parts.io.read_exact(&mut len_buf).await.unwrap();
+        let mut blob = vec![0u8; u64::from_le_bytes(len_buf) as usize];
+        parts.io.read_exact(&mut blob).await.unwrap();
+
+        parts
+            .io
+            .write_all(b"*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$4\r\n4096\r\n")
+            .await
+            .unwrap();
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let states = replication.registry.states();
+            if states.len() == 1 && states[0].ack_offset == 4096 {
+                assert!(
+                    states[0].last_ack_unix > 1_700_000_000,
+                    "an ack must stamp a real timestamp, got {}",
+                    states[0].last_ack_unix
+                );
+                assert_eq!(states[0].addr.as_deref(), Some("127.0.0.1:6480"));
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the leader never recorded the replica's ack: {states:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// The `read_buf` hand-off, made observable. A follower is free to pipeline its first ack
+    /// into the same write as its `PSYNC`, in which case the RESP codec has already pulled those
+    /// bytes off the socket while decoding `PSYNC` -- they live in `FramedParts::read_buf` and
+    /// nowhere else. `serve_replica` seeds its inbound reader with that buffer; if it ever stops
+    /// doing so, the ack is gone with no error anywhere and this test is what catches it.
+    ///
+    /// One `write_all` of both frames, so on loopback they land in a single read and the codec
+    /// genuinely reads ahead. Sending them as two writes would usually put the ack in a separate
+    /// read, where a dropped `read_buf` would not show up.
+    #[tokio::test]
+    async fn an_ack_pipelined_behind_psync_is_not_lost() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let engine = Arc::new(Engine::new());
+        let (_dir, aof) = test_aof();
+        let replication = Arc::new(crate::replication::ReplicationHandle::new(
+            Arc::clone(&engine),
+            std::env::temp_dir().join("psync-pipelined-ack-unused.snapshot"),
+        ));
+        tokio::spawn(serve(
+            listener,
+            Arc::clone(&engine),
+            Arc::clone(&aof),
+            Arc::clone(&replication),
+        ));
+
+        use tokio::io::AsyncWriteExt;
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(
+                b"*1\r\n$5\r\nPSYNC\r\n\
+                  *3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$1\r\n7\r\n",
+            )
+            .await
+            .unwrap();
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let states = replication.registry.states();
+            if states.len() == 1 && states[0].ack_offset == 7 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the ack pipelined behind PSYNC was dropped -- read_buf was not carried into \
+                 the inbound reader: {states:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        drop(stream);
+    }
+
+    /// A follower that never acks -- an older build, or any test that just PSYNCs -- stays a
+    /// perfectly good replica with no ack information. `PING` here stands in for any well-formed
+    /// frame this leader has no handler for: it must be ignored, not answered, and not fatal.
+    #[tokio::test]
+    async fn an_unrecognised_inbound_frame_leaves_the_replica_registered_and_unacked() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let engine = Arc::new(Engine::new());
+        let (_dir, aof) = test_aof();
+        let replication = Arc::new(crate::replication::ReplicationHandle::new(
+            Arc::clone(&engine),
+            std::env::temp_dir().join("psync-unknown-frame-unused.snapshot"),
+        ));
+        tokio::spawn(serve(
+            listener,
+            Arc::clone(&engine),
+            Arc::clone(&aof),
+            Arc::clone(&replication),
+        ));
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let mut framed = Framed::new(stream, RespCodec::default());
+        framed
+            .send(Frame::Array(vec![Frame::Bulk(Bytes::from_static(
+                b"PSYNC",
+            ))]))
+            .await
+            .unwrap();
+        let mut parts = framed.into_parts();
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut len_buf = [0u8; 8];
+        parts.io.read_exact(&mut len_buf).await.unwrap();
+        let mut blob = vec![0u8; u64::from_le_bytes(len_buf) as usize];
+        parts.io.read_exact(&mut blob).await.unwrap();
+
+        // A frame with no handler, a REPLCONF subcommand this leader does not implement, and an
+        // ack whose offset is not a number. None of the three may be recorded or answered.
+        parts
+            .io
+            .write_all(
+                b"*1\r\n$4\r\nPING\r\n\
+                  *3\r\n$8\r\nREPLCONF\r\n$14\r\nlistening-port\r\n$4\r\n6480\r\n\
+                  *3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$3\r\nabc\r\n",
+            )
+            .await
+            .unwrap();
+
+        // A real write, driven after them, must still arrive -- and be the very next bytes on
+        // this socket, proving nothing above drew a reply.
+        let mut client = Framed::new(
+            TcpStream::connect(addr).await.unwrap(),
+            RespCodec::default(),
+        );
+        client
+            .send(Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"SET")),
+                Frame::Bulk(Bytes::from_static(b"new")),
+                Frame::Bulk(Bytes::from_static(b"value")),
+            ]))
+            .await
+            .unwrap();
+        assert_eq!(
+            client.next().await.unwrap().unwrap(),
+            Frame::Simple("OK".into())
+        );
+
+        let expected = b"*3\r\n$3\r\nSET\r\n$3\r\nnew\r\n$5\r\nvalue\r\n";
+        let mut streamed = vec![0u8; expected.len()];
+        parts.io.read_exact(&mut streamed).await.unwrap();
+        assert_eq!(streamed, expected);
+
+        let states = replication.registry.states();
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].ack_offset, 0);
+        assert_eq!(
+            states[0].last_ack_unix, 0,
+            "nothing above is a well-formed REPLCONF ACK, so this replica has never acked"
+        );
     }
 
     use crate::logging::test_support::CapturedLogs;
