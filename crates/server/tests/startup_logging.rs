@@ -406,3 +406,91 @@ fn a_well_shaped_replica_announce_addr_starts_normally() {
         "a valid announce address must not stop the three always-on listeners, got:\n{stderr}"
     );
 }
+
+/// A TLS follower that never says where a peer should reach it announces its *plaintext* address,
+/// which is the misconfiguration the announce-address spec exists to surface. It must be visible
+/// at startup, at `warn`, exactly once -- not discovered later by reading a leader's
+/// `INFO REPLICATION` and noticing the port is the wrong one.
+#[test]
+fn a_tls_follower_with_no_announce_addr_is_warned_about_at_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let cert = fixtures.join("test-cert.pem");
+    let key = fixtures.join("test-key.pem");
+
+    // `replicaof` points at a port nothing listens on: the warn is a pure function of the config
+    // and fires before any connection is attempted, so a doomed reconnect loop is harmless here.
+    // Its own retry warnings carry a different message and cannot satisfy the assertions below.
+    let stderr = spawn_and_capture_stderr(
+        dir.path(),
+        &[
+            ("ROCKET_MEM_REPLICAOF", "127.0.0.1:1"),
+            ("ROCKET_MEM_TLS_RESP_ADDR", "127.0.0.1:0"),
+            ("ROCKET_MEM_TLS_CERT_PATH", cert.to_str().unwrap()),
+            ("ROCKET_MEM_TLS_KEY_PATH", key.to_str().unwrap()),
+        ],
+        &[],
+        4, // metrics, RMP, RESP+TLS, RESP
+    );
+
+    let line = stderr
+        .lines()
+        .find(|l| l.contains("replica_announce_addr is unset"))
+        .unwrap_or_else(|| {
+            panic!("expected a plaintext-announce warning at startup, got:\n{stderr}")
+        });
+
+    assert!(
+        line.contains("WARN"),
+        "this is an operator-actionable misconfiguration, so it must be warn, not info: {line}"
+    );
+    // `spawn_and_capture_stderr` sets ROCKET_MEM_ADDR=127.0.0.1:0, and the warning reports the
+    // configured `addr` -- the value that would be announced -- not the OS-assigned bound port.
+    // Unquoted, because the field is rendered with `%` (Display); a `?` sigil would produce
+    // `announced="127.0.0.1:0"` and this assertion would fail.
+    assert!(
+        line.contains("announced=127.0.0.1:0"),
+        "the warning must name the plaintext address being announced, unquoted: {line}"
+    );
+    assert_eq!(
+        stderr.matches("replica_announce_addr is unset").count(),
+        1,
+        "one line at startup, never a repeat, got:\n{stderr}"
+    );
+}
+
+/// The fix must actually silence the warning -- otherwise an operator who sets the field keeps
+/// seeing it and learns to ignore it. Identical config to the test above except for the one
+/// field, so a pass here can only mean that field is what turned it off.
+#[test]
+fn setting_replica_announce_addr_silences_the_startup_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let cert = fixtures.join("test-cert.pem");
+    let key = fixtures.join("test-key.pem");
+
+    let stderr = spawn_and_capture_stderr(
+        dir.path(),
+        &[
+            ("ROCKET_MEM_REPLICAOF", "127.0.0.1:1"),
+            ("ROCKET_MEM_TLS_RESP_ADDR", "127.0.0.1:0"),
+            ("ROCKET_MEM_TLS_CERT_PATH", cert.to_str().unwrap()),
+            ("ROCKET_MEM_TLS_KEY_PATH", key.to_str().unwrap()),
+            ("ROCKET_MEM_REPLICA_ANNOUNCE_ADDR", "numericlabs.lxd:16479"),
+        ],
+        &[],
+        4,
+    );
+
+    assert!(
+        !stderr.contains("replica_announce_addr is unset"),
+        "a node that announces an explicit address must not be warned, got:\n{stderr}"
+    );
+    // The canary for the assertion above: it must be looking at a real startup log, not at an
+    // empty capture that would make any absence-assertion pass vacuously.
+    assert_eq!(
+        stderr.matches(LISTENER_EVENT).count(),
+        4,
+        "the capture must contain a real startup log, got:\n{stderr}"
+    );
+}

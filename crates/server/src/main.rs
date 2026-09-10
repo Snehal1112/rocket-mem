@@ -328,6 +328,25 @@ async fn main() -> std::io::Result<()> {
     // sees a broken-looking replica and has nothing to grep for.
     rocket_mem::config::validate_replica_announce_addr(&config)?;
 
+    // The misconfiguration the announce-address spec exists to make visible: a follower serving
+    // TLS still tells its leader to find it at `addr`, the plaintext RESP listen address, because
+    // `announce_addr` is deliberately dumb rather than guessing at `tls_resp_addr`. One line, at
+    // startup, above every bind -- never per-command. See
+    // docs/superpowers/specs/2026-09-10-replica-announce-addr-spec.md's "Warn when the announced
+    // address contradicts the transport".
+    //
+    // `config.addr` is rendered unescaped, matching the `addr = %config.addr` field in the
+    // resolved-config summary above. It is an operator-supplied local config value, not the
+    // network-supplied `PSYNC` bulk that `connection.rs` routes through `logging::escape_ident` --
+    // no remote party can put bytes here.
+    if rocket_mem::config::should_warn_plaintext_announce(&config) {
+        tracing::warn!(
+            announced = %config.addr,
+            "replica_announce_addr is unset while a TLS listener is configured -- this node \
+             advertises its plaintext address to its leader"
+        );
+    }
+
     // A configured `replicaof` auto-connects on every startup, closing the "restarted follower
     // silently comes back as standalone" footgun documented in
     // docs/superpowers/specs/2026-08-30-sprint-5-spec.md. Fire-and-forget: this spawns its own
