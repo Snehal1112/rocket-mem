@@ -284,3 +284,125 @@ fn listener_bound_is_logged_for_tls_listeners_when_configured() {
         "expected exactly 5 listener-bound lines with TLS configured, got:\n{stderr}"
     );
 }
+
+/// How long to wait for the child to exit on its own before declaring the test failed. Only paid
+/// when the expectation is already going to fail -- a config the binary correctly rejects exits
+/// in milliseconds.
+const EXIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Spawns the real binary and waits for it to **exit**, returning whether it exited successfully
+/// and everything it wrote to stderr. The counterpart to `spawn_and_capture_stderr` above, for
+/// the configs that must abort startup rather than reach the accept loop.
+///
+/// `try_wait` in a bounded poll loop, never a bare `wait()` or `Command::output()`: the failure
+/// mode this test exists to catch is a binary that does NOT reject the config, and such a binary
+/// blocks forever in `rocket_mem::serve`. An unbounded wait would hang the suite instead of
+/// failing the test. The child is killed and reaped before any assertion runs, so a panicking
+/// test cannot leak a server process. Same `:0` addressing and same `RUST_LOG` scrub as
+/// `spawn_and_capture_stderr`, and likewise no `--config`, so the repo-root `rocket-mem.toml` is
+/// never loaded.
+fn spawn_and_wait_for_exit(dir: &std::path::Path, extra_env: &[(&str, &str)]) -> (bool, String) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_rocket-mem"));
+    cmd.env_remove("RUST_LOG")
+        .env("ROCKET_MEM_ADDR", "127.0.0.1:0")
+        .env("ROCKET_MEM_METRICS_ADDR", "127.0.0.1:0")
+        .env("ROCKET_MEM_RMP_ADDR", "127.0.0.1:0")
+        .env("ROCKET_MEM_AOF_PATH", dir.join("startup-exit-test.aof"))
+        .env(
+            "ROCKET_MEM_SNAPSHOT_PATH",
+            dir.join("startup-exit-test.snapshot"),
+        )
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn().expect("failed to spawn the rocket-mem binary");
+
+    let stderr = child.stderr.take().expect("child stderr was not piped");
+    let captured = Arc::new(Mutex::new(Vec::<String>::new()));
+    let sink = Arc::clone(&captured);
+    let reader = std::thread::spawn(move || {
+        let mut reader = BufReader::new(stderr);
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break, // EOF, or the pipe died with the child
+                Ok(_) => sink.lock().unwrap().push(line),
+            }
+        }
+    });
+
+    let deadline = std::time::Instant::now() + EXIT_DEADLINE;
+    let status = loop {
+        match child.try_wait().expect("failed to poll the child") {
+            Some(status) => break Some(status),
+            None if std::time::Instant::now() >= deadline => break None,
+            None => std::thread::sleep(std::time::Duration::from_millis(25)),
+        }
+    };
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = reader.join();
+    let output = captured.lock().unwrap().concat();
+
+    let Some(status) = status else {
+        panic!(
+            "the binary was still running after {EXIT_DEADLINE:?}; it must have rejected the \
+             config and exited. stderr so far:\n{output}"
+        );
+    };
+    (status.success(), output)
+}
+
+/// `validate_replica_announce_addr` is only useful if `main.rs` actually calls it, and calls it
+/// early. This asserts both: a non-zero exit, and no `listener bound` line -- the validator sits
+/// with `validate_replicaof`/`validate_tls`, above every `TcpListener::bind` in `main`, so a
+/// rejected config must never have opened a port.
+#[test]
+fn a_malformed_replica_announce_addr_aborts_startup_before_any_listener_binds() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let (success, stderr) = spawn_and_wait_for_exit(
+        dir.path(),
+        &[("ROCKET_MEM_REPLICA_ANNOUNCE_ADDR", "numericlabs.lxd")],
+    );
+
+    assert!(
+        !success,
+        "a replica_announce_addr with no port must fail startup, got a clean exit and:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("replica_announce_addr"),
+        "the error must name the field so an operator has something to grep for, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("numericlabs.lxd"),
+        "the error must echo the offending value, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains(LISTENER_EVENT),
+        "validation must run before anything binds, got:\n{stderr}"
+    );
+}
+
+/// The other half: a well-shaped value must not be rejected. Without this, deleting the
+/// `Ok(())` arm and rejecting everything would still pass the test above.
+#[test]
+fn a_well_shaped_replica_announce_addr_starts_normally() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let stderr = spawn_and_capture_stderr(
+        dir.path(),
+        &[("ROCKET_MEM_REPLICA_ANNOUNCE_ADDR", "numericlabs.lxd:16479")],
+        &[],
+        3,
+    );
+
+    assert_eq!(
+        stderr.matches(LISTENER_EVENT).count(),
+        3,
+        "a valid announce address must not stop the three always-on listeners, got:\n{stderr}"
+    );
+}

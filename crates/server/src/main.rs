@@ -317,6 +317,11 @@ async fn main() -> std::io::Result<()> {
     // into this node's engine and append to its own AOF.
     rocket_mem::config::validate_replicaof(&config)?;
     rocket_mem::config::validate_tls(&config)?;
+    // Same reasoning as the two above, and the same placement: a pure function of `&Config` whose
+    // failure must abort before anything binds. An unparseable announced address would otherwise
+    // survive to the leader's `INFO REPLICATION`, which renders it as `ip=?,port=0` -- an operator
+    // sees a broken-looking replica and has nothing to grep for.
+    rocket_mem::config::validate_replica_announce_addr(&config)?;
 
     // A configured `replicaof` auto-connects on every startup, closing the "restarted follower
     // silently comes back as standalone" footgun documented in
