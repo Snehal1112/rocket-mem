@@ -3406,14 +3406,34 @@ fn dispatch_and_log_inner(
     // anything. `min_replicas_to_write() == 0` short-circuits the common case (every deployment
     // before this feature existed, and every deployment that hasn't opted in) without touching
     // `registry.good_replicas`, which takes the registry's mutex.
-    if replication.min_replicas_to_write() > 0
-        && extract_write_command_name(&frame).is_some()
-        && (replication
+    if replication.min_replicas_to_write() > 0 && extract_write_command_name(&frame).is_some() {
+        let good = replication
             .registry
-            .good_replicas(replication.min_replicas_max_lag()) as u64)
-            < replication.min_replicas_to_write()
-    {
-        return Frame::Error("NOREPLICAS Not enough good replicas to write.".into());
+            .good_replicas(replication.min_replicas_max_lag());
+        let is_fenced = (good as u64) < replication.min_replicas_to_write();
+        // `swap`, not a separate load-then-store: this runs on every write attempt while fencing
+        // is enabled, potentially from many concurrent connections, and a torn read-then-write
+        // here could double-log a single transition under concurrency.
+        let was_fenced = replication
+            .fenced
+            .swap(is_fenced, std::sync::atomic::Ordering::Relaxed);
+        if is_fenced && !was_fenced {
+            tracing::warn!(
+                good_replicas = good,
+                min_replicas_to_write = replication.min_replicas_to_write(),
+                "entering fenced state: not enough good replicas, refusing writes with NOREPLICAS"
+            );
+        } else if !is_fenced && was_fenced {
+            tracing::info!(
+                good_replicas = good,
+                min_replicas_to_write = replication.min_replicas_to_write(),
+                "leaving fenced state: enough good replicas acked, accepting writes again"
+            );
+        }
+        if is_fenced {
+            ::metrics::counter!("rocket_mem_writes_rejected_no_replicas_total").increment(1);
+            return Frame::Error("NOREPLICAS Not enough good replicas to write.".into());
+        }
     }
 
     if let Some(reply) = handle_auth(&frame, session, replication) {
@@ -10268,6 +10288,111 @@ mod tests {
             engine.get(b"k"),
             None,
             "the write must never have reached the engine"
+        );
+    }
+
+    #[test]
+    fn a_rejected_write_flips_is_fenced_to_true() {
+        let engine = std::sync::Arc::new(Engine::new());
+        let (_dir, aof) = test_aof();
+        let replication = ReplicationHandle::new(
+            std::sync::Arc::clone(&engine),
+            "/tmp/unused.snapshot".into(),
+        )
+        .with_min_replicas(1, std::time::Duration::from_secs(10));
+
+        assert!(!replication.is_fenced(), "must start out not fenced");
+
+        dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"SET", b"k", b"v"]),
+            &Session::new(),
+            1,
+        );
+        assert!(replication.is_fenced());
+    }
+
+    #[test]
+    fn leaving_the_fenced_state_after_a_replica_starts_acking_flips_is_fenced_back_to_false() {
+        let engine = std::sync::Arc::new(Engine::new());
+        let (_dir, aof) = test_aof();
+        let replication = ReplicationHandle::new(
+            std::sync::Arc::clone(&engine),
+            "/tmp/unused.snapshot".into(),
+        )
+        .with_min_replicas(1, std::time::Duration::from_secs(10));
+
+        // No replica connected yet -- this write enters the fenced state.
+        let rejected = dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"SET", b"k", b"v"]),
+            &Session::new(),
+            1,
+        );
+        assert_eq!(
+            rejected,
+            Frame::Error("NOREPLICAS Not enough good replicas to write.".into())
+        );
+        assert!(replication.is_fenced());
+
+        // A replica registers and acks recently enough to count as "good".
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+        let entry = replication
+            .registry
+            .register(Some("127.0.0.1:1".to_string()), tx);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        entry
+            .last_ack_unix
+            .store(now, std::sync::atomic::Ordering::Relaxed);
+        entry
+            .ack_offset
+            .store(100, std::sync::atomic::Ordering::Relaxed);
+
+        let accepted = dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"SET", b"k", b"v2"]),
+            &Session::new(),
+            1,
+        );
+        assert_eq!(accepted, Frame::Simple("OK".into()));
+        assert!(
+            !replication.is_fenced(),
+            "must leave the fenced state once a replica is good"
+        );
+    }
+
+    #[test]
+    fn a_rejected_write_increments_the_writes_rejected_no_replicas_counter() {
+        let engine = std::sync::Arc::new(Engine::new());
+        let (_dir, aof) = test_aof();
+        let replication = ReplicationHandle::new(
+            std::sync::Arc::clone(&engine),
+            "/tmp/unused.snapshot".into(),
+        )
+        .with_min_replicas(1, std::time::Duration::from_secs(10));
+
+        let handle = crate::metrics::recorder_handle();
+        dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"SET", b"k", b"v"]),
+            &Session::new(),
+            1,
+        );
+        let rendered = handle.render();
+        assert!(
+            rendered.contains("rocket_mem_writes_rejected_no_replicas_total"),
+            "counter missing from render:\n{rendered}"
         );
     }
 

@@ -352,6 +352,18 @@ pub struct ReplicationHandle {
     /// How long a replica's last ack may be and still count as "good" for `min_replicas_to_write`.
     /// Irrelevant while `min_replicas_to_write` is `0`.
     min_replicas_max_lag: std::time::Duration,
+    /// Whether this node is currently refusing writes with `NOREPLICAS`. Flipped by
+    /// `dispatch_and_log_inner`'s fencing gate on every write attempt while `min_replicas_to_write`
+    /// is nonzero, so a transition can be logged exactly once per edge instead of once per
+    /// rejected write. `false` -- the default -- for every handle with fencing disabled. `pub`,
+    /// not accessed only through `is_fenced()` below, matching `is_replica`'s existing pattern
+    /// just above it in this struct: `dispatch_and_log_inner` needs to `swap` it directly (an
+    /// atomic read-modify-write, not a separate load-then-store), and it lives in a sibling
+    /// module (`dispatcher.rs`), so a plain private field would not be visible there at all --
+    /// Rust's field privacy is scoped to the defining module and its descendants, not the whole
+    /// crate. A plain field, not `Arc<AtomicBool>`, for the same reason `is_replica` isn't: the
+    /// whole handle is already behind one `Arc` wherever it's shared.
+    pub fenced: std::sync::atomic::AtomicBool,
 }
 
 impl ReplicationHandle {
@@ -383,6 +395,7 @@ impl ReplicationHandle {
             own_addr: None,
             min_replicas_to_write: 0,
             min_replicas_max_lag: std::time::Duration::from_secs(10),
+            fenced: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -475,6 +488,11 @@ impl ReplicationHandle {
     /// The configured lag window a replica's ack must fall within to count as "good".
     pub fn min_replicas_max_lag(&self) -> std::time::Duration {
         self.min_replicas_max_lag
+    }
+
+    /// Whether this node is currently in the fenced state (refusing writes with `NOREPLICAS`).
+    pub fn is_fenced(&self) -> bool {
+        self.fenced.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// `None` when cluster mode is off. `dispatch_and_log`'s redirection gate short-circuits on
