@@ -2752,7 +2752,11 @@ cluster_current_epoch:0
 
 **Notes:** `foo` hashes to slot 12182, owned by shard-c — used as the MOVED example in
 CLUSTER-04. `CLUSTER NODES`'s `@17101` cluster-bus port suffix is advertised by convention only;
-nothing is ever bound there (no cluster bus exists — see CLUSTER-06).
+nothing is ever bound there (no cluster bus exists — see CLUSTER-06). `connected` and
+`cluster_state:ok` above are live liveness-probe results, not hardcoded literals: each node probes
+every other configured peer once per `cluster_probe_interval_secs` (default 1s) and reports
+`disconnected`/`master,fail?`/`cluster_state:fail` once a peer misses `cluster_node_timeout_secs`
+(default 15s) of probes. See CLUSTER-06 for what a genuinely dead peer looks like here.
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -2825,14 +2829,19 @@ sleep 0.3
 (integer) 3443
 ```
 
-**Notes — known limits to expect, not bugs:** no cluster bus or gossip — every node always
-reports every configured node `connected` and `cluster_state:ok` regardless of whether the other
-processes are even running, because the topology is a static file, not a live membership
-protocol; no live resharding or failover — `CLUSTER SETSLOT`, `MIGRATE`, `ASK`/`ASKING` do not
-exist as commands at all; no request forwarding — a `MOVED` reply is final, the client must
-reconnect itself, this server never proxies a request to another shard on the client's behalf;
-`CLUSTER SLOTS` is not implemented (deprecated upstream since Redis 7.0 in favor of
-`CLUSTER SHARDS`, which is implemented — see CLUSTER-03).
+**Notes — known limits to expect, not bugs:** no cluster bus and no gossip — nodes never agree
+with each other on anything, so `cluster_slots_fail` is structurally always `0` and one node's
+suspicion of a dead peer can never be promoted to an agreed failure; each node does, however,
+probe its peers directly (`cluster_probe_interval_secs`/`cluster_node_timeout_secs`), so
+`CLUSTER NODES` reports a peer that stops answering as `disconnected`/`master,fail?` and
+`cluster_state` flips to `fail`, purely on this node's own observation — see CLUSTER-03's notes.
+`cluster_state:fail` is report-only here: unlike real Redis, this node keeps serving its own slots
+and a `MOVED` reply still points at the configured (possibly dead) owner, because picking a
+different owner is a topology decision nothing here can agree on; no live resharding or failover —
+`CLUSTER SETSLOT`, `MIGRATE`, `ASK`/`ASKING` do not exist as commands at all; no request
+forwarding — a `MOVED` reply is final, the client must reconnect itself, this server never proxies
+a request to another shard on the client's behalf; `CLUSTER SLOTS` is not implemented (deprecated
+upstream since Redis 7.0 in favor of `CLUSTER SHARDS`, which is implemented — see CLUSTER-03).
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -4993,7 +5002,7 @@ Read this before filing anything.
 | ACL replication | `ACL SETUSER`/`DELUSER` are not logged to AOF or fanned out to replicas. Follower's ACL state can diverge from leader's unless both start from the same bootstrap config. | Intentional design. ACL changes are leader-local. Users must coordinate ACL bootstrap config across deployment. |
 | Auth gate | Only `AUTH` and `HELLO` are reachable before an unauthenticated client authenticates. `ACL` deliberately is not exempt, preventing privilege escalation. | Security-first design: an unauthenticated client cannot bootstrap itself an admin account. |
 | `ACL LIST` format | Output renders a user's password as `#<hash>` (its stored Argon2 hash), not the plaintext. This `#<hash>` format is not accepted as input back to `ACL SETUSER`; only `>password` (plaintext to hash) and `nopass` are accepted. | Matches real Redis's rendering; the round-trip rejection is intentional. Plaintext passwords are never logged, persisted, or echoed. |
-| Cluster gossip | No cluster bus and no gossip. Nodes never talk to each other. Every configured node reports as `connected` and `cluster_state` is always `ok`. | Static config file design: cluster membership is fixed at process start, not dynamic. Honest answers would require inter-node communication, which is out of scope. |
+| Cluster gossip | No cluster bus and no gossip: nodes never agree with each other on anything, so `cluster_slots_fail` is structurally always `0`. Each node does directly probe its peers, though, so `CLUSTER NODES`/`SHARDS`/`INFO` report `disconnected`/`master,fail?`/`cluster_state:fail` based on that node's own observation — see CLUSTER-06's notes. `cluster_state:fail` is report-only: this node keeps serving its own slots and `cluster_redirect` still points at the configured owner even when it is known-dead. | Static config file design: cluster membership is fixed at process start, not dynamic. A per-node liveness probe (added by the failover-safety-primitives work, `docs/superpowers/plans/2026-09-09-failover-safety-primitives/`) makes reporting honest without adding a cluster bus, quorum, or automatic failover. |
 | Cluster resharding | No live resharding and no failover. Slot ownership is fixed at process start via static config file. `CLUSTER SETSLOT`, `MIGRATE`, `ASK`/`ASKING` do not exist. | Static slot assignment is the design constraint. Live resharding requires dynamic slot migration, which is a future backlog item per Sprint 8 spec. |
 | Cluster forwarding | No request forwarding. A `-MOVED` reply requires the *client* to reconnect and retry. This server never proxies requests to another shard. | Design choice for simplicity: clients handle redirection, not the server. Standard cluster-aware clients expect and handle this. |
 | `CLUSTER SLOTS` | Not implemented. Deprecated since Redis 7.0 in favor of `CLUSTER SHARDS`. | Intentional: `CLUSTER SHARDS` (implemented) is the modern equivalent. |
