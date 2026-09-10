@@ -302,7 +302,14 @@ async fn main() -> std::io::Result<()> {
     .with_own_addr(rocket_mem::config::announce_addr(&config))
     .with_slowlog_threshold(slowlog_threshold)
     .with_log_value_max_bytes(config.log_value_max_bytes)
-    .with_acl_bootstrap(acl_users);
+    .with_acl_bootstrap(acl_users)
+    // `min_replicas_to_write == 0` (the default) keeps fencing off, matching every deployment
+    // before this feature existed. See design contract §2.5 and the NOREPLICAS gate in
+    // dispatcher.rs's dispatch_and_log_inner.
+    .with_min_replicas(
+        config.min_replicas_to_write,
+        std::time::Duration::from_secs(config.min_replicas_max_lag_secs),
+    );
     if let Some(cluster) = cluster {
         handle = handle.with_cluster(cluster);
     }

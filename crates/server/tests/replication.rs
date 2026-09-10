@@ -1,8 +1,104 @@
 use futures_util::{SinkExt, StreamExt};
 use redis::AsyncCommands;
+use std::io::{BufRead, BufReader};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::net::TcpListener;
+
+/// Spawns the real compiled binary, reading its own stdout for the `RESP <addr>` banner row to
+/// discover which port it got -- same technique as `tests/kill_and_recover.rs::spawn_server`.
+/// Unlike `spawn_node_with_min_replicas`, this goes through `main.rs` end to end: env vars,
+/// `Config`, and the real `ReplicationHandle::with_min_replicas` call site, not a handle this
+/// test file built by hand. That is the one path none of this plan's other tests exercise, and
+/// exactly the path `main.rs`'s wiring could silently drop the fields on.
+fn spawn_real_binary_with_min_replicas(to_write: u64, max_lag_secs: u64) -> std::process::Child {
+    Command::new(env!("CARGO_BIN_EXE_rocket-mem"))
+        .env("ROCKET_MEM_ADDR", "127.0.0.1:0")
+        .env("ROCKET_MEM_METRICS_ADDR", "127.0.0.1:0")
+        .env("ROCKET_MEM_RMP_ADDR", "127.0.0.1:0")
+        .env(
+            "ROCKET_MEM_AOF_PATH",
+            tempfile::tempdir().unwrap().keep().join("node.aof"),
+        )
+        .env("ROCKET_MEM_MIN_REPLICAS_TO_WRITE", to_write.to_string())
+        .env(
+            "ROCKET_MEM_MIN_REPLICAS_MAX_LAG_SECS",
+            max_lag_secs.to_string(),
+        )
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn the rocket-mem binary")
+}
+
+/// Kills the wrapped child on drop, including on an unwind from a failed assertion -- the plain
+/// `child.kill()` at a test's tail never runs if `expect_err`/`assert_eq!` panics first, which
+/// otherwise leaves the spawned server alive with its stderr inherited from this test process.
+/// That keeps the underlying pipe open past the test's own exit, which is what made this
+/// exact regression hang the whole `cargo test` invocation instead of just failing it.
+struct KillOnDrop(std::process::Child);
+
+impl std::ops::Deref for KillOnDrop {
+    type Target = std::process::Child;
+    fn deref(&self) -> &std::process::Child {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for KillOnDrop {
+    fn deref_mut(&mut self) -> &mut std::process::Child {
+        &mut self.0
+    }
+}
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn read_resp_addr_from_banner(child: &mut std::process::Child) -> String {
+    let stdout = child.stdout.take().expect("child stdout was not piped");
+    let mut reader = BufReader::new(stdout);
+    for _ in 0..20 {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {
+                let trimmed = line.trim().trim_matches(|c| c == '│' || c == ' ');
+                let mut parts = trimmed.split_whitespace();
+                if parts.next() == Some("RESP") {
+                    if let Some(addr) = parts.next() {
+                        return addr.to_string();
+                    }
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    panic!("server never printed its listening address on stdout");
+}
+
+#[tokio::test]
+async fn the_real_binary_wires_min_replicas_config_onto_the_replication_handle() {
+    let mut child = KillOnDrop(spawn_real_binary_with_min_replicas(1, 10));
+    let addr = read_resp_addr_from_banner(&mut child);
+
+    let client = redis::Client::open(format!("redis://{addr}")).unwrap();
+    let mut con = client.get_multiplexed_async_connection().await.unwrap();
+    let result: Result<(), redis::RedisError> = con.set("k", "v").await;
+    assert_eq!(
+        result
+            .expect_err(
+                "ROCKET_MEM_MIN_REPLICAS_TO_WRITE=1 must reach the real ReplicationHandle \
+                 through main.rs and refuse the write -- if this passes, main.rs built the \
+                 handle without calling with_min_replicas"
+            )
+            .code(),
+        Some("NOREPLICAS")
+    );
+}
 
 /// Spawns one fully independent node — its own `Engine`, `AofWriter`, `ReplicationHandle`,
 /// and TCP listener — and returns everything a test needs to drive it or inspect its state.
@@ -57,6 +153,74 @@ async fn wait_for(engine: &engine::Engine, key: &[u8], value: &[u8]) {
         );
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
+}
+
+/// Like `spawn_node`, but applies `with_min_replicas` to the `ReplicationHandle` before serving
+/// -- `spawn_node` itself has no fencing knobs, since every other test in this file needs fencing
+/// off. A separate helper, not a parameter added to `spawn_node`, so every existing `spawn_node()`
+/// call site in this file stays untouched.
+async fn spawn_node_with_min_replicas(
+    to_write: u64,
+    max_lag: std::time::Duration,
+) -> (
+    tempfile::TempDir,
+    Arc<engine::Engine>,
+    Arc<rocket_mem::aof::AofWriter>,
+    Arc<rocket_mem::replication::ReplicationHandle>,
+    String,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Arc::new(engine::Engine::new());
+    let aof = Arc::new(
+        rocket_mem::aof::AofWriter::open(
+            &dir.path().join("node.aof"),
+            rocket_mem::aof::FsyncPolicy::Never,
+        )
+        .unwrap(),
+    );
+    let replication = Arc::new(
+        rocket_mem::replication::ReplicationHandle::new(
+            Arc::clone(&engine),
+            dir.path().join("node.snapshot"),
+        )
+        .with_min_replicas(to_write, max_lag),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(rocket_mem::serve(
+        listener,
+        Arc::clone(&engine),
+        Arc::clone(&aof),
+        Arc::clone(&replication),
+    ));
+    (dir, engine, aof, replication, addr.to_string())
+}
+
+#[tokio::test]
+async fn a_leader_with_fencing_enabled_and_no_acked_replicas_refuses_writes_with_noreplicas() {
+    let (_dir, _engine, _aof, _replication, addr) =
+        spawn_node_with_min_replicas(1, std::time::Duration::from_secs(10)).await;
+
+    let client = redis::Client::open(format!("redis://{addr}")).unwrap();
+    let mut con = client.get_multiplexed_async_connection().await.unwrap();
+    let result: Result<(), redis::RedisError> = con.set("k", "v").await;
+    assert_eq!(
+        result
+            .expect_err("must refuse the write with no replicas connected")
+            .code(),
+        Some("NOREPLICAS")
+    );
+}
+
+#[tokio::test]
+async fn a_leader_with_fencing_disabled_accepts_writes_with_zero_replicas_connected() {
+    let (_dir, engine, _aof, _replication, addr) =
+        spawn_node_with_min_replicas(0, std::time::Duration::from_secs(10)).await;
+
+    let client = redis::Client::open(format!("redis://{addr}")).unwrap();
+    let mut con = client.get_multiplexed_async_connection().await.unwrap();
+    let _: () = con.set("k", "v").await.unwrap();
+    wait_for(&engine, b"k", b"v").await;
 }
 
 /// Sends one `INFO replication` over raw RESP and returns the bulk body. Raw rather than the
