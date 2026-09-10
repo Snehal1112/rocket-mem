@@ -1,11 +1,36 @@
 # Replica of cluster node shard-b. Not a cluster member itself -- no cluster_config/
-# cluster_node_id here. Becomes read-only once `REPLICAOF numericlabs.lxd 6380 AUTH app
-# changeme` is sent to it -- the AUTH clause is required because shard-b has ACL users
-# configured; a bare REPLICAOF fails with NOAUTH.
+# cluster_node_id here. Auto-connects to shard-b and becomes read-only on every startup via
+# replicaof below -- no REPLICAOF command needs to be run by hand. The auth fields are
+# required because shard-b has ACL users configured; without them PSYNC fails with NOAUTH.
 
 addr = "numericlabs.lxd:6480"
 rmp_addr = "numericlabs.lxd:7480"
 metrics_addr = "numericlabs.lxd:9222"
+
+replicaof = "numericlabs.lxd:16380"
+replicaof_auth_username = "app"
+replicaof_auth_password = "changeme"
+
+# IF YOU PROMOTE THIS NODE, these two lines must be uncommented before it serves traffic.
+# A promoted node without them has no cluster identity, so it never sends -MOVED and will
+# silently accept keys for slots it does not own, while every other node keeps redirecting
+# clients here for shard-b's slots only. Those stray keys are then invisible to the cluster.
+#
+# Full promotion, in order:
+#   1. Comment out the `replicaof*` lines above, or run `REPLICAOF NO ONE`.
+#   2. Uncomment the two lines below.
+#   3. On EVERY node, edit cluster.conf: `shard-b numericlabs.lxd:16380 5461 10922`
+#      becomes `shard-b numericlabs.lxd:16480 5461 10922` (this node's TLS address).
+#   4. Restart EVERY node -- cluster topology is only read at startup.
+#
+#cluster_config = "/home/numericlabs/data/rocket/rocket-mem/cluster.conf"
+#cluster_node_id = "shard-b"
+
+tls_resp_addr = "numericlabs.lxd:16480"
+tls_rmp_addr = "numericlabs.lxd:17480"
+tls_cert_path = "/home/numericlabs/data/tls/server.crt"
+tls_key_path = "/home/numericlabs/data/tls/server.key"
+tls_ca_path = "/home/numericlabs/data/tls/root_ca-numericlabs.crt"
 
 aof_path = "./appendonly-shard-b-replica.aof"
 snapshot_path = "./dump-shard-b-replica.snapshot"
