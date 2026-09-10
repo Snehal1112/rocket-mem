@@ -1390,12 +1390,19 @@ mod tests {
 
         // A frame with no handler, a REPLCONF subcommand this leader does not implement, and an
         // ack whose offset is not a number. None of the three may be recorded or answered.
+        //
+        // The fourth frame is a real ack, and it is what makes the assertions below mean
+        // anything. Without it, "this replica has never acked" would also hold if the leader had
+        // never read the socket at all -- the test would pass while proving nothing. `FramedRead`
+        // decodes in arrival order, so observing this ack recorded proves the three ahead of it
+        // were decoded first and deliberately ignored.
         parts
             .io
             .write_all(
                 b"*1\r\n$4\r\nPING\r\n\
                   *3\r\n$8\r\nREPLCONF\r\n$14\r\nlistening-port\r\n$4\r\n6480\r\n\
-                  *3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$3\r\nabc\r\n",
+                  *3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$3\r\nabc\r\n\
+                  *3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$1\r\n1\r\n",
             )
             .await
             .unwrap();
@@ -1424,13 +1431,32 @@ mod tests {
         parts.io.read_exact(&mut streamed).await.unwrap();
         assert_eq!(streamed, expected);
 
-        let states = replication.registry.states();
-        assert_eq!(states.len(), 1);
-        assert_eq!(states[0].ack_offset, 0);
-        assert_eq!(
-            states[0].last_ack_unix, 0,
-            "nothing above is a well-formed REPLCONF ACK, so this replica has never acked"
-        );
+        // Bounded poll: the sentinel is recorded by the inbound arm, which races the outbound
+        // arm the write above drove.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let states = replication.registry.states();
+            assert_eq!(states.len(), 1);
+            if states[0].ack_offset != 0 {
+                // Exactly the sentinel's offset. Had any of the three malformed frames been
+                // recorded instead of ignored, this would carry some other value -- and had the
+                // leader answered one of them, the `SET` above would not have been the very next
+                // bytes on this socket.
+                assert_eq!(
+                    states[0].ack_offset, 1,
+                    "only the trailing sentinel may be recorded; the three frames before it are \
+                     unrecognised and must be ignored"
+                );
+                assert!(states[0].last_ack_unix > 0);
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the sentinel ack was never recorded, so nothing proves the leader ever decoded \
+                 the three frames ahead of it: {states:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 
     use crate::logging::test_support::CapturedLogs;

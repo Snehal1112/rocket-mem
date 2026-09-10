@@ -5877,6 +5877,20 @@ mod tests {
             text.contains("slave1:ip=?,port=0,state=online,offset=0,lag=-1\r\n"),
             "{text}"
         );
+        // Field *order*, which every other assertion here is blind to: `contains` does not care
+        // where a line sits. Real Redis emits `master_repl_offset` after the per-replica lines,
+        // and this plan's own instructions contradicted themselves about that -- one half said
+        // keep the order, the other moved it. Nothing else would catch a silent reordering of a
+        // format real clients parse.
+        let slave0 = text.find("slave0:").expect("{text}");
+        let slave1 = text.find("slave1:").expect("{text}");
+        let offset = text
+            .find("master_repl_offset:")
+            .expect("master_repl_offset must be present on a leader");
+        assert!(
+            slave0 < slave1 && slave1 < offset,
+            "master_repl_offset must follow the slaveN: lines, matching real Redis:\n{text}"
+        );
     }
 
     #[test]
