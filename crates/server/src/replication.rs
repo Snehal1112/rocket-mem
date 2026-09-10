@@ -916,6 +916,19 @@ fn replicated_command_name(frame: &protocol::Frame) -> String {
     String::from_utf8_lossy(name).to_uppercase()
 }
 
+/// Builds one `REPLCONF ACK <offset>` frame: a plain RESP array on the follower's existing
+/// replication socket, with the offset as decimal ASCII. This is the shape the failover-safety
+/// design contract's section 2.3 fixes, and it is deliberately ordinary -- a leader that has
+/// never heard of it decodes a well-formed frame it has no handler for, logs it at `debug`, and
+/// keeps streaming, rather than erroring or dropping the connection.
+fn replconf_ack_frame(offset: u64) -> protocol::Frame {
+    protocol::Frame::Array(vec![
+        protocol::Frame::Bulk(bytes::Bytes::from_static(b"REPLCONF")),
+        protocol::Frame::Bulk(bytes::Bytes::from_static(b"ACK")),
+        protocol::Frame::Bulk(bytes::Bytes::from(offset.to_string())),
+    ])
+}
+
 /// One full sync: `PSYNC`, load the snapshot, then apply every subsequent frame until the
 /// connection ends (cleanly or with an error). Never called `dispatch_and_log` — see this
 /// plan's Global Constraints. Checks `generation` against `my_generation` immediately before
@@ -1064,8 +1077,21 @@ where
 
     // From here on the leader sends plain RESP frames, byte-for-byte what its own AOF
     // received — rebuild a Framed over the same socket (whose read position is exactly past
-    // the blob) to resume decoding normally.
+    // the blob) to resume decoding normally. It is a Sink as well as a Stream, which is what
+    // lets the ack below go back up this same socket with no second connection.
     let mut framed = tokio_util::codec::Framed::from_parts(parts);
+
+    // Ack immediately, as soon as the snapshot is loaded. The snapshot header already told this
+    // follower where it sits, so there is nothing to wait for -- and without this, a
+    // freshly-attached replica reads as `offset=0,lag=-1` on the leader even though both ends
+    // agree it is caught up. A send failure here is the connection dying; returning the error
+    // puts `replication_client_loop` into its normal reconnect backoff, rather than leaving this
+    // follower silently ack-less on a half-dead socket.
+    framed
+        .send(replconf_ack_frame(
+            status.slave_offset.load(Ordering::Relaxed),
+        ))
+        .await?;
     let mut frames_applied: u64 = 0; // per-session counter, not persisted or shared -- see Global Constraints
     while let Some(result) = framed.next().await {
         if generation.load(Ordering::SeqCst) != my_generation {
@@ -1443,6 +1469,84 @@ mod tests {
         );
     }
 
+    /// A follower that has just loaded a snapshot already knows exactly where it sits in the
+    /// replication stream -- the leader stamped that position into the blob's 8-byte header.
+    /// Saying so straight away, rather than waiting out a whole ack interval, is what stops a
+    /// freshly-attached replica spending its first second reported as `offset=0,lag=-1` on a
+    /// leader that is in fact fully caught up with it.
+    #[tokio::test]
+    async fn sync_once_acks_the_snapshot_offset_as_soon_as_it_has_loaded_it() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let fake_leader = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            // `*1\r\n$5\r\nPSYNC\r\n` is exactly 15 bytes.
+            let mut psync_bytes = [0u8; 15];
+            socket.read_exact(&mut psync_bytes).await.unwrap();
+
+            // 4096 is this leader's replication offset at hand-off time, carried in the
+            // snapshot header exactly as `serve_replica` does it.
+            let blob = engine::Engine::new().snapshot(4096);
+            socket
+                .write_all(&(blob.len() as u64).to_le_bytes())
+                .await
+                .unwrap();
+            socket.write_all(&blob).await.unwrap();
+
+            // Past the blob, the follower speaks plain RESP back up this same socket.
+            let mut framed =
+                tokio_util::codec::Framed::new(socket, protocol::codec::RespCodec::default());
+            tokio::time::timeout(std::time::Duration::from_secs(5), framed.next())
+                .await
+                .expect("the follower sent no REPLCONF ACK within 5s of loading the snapshot")
+                .expect("the connection ended before any ack arrived")
+                .unwrap()
+        });
+
+        let engine = Arc::new(engine::Engine::new());
+        let host_port = addr.to_string();
+        let generation = Arc::new(AtomicU64::new(0));
+        let slave_offset = Arc::new(AtomicU64::new(0));
+        let sync_task = {
+            let engine = Arc::clone(&engine);
+            let generation = Arc::clone(&generation);
+            let slave_offset = Arc::clone(&slave_offset);
+            tokio::spawn(async move {
+                let stream = tokio::net::TcpStream::connect(&host_port).await.unwrap();
+                sync_once(
+                    stream,
+                    &engine,
+                    &generation,
+                    0,
+                    None,
+                    FollowerStatus {
+                        last_apply: &AtomicI64::new(0),
+                        link_up: &AtomicBool::new(false),
+                        slave_offset: &slave_offset,
+                    },
+                    &FollowerIdentity::default(),
+                )
+                .await
+            })
+        };
+
+        let ack = fake_leader.await.unwrap();
+        sync_task.abort();
+
+        assert_eq!(
+            ack,
+            protocol::Frame::Array(vec![
+                protocol::Frame::Bulk(bytes::Bytes::from_static(b"REPLCONF")),
+                protocol::Frame::Bulk(bytes::Bytes::from_static(b"ACK")),
+                protocol::Frame::Bulk(bytes::Bytes::from_static(b"4096")),
+            ]),
+            "the follower must ack the offset its snapshot was stamped with"
+        );
+    }
+
     /// The follower must not start counting from zero when it attaches to a leader that has
     /// already produced a replication stream. The snapshot header carries that position across,
     /// which is what makes a follower's offset comparable to its leader's.
@@ -1466,6 +1570,13 @@ mod tests {
                 .await
                 .unwrap();
             socket.write_all(&blob).await.unwrap();
+            // Drain the follower's `REPLCONF ACK`, exactly as a real leader's `serve_replica`
+            // does. A fake leader that never reads would close this socket with those bytes
+            // still queued, and the kernel answers an unread close with an RST -- which the
+            // follower sees as a `ConnectionReset` rather than the clean EOF this test wants.
+            let mut framed =
+                tokio_util::codec::Framed::new(socket, protocol::codec::RespCodec::default());
+            framed.next().await.unwrap().unwrap();
             // Hold the socket open just long enough for the follower to read the blob, then drop
             // it so `sync_once` returns on its own instead of needing a timeout.
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1527,6 +1638,13 @@ mod tests {
                 .unwrap();
             socket.write_all(&blob).await.unwrap();
             socket.write_all(STREAMED).await.unwrap();
+            // Drain the follower's `REPLCONF ACK`, exactly as a real leader's `serve_replica`
+            // does. A fake leader that never reads would close this socket with those bytes
+            // still queued, and the kernel answers an unread close with an RST -- which the
+            // follower sees as a `ConnectionReset` rather than the clean EOF this test wants.
+            let mut framed =
+                tokio_util::codec::Framed::new(socket, protocol::codec::RespCodec::default());
+            framed.next().await.unwrap().unwrap();
             // Hold the socket open long enough for the follower to read and apply the frame,
             // then drop it so `sync_once` returns on its own instead of needing a timeout.
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1594,6 +1712,11 @@ mod tests {
                 .unwrap();
             socket.write_all(&blob).await.unwrap();
             socket.write_all(STREAMED).await.unwrap();
+            // Drain the follower's `REPLCONF ACK` before closing -- see the same comment in
+            // `sync_once_seeds_the_follower_offset_from_the_snapshot_header`.
+            let mut framed =
+                tokio_util::codec::Framed::new(socket, protocol::codec::RespCodec::default());
+            framed.next().await.unwrap().unwrap();
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         });
 
