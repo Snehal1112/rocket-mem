@@ -603,3 +603,81 @@ async fn a_follower_never_resyncs_when_pinned_to_the_wrong_certificate() {
     assert_eq!(follower_engine.get(b"pre-existing"), None);
     assert!(!follower_replication.link_up());
 }
+
+/// The TLS test above proves a follower can read the *snapshot blob* over TLS. It says so in its
+/// own comment, and it stops there. Everything the bidirectional restructure of `serve_replica`
+/// touched is on the other side of that handshake: the split socket, and the `select!` loop that
+/// writes streamed frames while a read is parked on the same TLS stream. This test drives a write
+/// *after* the follower has synced and requires it to arrive, which is the only way that
+/// interleaving gets exercised over `TlsStream` rather than only over a plain `TcpStream`.
+///
+/// The leader binds two listeners over one shared engine/AOF/handle: a TLS one the follower
+/// PSYNCs to, and a plaintext one the ordinary client below writes through. Both feed the same
+/// `ReplicaRegistry`, so the write fans out down the TLS replica connection.
+#[tokio::test]
+async fn a_tls_follower_keeps_receiving_streamed_writes_after_its_resync() {
+    let leader_dir = tempfile::tempdir().unwrap();
+    let leader_engine = Arc::new(engine::Engine::new());
+    let leader_aof = Arc::new(
+        rocket_mem::aof::AofWriter::open(
+            &leader_dir.path().join("leader.aof"),
+            rocket_mem::aof::FsyncPolicy::Never,
+        )
+        .unwrap(),
+    );
+    let leader_replication = Arc::new(rocket_mem::replication::ReplicationHandle::new(
+        Arc::clone(&leader_engine),
+        leader_dir.path().join("leader.snapshot"),
+    ));
+
+    let tls_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let tls_addr = tls_listener.local_addr().unwrap();
+    let server_tls_config =
+        rocket_mem::tls::load_server_config(&fixture("test-cert.pem"), &fixture("test-key.pem"))
+            .unwrap();
+    tokio::spawn(rocket_mem::serve_tls(
+        tls_listener,
+        server_tls_config,
+        Arc::clone(&leader_engine),
+        Arc::clone(&leader_aof),
+        Arc::clone(&leader_replication),
+    ));
+
+    let plain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let plain_addr = plain_listener.local_addr().unwrap();
+    tokio::spawn(rocket_mem::serve(
+        plain_listener,
+        Arc::clone(&leader_engine),
+        Arc::clone(&leader_aof),
+        Arc::clone(&leader_replication),
+    ));
+
+    let follower_dir = tempfile::tempdir().unwrap();
+    let follower_engine = Arc::new(engine::Engine::new());
+    let client_tls_config = rocket_mem::tls::load_client_config(&fixture("test-cert.pem")).unwrap();
+    let follower_replication = Arc::new(
+        rocket_mem::replication::ReplicationHandle::new(
+            Arc::clone(&follower_engine),
+            follower_dir.path().join("follower.snapshot"),
+        )
+        .with_replication_tls_client_config(client_tls_config),
+    );
+    follower_replication.start_replicating(tls_addr.to_string());
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !follower_replication.link_up() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the follower never linked up over TLS"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    // Written only after the link is up, so it can only reach the follower through the streamed
+    // path on the split TLS socket -- never through the snapshot blob.
+    let client = redis::Client::open(format!("redis://{plain_addr}")).unwrap();
+    let mut con = client.get_multiplexed_async_connection().await.unwrap();
+    let _: () = con.set("streamed-over-tls", "yes").await.unwrap();
+
+    wait_for(&follower_engine, b"streamed-over-tls", b"yes").await;
+}
