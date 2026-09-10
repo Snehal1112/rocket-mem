@@ -508,6 +508,29 @@ pub fn replicaof_auth(config: &Config) -> Option<(String, String)> {
     }
 }
 
+/// The address this node announces to its leader in `PSYNC`: `replica_announce_addr` when set,
+/// otherwise `addr`. Unset therefore means today's behaviour byte for byte -- see the field's own
+/// doc comment for when to set it.
+///
+/// Pulled out as its own function for the same reason `replicaof_auth` is: it makes the `Config`
+/// -> announced-address mapping exercisable from a test without hand-building `main.rs`'s whole
+/// startup path, and it keeps the fallback in one place instead of inline at the single builder
+/// call site. `main.rs`'s `.with_own_addr(...)` is the only production caller.
+///
+/// Deliberately dumb: it never consults `tls_resp_addr`, `tls_rmp_addr`, or the cluster topology.
+/// The spec rejected both of those as defaults -- deriving from the cluster config announces the
+/// *leader's* address on a replica whose `cluster_node_id` names its leader, and defaulting to
+/// `tls_resp_addr` silently changes what every existing follower reports the moment TLS is
+/// switched on, while still assuming the reachable address is one this node binds locally (false
+/// under NAT, container port mapping, or a load balancer). The misconfiguration those defaults
+/// would have papered over is surfaced by `should_warn_plaintext_announce` instead.
+pub fn announce_addr(config: &Config) -> String {
+    config
+        .replica_announce_addr
+        .clone()
+        .unwrap_or_else(|| config.addr.clone())
+}
+
 /// Resolves the log filter directive: `RUST_LOG`, when set, wins over `log_level` -- the
 /// standard `tracing` convention of letting an operator's env var override any code- or
 /// config-file-supplied default. Returns a plain `String` (not an `EnvFilter`) so this stays
@@ -1140,6 +1163,32 @@ mod tests {
         assert_eq!(
             replicaof_auth(&cfg),
             Some(("app".to_string(), "changeme".to_string()))
+        );
+    }
+
+    /// The compatibility guarantee in one assertion: unset means `addr`, so a deployment that
+    /// never sets the new field announces exactly what it announced before the field existed.
+    #[test]
+    fn announce_addr_falls_back_to_addr_when_the_field_is_unset() {
+        let cfg = Config {
+            addr: "127.0.0.1:6479".to_string(),
+            ..Config::default()
+        };
+        assert_eq!(announce_addr(&cfg), "127.0.0.1:6479");
+    }
+
+    #[test]
+    fn announce_addr_prefers_the_configured_announce_address_over_addr() {
+        let cfg = Config {
+            addr: "127.0.0.1:6479".to_string(),
+            replica_announce_addr: Some("numericlabs.lxd:16479".to_string()),
+            ..Config::default()
+        };
+        assert_eq!(
+            announce_addr(&cfg),
+            "numericlabs.lxd:16479",
+            "the announced address must be independent of the bound one -- the whole point of the \
+             field is a NAT, container, or TLS deployment where they differ"
         );
     }
 
