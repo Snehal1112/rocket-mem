@@ -16,6 +16,14 @@ pub struct Config {
     pub slowlog_threshold_micros: u64,
     pub cluster_config: Option<String>,
     pub cluster_node_id: Option<String>,
+    /// How often, in seconds, the cluster peer prober probes every other node in the topology.
+    /// Read only in cluster mode -- a standalone node has no peers and never starts a prober.
+    /// Must be at least 1; see `validate_cluster_health`.
+    pub cluster_probe_interval_secs: u64,
+    /// How long, in seconds, a peer may go without answering a probe before this node reports it
+    /// failed in `CLUSTER NODES`/`SHARDS`/`INFO`. Reporting only: nothing is promoted, no
+    /// topology is rewritten, and routing is unchanged. Must be at least 1.
+    pub cluster_node_timeout_secs: u64,
     pub tls_resp_addr: Option<String>,
     pub tls_rmp_addr: Option<String>,
     pub tls_cert_path: Option<String>,
@@ -84,6 +92,8 @@ impl Default for Config {
             slowlog_threshold_micros: 10_000,
             cluster_config: None,
             cluster_node_id: None,
+            cluster_probe_interval_secs: 1,
+            cluster_node_timeout_secs: 15,
             tls_resp_addr: None,
             tls_rmp_addr: None,
             tls_cert_path: None,
@@ -133,6 +143,8 @@ impl std::fmt::Debug for Config {
             slowlog_threshold_micros,
             cluster_config,
             cluster_node_id,
+            cluster_probe_interval_secs,
+            cluster_node_timeout_secs,
             tls_resp_addr,
             tls_rmp_addr,
             tls_cert_path,
@@ -164,6 +176,8 @@ impl std::fmt::Debug for Config {
             .field("slowlog_threshold_micros", slowlog_threshold_micros)
             .field("cluster_config", cluster_config)
             .field("cluster_node_id", cluster_node_id)
+            .field("cluster_probe_interval_secs", cluster_probe_interval_secs)
+            .field("cluster_node_timeout_secs", cluster_node_timeout_secs)
             .field("tls_resp_addr", tls_resp_addr)
             .field("tls_rmp_addr", tls_rmp_addr)
             .field("tls_cert_path", tls_cert_path)
@@ -312,6 +326,12 @@ pub struct Cli {
     /// This node's id within --cluster-config's topology; requires --cluster-config [default: unset]
     #[arg(long)]
     pub cluster_node_id: Option<String>,
+    /// Seconds between cluster peer liveness probes; cluster mode only [default: 1]
+    #[arg(long)]
+    pub cluster_probe_interval_secs: Option<u64>,
+    /// Seconds without a successful probe before a peer is reported failed; cluster mode only [default: 15]
+    #[arg(long)]
+    pub cluster_node_timeout_secs: Option<u64>,
     /// TCP address for TLS-wrapped RESP clients [default: unset, TLS disabled]
     #[arg(long)]
     pub tls_resp_addr: Option<String>,
@@ -413,6 +433,12 @@ fn cli_overrides(
     if let Some(v) = cli.min_replicas_max_lag_secs {
         map.insert("min_replicas_max_lag_secs", Value::from(v));
     }
+    if let Some(v) = cli.cluster_probe_interval_secs {
+        map.insert("cluster_probe_interval_secs", Value::from(v));
+    }
+    if let Some(v) = cli.cluster_node_timeout_secs {
+        map.insert("cluster_node_timeout_secs", Value::from(v));
+    }
     Serialized::defaults(map)
 }
 
@@ -477,6 +503,30 @@ pub fn validate_replicaof(config: &Config) -> Result<(), std::io::Error> {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "replicaof_auth_username and replicaof_auth_password must both be set, or neither",
+        ));
+    }
+    Ok(())
+}
+
+/// Enforces that both cluster-health timers are usable at all. Zero is rejected on both, for two
+/// different reasons: `tokio::time::interval` panics outright on a zero period, and a zero node
+/// timeout would report every peer failed the moment its last-success stamp aged by a single
+/// second -- a permanent false alarm spelled as a config typo, the same class of mistake
+/// `min_replicas_max_lag_secs == 0` is rejected for. Validated unconditionally rather than only
+/// in cluster mode: a value that would crash or lie should fail startup wherever it is set, not
+/// only once someone also turns cluster mode on. `main.rs` calls this before it spawns the
+/// prober.
+pub fn validate_cluster_health(config: &Config) -> Result<(), std::io::Error> {
+    if config.cluster_probe_interval_secs == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "cluster_probe_interval_secs must be at least 1",
+        ));
+    }
+    if config.cluster_node_timeout_secs == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "cluster_node_timeout_secs must be at least 1",
         ));
     }
     Ok(())
@@ -641,6 +691,77 @@ mod tests {
         assert_eq!(cfg.replica_announce_addr, None);
         assert_eq!(cfg.log_level, "info");
         assert!(cfg.acl.users.is_empty());
+    }
+
+    #[test]
+    fn default_config_has_the_documented_cluster_health_timers() {
+        let cfg = Config::default();
+        assert_eq!(cfg.cluster_probe_interval_secs, 1);
+        assert_eq!(cfg.cluster_node_timeout_secs, 15);
+    }
+
+    #[test]
+    fn the_cluster_health_timers_are_layered_like_every_other_numeric_field() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "rocket-mem.toml",
+                "cluster_probe_interval_secs = 2\ncluster_node_timeout_secs = 20\n",
+            )?;
+            let cfg = load_layered(Some(std::path::Path::new("rocket-mem.toml"))).unwrap();
+            assert_eq!(cfg.cluster_probe_interval_secs, 2, "file overrides default");
+            assert_eq!(cfg.cluster_node_timeout_secs, 20, "file overrides default");
+
+            jail.set_env("ROCKET_MEM_CLUSTER_PROBE_INTERVAL_SECS", "3");
+            jail.set_env("ROCKET_MEM_CLUSTER_NODE_TIMEOUT_SECS", "30");
+            let cfg = load_layered(Some(std::path::Path::new("rocket-mem.toml"))).unwrap();
+            assert_eq!(cfg.cluster_probe_interval_secs, 3, "env overrides file");
+            assert_eq!(cfg.cluster_node_timeout_secs, 30, "env overrides file");
+
+            let cli = Cli::parse_from([
+                "rocket-mem",
+                "--config",
+                "rocket-mem.toml",
+                "--cluster-probe-interval-secs",
+                "5",
+                "--cluster-node-timeout-secs",
+                "50",
+            ]);
+            let cfg = load_with_cli(cli).unwrap();
+            assert_eq!(cfg.cluster_probe_interval_secs, 5, "CLI overrides env");
+            assert_eq!(cfg.cluster_node_timeout_secs, 50, "CLI overrides env");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn validate_cluster_health_rejects_a_zero_probe_interval() {
+        let cfg = Config {
+            cluster_probe_interval_secs: 0,
+            ..Config::default()
+        };
+        let err = validate_cluster_health(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("cluster_probe_interval_secs"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn validate_cluster_health_rejects_a_zero_node_timeout() {
+        let cfg = Config {
+            cluster_node_timeout_secs: 0,
+            ..Config::default()
+        };
+        let err = validate_cluster_health(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("cluster_node_timeout_secs"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn validate_cluster_health_accepts_the_defaults() {
+        assert!(validate_cluster_health(&Config::default()).is_ok());
     }
 
     #[test]
@@ -849,6 +970,8 @@ mod tests {
             slowlog_threshold_micros: 4321,
             cluster_config: Some("/zz/cluster.conf".to_string()),
             cluster_node_id: Some("zznode".to_string()),
+            cluster_probe_interval_secs: 4325,
+            cluster_node_timeout_secs: 4326,
             tls_resp_addr: Some("1.1.1.1:4".to_string()),
             tls_rmp_addr: Some("1.1.1.1:5".to_string()),
             tls_cert_path: Some("/zz/cert.pem".to_string()),
@@ -875,6 +998,8 @@ mod tests {
             "4321",
             "/zz/cluster.conf",
             "zznode",
+            "4325",
+            "4326",
             "1.1.1.1:4",
             "1.1.1.1:5",
             // The TLS paths and the replication username are the residue this impl deliberately
