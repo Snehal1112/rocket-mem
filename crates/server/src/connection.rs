@@ -451,6 +451,9 @@ async fn serve_replica<S>(
     // follower sends back. Both branch futures are cancel-safe, which is what makes them legal
     // `select!` arms; the writes themselves happen in the arm bodies, after the other future
     // has been dropped.
+    // Cleared by a decode error, which disables the inbound branch for the rest of this
+    // connection's life. The write stream is untouched either way.
+    let mut inbound_open = true;
     loop {
         tokio::select! {
             outbound = rx.recv() => match outbound {
@@ -468,17 +471,35 @@ async fn serve_replica<S>(
                 // again, so end the connection rather than parking on it forever.
                 None => return,
             },
-            incoming = inbound.next() => match incoming {
+            incoming = inbound.next(), if inbound_open => match incoming {
                 // Nothing interprets inbound frames yet, so logging and dropping is the whole
                 // handler for now. That is deliberate: an unrecognised frame must never draw
                 // an error reply and must never cost the follower its connection. Ack
-                // tracking will replace this arm's body with `REPLCONF ACK` parsing.
+                // tracking will replace this arm's body with `REPLCONF ACK` parsing. Only the
+                // frame's kind and length are logged, never its contents: a replica's frames
+                // are arbitrary client bytes, and `logging.rs` is the one place that decides
+                // what may be rendered.
                 Some(Ok(frame)) => {
-                    tracing::debug!(?frame, "ignoring inbound frame from a replica");
+                    tracing::debug!(
+                        kind = frame.kind(),
+                        len = frame.log_len(),
+                        "ignoring inbound frame from a replica"
+                    );
                 }
+                // The follower sent bytes this codec cannot parse, so the read side is
+                // desynced and can never resynchronise -- `RespCodec::decode` errors on an
+                // unknown type byte without consuming it, so re-polling would spin forever.
+                // Stop reading and keep streaming: the leader loses this follower's ack
+                // information, exactly as it would for a follower that never acks, and the
+                // follower keeps replicating. Dropping the connection instead would punish a
+                // replica for speaking a dialect this leader has not learned yet.
                 Some(Err(e)) => {
-                    tracing::debug!(error = %e, "replica connection decode error");
-                    return;
+                    tracing::debug!(
+                        error = %e,
+                        "unparseable inbound bytes from a replica; no longer reading this \
+                         connection, but still streaming to it"
+                    );
+                    inbound_open = false;
                 }
                 // The follower closed its side. Return so this task's `ClientGuard` drops and
                 // its sender goes with it, instead of waiting for some later broadcast to fail.
@@ -1023,6 +1044,82 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+    }
+
+    /// A follower is allowed to say things this leader does not understand. A well-formed frame
+    /// with no handler is ignored, and bytes the RESP codec cannot parse at all cost the leader
+    /// this follower's ack information -- nothing more. Neither may draw a reply, and neither
+    /// may take the replication stream down: an older follower build that speaks a dialect this
+    /// leader has never heard of must keep replicating.
+    #[tokio::test]
+    async fn a_replica_sending_unparseable_bytes_keeps_receiving_the_write_stream() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let engine = Arc::new(Engine::new());
+        let (_dir, aof) = test_aof();
+        let replication = Arc::new(crate::replication::ReplicationHandle::new(
+            Arc::clone(&engine),
+            std::env::temp_dir().join("psync-garbage-unused.snapshot"),
+        ));
+        tokio::spawn(serve(
+            listener,
+            Arc::clone(&engine),
+            Arc::clone(&aof),
+            Arc::clone(&replication),
+        ));
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let mut framed = Framed::new(stream, RespCodec::default());
+        framed
+            .send(Frame::Array(vec![Frame::Bulk(Bytes::from_static(
+                b"PSYNC",
+            ))]))
+            .await
+            .unwrap();
+        let mut parts = framed.into_parts();
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut len_buf = [0u8; 8];
+        parts.io.read_exact(&mut len_buf).await.unwrap();
+        let mut blob = vec![0u8; u64::from_le_bytes(len_buf) as usize];
+        parts.io.read_exact(&mut blob).await.unwrap();
+
+        // A well-formed frame with no handler, then bytes that are not RESP at all. `g` is not
+        // a RESP type byte, so `parse_frame` errors on it and consumes nothing.
+        parts
+            .io
+            .write_all(b"*1\r\n$4\r\nPING\r\ngarbage\r\n")
+            .await
+            .unwrap();
+
+        // Drive a write through an ordinary client. It must arrive on the replica socket, and
+        // it must be the very next bytes on it -- proving the leader neither replied to
+        // anything above nor tore the connection down over it.
+        let mut client = Framed::new(
+            TcpStream::connect(addr).await.unwrap(),
+            RespCodec::default(),
+        );
+        client
+            .send(Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"SET")),
+                Frame::Bulk(Bytes::from_static(b"new")),
+                Frame::Bulk(Bytes::from_static(b"value")),
+            ]))
+            .await
+            .unwrap();
+        assert_eq!(
+            client.next().await.unwrap().unwrap(),
+            Frame::Simple("OK".into())
+        );
+
+        let expected = b"*3\r\n$3\r\nSET\r\n$3\r\nnew\r\n$5\r\nvalue\r\n";
+        let mut streamed = vec![0u8; expected.len()];
+        parts
+            .io
+            .read_exact(&mut streamed)
+            .await
+            .expect("the replica must still be receiving the write stream");
+        assert_eq!(streamed, expected);
     }
 
     use crate::logging::test_support::CapturedLogs;
