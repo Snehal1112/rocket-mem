@@ -651,6 +651,7 @@ redis-cli -p 6540 INFO replication
 ```
 # Replication
 role:master
+master_repl_offset:0
 connected_slaves:0
 ```
 
@@ -2491,13 +2492,17 @@ redis-cli -p 6562 info replication
 ```
 # Replication
 role:master
+master_repl_offset:<n>
 connected_slaves:1
+slave0:ip=127.0.0.1,port=6562,state=online,offset=<n>,lag=<n>
 
 # Replication
 role:slave
 master_host:127.0.0.1
 master_port:6560
 master_link_status:up
+slave_repl_offset:<n>
+master_repl_offset:<n>
 ```
 
 **Result:** ☐ Pass ☐ Fail
@@ -2525,6 +2530,7 @@ sleep 0.3
 OK
 # Replication
 role:master
+master_repl_offset:0
 connected_slaves:0
 OK
 yes
@@ -3458,6 +3464,7 @@ redis-cli -p 6570 info replication
 ```
 # Replication
 role:master
+master_repl_offset:0
 connected_slaves:0
 
 ```
@@ -4979,7 +4986,7 @@ Read this before filing anything.
 | `SLOWLOG` format | Entries carry 4 fields instead of real Redis's 6. Missing: client address and client name. Argument list shows command name and first argument only; remaining arguments shown as `(N more arguments)`. | Dispatcher never learns the peer socket address — it is discarded at the connection layer before dispatch. Threading it through six call layers for cosmetic fields was not prioritized. |
 | `INFO expired_keys` | Counts only *actively* expired keys (background sweep removals). Passive expiry (a read finding a key already dead) removes keys without counting them. | Passive expiry counter would touch the hottest read path in the project; was deprioritized against write-path and replication priorities. |
 | Replication resync | Every resync is full. Dropped follower connection always triggers a full resnapshot. No partial-resync or offset-resume support. | Simplified design. Full resync removes complexity around offset tracking and partial-state recovery. |
-| Replication lag metric | No true replication-offset lag metric. Reported metric `rocket_mem_replication_last_apply_timestamp_seconds` measures apply time, not offset distance. | Full-resync-only design means no offsets exist. Timestamp is the honest substitute for offset-based lag. |
+| Replication lag metric | Superseded: replication offsets now exist. `INFO REPLICATION` reports `master_repl_offset`/`slave_repl_offset` on both roles, and each `slaveN:` line carries `offset=<n>,lag=<secs>` (`lag=-1` for a replica that has never acked). Prometheus exports `rocket_mem_master_repl_offset`, `rocket_mem_slave_repl_offset`, and `rocket_mem_good_replicas`. `rocket_mem_replication_last_apply_timestamp_seconds` still exists alongside them as a coarser wall-clock signal. | Added by the failover-safety-primitives work (`docs/superpowers/plans/2026-09-09-failover-safety-primitives/`, chain A — see `00-design-contract.md` §2.1-§2.4). |
 | `DEBUG SLEEP` | Capped at 10-second maximum duration. Requests over 10 seconds are rejected with an error. | Prevents accidental server thread blocking indefinitely from client requests. Safety limit, not a bug. |
 | `@category` ACL grants | Only explicit `+CMDNAME`/`-CMDNAME` grants and `allcommands`/`nocommands` (or `+@all`/`-@all`) are accepted. Other categories like `+@read`, `+@write` are syntax errors. | Category taxonomy is large and the project prioritizes explicit command grants for clarity. Future backlog item. |
 | ACL users persistence | Runtime `ACL SETUSER` is not persisted to AOF or snapshot. Lost on restart unless user is also declared in `[[acl.users]]` bootstrap array in TOML config. | Intentional design: ACL state is in-memory and local. Mirrors real Redis when `ACL SAVE`/`aclfile` is not configured. The project has no `ACL SAVE` command and no `aclfile` equivalent beyond TOML bootstrap. |
