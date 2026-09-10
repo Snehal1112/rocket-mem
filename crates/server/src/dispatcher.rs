@@ -21,6 +21,17 @@ use protocol::Frame;
 /// clones it into every spawned per-request task (plan 07's `rmp_connection.rs`) — this is what
 /// lets `AUTH` on one RMP request stay visible to a later, independently-spawned request on the
 /// same connection.
+/// A connection's `MULTI`/`EXEC`/`DISCARD` state. `Idle` is the state every connection starts
+/// and ends in; `Queuing` holds every command captured since the matching `MULTI`, plus whether
+/// any of them was rejected at queue time (which turns `EXEC` into `EXECABORT` — see
+/// `docs/superpowers/specs/2026-09-10-multi-exec-transactions-spec.md`).
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)] // Queuing is constructed by Task 2's intercept_for_transaction.
+pub(crate) enum TransactionState {
+    Idle,
+    Queuing { commands: Vec<Frame>, dirty: bool },
+}
+
 pub struct Session {
     protocol: std::sync::Mutex<Protocol>,
     authenticated_user: std::sync::Mutex<Option<std::sync::Arc<crate::acl::AclUser>>>,
@@ -30,6 +41,17 @@ pub struct Session {
     /// The peer address, for `CLIENT INFO`'s `addr=` field. `None` for sessions built outside an
     /// accepted TCP connection (RMP's shared session, and tests), which render an empty `addr=`.
     peer_addr: Option<std::net::SocketAddr>,
+    /// Fast path for the overwhelmingly common case (no transaction ever opened): checked with
+    /// a relaxed load before `tx`'s mutex is ever touched, so an ordinary connection that never
+    /// sends `MULTI` pays one atomic load per command and nothing else. Set `true` by `MULTI`,
+    /// `false` by `DISCARD` and by `EXEC` once it finishes. See the spec's "Performance" section.
+    #[allow(dead_code)] // Read by Task 2's intercept_for_transaction.
+    in_transaction: std::sync::atomic::AtomicBool,
+    /// The queue itself. A separate lock from `protocol`/`authenticated_user`/`name` above:
+    /// nothing about a transaction's queue needs to be visible to, or block, an unrelated read
+    /// of the connection's name or auth state.
+    #[allow(dead_code)] // Read by Task 2's intercept_for_transaction.
+    tx: std::sync::Mutex<TransactionState>,
 }
 
 impl Session {
@@ -39,6 +61,8 @@ impl Session {
             authenticated_user: std::sync::Mutex::new(None),
             name: std::sync::Mutex::new(None),
             peer_addr: None,
+            in_transaction: std::sync::atomic::AtomicBool::new(false),
+            tx: std::sync::Mutex::new(TransactionState::Idle),
         }
     }
 
@@ -82,6 +106,11 @@ impl Session {
             .authenticated_user
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = user;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tx_state_for_test(&self) -> TransactionState {
+        self.tx.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }
 
@@ -4141,6 +4170,28 @@ mod tests {
     #[test]
     fn session_is_send_and_sync() {
         assert_send_sync::<Session>();
+    }
+
+    #[test]
+    fn new_session_starts_idle_with_no_queued_commands() {
+        let session = Session::new();
+        assert_eq!(session.tx_state_for_test(), TransactionState::Idle);
+        assert!(!session
+            .in_transaction
+            .load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn transaction_state_derives_clone_and_partial_eq_for_test_assertions() {
+        // Guards the derive itself: if `Frame` (which `TransactionState::Queuing` embeds via
+        // `Vec<Frame>`) ever loses `PartialEq`, this is the test that breaks first and points
+        // at the real cause instead of a confusing failure somewhere in Task 2's tests.
+        let a = TransactionState::Queuing {
+            commands: vec![Frame::Simple("PING".into())],
+            dirty: false,
+        };
+        let b = a.clone();
+        assert_eq!(a, b);
     }
 
     #[test]
