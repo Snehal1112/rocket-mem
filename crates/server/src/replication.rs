@@ -343,6 +343,15 @@ pub struct ReplicationHandle {
     /// listening-port` serves. `None` -- the default -- sends a bare `PSYNC`, matching every
     /// pre-this-feature test and any deployment that never calls `with_own_addr`.
     own_addr: Option<String>,
+    /// `min-replicas-to-write` self-fencing threshold (design contract §2.5): the minimum number
+    /// of replicas that must have acked within `min_replicas_max_lag` for this node to accept a
+    /// client write. `0` -- the default for `new`/`Default` -- disables fencing entirely, matching
+    /// every deployment before this feature existed. Set via `with_min_replicas`; read by
+    /// `dispatch_and_log_inner`'s `NOREPLICAS` gate.
+    min_replicas_to_write: u64,
+    /// How long a replica's last ack may be and still count as "good" for `min_replicas_to_write`.
+    /// Irrelevant while `min_replicas_to_write` is `0`.
+    min_replicas_max_lag: std::time::Duration,
 }
 
 impl ReplicationHandle {
@@ -372,6 +381,8 @@ impl ReplicationHandle {
             log_value_max_bytes: 128,
             acl: crate::acl::AclStore::default(),
             own_addr: None,
+            min_replicas_to_write: 0,
+            min_replicas_max_lag: std::time::Duration::from_secs(10),
         }
     }
 
@@ -442,6 +453,28 @@ impl ReplicationHandle {
             self.acl.insert_bootstrap(user);
         }
         self
+    }
+
+    /// Configures `min-replicas-to-write` self-fencing thresholds, read by the `NOREPLICAS` gate
+    /// in `dispatch_and_log_inner`. `to_write == 0` disables fencing entirely -- the default via
+    /// `new`/`Default` -- matching every deployment before this feature existed. `main.rs` calls
+    /// this with `config.min_replicas_to_write`/`config.min_replicas_max_lag_secs`; the ~25
+    /// existing `ReplicationHandle::new` call sites (all tests) stay untouched by leaving this
+    /// unset, which keeps fencing off for them.
+    pub fn with_min_replicas(mut self, to_write: u64, max_lag: std::time::Duration) -> Self {
+        self.min_replicas_to_write = to_write;
+        self.min_replicas_max_lag = max_lag;
+        self
+    }
+
+    /// The configured `min-replicas-to-write` threshold; `0` means fencing is off.
+    pub fn min_replicas_to_write(&self) -> u64 {
+        self.min_replicas_to_write
+    }
+
+    /// The configured lag window a replica's ack must fall within to count as "good".
+    pub fn min_replicas_max_lag(&self) -> std::time::Duration {
+        self.min_replicas_max_lag
     }
 
     /// `None` when cluster mode is off. `dispatch_and_log`'s redirection gate short-circuits on
@@ -2472,6 +2505,29 @@ mod tests {
             }]);
         assert!(!h.acl.is_empty());
         assert!(h.acl.get_user("seed").unwrap().enabled);
+    }
+
+    #[test]
+    fn a_new_handle_has_fencing_disabled_by_default() {
+        let engine = std::sync::Arc::new(Engine::new());
+        let replication = ReplicationHandle::new(engine, "/tmp/unused.snapshot".into());
+        assert_eq!(
+            replication.min_replicas_to_write(),
+            0,
+            "fencing must be off for every existing ReplicationHandle::new call site"
+        );
+    }
+
+    #[test]
+    fn with_min_replicas_sets_both_thresholds() {
+        let engine = std::sync::Arc::new(Engine::new());
+        let replication = ReplicationHandle::new(engine, "/tmp/unused.snapshot".into())
+            .with_min_replicas(2, std::time::Duration::from_secs(5));
+        assert_eq!(replication.min_replicas_to_write(), 2);
+        assert_eq!(
+            replication.min_replicas_max_lag(),
+            std::time::Duration::from_secs(5)
+        );
     }
 
     #[test]
