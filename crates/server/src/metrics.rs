@@ -90,6 +90,23 @@ pub fn refresh_sampled_gauges(engine: &Engine, replication: &ReplicationHandle) 
     ::metrics::counter!("rocket_mem_evicted_keys_total").absolute(engine.eviction_count() as u64);
     ::metrics::counter!("rocket_mem_expired_keys_total").absolute(replication.expired_keys());
     ::metrics::counter!("rocket_mem_connections_total").absolute(replication.total_connections());
+    refresh_cluster_gauges(replication);
+}
+
+/// Publishes the peer prober's aggregate view. Only emitted when a health map exists -- that is,
+/// only in cluster mode with a prober running. A standalone node has no peers at all, and
+/// publishing `0`/`0` there would put an empty cluster panel on every standalone dashboard; the
+/// metrics' absence is the honest signal that this process has no peers to report on.
+///
+/// Aggregate counts, never per-peer labels: node addresses are unbounded-cardinality from
+/// Prometheus's point of view, and `CLUSTER NODES` already carries the per-peer detail.
+pub fn refresh_cluster_gauges(replication: &ReplicationHandle) {
+    let Some(health) = replication.peer_health() else {
+        return;
+    };
+    ::metrics::gauge!("rocket_mem_cluster_peers_reachable").set(health.reachable_count() as f64);
+    ::metrics::gauge!("rocket_mem_cluster_peers_unreachable")
+        .set(health.unreachable_count() as f64);
 }
 
 /// Serves `GET /metrics` (404 for anything else) over `listener` forever, and runs the
@@ -294,6 +311,52 @@ mod tests {
             rendered.contains("rocket_mem_replica_min_ack_offset 200"),
             "expected the lower of the two replicas' ack_offsets to win:\n{rendered}"
         );
+    }
+
+    #[test]
+    fn the_cluster_peer_gauges_count_reachable_and_unreachable_peers() {
+        let handle = recorder_handle();
+        let config = std::sync::Arc::new(
+            crate::cluster::ClusterConfig::parse(
+                "shard-a 127.0.0.1:7001 0 5460\n\
+                 shard-b 127.0.0.1:7002 5461 10922\n\
+                 shard-c 127.0.0.1:7003 10923 16383\n",
+                "shard-a",
+            )
+            .unwrap(),
+        );
+        let health = std::sync::Arc::new(crate::cluster_health::PeerHealth::for_cluster(
+            &config,
+            std::time::Duration::from_secs(15),
+        ));
+        health.set_last_ok_unix("shard-c", crate::replication::unix_now_secs() - 3600);
+        let replication = crate::replication::ReplicationHandle::default()
+            .with_cluster(config)
+            .with_peer_health(health);
+
+        // Deliberately not `refresh_sampled_gauges`: the recorder is process-wide and the test
+        // binary runs many servers in it, so touching the shared key/client gauges here would
+        // race the endpoint test above. This function writes only the two cluster gauges.
+        refresh_cluster_gauges(&replication);
+        let rendered = handle.render();
+        assert!(
+            rendered.contains("rocket_mem_cluster_peers_reachable 1"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("rocket_mem_cluster_peers_unreachable 1"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_node_with_no_prober_has_no_peer_health_to_report() {
+        // The gauges are emitted only when a health map exists, so a standalone node publishes
+        // neither. Asserting their absence in the rendered output would depend on which other
+        // test ran first in this shared recorder, so the condition itself is what gets pinned.
+        let replication = crate::replication::ReplicationHandle::default();
+        assert!(replication.peer_health().is_none());
+        refresh_cluster_gauges(&replication); // must not panic and must write nothing
     }
 
     #[tokio::test]
