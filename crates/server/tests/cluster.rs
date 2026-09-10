@@ -331,3 +331,120 @@ async fn keyless_commands_work_on_every_shard_without_redirection() {
         );
     }
 }
+
+/// Two live nodes plus one address nothing listens on, each live node running the peer prober.
+/// This reproduces the live-verified failure this plan chain exists for: a shard's leader process
+/// killed outright, seen from a surviving node.
+///
+/// The timers are deliberate. `last_ok_unix` has one-second resolution, so a one-second node
+/// timeout takes between one and two seconds of real time to trip; the test sleeps past that.
+async fn spawn_cluster_with_one_dead_node() -> (Vec<tempfile::TempDir>, Vec<String>, String) {
+    let mut listeners = Vec::new();
+    let mut addrs = Vec::new();
+    for _ in 0..2 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        addrs.push(listener.local_addr().unwrap().to_string());
+        listeners.push(listener);
+    }
+    // Bound to claim an ephemeral port, then dropped: a connect there is refused immediately, so
+    // the prober sees a dead node without this test waiting on a real network timeout.
+    let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead_addr = dead.local_addr().unwrap().to_string();
+    drop(dead);
+
+    let config_text = format!(
+        "live-a {} 0 5460\nlive-b {} 5461 10922\ndead-c {} 10923 16383\n",
+        addrs[0], addrs[1], dead_addr
+    );
+    let ids = ["live-a", "live-b"];
+    let mut dirs = Vec::new();
+    for (i, listener) in listeners.into_iter().enumerate() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(engine::Engine::new());
+        let aof = Arc::new(
+            rocket_mem::aof::AofWriter::open(
+                &dir.path().join("node.aof"),
+                rocket_mem::aof::FsyncPolicy::Never,
+            )
+            .unwrap(),
+        );
+        let cluster =
+            Arc::new(rocket_mem::cluster::ClusterConfig::parse(&config_text, ids[i]).unwrap());
+        let health = rocket_mem::cluster_health::spawn_peer_prober(
+            &cluster,
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_secs(1),
+        );
+        let replication = Arc::new(
+            rocket_mem::replication::ReplicationHandle::new(
+                Arc::clone(&engine),
+                dir.path().join("node.snapshot"),
+            )
+            .with_cluster(Arc::clone(&cluster))
+            .with_peer_health(health),
+        );
+        tokio::spawn(rocket_mem::serve(listener, engine, aof, replication));
+        dirs.push(dir);
+    }
+    (dirs, addrs, dead_addr)
+}
+
+#[tokio::test]
+async fn a_dead_node_is_reported_as_failed_by_its_surviving_peers_without_changing_routing() {
+    let (_dirs, addrs, dead_addr) = spawn_cluster_with_one_dead_node().await;
+    // Past the one-second node timeout, allowing for the one-second stamp resolution.
+    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+    let mut c = connect(&addrs[0]).await;
+
+    let Frame::Bulk(nodes) = send(&mut c, &[b"CLUSTER", b"NODES"]).await else {
+        panic!("expected Bulk")
+    };
+    let nodes = String::from_utf8(nodes.to_vec()).unwrap();
+    let dead_line = nodes
+        .lines()
+        .find(|l| l.starts_with("dead-c "))
+        .unwrap_or_else(|| panic!("{nodes}"));
+    assert!(dead_line.contains("master,fail?"), "{nodes}");
+    assert!(dead_line.contains(" disconnected "), "{nodes}");
+    let live_line = nodes
+        .lines()
+        .find(|l| l.starts_with("live-b "))
+        .unwrap_or_else(|| panic!("{nodes}"));
+    assert!(live_line.contains(" connected "), "{nodes}");
+    assert!(!live_line.contains("fail?"), "{nodes}");
+
+    let Frame::Bulk(info) = send(&mut c, &[b"CLUSTER", b"INFO"]).await else {
+        panic!("expected Bulk")
+    };
+    let info = String::from_utf8(info.to_vec()).unwrap();
+    assert!(info.contains("cluster_state:fail\r\n"), "{info}");
+    assert!(info.contains("cluster_slots_pfail:5461\r\n"), "{info}");
+    assert!(info.contains("cluster_slots_ok:10923\r\n"), "{info}");
+    // `fail` stays 0 beside a `fail` state, on purpose: this node suspects dead-c, and no quorum
+    // exists anywhere in this project that could turn that suspicion into an agreed failure.
+    assert!(info.contains("cluster_slots_fail:0\r\n"), "{info}");
+
+    // dead-c owns 10923-16383 and sorts last, so it is the third shard entry.
+    let Frame::Array(shards) = send(&mut c, &[b"CLUSTER", b"SHARDS"]).await else {
+        panic!("expected Array")
+    };
+    let Frame::Array(entry) = &shards[2] else {
+        panic!("expected a shard Array")
+    };
+    let Frame::Array(shard_nodes) = &entry[3] else {
+        panic!("expected a nodes Array")
+    };
+    let Frame::Array(node) = &shard_nodes[0] else {
+        panic!("expected a node Array")
+    };
+    assert_eq!(node[12], Frame::Bulk(Bytes::from_static(b"health")));
+    assert_eq!(node[13], Frame::Bulk(Bytes::from_static(b"failed")));
+
+    // Routing is deliberately unchanged. "foo" is slot 12182, which dead-c owns, and this node
+    // still redirects there -- picking a different owner is a topology decision nothing in this
+    // project can agree on. Honest reporting is the whole deliverable; failover is not.
+    assert_eq!(
+        send(&mut c, &[b"GET", b"foo"]).await,
+        Frame::Error(format!("MOVED 12182 {dead_addr}"))
+    );
+}

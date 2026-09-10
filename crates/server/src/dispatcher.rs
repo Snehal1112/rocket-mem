@@ -1686,30 +1686,64 @@ fn split_addr(addr: &str) -> (&str, i64) {
     }
 }
 
-/// `CLUSTER INFO`'s body. `cluster_state` is unconditionally `ok` and every epoch is
-/// unconditionally `0` because a static config has no way to know otherwise -- there is no
-/// gossip to learn a peer is down, and no epoch bumping without resharding or failover. Pinning
-/// the fields we cannot compute to the value that is true by construction beats fabricating one.
+/// `CLUSTER INFO`'s body.
 ///
-/// The full field set real Redis always emits is present, because clients render it directly:
-/// RedisInsight's cluster panel reads each one and shows `0` for anything missing, which made a
-/// healthy cluster look like it had no slots. `slots_ok` mirrors `slots_assigned` and both fail
-/// counters are `0` for the same reason `cluster_state` is `ok` -- nothing here can observe a
-/// slot failing. The two `stats_messages_*` counters are honestly `0`: there is no cluster bus,
-/// so no gossip message has ever been sent or received. `cluster_enabled` is a deliberate extra;
-/// real Redis reports it in `INFO`'s Cluster section rather than here, but clients read it from
-/// both and an additional key breaks no parser.
-fn cluster_info_text(cluster: Option<&std::sync::Arc<crate::cluster::ClusterConfig>>) -> String {
-    let (enabled, assigned, count) = match cluster {
-        Some(c) => (1, crate::cluster::SLOT_COUNT as u32, c.nodes().len()),
-        None => (0, 0, 0),
+/// `cluster_state`, `cluster_slots_ok`, and `cluster_slots_pfail` are derived from the peer
+/// prober's health map: every node this one cannot reach contributes its whole slot span to the
+/// pfail count, and any suspected slot makes the state `fail`. With no prober running -- cluster
+/// mode off, or a build that never started one -- nothing is suspected, so the counters are zero
+/// and the state is `ok`, exactly as before the prober existed.
+///
+/// **`cluster_slots_fail` is always `0`, and that is a fact about this system rather than a
+/// placeholder.** Redis distinguishes *pfail* (`fail?` -- one node suspects a peer) from *fail*
+/// (a majority agreed over the cluster bus that it is down). This project has no cluster bus and
+/// no quorum mechanism of any kind, so a suspicion can never be promoted to an agreed failure:
+/// there is no value this counter could ever honestly take but zero. Do not "fix" it to match
+/// `cluster_state` -- a non-zero `cluster_slots_fail` would assert a consensus that does not
+/// exist, which is the same class of confident falsehood this whole reply was rewritten to stop.
+/// `cluster_slots_ok` subtracts the pfail span once, and nothing subtracts twice.
+///
+/// `cluster_state:fail` therefore sits beside `cluster_slots_fail:0`. That reads oddly the first
+/// time and is nonetheless the truthful pair: this node's own verdict is that it cannot reach the
+/// owner of some slots (`state`), while nothing anywhere has agreed that that owner is dead
+/// (`slots_fail`).
+///
+/// `cluster_state:fail` here is also a **report, not a mode**: unlike real Redis, this node keeps
+/// serving its own slots and `cluster_redirect` keeps routing normally. Nothing is promoted and no
+/// topology is rewritten. This is a deliberate wire-compatibility divergence -- a cluster-aware
+/// client that gates on `cluster_state` before sending commands may behave unexpectedly here --
+/// and it is documented in `docs/config-reference.md` and `.claude/manual-testing.md` too.
+///
+/// The epochs stay `0` and both `stats_messages_*` counters stay `0` honestly: there is no
+/// resharding, no failover, and no cluster bus, so no epoch was ever bumped and no gossip message
+/// was ever sent. `cluster_enabled` is a deliberate extra; real Redis reports it in `INFO`'s
+/// Cluster section rather than here, but clients read it from both and an additional key breaks
+/// no parser.
+fn cluster_info_text(
+    cluster: Option<&std::sync::Arc<crate::cluster::ClusterConfig>>,
+    health: Option<&std::sync::Arc<crate::cluster_health::PeerHealth>>,
+) -> String {
+    let (enabled, assigned, count, pfail) = match cluster {
+        Some(c) => {
+            let my_id = &c.myself().id;
+            let pfail: u32 = c
+                .nodes()
+                .iter()
+                .filter(|n| !node_is_reachable(n, my_id, health))
+                .map(|n| n.last_slot as u32 - n.first_slot as u32 + 1)
+                .sum();
+            (1, crate::cluster::SLOT_COUNT as u32, c.nodes().len(), pfail)
+        }
+        None => (0, 0, 0, 0),
     };
+    let state = if pfail == 0 { "ok" } else { "fail" };
+    let slots_ok = assigned - pfail;
     format!(
         "cluster_enabled:{enabled}\r\n\
-         cluster_state:ok\r\n\
+         cluster_state:{state}\r\n\
          cluster_slots_assigned:{assigned}\r\n\
-         cluster_slots_ok:{assigned}\r\n\
-         cluster_slots_pfail:0\r\n\
+         cluster_slots_ok:{slots_ok}\r\n\
+         cluster_slots_pfail:{pfail}\r\n\
          cluster_slots_fail:0\r\n\
          cluster_known_nodes:{count}\r\n\
          cluster_size:{count}\r\n\
@@ -1935,7 +1969,7 @@ fn handle_cluster(
             // 40 zeroes: real Redis's "no cluster identity" shape, rather than inventing one.
             None => Bytes::from("0".repeat(40)),
         }),
-        "INFO" => Frame::Bulk(Bytes::from(cluster_info_text(cluster))),
+        "INFO" => Frame::Bulk(Bytes::from(cluster_info_text(cluster, health))),
         "SHARDS" => cluster_shards_reply(cluster, health, replication.master_repl_offset()),
         "SLOTS" => cluster_slots_reply(cluster),
         "NODES" => Frame::Bulk(Bytes::from(cluster_nodes_text(cluster, health))),
@@ -10880,8 +10914,10 @@ mod tests {
             panic!("expected Bulk")
         };
         let text = String::from_utf8(text.to_vec()).unwrap();
-        // Every slot is assigned and none can be failing: there is no failure detection here,
-        // so ok mirrors assigned and both fail counters are honestly zero.
+        // `cluster_handle` attaches no peer-health map, so nothing is even suspected and
+        // `cluster_slots_pfail` is honestly zero. `cluster_slots_fail` is zero for a stronger
+        // reason -- it always is, because nothing here can agree that a node has failed. See
+        // `cluster_info_reports_fail_and_the_dead_nodes_slot_span_when_a_peer_is_unreachable`.
         assert!(text.contains("cluster_slots_ok:16384\r\n"), "{text}");
         assert!(text.contains("cluster_slots_pfail:0\r\n"), "{text}");
         assert!(text.contains("cluster_slots_fail:0\r\n"), "{text}");
@@ -10895,6 +10931,81 @@ mod tests {
             text.contains("total_cluster_links_buffer_limit_exceeded:0\r\n"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn cluster_info_reports_fail_and_the_dead_nodes_slot_span_when_a_peer_is_unreachable() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let Frame::Bulk(text) = dispatch_and_log(
+            &engine,
+            &aof,
+            // shard-c owns 10923-16383, which is 5461 slots.
+            &cluster_handle_with_dead("shard-a", &["shard-c"]),
+            cmd(&[b"CLUSTER", b"INFO"]),
+            &Session::new(),
+            1,
+        ) else {
+            panic!("expected Bulk")
+        };
+        let text = String::from_utf8(text.to_vec()).unwrap();
+        assert!(text.contains("cluster_state:fail\r\n"), "{text}");
+        assert!(text.contains("cluster_slots_assigned:16384\r\n"), "{text}");
+        assert!(text.contains("cluster_slots_ok:10923\r\n"), "{text}");
+        assert!(text.contains("cluster_slots_pfail:5461\r\n"), "{text}");
+        // Structurally zero, not a placeholder: `fail` means a quorum agreed over a cluster bus,
+        // and this project has neither. One node's suspicion can never be promoted here, so this
+        // counter has no value it could ever honestly take other than 0.
+        assert!(text.contains("cluster_slots_fail:0\r\n"), "{text}");
+        // Every node is still known and still counted: nothing was removed from the topology.
+        assert!(text.contains("cluster_known_nodes:3\r\n"), "{text}");
+        assert!(text.contains("cluster_size:3\r\n"), "{text}");
+    }
+
+    #[test]
+    fn cluster_info_sums_the_slot_spans_of_every_unreachable_node() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let Frame::Bulk(text) = dispatch_and_log(
+            &engine,
+            &aof,
+            // shard-b owns 5461-10922 (5462 slots) and shard-c owns 10923-16383 (5461 slots),
+            // so 10923 are unreachable and shard-a's own 5461 are the only ones still ok.
+            &cluster_handle_with_dead("shard-a", &["shard-b", "shard-c"]),
+            cmd(&[b"CLUSTER", b"INFO"]),
+            &Session::new(),
+            1,
+        ) else {
+            panic!("expected Bulk")
+        };
+        let text = String::from_utf8(text.to_vec()).unwrap();
+        assert!(text.contains("cluster_slots_pfail:10923\r\n"), "{text}");
+        assert!(text.contains("cluster_slots_ok:5461\r\n"), "{text}");
+        assert!(
+            text.contains("cluster_slots_fail:0\r\n"),
+            "however many peers are suspected, none of it is agreed: {text}"
+        );
+    }
+
+    #[test]
+    fn cluster_info_reports_ok_while_every_peer_answers() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let Frame::Bulk(text) = dispatch_and_log(
+            &engine,
+            &aof,
+            &cluster_handle_with_dead("shard-a", &[]),
+            cmd(&[b"CLUSTER", b"INFO"]),
+            &Session::new(),
+            1,
+        ) else {
+            panic!("expected Bulk")
+        };
+        let text = String::from_utf8(text.to_vec()).unwrap();
+        assert!(text.contains("cluster_state:ok\r\n"), "{text}");
+        assert!(text.contains("cluster_slots_ok:16384\r\n"), "{text}");
+        assert!(text.contains("cluster_slots_pfail:0\r\n"), "{text}");
+        assert!(text.contains("cluster_slots_fail:0\r\n"), "{text}");
     }
 
     #[test]
