@@ -407,6 +407,61 @@ fn a_well_shaped_replica_announce_addr_starts_normally() {
     );
 }
 
+/// Same reasoning as the announce-address pair above: `validate_min_replicas` is only worth having
+/// if `main.rs` actually calls it, and calls it before anything binds. A nonzero
+/// `min_replicas_to_write` with a zero lag window can never be satisfied by any replica, so it
+/// would refuse every client write forever -- a permanent outage that must abort startup rather
+/// than come up looking healthy and fail the first write.
+#[test]
+fn fencing_with_a_zero_lag_window_aborts_startup_before_any_listener_binds() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let (success, stderr) = spawn_and_wait_for_exit(
+        dir.path(),
+        &[
+            ("ROCKET_MEM_MIN_REPLICAS_TO_WRITE", "1"),
+            ("ROCKET_MEM_MIN_REPLICAS_MAX_LAG_SECS", "0"),
+        ],
+    );
+
+    assert!(
+        !success,
+        "fencing with a zero lag window must fail startup, got a clean exit and:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("min_replicas_to_write") && stderr.contains("min_replicas_max_lag_secs"),
+        "the error must name both fields so an operator knows which pairing is wrong, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains(LISTENER_EVENT),
+        "validation must run before anything binds, got:\n{stderr}"
+    );
+}
+
+/// The other half, for the same reason the announce-address pair needs one: without this, making
+/// `validate_min_replicas` reject every config would still pass the test above. Fencing switched
+/// on with a sane lag window is a supported deployment and must start normally.
+#[test]
+fn fencing_enabled_with_a_nonzero_lag_window_starts_normally() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let stderr = spawn_and_capture_stderr(
+        dir.path(),
+        &[
+            ("ROCKET_MEM_MIN_REPLICAS_TO_WRITE", "1"),
+            ("ROCKET_MEM_MIN_REPLICAS_MAX_LAG_SECS", "10"),
+        ],
+        &[],
+        3,
+    );
+
+    assert_eq!(
+        stderr.matches(LISTENER_EVENT).count(),
+        3,
+        "enabling fencing must not stop the three always-on listeners, got:\n{stderr}"
+    );
+}
+
 /// A TLS follower that never says where a peer should reach it announces its *plaintext* address,
 /// which is the misconfiguration the announce-address spec exists to surface. It must be visible
 /// at startup, at `warn`, exactly once -- not discovered later by reading a leader's

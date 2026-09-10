@@ -482,6 +482,23 @@ pub fn validate_replicaof(config: &Config) -> Result<(), std::io::Error> {
     Ok(())
 }
 
+/// Enforces the design contract's fencing safety rule (`00-design-contract.md` §2.5): a
+/// `min_replicas_to_write` above zero paired with a `min_replicas_max_lag_secs` of zero means no
+/// replica's ack could ever be recent enough to count as "good" -- `good_replicas` requires an ack
+/// within the lag window, and no ack arrives in zero seconds. That combination would silently
+/// refuse every write forever, which is a permanent outage spelled as a config typo, not a real
+/// deployment intent. `main.rs` calls this before any listener binds, alongside `validate_tls` and
+/// `validate_replicaof`.
+pub fn validate_min_replicas(config: &Config) -> Result<(), std::io::Error> {
+    if config.min_replicas_to_write > 0 && config.min_replicas_max_lag_secs == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "min_replicas_to_write is set but min_replicas_max_lag_secs is 0 -- no replica could ever qualify, so every write would be refused forever",
+        ));
+    }
+    Ok(())
+}
+
 /// Enforces that `replica_announce_addr`, when set, is at least *shaped* like something a peer
 /// could dial: `host:port`, with a non-empty host and a port that parses as a `u16`. Follows
 /// `validate_replicaof`/`validate_tls`'s precedent of rejecting a malformed value at startup,
@@ -1387,6 +1404,47 @@ mod tests {
         assert!(
             validate_replicaof(&cfg).is_ok(),
             "replicaof with no ACL-protected leader needs no auth fields at all"
+        );
+    }
+
+    #[test]
+    fn validate_min_replicas_rejects_zero_lag_with_fencing_enabled() {
+        let cfg = Config {
+            min_replicas_to_write: 1,
+            min_replicas_max_lag_secs: 0,
+            ..Config::default()
+        };
+        assert!(
+            validate_min_replicas(&cfg).is_err(),
+            "min_replicas_to_write > 0 with a 0-second lag window means no replica could ever qualify"
+        );
+    }
+
+    #[test]
+    fn validate_min_replicas_accepts_the_default() {
+        assert!(validate_min_replicas(&Config::default()).is_ok());
+    }
+
+    #[test]
+    fn validate_min_replicas_accepts_fencing_enabled_with_a_nonzero_lag() {
+        let cfg = Config {
+            min_replicas_to_write: 2,
+            min_replicas_max_lag_secs: 5,
+            ..Config::default()
+        };
+        assert!(validate_min_replicas(&cfg).is_ok());
+    }
+
+    #[test]
+    fn validate_min_replicas_accepts_zero_lag_when_fencing_is_disabled() {
+        let cfg = Config {
+            min_replicas_to_write: 0,
+            min_replicas_max_lag_secs: 0,
+            ..Config::default()
+        };
+        assert!(
+            validate_min_replicas(&cfg).is_ok(),
+            "fencing disabled means the lag value is irrelevant"
         );
     }
 

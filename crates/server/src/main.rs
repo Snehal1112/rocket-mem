@@ -327,6 +327,10 @@ async fn main() -> std::io::Result<()> {
     // survive to the leader's `INFO REPLICATION`, which renders it as `ip=?,port=0` -- an operator
     // sees a broken-looking replica and has nothing to grep for.
     rocket_mem::config::validate_replica_announce_addr(&config)?;
+    // Same placement, same reasoning: a nonzero `min_replicas_to_write` paired with a zero lag
+    // window refuses every write forever, so it must abort startup rather than come up looking
+    // healthy and reject the first client write.
+    rocket_mem::config::validate_min_replicas(&config)?;
 
     // The misconfiguration the announce-address spec exists to make visible: a follower serving
     // TLS still tells its leader to find it at `addr`, the plaintext RESP listen address, because
