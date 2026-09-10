@@ -25,6 +25,8 @@ want to change from the default.
 | `log_value_max_bytes` | `ROCKET_MEM_LOG_VALUE_MAX_BYTES` | `--log-value-max-bytes` | `128` | Maximum bytes of a value or command argument rendered into a `trace`-level log line before truncation. Only consulted at `trace`. |
 | `cluster_config` | `ROCKET_MEM_CLUSTER_CONFIG` | `--cluster-config` | unset | Path to the cluster topology file. Requires `cluster_node_id` to also be set; unset means standalone (non-cluster) mode. |
 | `cluster_node_id` | `ROCKET_MEM_CLUSTER_NODE_ID` | `--cluster-node-id` | unset | This node's id within `cluster_config`'s topology. Requires `cluster_config` to also be set. |
+| `cluster_probe_interval_secs` | `ROCKET_MEM_CLUSTER_PROBE_INTERVAL_SECS` | `--cluster-probe-interval-secs` | `1` | How often, in seconds, this node probes every other node in `cluster_config`'s topology for liveness (a TCP connect plus a `PING`). Cluster mode only — a standalone node has no peers and never starts a prober. Must be at least 1. |
+| `cluster_node_timeout_secs` | `ROCKET_MEM_CLUSTER_NODE_TIMEOUT_SECS` | `--cluster-node-timeout-secs` | `15` | How long, in seconds, a peer may go without answering a probe before this node reports it failed in `CLUSTER NODES`, `CLUSTER SHARDS`, and `CLUSTER INFO`. Reporting only — see the note below. Must be at least 1. |
 | `tls_resp_addr` | `ROCKET_MEM_TLS_RESP_ADDR` | `--tls-resp-addr` | unset | TCP address for a TLS-wrapped RESP listener, run alongside the plaintext one at `addr`. Unset means no TLS RESP listener. Setting this requires `tls_cert_path` and `tls_key_path` — see the TLS note below. |
 | `tls_rmp_addr` | `ROCKET_MEM_TLS_RMP_ADDR` | `--tls-rmp-addr` | unset | TCP address for a TLS-wrapped RMP listener, run alongside the plaintext one at `rmp_addr`. Unset means no TLS RMP listener. Setting this requires `tls_cert_path` and `tls_key_path` — see the TLS note below. |
 | `tls_cert_path` | `ROCKET_MEM_TLS_CERT_PATH` | `--tls-cert-path` | unset | Path to a PEM certificate chain, shared by both TLS listeners. |
@@ -69,6 +71,39 @@ soft — the node starts normally, and its background reconnect loop retries onc
 forever, exactly as it would for a leader that later becomes unreachable. This mirrors the
 live `REPLICAOF` command's existing behavior; see `.claude/manual-testing.md`'s "Replication
 (`REPLICAOF`)" section.
+
+### Cluster peer health is reported, never acted on
+
+In cluster mode, `rocket-mem` probes every other node in the topology every
+`cluster_probe_interval_secs` and reports any peer that has not answered within
+`cluster_node_timeout_secs` as `master,fail?`/`disconnected` in `CLUSTER NODES`, `health: failed`
+in `CLUSTER SHARDS`, and `cluster_state:fail` with a non-zero `cluster_slots_pfail` in
+`CLUSTER INFO`. Two Prometheus gauges, `rocket_mem_cluster_peers_reachable` and
+`rocket_mem_cluster_peers_unreachable`, carry the same information, and each state change is
+logged once — once per change, not once per probe.
+
+`cluster_slots_fail` stays `0` even then, and that is correct rather than a bug. Redis's *pfail*
+(`fail?`) means one node suspects a peer; *fail* means a majority agreed over the cluster bus.
+`rocket-mem` has no cluster bus and no quorum, so a suspicion here can never be promoted — nothing
+can ever agree — and the counter has no value it could honestly take but zero. Read
+`cluster_slots_pfail` and `cluster_state`; `cluster_slots_fail` is structurally always zero.
+
+That is the entire feature. **Nothing is promoted and no routing changes.** A slot's owner stays
+its configured owner while it is dead, so clients keep getting `-MOVED` to a dead address until an
+operator intervenes: picking a different owner is a topology decision this project has no
+mechanism to agree on (there is no cluster bus, and `cluster_current_epoch` is pinned to `0`).
+Recovering write access to a dead shard's slots still means hand-editing `cluster.conf` on every
+node and restarting every node.
+
+`cluster_state:fail` here is a report, not a mode — unlike real Redis, this node keeps serving its
+own slots and keeps redirecting for everyone else's. That is a deliberate wire-compatibility
+divergence: a cluster-aware client that checks `cluster_state` before sending commands may treat
+this node as unusable when it is still serving normally.
+
+Both timers are rejected at startup if set to `0`: a zero probe interval is not a valid timer at
+all, and a zero node timeout would report every peer failed permanently. If you want faster
+detection, lower `cluster_node_timeout_secs` — but keep it comfortably above
+`cluster_probe_interval_secs`, or a single slow round will flap a healthy peer.
 
 ### `replica_announce_addr` is shape-checked, not reachability-checked
 

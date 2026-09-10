@@ -754,7 +754,90 @@ redis-cli -p 7001 mset hello 1 foo 2     # different slots -> CROSSSLOT error
 
 redis-cli -p 7001 cluster keyslot '{user1000}.name'   # same slot as...
 redis-cli -p 7001 cluster keyslot '{user1000}.city'   # ...this, via the hash tag
+```
 
+### Killing a shard: what the survivors report
+
+Before this existed, killing shard-a left every surviving node reporting it as `master` /
+`connected` forever — nothing probed liveness, so a dead node was indistinguishable from a healthy
+one. Now each node probes its peers every `cluster_probe_interval_secs` (default 1) and reports a
+peer that has gone quiet for `cluster_node_timeout_secs` (default 15) as failed.
+
+Start the three nodes with a shorter timeout so this takes seconds instead of a quarter minute —
+add these to each node's env in the block above:
+
+```bash
+ROCKET_MEM_CLUSTER_PROBE_INTERVAL_SECS=1 ROCKET_MEM_CLUSTER_NODE_TIMEOUT_SECS=3
+```
+
+Then kill shard-a outright — no shutdown, the way a crash looks:
+
+```bash
+ss -tlnp | grep ':7001'          # find shard-a's PID
+kill -9 <pid>
+sleep 5                          # one node timeout plus a probe interval
+```
+
+If you are running the cluster under systemd (`systemctl --user status rocket-mem-shard-a`), stop
+it that way instead — `systemctl --user stop rocket-mem-shard-a` — or systemd will restart it out
+from under you and you will watch it come straight back.
+
+```bash
+redis-cli -p 7002 cluster nodes
+# -> shard-a 127.0.0.1:7001@17001 master,fail? - 0 0 0 disconnected 0-5460
+#    shard-b 127.0.0.1:7002@17002 myself,master - 0 0 0 connected 5461-10922
+#    shard-c 127.0.0.1:7003@17003 master - 0 0 0 connected 10923-16383
+
+redis-cli -p 7002 cluster info | grep -E 'cluster_state|cluster_slots_'
+# -> cluster_state:fail
+#    cluster_slots_assigned:16384
+#    cluster_slots_ok:10923
+#    cluster_slots_pfail:5461      <- shard-a's whole span, 0-5460
+#    cluster_slots_fail:0          <- always 0: `fail` means a quorum agreed, and there is no
+#                                     cluster bus here for anyone to agree over. Read pfail.
+
+redis-cli -p 7002 cluster shards   # shard-a's node entry now reads health: failed
+
+curl -s localhost:9122/metrics | grep cluster_peers
+# -> rocket_mem_cluster_peers_reachable 1
+#    rocket_mem_cluster_peers_unreachable 1
+```
+
+shard-b's log carries exactly one line for the change, not one per probe:
+
+```
+WARN rocket_mem::cluster_health: cluster peer has not answered a probe within
+     cluster_node_timeout_secs; reporting it failed in CLUSTER NODES/SHARDS/INFO. Nothing was
+     promoted and routing is unchanged -- clients are still redirected to this peer's configured
+     address. peer=shard-a node_timeout_secs=3
+```
+
+**Routing is deliberately unchanged**, and this is the part to internalize before relying on any
+of it:
+
+```bash
+redis-cli -p 7002 get hello        # slot 866, owned by the dead shard-a
+# -> MOVED 866 127.0.0.1:7001      still the dead address, on purpose
+```
+
+Nothing here is a failover. There is no promotion, `cluster.conf` is never rewritten, and no
+replica takes over shard-a's slots. Restoring write access to slots 0-5460 is still the manual
+runbook: promote shard-a's replica by hand, hand-edit `cluster.conf` on *every* node to name the
+promoted address, and restart *every* node — cluster mode has no live topology-reload path. What
+changed is only that you can now see which node is dead instead of guessing.
+
+Bring shard-a back and the report reverses within one probe interval, with one `INFO` line:
+
+```bash
+# restart shard-a with the same env as before
+sleep 2
+redis-cli -p 7002 cluster nodes | head -1
+# -> shard-a 127.0.0.1:7001@17001 master - 0 0 0 connected 0-5460
+redis-cli -p 7002 cluster info | grep cluster_state
+# -> cluster_state:ok
+```
+
+```bash
 kill %1 %2 %3
 ```
 
