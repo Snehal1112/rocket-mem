@@ -128,6 +128,55 @@ async fn one_leader_two_followers_propagates_writes_within_a_bounded_time_window
     wait_for(&f2_engine, b"k", b"v").await;
 }
 
+/// The payoff of the offset chain: a leader and a caught-up follower report the *same* number.
+/// Both halves are exercised -- a write taken before the follower attached (carried across in
+/// the snapshot header) and one taken after (counted in the apply loop) -- because either half
+/// alone would let the two sides agree by accident.
+#[tokio::test]
+async fn a_followers_replication_offset_converges_on_its_leaders() {
+    let (_leader_dir, _leader_engine, _leader_aof, leader_replication, leader_addr) =
+        spawn_node().await;
+    let (_f_dir, f_engine, _f_aof, f_replication, _f_addr) = spawn_node().await;
+
+    let client = redis::Client::open(format!("redis://{leader_addr}")).unwrap();
+    let mut con = client.get_multiplexed_async_connection().await.unwrap();
+
+    // Write *before* the follower attaches, so the leader's offset is already non-zero when the
+    // snapshot header carries it across.
+    let _: () = con.set("before", "1").await.unwrap();
+    assert!(
+        leader_replication.master_repl_offset() > 0,
+        "the pre-attach write should have advanced the leader's offset"
+    );
+
+    f_replication.start_replicating(leader_addr.clone());
+    wait_for(&f_engine, b"before", b"1").await;
+
+    // And one *after*, so the apply loop's per-frame advance is exercised too.
+    let _: () = con.set("after", "2").await.unwrap();
+    wait_for(&f_engine, b"after", b"2").await;
+
+    // A bounded poll rather than a bare assertion: the apply loop stores the new offset just
+    // after the dispatch that `wait_for` observes, so the two can race by a few instructions.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let leader = leader_replication.master_repl_offset();
+        let follower = f_replication.slave_repl_offset();
+        if leader == follower {
+            assert!(
+                follower > 0,
+                "both offsets converged on zero, which proves nothing"
+            );
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "follower offset {follower} never caught up to leader offset {leader}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
 /// Reproduces the real-world scenario `REPLICAOF ... AUTH` exists to fix: before it, a follower
 /// could never sync from a leader with ACL users configured at all -- an unauthenticated PSYNC
 /// is rejected with NOAUTH, and (before a separate earlier fix) that rejection actually crashed

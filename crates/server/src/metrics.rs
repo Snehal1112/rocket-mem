@@ -57,6 +57,9 @@ pub fn refresh_sampled_gauges(engine: &Engine, replication: &ReplicationHandle) 
     ::metrics::gauge!("rocket_mem_replication_last_apply_timestamp_seconds")
         .set(replication.last_apply_unix() as f64);
     ::metrics::gauge!("rocket_mem_master_repl_offset").set(replication.master_repl_offset() as f64);
+    // Zero on a node that has never been a follower. `INFO` hides this behind `role:slave`;
+    // a gauge cannot, so it simply reads 0 there, which is the honest value.
+    ::metrics::gauge!("rocket_mem_slave_repl_offset").set(replication.slave_repl_offset() as f64);
     ::metrics::counter!("rocket_mem_evicted_keys_total").absolute(engine.eviction_count() as u64);
     ::metrics::counter!("rocket_mem_expired_keys_total").absolute(replication.expired_keys());
     ::metrics::counter!("rocket_mem_connections_total").absolute(replication.total_connections());
@@ -188,6 +191,9 @@ mod tests {
         }
 
         replication.advance_master_repl_offset(42);
+        // A different number from the leader offset above, on purpose: identical values would
+        // let a gauge wired to the wrong accessor pass this test.
+        replication.set_slave_repl_offset(4134);
         let body = get(addr, "/metrics").await;
         assert!(body.starts_with("HTTP/1.1 200 OK\r\n"), "{body}");
         assert!(
@@ -198,6 +204,7 @@ mod tests {
         assert!(body.contains("rocket_mem_connected_clients 1"), "{body}");
         assert!(body.contains("rocket_mem_memory_used_bytes"), "{body}");
         assert!(body.contains("rocket_mem_master_repl_offset 42"), "{body}");
+        assert!(body.contains("rocket_mem_slave_repl_offset 4134"), "{body}");
 
         let missing = get(addr, "/nope").await;
         assert!(
