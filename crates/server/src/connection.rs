@@ -351,15 +351,22 @@ fn psync_advertised_addr(frame: &protocol::Frame) -> Option<String> {
 
 /// Pulls the offset out of a follower's `REPLCONF ACK <offset>` frame -- the ack shape fixed by
 /// the failover-safety design contract's §2.3, a plain RESP array on the existing replication
-/// socket. `None` for anything else at all: a different frame type, a different arity, a
-/// `REPLCONF` subcommand this leader does not implement, or an offset that is not decimal ASCII.
-/// The caller logs those at `debug` and ignores them -- an unrecognised inbound frame must never
-/// draw an error reply and must never cost the follower its connection.
+/// socket. `None` for anything else: a different frame type, too few elements, a `REPLCONF`
+/// subcommand this leader does not implement, or an offset that does not parse as a `u64`. The
+/// caller logs those at `debug` and ignores them -- an unrecognised inbound frame must never draw
+/// an error reply and must never cost the follower its connection.
+///
+/// Three elements *or more*, deliberately. A real `redis-server` replica from 7.4 onward sends
+/// `REPLCONF ACK <offset> FACK <offset>`, appending its fsynced offset. Requiring exactly three
+/// would read that as "not an ack" and leave a genuine Redis replica looking like it had never
+/// acked at all -- which write fencing would later treat as a replica that does not count. The
+/// trailing fields are ignored rather than parsed: this leader has no use for a fsync offset, and
+/// guessing at fields it does not implement is how a parser starts lying.
 fn parse_replconf_ack(frame: &protocol::Frame) -> Option<u64> {
     let protocol::Frame::Array(items) = frame else {
         return None;
     };
-    if items.len() != 3 {
+    if items.len() < 3 {
         return None;
     }
     let protocol::Frame::Bulk(name) = &items[0] else {
@@ -516,7 +523,13 @@ async fn serve_replica<S>(
                 // A `REPLCONF ACK <offset>` is recorded straight onto this replica's own entry,
                 // so the ack path takes no registry lock at all.
                 Some(Ok(frame)) => match parse_replconf_ack(&frame) {
-                    Some(offset) => entry.record_ack(offset),
+                    Some(offset) => {
+                        entry.record_ack(offset);
+                        // Logged so a stuck offset can be told apart from a missing one. Without
+                        // this, an operator watching a replica that stops advancing cannot see
+                        // whether acks are arriving and repeating, or not arriving at all.
+                        tracing::debug!(offset, "recorded replica ack");
+                    }
                     // Logged and dropped, never answered: an unrecognised frame must not draw an
                     // error reply and must not cost the follower its connection. A follower that
                     // never sends a recognisable ack stays a replica with no ack information.
@@ -1169,6 +1182,59 @@ mod tests {
             .await
             .expect("the replica must still be receiving the write stream");
         assert_eq!(streamed, expected);
+    }
+
+    /// The parser's accepted shapes, pinned directly rather than through a socket. The
+    /// five-element case is the one that matters: a real `redis-server` replica from 7.4 onward
+    /// appends `FACK <offset>`, and rejecting that would leave a genuine Redis replica looking
+    /// like it had never acked -- which write fencing would later read as a replica that does not
+    /// count.
+    #[test]
+    fn parse_replconf_ack_accepts_a_real_redis_replicas_longer_ack() {
+        fn ack(parts: &[&[u8]]) -> protocol::Frame {
+            protocol::Frame::Array(
+                parts
+                    .iter()
+                    .map(|p| protocol::Frame::Bulk(Bytes::copy_from_slice(p)))
+                    .collect(),
+            )
+        }
+
+        assert_eq!(
+            parse_replconf_ack(&ack(&[b"REPLCONF", b"ACK", b"7"])),
+            Some(7)
+        );
+        // Redis >= 7.4 appends its fsynced offset. The leading offset is still ours.
+        assert_eq!(
+            parse_replconf_ack(&ack(&[b"REPLCONF", b"ACK", b"7", b"FACK", b"4"])),
+            Some(7)
+        );
+        // Case-insensitive on both words, as real clients vary.
+        assert_eq!(
+            parse_replconf_ack(&ack(&[b"replconf", b"ack", b"9"])),
+            Some(9)
+        );
+
+        // Still rejected, and none of these may panic.
+        assert_eq!(parse_replconf_ack(&ack(&[b"REPLCONF", b"ACK"])), None);
+        assert_eq!(
+            parse_replconf_ack(&ack(&[b"REPLCONF", b"GETACK", b"7"])),
+            None
+        );
+        assert_eq!(parse_replconf_ack(&ack(&[b"PING", b"ACK", b"7"])), None);
+        assert_eq!(
+            parse_replconf_ack(&ack(&[b"REPLCONF", b"ACK", b"-1"])),
+            None
+        );
+        assert_eq!(
+            parse_replconf_ack(&ack(&[b"REPLCONF", b"ACK", b"nope"])),
+            None
+        );
+        assert_eq!(
+            parse_replconf_ack(&ack(&[b"REPLCONF", b"ACK", b"99999999999999999999999"])),
+            None
+        );
+        assert_eq!(parse_replconf_ack(&protocol::Frame::Null), None);
     }
 
     /// The point of making the connection bidirectional: an ack a follower sends up the same
