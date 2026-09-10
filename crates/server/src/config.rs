@@ -37,6 +37,17 @@ pub struct Config {
     /// `[[acl.users]]`'s own `password` field -- there is no encryption-at-rest for config
     /// secrets anywhere in this project today.
     pub replicaof_auth_password: Option<String>,
+    /// The address this node advertises to its leader in its `PSYNC <addr>` frame, and which the
+    /// leader then reports in `INFO REPLICATION`'s `slaveN:ip=...,port=...` lines. Unset means
+    /// `addr` -- today's behaviour byte for byte, for every deployment that predates this field.
+    ///
+    /// Set it when the address a peer must dial differs from the address this node binds: a TLS
+    /// deployment (announce `tls_resp_addr`, since `addr` is the plaintext port), or NAT and
+    /// container port mapping (announce the externally reachable `host:port`). Shape-validated at
+    /// startup by `validate_replica_announce_addr`; never checked for reachability, because this
+    /// node cannot know how a peer routes to it. See
+    /// `docs/superpowers/specs/2026-09-10-replica-announce-addr-spec.md`.
+    pub replica_announce_addr: Option<String>,
     pub acl: AclBootstrapConfig,
     /// Log level filter, e.g. "info", "debug", "rocket_mem=debug,warn" -- same syntax as
     /// `RUST_LOG`. Overridden by the `RUST_LOG` env var when it's set (see
@@ -70,6 +81,7 @@ impl Default for Config {
             replicaof: None,
             replicaof_auth_username: None,
             replicaof_auth_password: None,
+            replica_announce_addr: None,
             acl: AclBootstrapConfig::default(),
             log_level: "info".to_string(),
             log_value_max_bytes: 128,
@@ -116,6 +128,7 @@ impl std::fmt::Debug for Config {
             replicaof,
             replicaof_auth_username,
             replicaof_auth_password,
+            replica_announce_addr,
             acl,
             log_level,
             log_value_max_bytes,
@@ -144,6 +157,7 @@ impl std::fmt::Debug for Config {
             .field("replicaof", replicaof)
             .field("replicaof_auth_username", replicaof_auth_username)
             .field("replicaof_auth_password", &replicaof_auth_password)
+            .field("replica_announce_addr", replica_announce_addr)
             .field("acl", acl)
             .field("log_level", log_level)
             .field("log_value_max_bytes", log_value_max_bytes)
@@ -304,6 +318,10 @@ pub struct Cli {
     /// Password for the AUTH clause sent before PSYNC to --replicaof's leader [default: unset]
     #[arg(long)]
     pub replicaof_auth_password: Option<String>,
+    /// `host:port` this node advertises to its leader in PSYNC, when the address a peer must dial
+    /// differs from --addr [default: unset, announces --addr]
+    #[arg(long)]
+    pub replica_announce_addr: Option<String>,
     /// Log level filter, e.g. "info", "debug", "rocket_mem=debug,warn" [default: info]
     #[arg(long)]
     pub log_level: Option<String>,
@@ -354,6 +372,7 @@ fn cli_overrides(
     set!(replicaof);
     set!(replicaof_auth_username);
     set!(replicaof_auth_password);
+    set!(replica_announce_addr);
     set!(log_level);
     if let Some(v) = cli.slowlog_threshold_micros {
         map.insert("slowlog_threshold_micros", Value::from(v));
@@ -478,6 +497,7 @@ mod tests {
         assert_eq!(cfg.tls_cert_path, None);
         assert_eq!(cfg.tls_key_path, None);
         assert_eq!(cfg.tls_ca_path, None);
+        assert_eq!(cfg.replica_announce_addr, None);
         assert_eq!(cfg.log_level, "info");
         assert!(cfg.acl.users.is_empty());
     }
@@ -696,6 +716,7 @@ mod tests {
             replicaof: Some("1.1.1.1:6".to_string()),
             replicaof_auth_username: Some("zzuser".to_string()),
             replicaof_auth_password: Some("zzleaderpassword".to_string()),
+            replica_announce_addr: Some("1.1.1.1:7".to_string()),
             acl: AclBootstrapConfig::default(),
             log_level: "zzlevel".to_string(),
             log_value_max_bytes: 4322,
@@ -721,6 +742,7 @@ mod tests {
             "/zz/ca.pem",
             "1.1.1.1:6",
             "zzuser",
+            "1.1.1.1:7",
             "acl",
             "zzlevel",
             "4322",
@@ -821,6 +843,62 @@ mod tests {
             assert_eq!(cfg.replicaof.as_deref(), Some("127.0.0.1:1111"));
             assert_eq!(cfg.replicaof_auth_username.as_deref(), Some("cliuser"));
             assert_eq!(cfg.replicaof_auth_password.as_deref(), Some("clipass"));
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn default_config_has_no_replica_announce_addr() {
+        // Unset is the whole compatibility guarantee: a node with no `replica_announce_addr`
+        // must announce `addr`, exactly as every deployment did before this field existed.
+        assert_eq!(Config::default().replica_announce_addr, None);
+    }
+
+    #[test]
+    fn replica_announce_addr_is_layered_like_every_other_optional_string_field() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "rocket-mem.toml",
+                "replica_announce_addr = \"numericlabs.lxd:16479\"\n",
+            )?;
+            let cfg = load_layered(Some(std::path::Path::new("rocket-mem.toml"))).unwrap();
+            assert_eq!(
+                cfg.replica_announce_addr.as_deref(),
+                Some("numericlabs.lxd:16479"),
+                "file overrides default"
+            );
+
+            jail.set_env("ROCKET_MEM_REPLICA_ANNOUNCE_ADDR", "numericlabs.lxd:26479");
+            let cfg = load_layered(Some(std::path::Path::new("rocket-mem.toml"))).unwrap();
+            assert_eq!(
+                cfg.replica_announce_addr.as_deref(),
+                Some("numericlabs.lxd:26479"),
+                "env overrides file"
+            );
+
+            let cli = Cli::parse_from([
+                "rocket-mem",
+                "--config",
+                "rocket-mem.toml",
+                "--replica-announce-addr",
+                "numericlabs.lxd:36479",
+            ]);
+            let cfg = load_with_cli(cli).unwrap();
+            assert_eq!(
+                cfg.replica_announce_addr.as_deref(),
+                Some("numericlabs.lxd:36479"),
+                "CLI overrides env"
+            );
+
+            // The layer that is easiest to break by forgetting a `set!` line: an unset flag must
+            // leave the env value alone rather than clobbering it with `None`.
+            let cli = Cli::parse_from(["rocket-mem", "--config", "rocket-mem.toml"]);
+            let cfg = load_with_cli(cli).unwrap();
+            assert_eq!(
+                cfg.replica_announce_addr.as_deref(),
+                Some("numericlabs.lxd:26479"),
+                "an unset CLI flag must not clobber the env value"
+            );
             Ok(())
         });
     }
