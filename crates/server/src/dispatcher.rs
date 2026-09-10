@@ -3398,6 +3398,24 @@ fn dispatch_and_log_inner(
         return Frame::Error("READONLY You can't write against a read only replica.".into());
     }
 
+    // `min-replicas-to-write` self-fencing (design contract §2.5). Checked immediately after the
+    // READONLY gate above -- a replica must still answer READONLY first, which it already has by
+    // the time execution reaches here, so there is no need to re-check `is_replica` -- and before
+    // every other interception and the write path's AOF ordering lock further down: a rejected
+    // write must never touch that lock, since it never gets far enough to log or broadcast
+    // anything. `min_replicas_to_write() == 0` short-circuits the common case (every deployment
+    // before this feature existed, and every deployment that hasn't opted in) without touching
+    // `registry.good_replicas`, which takes the registry's mutex.
+    if replication.min_replicas_to_write() > 0
+        && extract_write_command_name(&frame).is_some()
+        && (replication
+            .registry
+            .good_replicas(replication.min_replicas_max_lag()) as u64)
+            < replication.min_replicas_to_write()
+    {
+        return Frame::Error("NOREPLICAS Not enough good replicas to write.".into());
+    }
+
     if let Some(reply) = handle_auth(&frame, session, replication) {
         return reply;
     }
@@ -10221,6 +10239,88 @@ mod tests {
             Frame::Error("READONLY You can't write against a read only replica.".into())
         );
         assert_eq!(engine.get(b"k"), None); // the write must never have reached the engine
+    }
+
+    #[test]
+    fn a_write_command_is_rejected_with_noreplicas_when_fencing_is_enabled_and_no_replica_has_acked(
+    ) {
+        let engine = std::sync::Arc::new(Engine::new());
+        let (_dir, aof) = test_aof();
+        let replication = ReplicationHandle::new(
+            std::sync::Arc::clone(&engine),
+            "/tmp/unused.snapshot".into(),
+        )
+        .with_min_replicas(1, std::time::Duration::from_secs(10));
+
+        let reply = dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"SET", b"k", b"v"]),
+            &Session::new(),
+            1,
+        );
+        assert_eq!(
+            reply,
+            Frame::Error("NOREPLICAS Not enough good replicas to write.".into())
+        );
+        assert_eq!(
+            engine.get(b"k"),
+            None,
+            "the write must never have reached the engine"
+        );
+    }
+
+    #[test]
+    fn a_read_command_is_not_fenced_even_with_no_good_replicas() {
+        let engine = std::sync::Arc::new(Engine::new());
+        dispatch(
+            &engine,
+            cmd(&[b"SET", b"k", b"v"]),
+            &mut Protocol::default(),
+            1,
+        );
+        let (_dir, aof) = test_aof();
+        let replication = ReplicationHandle::new(
+            std::sync::Arc::clone(&engine),
+            "/tmp/unused.snapshot".into(),
+        )
+        .with_min_replicas(1, std::time::Duration::from_secs(10));
+
+        let reply = dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"GET", b"k"]),
+            &Session::new(),
+            1,
+        );
+        assert_eq!(reply, Frame::Bulk(Bytes::from_static(b"v")));
+    }
+
+    #[test]
+    fn fencing_disabled_by_default_accepts_writes_with_zero_replicas_connected() {
+        let engine = std::sync::Arc::new(Engine::new());
+        let (_dir, aof) = test_aof();
+        // min_replicas_to_write defaults to 0 -- fencing off -- so no .with_min_replicas call here.
+        let replication = ReplicationHandle::new(
+            std::sync::Arc::clone(&engine),
+            "/tmp/unused.snapshot".into(),
+        );
+
+        let reply = dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"SET", b"k", b"v"]),
+            &Session::new(),
+            1,
+        );
+        assert_eq!(reply, Frame::Simple("OK".into()));
+        assert_eq!(
+            engine.get(b"k"),
+            Some(engine::Value::String(Bytes::from_static(b"v")))
+        );
     }
 
     #[test]
