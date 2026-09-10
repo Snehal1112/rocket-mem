@@ -486,13 +486,19 @@ async fn serve_replica<S>(
                         "ignoring inbound frame from a replica"
                     );
                 }
-                // The follower sent bytes this codec cannot parse, so the read side is
-                // desynced and can never resynchronise -- `RespCodec::decode` errors on an
-                // unknown type byte without consuming it, so re-polling would spin forever.
+                // The follower sent bytes this codec cannot parse, so the read side is desynced
+                // and can never resynchronise -- `RespCodec::decode` errors on an unknown type
+                // byte without consuming it, so that byte stays at the head of the buffer.
+                // Clearing the flag is not the same as `continue`: `FramedRead` fuses after a
+                // decoder error, so the next poll would yield `None`, and `None` is handled
+                // below as end-of-stream. Continuing would therefore drop this replica by a
+                // roundabout route, which is the one thing this arm exists to prevent.
                 // Stop reading and keep streaming: the leader loses this follower's ack
                 // information, exactly as it would for a follower that never acks, and the
                 // follower keeps replicating. Dropping the connection instead would punish a
-                // replica for speaking a dialect this leader has not learned yet.
+                // replica for speaking a dialect this leader has not learned yet. The cost is
+                // that this connection also stops noticing a disconnect promptly, falling back
+                // to the write-failure pruning that predated the bidirectional split.
                 Some(Err(e)) => {
                     tracing::debug!(
                         error = %e,
