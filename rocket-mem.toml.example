@@ -29,6 +29,19 @@
 # 0 disables the slow log entirely.
 # slowlog_threshold_micros = 10000
 
+# --- Logging ------------------------------------------------------------------
+
+# Tracing filter directive, e.g. "info", "debug", "trace", "rocket_mem=debug,warn" --
+# same syntax as RUST_LOG. Overridden by the RUST_LOG environment variable when it is
+# set; this field is only the default for a deployment that doesn't set RUST_LOG.
+# log_level = "info"
+
+# Maximum bytes of a value or command argument rendered into a `trace`-level log line
+# before truncation. Only consulted when logging at `trace` -- lower it to keep trace
+# logs readable, raise it to see whole values. Trace-level logging writes your data to
+# disk in plaintext; see docs/config-reference.md's note on this before enabling it.
+# log_value_max_bytes = 128
+
 # --- Cluster mode -----------------------------------------------------------
 # Both fields are unset by default (standalone mode). Setting one requires the other.
 
@@ -38,6 +51,20 @@
 
 # This node's id, matched against a line in cluster_config's topology file.
 # cluster_node_id = "shard-a"
+
+# How often, in seconds, the cluster peer prober probes every other node in the
+# topology. Read only in cluster mode -- a standalone node has no peers and never
+# starts a prober. Must be at least 1: a zero value crashes tokio's timer outright.
+# Default: 1
+# cluster_probe_interval_secs = 1
+
+# How long, in seconds, a peer may go without answering a probe before this node
+# reports it failed in CLUSTER NODES/SHARDS/INFO. Reporting only -- nothing is
+# promoted, no topology is rewritten, and routing is unchanged. Must be at least 1:
+# a zero value would report every peer failed the instant its last ack ages by a
+# single second, a permanent false alarm spelled as a config typo.
+# Default: 15
+# cluster_node_timeout_secs = 15
 
 # --- TLS ---------------------------------------------------------------------
 # TLS listeners run *alongside* the plaintext ones — they never replace addr/rmp_addr.
@@ -57,6 +84,55 @@
 
 # PEM private key, shared by both TLS listeners. Same relative-path caveat as above.
 # tls_key_path = "/etc/rocket-mem/tls/server.key"
+
+# The leader's certificate file, for THIS node's own replication connection (as a
+# follower, via replicaof below) to verify and pin to when connecting over TLS. Unset
+# means plaintext replication, regardless of whether tls_resp_addr/tls_rmp_addr above
+# are set -- those govern this node's own listeners, not its outgoing connection to a
+# leader.
+# tls_ca_path = "/etc/rocket-mem/tls/leader-ca.crt"
+
+# --- Replication & Failover Safety --------------------------------------------
+
+# host:port of a leader to auto-connect to as a follower on every startup. Unset means
+# standalone (or purely live-REPLICAOF-driven) operation -- REPLICAOF issued by hand
+# still works with this field unset, it just isn't restored automatically on restart.
+# Not validated at startup beyond being present: a bad host or unreachable leader is
+# only discoverable by attempting the connection, so it fails soft with a background
+# reconnect loop, exactly like the live REPLICAOF command's own behavior.
+# replicaof = "127.0.0.1:6379"
+
+# Username sent in AUTH before PSYNC, when replicaof's leader has ACL users configured.
+# Must be set together with replicaof_auth_password, or neither -- rocket-mem checks
+# this at startup, before any listener binds, and aborts if only one is set.
+# replicaof_auth_username = "app"
+
+# Password sent in AUTH before PSYNC. Plaintext in this file, same as [[acl.users]]'s
+# own password field below -- there is no encryption-at-rest for config secrets.
+# replicaof_auth_password = "change-me"
+
+# The host:port THIS node advertises to its leader in PSYNC, and which the leader
+# reports back in INFO REPLICATION's slaveN:ip=...,port=... lines. Left unset, this
+# defaults to addr above -- the plaintext RESP listen address, even when replication
+# itself runs over TLS. Set it when the address a peer must dial differs from the
+# address this node binds: announce tls_resp_addr in a TLS deployment, or the
+# externally reachable host:port under NAT or container port mapping. Shape-checked
+# at startup (host:port, port must parse as u16) but never checked for reachability --
+# this node cannot know how a peer routes to it.
+# replica_announce_addr = "10.0.0.7:16379"
+
+# Minimum number of replicas that must have acknowledged within min_replicas_max_lag_secs
+# below for this leader node to accept write commands. 0 disables write fencing
+# entirely, which is the default. A leader with fewer than this many recently-acking
+# replicas refuses writes with a NOREPLICAS error instead of silently accepting writes
+# no replica may ever receive -- see docs/config-reference.md's "Replica fencing" note.
+# min_replicas_to_write = 0
+
+# How many seconds old a replica's last acked offset may be and still count as "good"
+# for min_replicas_to_write above. Ignored while min_replicas_to_write is 0. Setting
+# min_replicas_to_write above 0 while leaving this at 0 is a startup error -- no
+# replica could ever qualify and every write would be refused forever.
+# min_replicas_max_lag_secs = 10
 
 # --- ACL / authentication -----------------------------------------------------
 # File-only: there is no flat ROCKET_MEM_* env var that can express an array of
