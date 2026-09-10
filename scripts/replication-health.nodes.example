@@ -1,0 +1,16 @@
+# rocket-mem 3-shard + 3-replica deployment (see cluster.conf and rocket-mem.toml /
+# rocket-mem-shard-{b,c}.toml / rocket-mem-shard-{a,b,c}-replica.toml at the repo root).
+# All addresses below are TLS RESP listeners, and every node in this deployment has ACL
+# users configured, so pass --tls-ca/--user/--pass (or ROCKET_MEM_HEALTH_PASS) when using
+# this file, e.g.:
+#
+#   scripts/replication-health.sh --nodes scripts/replication-health.nodes.example \
+#     --tls-ca /home/numericlabs/data/tls/root_ca-numericlabs.crt --user app
+#
+# <name> <host:port> <role> <tls>
+shard-a          numericlabs.lxd:16379 leader   yes
+shard-a-replica  numericlabs.lxd:16479 follower yes
+shard-b          numericlabs.lxd:16380 leader   yes
+shard-b-replica  numericlabs.lxd:16480 follower yes
+shard-c          numericlabs.lxd:16381 leader   yes
+shard-c-replica  numericlabs.lxd:16481 follower yes
