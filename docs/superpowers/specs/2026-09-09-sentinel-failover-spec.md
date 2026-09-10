@@ -88,3 +88,13 @@ safe feature to build **after** step 1 exists — not before, and not as part of
   above this one), which itself depends on offsets.
 - Any of this shipping as part of the current 8-sprint roadmap (`docs/rocket-mem-sprint-plan.md`)
   — this is explicitly post-Sprint-8, future work.
+- **The sentinel control plane's TLS and authentication design — an open question, not decided
+  here.** Option (b) above dials the addresses replicas announce about themselves, discovered via
+  `INFO REPLICATION`'s `slaveN:ip=...` lines. What gets announced is now controlled by
+  `replica_announce_addr` (defaulting to the plaintext `addr`) — see
+  [`../../specs/2026-09-10-replica-announce-addr-spec.md`](../../specs/2026-09-10-replica-announce-addr-spec.md).
+  This spec has no answer for whether sentinel probes speak TLS, whether they authenticate, or
+  what a sentinel does when a replica announces an address whose protocol it cannot determine (an
+  address string carries no protocol marker). Blocks nothing today, because nothing dials the
+  announced address yet — but it must be answered before option (b) is built, not discovered
+  while building it.
