@@ -15,37 +15,84 @@ fn unix_now_secs() -> i64 {
         .unwrap_or(0)
 }
 
-/// Holds one outbound channel per connected replica, paired with the address (if any) that
-/// replica advertised in its `PSYNC` -- see `ReplicationHandle::own_addr`'s doc comment. The
-/// `Mutex` is a plain `std::sync::Mutex`, not `tokio::sync::Mutex`: every access is a quick,
-/// synchronous push/retain, never held across an `.await`, so the lighter std lock is the right
-/// tool — matching `AofWriter::order`'s existing choice for the same reason.
+/// One connected replica, from the leader's side: the outbound channel its `serve_replica` task
+/// drains, the address (if any) it advertised in its `PSYNC` -- see `ReplicationHandle::own_addr`'s
+/// doc comment -- and how caught up it last told this leader it was.
+///
+/// `ReplicaRegistry::register` hands the caller an `Arc` of the very entry it pushed, so
+/// `serve_replica` records an ack with a relaxed atomic store: no id, no lookup, and no contention
+/// with `broadcast` on the registry's own mutex. That matters because acks arrive on the hot
+/// replication path.
+pub struct ReplicaEntry {
+    /// What this replica advertised in its `PSYNC` frame -- `None` for a bare `PSYNC` (an old
+    /// client, or a test). Immutable for the entry's life, so it needs no synchronization.
+    pub addr: Option<String>,
+    tx: tokio::sync::mpsc::UnboundedSender<bytes::Bytes>,
+    /// The replication-stream offset this replica last acknowledged, in bytes. 0 until its
+    /// first ack, which is indistinguishable from a genuine ack of 0 -- use `last_ack_unix` to
+    /// tell those apart.
+    pub ack_offset: AtomicU64,
+    /// Unix seconds at which `ack_offset` was last updated; 0 for a replica that has never
+    /// acked at all. Never treat 0 as "acked at the epoch": it means unknown.
+    pub last_ack_unix: AtomicI64,
+}
+
+impl ReplicaEntry {
+    /// Records one `REPLCONF ACK <offset>` from this replica. Called from `serve_replica`'s
+    /// inbound arm, once per ack. Relaxed ordering throughout: these two fields are only ever
+    /// read for reporting and for the `min-replicas-to-write` count, neither of which orders
+    /// anything else against them.
+    pub fn record_ack(&self, offset: u64) {
+        self.ack_offset.store(offset, Ordering::Relaxed);
+        self.last_ack_unix.store(unix_now_secs(), Ordering::Relaxed);
+    }
+}
+
+/// A plain, lock-free snapshot of one replica's state, so `INFO REPLICATION` can render its
+/// `slaveN:` lines without holding the registry's mutex across a `format!`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicaState {
+    pub addr: Option<String>,
+    pub ack_offset: u64,
+    /// 0 means this replica has never acked. See `ReplicaEntry::last_ack_unix`.
+    pub last_ack_unix: i64,
+}
+
+/// Holds one `ReplicaEntry` per connected replica. The `Mutex` is a plain `std::sync::Mutex`,
+/// not `tokio::sync::Mutex`: every access is a quick, synchronous push/retain/map, never held
+/// across an `.await`, so the lighter std lock is the right tool — matching `AofWriter::order`'s
+/// existing choice for the same reason. Recording an ack does not take this lock at all; it goes
+/// straight through the `Arc<ReplicaEntry>` `register` returned.
 #[derive(Default)]
 pub struct ReplicaRegistry {
-    replicas: std::sync::Mutex<
-        Vec<(
-            Option<String>,
-            tokio::sync::mpsc::UnboundedSender<bytes::Bytes>,
-        )>,
-    >,
+    replicas: std::sync::Mutex<Vec<Arc<ReplicaEntry>>>,
 }
 
 impl ReplicaRegistry {
     /// Registers a newly-synced replica's outbound channel, alongside the address (if any) it
     /// advertised in its `PSYNC` frame -- `None` for a bare `PSYNC` (an old client, or a test).
-    /// Called only from `serve_replica` (Task 4), while it still holds
-    /// `AofWriter::lock_for_ordering()` — see this plan's Global Constraints for why
-    /// registration must happen inside that same critical section as the snapshot walk, not
-    /// after it.
+    /// Called only from `serve_replica`, while it still holds `AofWriter::lock_all_shards()` —
+    /// see the failover-safety plans' Global Constraints for why registration must happen inside
+    /// that same critical section as the snapshot walk, not after it.
+    ///
+    /// Returns the entry it just pushed so the caller can record acks on it directly. Ignoring
+    /// the return value is fine and is what every pre-ack call site does.
     pub fn register(
         &self,
         addr: Option<String>,
         sender: tokio::sync::mpsc::UnboundedSender<bytes::Bytes>,
-    ) {
+    ) -> Arc<ReplicaEntry> {
+        let entry = Arc::new(ReplicaEntry {
+            addr,
+            tx: sender,
+            ack_offset: AtomicU64::new(0),
+            last_ack_unix: AtomicI64::new(0),
+        });
         self.replicas
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push((addr, sender));
+            .push(Arc::clone(&entry));
+        entry
     }
 
     /// Fans `bytes` out to every registered replica, pruning any whose receiver has been
@@ -54,14 +101,14 @@ impl ReplicaRegistry {
     /// roll back the write that already committed on the leader.
     pub fn broadcast(&self, bytes: bytes::Bytes) {
         let mut replicas = self.replicas.lock().unwrap_or_else(|e| e.into_inner());
-        replicas.retain(|(addr, tx)| {
-            let alive = tx.send(bytes.clone()).is_ok();
+        replicas.retain(|entry| {
+            let alive = entry.tx.send(bytes.clone()).is_ok();
             if !alive {
-                // Escaped: `addr` is the address the replica advertised in its own `PSYNC`
-                // frame -- raw client bytes, reaching an `info` event on a server that never
-                // authenticated it. See `connection::serve_replica`'s doc comment.
+                // Escaped: the address the replica advertised in its own `PSYNC` frame -- raw
+                // client bytes, reaching an `info` event on a server that never authenticated
+                // it. See `connection::serve_replica`'s doc comment.
                 tracing::info!(
-                    host_port = %crate::logging::escape_ident(addr.as_deref().unwrap_or("unknown")),
+                    host_port = %crate::logging::escape_ident(entry.addr.as_deref().unwrap_or("unknown")),
                     "replica pruned"
                 );
             }
@@ -80,20 +127,62 @@ impl ReplicaRegistry {
     }
 
     /// Every currently-registered replica's advertised address, in registration order -- `None`
-    /// for a replica whose `PSYNC` carried no address. Feeds `INFO REPLICATION`'s `slaveN:`
-    /// lines on the leader side; subject to the same lazy-pruning lag as `len`.
+    /// for a replica whose `PSYNC` carried no address. Feeds `main.rs`'s startup banner; subject
+    /// to the same lazy-pruning lag as `len`. `INFO REPLICATION` uses `states` instead, because
+    /// it needs the ack fields too.
     pub fn addrs(&self) -> Vec<Option<String>> {
         self.replicas
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .map(|(addr, _)| addr.clone())
+            .map(|entry| entry.addr.clone())
             .collect()
     }
 
     /// Required by `clippy::len_without_is_empty`, which `-D warnings` makes a hard error.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// How many replicas have acknowledged something within `max_lag` of now.
+    ///
+    /// A replica that has never acked is **never** good: "we have no idea where this replica is"
+    /// must not read as "this replica is caught up", which is the entire reason the number
+    /// exists. That also means an older follower build, which sends no acks at all, never counts
+    /// -- deliberately, since fencing on a replica whose position is unknowable would be
+    /// fencing on nothing. Feeds `min-replicas-to-write` and the `rocket_mem_good_replicas`
+    /// gauge.
+    pub fn good_replicas(&self, max_lag: std::time::Duration) -> usize {
+        let now = unix_now_secs();
+        let max_lag = max_lag.as_secs() as i64;
+        self.replicas
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|entry| {
+                let last = entry.last_ack_unix.load(Ordering::Relaxed);
+                // `saturating_sub` guards a clock that stepped backwards: that yields a
+                // negative difference, which compares as "not lagging" rather than panicking or
+                // wrapping into an enormous lag.
+                last > 0 && now.saturating_sub(last) <= max_lag
+            })
+            .count()
+    }
+
+    /// A snapshot of every registered replica, in registration order, for `INFO REPLICATION` and
+    /// metrics to render after the lock is released. Subject to the same lazy-pruning lag as
+    /// `len` and `addrs`.
+    pub fn states(&self) -> Vec<ReplicaState> {
+        self.replicas
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|entry| ReplicaState {
+                addr: entry.addr.clone(),
+                ack_offset: entry.ack_offset.load(Ordering::Relaxed),
+                last_ack_unix: entry.last_ack_unix.load(Ordering::Relaxed),
+            })
+            .collect()
     }
 }
 
@@ -1107,6 +1196,93 @@ mod tests {
             registry.addrs(),
             vec![Some("127.0.0.1:6480".to_string()), None]
         );
+    }
+
+    #[test]
+    fn register_returns_an_entry_that_starts_out_unacked() {
+        let registry = ReplicaRegistry::default();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let entry = registry.register(Some("127.0.0.1:6480".to_string()), tx);
+
+        assert_eq!(entry.addr.as_deref(), Some("127.0.0.1:6480"));
+        assert_eq!(entry.ack_offset.load(Ordering::Relaxed), 0);
+        // 0, not "now": a replica that has never acked must be distinguishable from one that
+        // acked this instant, or `INFO`'s lag field would report a lie.
+        assert_eq!(entry.last_ack_unix.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn record_ack_stores_the_offset_and_stamps_the_time() {
+        let registry = ReplicaRegistry::default();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let entry = registry.register(None, tx);
+
+        entry.record_ack(4096);
+
+        assert_eq!(entry.ack_offset.load(Ordering::Relaxed), 4096);
+        assert!(
+            entry.last_ack_unix.load(Ordering::Relaxed) > 1_700_000_000,
+            "record_ack should stamp a real unix timestamp, got {}",
+            entry.last_ack_unix.load(Ordering::Relaxed)
+        );
+        // The registry sees the same entry, because `register` handed back an `Arc` of the one
+        // it pushed rather than a copy.
+        assert_eq!(registry.states()[0].ack_offset, 4096);
+    }
+
+    #[test]
+    fn good_replicas_counts_only_replicas_that_acked_recently() {
+        let registry = ReplicaRegistry::default();
+        let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
+        let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel();
+        let (tx3, _rx3) = tokio::sync::mpsc::unbounded_channel();
+        let fresh = registry.register(Some("fresh".to_string()), tx1);
+        let stale = registry.register(Some("stale".to_string()), tx2);
+        let _never = registry.register(Some("never".to_string()), tx3);
+
+        fresh.record_ack(100);
+        stale.record_ack(50);
+        // Backdate the stale one well past the window, rather than sleeping for it.
+        stale
+            .last_ack_unix
+            .store(unix_now_secs() - 60, Ordering::Relaxed);
+
+        // Only `fresh`. `stale` acked too long ago, and `never` has no ack at all -- "unknown"
+        // must never count as "healthy", which is the whole reason this number exists.
+        assert_eq!(
+            registry.good_replicas(std::time::Duration::from_secs(10)),
+            1
+        );
+        // A window wide enough to cover the backdated ack picks up both, proving the filter is
+        // the lag comparison and not something incidental.
+        assert_eq!(
+            registry.good_replicas(std::time::Duration::from_secs(600)),
+            2
+        );
+        // A zero-second window admits nothing that isn't acked this very second, and still
+        // never admits the never-acked one.
+        assert!(registry.good_replicas(std::time::Duration::ZERO) <= 1);
+    }
+
+    #[test]
+    fn states_snapshots_every_replica_in_registration_order() {
+        let registry = ReplicaRegistry::default();
+        let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
+        let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel();
+        let first = registry.register(Some("127.0.0.1:6480".to_string()), tx1);
+        registry.register(None, tx2); // a bare PSYNC advertised no address
+        first.record_ack(7);
+
+        let states = registry.states();
+
+        assert_eq!(states.len(), 2);
+        assert_eq!(states[0].addr.as_deref(), Some("127.0.0.1:6480"));
+        assert_eq!(states[0].ack_offset, 7);
+        assert!(states[0].last_ack_unix > 0);
+        assert_eq!(states[1].addr, None);
+        assert_eq!(states[1].ack_offset, 0);
+        assert_eq!(states[1].last_ack_unix, 0);
     }
 
     #[test]
