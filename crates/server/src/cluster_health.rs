@@ -9,6 +9,7 @@ use crate::cluster::ClusterConfig;
 use crate::replication::unix_now_secs;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// One peer's liveness state. Only the last-success stamp is stored: "failed" is derived from it
@@ -121,6 +122,107 @@ impl PeerHealth {
     }
 }
 
+/// How long one probe (connect, send `PING`, read a reply) may take before it counts as a
+/// failure. Deliberately far below the smallest allowed probe interval of one second: a peer
+/// whose host vanished without sending a RST leaves `connect` hanging until the OS TCP timeout,
+/// which is over two minutes on Linux, and an unbounded connect would stall the whole prober
+/// behind one dead peer.
+const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// One probe of `addr`: connect, send `PING`, read the first bytes of a reply, all inside
+/// `timeout`. `true` means a process at that address answered.
+///
+/// **Any RESP reply counts as alive, not only `+PONG`, and that is deliberate -- do not tighten
+/// this to require a literal `+PONG`.** A node with ACL users configured answers an
+/// unauthenticated `PING` with `-NOAUTH Authentication required.`, so a `+PONG`-only check would
+/// report every node of an ACL-protected cluster permanently failed -- a self-inflicted
+/// cluster-wide false alarm on exactly the deployments most likely to be production. A peer that
+/// answers at all is up, and "is it up" is the entire question being asked here.
+///
+/// The prober deliberately never authenticates: it needs liveness, not access, and giving this
+/// loop cluster-wide credentials would be a new secret to manage for no extra information. See
+/// the failover-safety design contract, §2.6.
+async fn probe_once(addr: &str, timeout: Duration) -> bool {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let probe = async {
+        let mut socket = tokio::net::TcpStream::connect(addr).await.ok()?;
+        socket.write_all(b"*1\r\n$4\r\nPING\r\n").await.ok()?;
+        let mut buf = [0u8; 32];
+        let read = socket.read(&mut buf).await.ok()?;
+        // A zero-length read is the peer closing the connection, not answering it.
+        (read > 0 && (buf[0] == b'+' || buf[0] == b'-')).then_some(())
+    };
+    tokio::time::timeout(timeout, probe)
+        .await
+        .ok()
+        .flatten()
+        .is_some()
+}
+
+/// Probes every peer in `cluster` forever, one round every `interval`, recording each success in
+/// `health`.
+///
+/// Observational only. It writes nothing but timestamps: no promotion, no `cluster.conf` rewrite,
+/// no routing change. A slot's configured owner stays its owner while it is dead, and
+/// `cluster_redirect` keeps sending clients there -- see this module's doc comment.
+pub async fn run_peer_prober(
+    cluster: Arc<ClusterConfig>,
+    health: Arc<PeerHealth>,
+    interval: Duration,
+) {
+    let my_id = cluster.myself().id.clone();
+    // The peer list is snapshotted once: `ClusterConfig` never changes for the life of the
+    // process, so re-reading it every round would buy nothing.
+    let peers: Vec<(String, String)> = cluster
+        .nodes()
+        .iter()
+        .filter(|n| n.id != my_id)
+        .map(|n| (n.id.clone(), n.addr.clone()))
+        .collect();
+    if peers.is_empty() {
+        return; // a single-node cluster has nothing to probe
+    }
+    let mut ticker = tokio::time::interval(interval);
+    // Delay, not the default Burst: after a slow round the next tick should be a fresh interval
+    // away, not a backlog of missed ticks firing back to back.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        // Concurrently, not one peer after another: a round then costs one `PROBE_TIMEOUT` at
+        // worst however many peers are dead, so a large cluster's round cannot outlast its own
+        // interval.
+        let results =
+            futures_util::future::join_all(peers.iter().map(|(id, addr)| async move {
+                (id.as_str(), probe_once(addr, PROBE_TIMEOUT).await)
+            }))
+            .await;
+        for (id, answered) in results {
+            if answered {
+                health.record_ok(id);
+            }
+        }
+    }
+}
+
+/// Builds the peer-health map for `cluster` and spawns the prober that keeps it current, then
+/// returns the map so the caller can hand it to `ReplicationHandle::with_peer_health`.
+///
+/// Called only in cluster mode: a standalone node has no peers, so it gets no map at all and its
+/// `CLUSTER` replies keep reporting exactly what they reported before this existed.
+pub fn spawn_peer_prober(
+    cluster: &Arc<ClusterConfig>,
+    probe_interval: Duration,
+    node_timeout: Duration,
+) -> Arc<PeerHealth> {
+    let health = Arc::new(PeerHealth::for_cluster(cluster, node_timeout));
+    tokio::spawn(run_peer_prober(
+        Arc::clone(cluster),
+        Arc::clone(&health),
+        probe_interval,
+    ));
+    health
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,5 +322,127 @@ shard-c 127.0.0.1:7003 10923 16383
             )));
         assert!(handle.peer_health().is_some());
         assert!(handle.peer_health().unwrap().is_reachable("shard-a"));
+    }
+
+    /// A minimal server that answers one `PING` per connection with `+PONG`, so the prober has a
+    /// real socket to talk to. The spawned task lives as long as the test process.
+    async fn spawn_ping_responder() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 64];
+                    if socket.read(&mut buf).await.unwrap_or(0) > 0 {
+                        let _ = socket.write_all(b"+PONG\r\n").await;
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    /// An address nothing listens on: bound to claim an ephemeral port, then dropped. A connect
+    /// to it is refused immediately on loopback, so no test here ever waits on a real network
+    /// timeout.
+    async fn dead_addr() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        addr
+    }
+
+    #[tokio::test]
+    async fn a_probe_of_a_live_node_succeeds() {
+        let addr = spawn_ping_responder().await;
+        assert!(probe_once(&addr, Duration::from_secs(1)).await);
+    }
+
+    #[tokio::test]
+    async fn a_probe_of_an_address_nothing_listens_on_fails() {
+        let addr = dead_addr().await;
+        assert!(!probe_once(&addr, Duration::from_secs(1)).await);
+    }
+
+    #[tokio::test]
+    async fn a_probe_of_a_peer_that_accepts_but_never_answers_times_out() {
+        // The case the timeout exists for: the socket is open, so connect succeeds, and without a
+        // bound the read would hang until the OS gave up minutes later, stalling the prober.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let _accepted = listener.accept().await;
+            std::future::pending::<()>().await; // hold the connection open, answer nothing
+        });
+        assert!(!probe_once(&addr, Duration::from_millis(50)).await);
+    }
+
+    #[tokio::test]
+    async fn the_prober_marks_a_peer_that_stops_answering_as_unreachable() {
+        let dead = dead_addr().await;
+        let config = std::sync::Arc::new(
+            crate::cluster::ClusterConfig::parse(
+                &format!("me 127.0.0.1:1 0 8000\npeer {dead} 8001 16383\n"),
+                "me",
+            )
+            .unwrap(),
+        );
+        let health = std::sync::Arc::new(PeerHealth::for_cluster(&config, Duration::from_secs(1)));
+        // Start from a stale stamp so one failed round is decisive, instead of waiting out a real
+        // node timeout in a unit test.
+        health.set_last_ok_unix("peer", unix_now_secs() - 3600);
+        let task = tokio::spawn(run_peer_prober(
+            std::sync::Arc::clone(&config),
+            std::sync::Arc::clone(&health),
+            Duration::from_millis(20),
+        ));
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        task.abort();
+        assert!(
+            !health.is_reachable("peer"),
+            "a refused connection must never refresh the last-success stamp"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_prober_brings_a_peer_back_when_it_starts_answering_again() {
+        let live = spawn_ping_responder().await;
+        let config = std::sync::Arc::new(
+            crate::cluster::ClusterConfig::parse(
+                &format!("me 127.0.0.1:1 0 8000\npeer {live} 8001 16383\n"),
+                "me",
+            )
+            .unwrap(),
+        );
+        let health = std::sync::Arc::new(PeerHealth::for_cluster(&config, Duration::from_secs(1)));
+        health.set_last_ok_unix("peer", unix_now_secs() - 3600);
+        assert!(!health.is_reachable("peer"), "starts out failed");
+        let task = tokio::spawn(run_peer_prober(
+            std::sync::Arc::clone(&config),
+            std::sync::Arc::clone(&health),
+            Duration::from_millis(20),
+        ));
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        task.abort();
+        assert!(health.is_reachable("peer"), "one answered probe is enough");
+    }
+
+    #[tokio::test]
+    async fn spawn_peer_prober_returns_a_map_its_own_task_keeps_current() {
+        let live = spawn_ping_responder().await;
+        let config = std::sync::Arc::new(
+            crate::cluster::ClusterConfig::parse(
+                &format!("me 127.0.0.1:1 0 8000\npeer {live} 8001 16383\n"),
+                "me",
+            )
+            .unwrap(),
+        );
+        let health = spawn_peer_prober(&config, Duration::from_millis(20), Duration::from_secs(1));
+        health.set_last_ok_unix("peer", unix_now_secs() - 3600);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(health.is_reachable("peer"));
+        assert_eq!(health.reachable_count(), 1);
+        assert_eq!(health.unreachable_count(), 0);
     }
 }

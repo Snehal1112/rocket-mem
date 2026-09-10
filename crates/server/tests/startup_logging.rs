@@ -462,6 +462,58 @@ fn fencing_enabled_with_a_nonzero_lag_window_starts_normally() {
     );
 }
 
+/// `validate_cluster_health` is only worth having if `main.rs` actually calls it, and calls it
+/// before `spawn_peer_prober` would build a `tokio::time::interval` (which panics outright on a
+/// zero period) or anything binds. Checked unconditionally, not only in cluster mode -- see the
+/// validator's own doc comment -- so a standalone config with no cluster fields set is enough to
+/// exercise it here.
+#[test]
+fn a_zero_cluster_probe_interval_aborts_startup_before_any_listener_binds() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let (success, stderr) = spawn_and_wait_for_exit(
+        dir.path(),
+        &[("ROCKET_MEM_CLUSTER_PROBE_INTERVAL_SECS", "0")],
+    );
+
+    assert!(
+        !success,
+        "a zero probe interval must fail startup, got a clean exit and:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("cluster_probe_interval_secs"),
+        "the error must name the field, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains(LISTENER_EVENT),
+        "validation must run before anything binds, got:\n{stderr}"
+    );
+}
+
+/// The other half: a sane, nonzero pair of cluster-health timers must not stop startup, even
+/// outside cluster mode -- these fields are validated unconditionally but only ever read by a
+/// prober that a standalone node never spawns.
+#[test]
+fn nonzero_cluster_health_timers_start_normally_even_outside_cluster_mode() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let stderr = spawn_and_capture_stderr(
+        dir.path(),
+        &[
+            ("ROCKET_MEM_CLUSTER_PROBE_INTERVAL_SECS", "2"),
+            ("ROCKET_MEM_CLUSTER_NODE_TIMEOUT_SECS", "20"),
+        ],
+        &[],
+        3,
+    );
+
+    assert_eq!(
+        stderr.matches(LISTENER_EVENT).count(),
+        3,
+        "sane cluster-health timers must not stop the three always-on listeners, got:\n{stderr}"
+    );
+}
+
 /// A TLS follower that never says where a peer should reach it announces its *plaintext* address,
 /// which is the misconfiguration the announce-address spec exists to surface. It must be visible
 /// at startup, at `warn`, exactly once -- not discovered later by reading a leader's

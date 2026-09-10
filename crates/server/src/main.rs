@@ -176,6 +176,11 @@ async fn main() -> std::io::Result<()> {
     let mut cluster_summary = paint("2", "standalone (no cluster_config set)", color);
     let mut cluster_topology_lines: Vec<String> = Vec::new();
 
+    // Before the cluster block, because `spawn_peer_prober` builds a `tokio::time::interval`,
+    // which panics outright on a zero period. A bad timer must fail startup with a readable
+    // error, not abort the process from inside a spawned task.
+    rocket_mem::config::validate_cluster_health(&config)?;
+
     let cluster = match (&config.cluster_config, &config.cluster_node_id) {
         (Some(path), Some(node_id)) => {
             let cluster_config =
@@ -311,7 +316,16 @@ async fn main() -> std::io::Result<()> {
         std::time::Duration::from_secs(config.min_replicas_max_lag_secs),
     );
     if let Some(cluster) = cluster {
-        handle = handle.with_cluster(cluster);
+        // Cluster mode only: the prober needs peers, and a standalone node has none. It is purely
+        // observational -- it makes `CLUSTER NODES`/`SHARDS`/`INFO` tell the truth about which
+        // peers are answering, and changes nothing about routing, promotion, or the topology
+        // file. See docs/superpowers/plans/2026-09-09-failover-safety-primitives/.
+        let peer_health = rocket_mem::cluster_health::spawn_peer_prober(
+            &cluster,
+            std::time::Duration::from_secs(config.cluster_probe_interval_secs),
+            std::time::Duration::from_secs(config.cluster_node_timeout_secs),
+        );
+        handle = handle.with_cluster(cluster).with_peer_health(peer_health);
     }
     if let Some(ca_path) = &config.tls_ca_path {
         let client_config = rocket_mem::tls::load_client_config(std::path::Path::new(ca_path))
