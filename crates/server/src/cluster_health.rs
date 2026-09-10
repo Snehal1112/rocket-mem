@@ -159,6 +159,48 @@ async fn probe_once(addr: &str, timeout: Duration) -> bool {
         .is_some()
 }
 
+/// One probe round: probes every peer concurrently, records the successes, and returns the peers
+/// whose reachability changed since the previous round, updating `last_reported` as it goes.
+///
+/// Sampling state once per round, rather than reacting to each probe's result, is what makes the
+/// "went down" edge detectable at all. A peer only *becomes* failed when `cluster_node_timeout_secs`
+/// elapses, which happens as time passes between rounds, not at any one probe -- comparing this
+/// round's sampled state against what the previous round saw catches that edge exactly once.
+///
+/// A peer missing from `last_reported` is assumed to have been reachable, matching
+/// `PeerHealth::new`'s optimistic seeding: a freshly started process should log the moment a peer
+/// goes quiet, not announce at startup that everything is fine.
+///
+/// Probing is concurrent, not sequential: a round then costs one `probe_timeout` at worst however
+/// many peers are dead, so a large cluster's round cannot outlast its own interval.
+async fn probe_round(
+    peers: &[(String, String)],
+    health: &PeerHealth,
+    probe_timeout: Duration,
+    last_reported: &mut HashMap<String, bool>,
+) -> Vec<(String, bool)> {
+    let results = futures_util::future::join_all(
+        peers
+            .iter()
+            .map(|(id, addr)| async move { (id.as_str(), probe_once(addr, probe_timeout).await) }),
+    )
+    .await;
+    let mut changed = Vec::new();
+    for (id, answered) in results {
+        if answered {
+            health.record_ok(id);
+        }
+        let reachable = health.is_reachable(id);
+        let previously = last_reported
+            .insert(id.to_string(), reachable)
+            .unwrap_or(true);
+        if reachable != previously {
+            changed.push((id.to_string(), reachable));
+        }
+    }
+    changed
+}
+
 /// Probes every peer in `cluster` forever, one round every `interval`, recording each success in
 /// `health`.
 ///
@@ -182,23 +224,32 @@ pub async fn run_peer_prober(
     if peers.is_empty() {
         return; // a single-node cluster has nothing to probe
     }
+    // What the previous round reported for each peer, so only *changes* are logged. At one probe
+    // a second, logging every probe would be 86,400 lines per peer per day and would bury the one
+    // line that matters.
+    let mut last_reported: HashMap<String, bool> = HashMap::new();
     let mut ticker = tokio::time::interval(interval);
     // Delay, not the default Burst: after a slow round the next tick should be a fresh interval
     // away, not a backlog of missed ticks firing back to back.
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         ticker.tick().await;
-        // Concurrently, not one peer after another: a round then costs one `PROBE_TIMEOUT` at
-        // worst however many peers are dead, so a large cluster's round cannot outlast its own
-        // interval.
-        let results =
-            futures_util::future::join_all(peers.iter().map(|(id, addr)| async move {
-                (id.as_str(), probe_once(addr, PROBE_TIMEOUT).await)
-            }))
-            .await;
-        for (id, answered) in results {
-            if answered {
-                health.record_ok(id);
+        for (id, reachable) in probe_round(&peers, &health, PROBE_TIMEOUT, &mut last_reported).await
+        {
+            if reachable {
+                tracing::info!(
+                    peer = %id,
+                    "cluster peer answered a probe again; reporting it connected"
+                );
+            } else {
+                tracing::warn!(
+                    peer = %id,
+                    node_timeout_secs = health.node_timeout().as_secs(),
+                    "cluster peer has not answered a probe within cluster_node_timeout_secs; \
+                     reporting it failed in CLUSTER NODES/SHARDS/INFO. Nothing was promoted and \
+                     routing is unchanged -- clients are still redirected to this peer's \
+                     configured address."
+                );
             }
         }
     }
@@ -444,5 +495,86 @@ shard-c 127.0.0.1:7003 10923 16383
         assert!(health.is_reachable("peer"));
         assert_eq!(health.reachable_count(), 1);
         assert_eq!(health.unreachable_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_peer_going_down_is_reported_once_not_once_per_probe() {
+        let dead = dead_addr().await;
+        let peers = vec![("peer".to_string(), dead)];
+        let health = PeerHealth::new(["peer".to_string()], Duration::from_secs(1));
+        // Already past the timeout, so the very first round is the one that notices.
+        health.set_last_ok_unix("peer", unix_now_secs() - 3600);
+        let mut last_reported = std::collections::HashMap::new();
+
+        let first = probe_round(
+            &peers,
+            &health,
+            Duration::from_millis(50),
+            &mut last_reported,
+        )
+        .await;
+        assert_eq!(first, vec![("peer".to_string(), false)]);
+
+        for round in 2..=4 {
+            let later = probe_round(
+                &peers,
+                &health,
+                Duration::from_millis(50),
+                &mut last_reported,
+            )
+            .await;
+            assert!(
+                later.is_empty(),
+                "round {round} re-reported a peer that was already failed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_peer_coming_back_is_reported_once() {
+        let live = spawn_ping_responder().await;
+        let peers = vec![("peer".to_string(), live)];
+        let health = PeerHealth::new(["peer".to_string()], Duration::from_secs(1));
+        health.set_last_ok_unix("peer", unix_now_secs() - 3600);
+        let mut last_reported = std::collections::HashMap::from([("peer".to_string(), false)]);
+
+        let first = probe_round(
+            &peers,
+            &health,
+            Duration::from_millis(500),
+            &mut last_reported,
+        )
+        .await;
+        assert_eq!(first, vec![("peer".to_string(), true)]);
+
+        let second = probe_round(
+            &peers,
+            &health,
+            Duration::from_millis(500),
+            &mut last_reported,
+        )
+        .await;
+        assert!(
+            second.is_empty(),
+            "a peer that is still answering is not a new event"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_never_changes_state_is_never_reported() {
+        let live = spawn_ping_responder().await;
+        let peers = vec![("peer".to_string(), live)];
+        let health = PeerHealth::new(["peer".to_string()], Duration::from_secs(15));
+        let mut last_reported = std::collections::HashMap::new();
+        for round in 1..=3 {
+            let changed = probe_round(
+                &peers,
+                &health,
+                Duration::from_millis(500),
+                &mut last_reported,
+            )
+            .await;
+            assert!(changed.is_empty(), "round {round} reported a healthy peer");
+        }
     }
 }
