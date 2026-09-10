@@ -128,8 +128,8 @@ impl ReplicaRegistry {
 
     /// Every currently-registered replica's advertised address, in registration order -- `None`
     /// for a replica whose `PSYNC` carried no address. Feeds `main.rs`'s startup banner; subject
-    /// to the same lazy-pruning lag as `len`. `INFO REPLICATION` uses `states` instead, because
-    /// it needs the ack fields too.
+    /// to the same lazy-pruning lag as `len`. Callers that also need the ack fields should use
+    /// `states` instead, which snapshots both.
     pub fn addrs(&self) -> Vec<Option<String>> {
         self.replicas
             .lock()
@@ -154,17 +154,26 @@ impl ReplicaRegistry {
     /// gauge.
     pub fn good_replicas(&self, max_lag: std::time::Duration) -> usize {
         let now = unix_now_secs();
-        let max_lag = max_lag.as_secs() as i64;
+        // Clamped, not `as i64`: a plain cast wraps an absurd window to a negative number, which
+        // would exclude every replica including one that acked this instant, and read downstream
+        // as a total loss of replicas rather than as the bad config it is.
+        let max_lag = i64::try_from(max_lag.as_secs()).unwrap_or(i64::MAX);
         self.replicas
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
             .filter(|entry| {
                 let last = entry.last_ack_unix.load(Ordering::Relaxed);
-                // `saturating_sub` guards a clock that stepped backwards: that yields a
-                // negative difference, which compares as "not lagging" rather than panicking or
-                // wrapping into an enormous lag.
-                last > 0 && now.saturating_sub(last) <= max_lag
+                // `last > 0` is load-bearing on its own, not a cheap guard against silly input.
+                // A replica that has never acked has `last == 0`, and `now - 0` is merely the
+                // seconds since the epoch -- a finite number a wide enough window would happily
+                // admit. Unknown must never count as caught up.
+                //
+                // A clock that stepped backwards makes the difference negative, which compares
+                // as "not lagging". That is deliberate: both stamps come from this process, so a
+                // step moves them together, and the alternative turns an NTP correction into a
+                // cluster-wide write outage once fencing consumes this number.
+                last > 0 && now - last <= max_lag
             })
             .count()
     }
@@ -1263,6 +1272,17 @@ mod tests {
         // A zero-second window admits nothing that isn't acked this very second, and still
         // never admits the never-acked one.
         assert!(registry.good_replicas(std::time::Duration::ZERO) <= 1);
+        // The assertions above all pass even with the `last > 0` guard deleted, because
+        // `now - 0` is about 1.8e9 seconds and exceeds every window they use. This one does
+        // not: a window wider than the epoch admits the never-acked replica on lag alone, so
+        // only the guard keeps the count at 2. Without it this reads 3.
+        assert_eq!(
+            registry.good_replicas(std::time::Duration::from_secs(2_000_000_000)),
+            2,
+            "a replica that has never acked must never count, however wide the window"
+        );
+        // An absurd window must not wrap into a negative threshold and exclude everyone.
+        assert_eq!(registry.good_replicas(std::time::Duration::MAX), 2);
     }
 
     #[test]
