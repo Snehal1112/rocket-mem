@@ -26,7 +26,6 @@ use protocol::Frame;
 /// any of them was rejected at queue time (which turns `EXEC` into `EXECABORT` — see
 /// `docs/superpowers/specs/2026-09-10-multi-exec-transactions-spec.md`).
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)] // Queuing is constructed by Task 2's intercept_for_transaction.
 pub(crate) enum TransactionState {
     Idle,
     Queuing { commands: Vec<Frame>, dirty: bool },
@@ -45,12 +44,10 @@ pub struct Session {
     /// a relaxed load before `tx`'s mutex is ever touched, so an ordinary connection that never
     /// sends `MULTI` pays one atomic load per command and nothing else. Set `true` by `MULTI`,
     /// `false` by `DISCARD` and by `EXEC` once it finishes. See the spec's "Performance" section.
-    #[allow(dead_code)] // Read by Task 2's intercept_for_transaction.
     in_transaction: std::sync::atomic::AtomicBool,
     /// The queue itself. A separate lock from `protocol`/`authenticated_user`/`name` above:
     /// nothing about a transaction's queue needs to be visible to, or block, an unrelated read
     /// of the connection's name or auth state.
-    #[allow(dead_code)] // Read by Task 2's intercept_for_transaction.
     tx: std::sync::Mutex<TransactionState>,
 }
 
@@ -3140,6 +3137,91 @@ pub(crate) fn auth_gate(
     None
 }
 
+/// Intercepts `MULTI`, `DISCARD`, and — while a transaction is open — every other command,
+/// capturing it into the queue instead of letting it run. Returns `None` only when this frame
+/// should proceed through the normal gated dispatch path: there is no open transaction, and
+/// this frame is not itself `MULTI`/`DISCARD`. `EXEC` is matched here too but is a stub in this
+/// plan; Plan 02 gives it a real body in the same arm.
+///
+/// Runs *after* `auth_gate` and *before* every other gate in `dispatch_and_log_inner` — an
+/// unauthenticated client must not be able to open or feed a transaction, but nothing else
+/// (cluster redirect, READONLY, fencing) is checked until `EXEC` actually runs each queued
+/// command, per the spec's "Gate timing" section.
+fn intercept_for_transaction(frame: &Frame, session: &Session) -> Option<Frame> {
+    let Frame::Array(items) = frame else {
+        return None;
+    };
+    let Some(Frame::Bulk(name_bytes)) = items.first() else {
+        return None;
+    };
+    let name = upper_name(name_bytes)?;
+    match name.as_str() {
+        "MULTI" => Some(handle_multi(session)),
+        "DISCARD" => Some(handle_discard(session)),
+        "EXEC" => Some(Frame::Error("ERR EXEC without MULTI".into())), // Plan 02 replaces this arm
+        _ => {
+            // Fast path: an ordinary connection that never opens a transaction never locks
+            // `tx`. See the spec's "Performance" section.
+            if !session
+                .in_transaction
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return None;
+            }
+            let mut state = session.tx.lock().unwrap_or_else(|e| e.into_inner());
+            let TransactionState::Queuing { commands, dirty } = &mut *state else {
+                // `in_transaction` said true but the state is Idle: EXEC/DISCARD just reset it
+                // and this call raced in ahead of the flag update on the same connection, which
+                // cannot happen since both live behind the one call sequence of a single
+                // connection's serial command loop. Kept as a safe fallthrough, not a panic.
+                return None;
+            };
+            if KNOWN_COMMANDS.binary_search(&name.as_str()).is_err() {
+                *dirty = true;
+                tracing::debug!(command = %name.as_str(), "transaction marked dirty");
+                return Some(Frame::Error(format!(
+                    "ERR unknown command '{}'",
+                    name.as_str()
+                )));
+            }
+            commands.push(frame.clone());
+            tracing::trace!(command = %name.as_str(), "command queued");
+            Some(Frame::Simple("QUEUED".into()))
+        }
+    }
+}
+
+/// `MULTI`: opens a transaction, or errors without disturbing an already-open one.
+fn handle_multi(session: &Session) -> Frame {
+    let mut state = session.tx.lock().unwrap_or_else(|e| e.into_inner());
+    if matches!(*state, TransactionState::Queuing { .. }) {
+        return Frame::Error("ERR MULTI calls can not be nested".into());
+    }
+    *state = TransactionState::Queuing {
+        commands: Vec::new(),
+        dirty: false,
+    };
+    session
+        .in_transaction
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    tracing::debug!("transaction started");
+    Frame::Simple("OK".into())
+}
+
+/// `DISCARD`: closes an open transaction without running anything it queued.
+fn handle_discard(session: &Session) -> Frame {
+    let mut state = session.tx.lock().unwrap_or_else(|e| e.into_inner());
+    let TransactionState::Queuing { commands, .. } = &*state else {
+        return Frame::Error("ERR DISCARD without MULTI".into());
+    };
+    tracing::debug!(queued_count = commands.len(), "transaction discarded");
+    *state = TransactionState::Idle;
+    session
+        .in_transaction
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    Frame::Simple("OK".into())
+}
+
 /// The uppercased command name, or `None` for a frame that isn't a command array. Cheap enough to
 /// call once per command -- uppercases into a stack buffer rather than allocating.
 fn command_name_upper(frame: &Frame) -> Option<CommandName> {
@@ -3502,6 +3584,10 @@ fn dispatch_and_log_inner(
     // or unauthorized client must not learn cluster topology or reach any other gate. Matches
     // real Redis's own auth-before-everything ordering.
     if let Some(reply) = auth_gate(replication, session, &frame) {
+        return reply;
+    }
+
+    if let Some(reply) = intercept_for_transaction(&frame, session) {
         return reply;
     }
 
@@ -4192,6 +4278,151 @@ mod tests {
         };
         let b = a.clone();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn multi_replies_ok_and_opens_a_transaction() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let replication = ReplicationHandle::default();
+        let session = Session::new();
+        let reply = dispatch_and_log(&engine, &aof, &replication, cmd(&[b"MULTI"]), &session, 1);
+        assert_eq!(reply, Frame::Simple("OK".into()));
+        assert_eq!(
+            session.tx_state_for_test(),
+            TransactionState::Queuing {
+                commands: vec![],
+                dirty: false
+            }
+        );
+    }
+
+    #[test]
+    fn nested_multi_errors_without_touching_the_existing_queue() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let replication = ReplicationHandle::default();
+        let session = Session::new();
+        dispatch_and_log(&engine, &aof, &replication, cmd(&[b"MULTI"]), &session, 1);
+        dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"SET", b"k", b"v"]),
+            &session,
+            1,
+        );
+        let reply = dispatch_and_log(&engine, &aof, &replication, cmd(&[b"MULTI"]), &session, 1);
+        assert_eq!(
+            reply,
+            Frame::Error("ERR MULTI calls can not be nested".into())
+        );
+        assert_eq!(
+            session.tx_state_for_test(),
+            TransactionState::Queuing {
+                commands: vec![cmd(&[b"SET", b"k", b"v"])],
+                dirty: false,
+            },
+            "the queue from before the nested MULTI must survive untouched"
+        );
+    }
+
+    #[test]
+    fn a_known_command_while_queuing_is_captured_as_queued_and_not_run() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let replication = ReplicationHandle::default();
+        let session = Session::new();
+        dispatch_and_log(&engine, &aof, &replication, cmd(&[b"MULTI"]), &session, 1);
+        let reply = dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"SET", b"k", b"v"]),
+            &session,
+            1,
+        );
+        assert_eq!(reply, Frame::Simple("QUEUED".into()));
+        assert_eq!(engine.get(b"k"), None, "queuing must not touch the engine");
+        assert_eq!(
+            session.tx_state_for_test(),
+            TransactionState::Queuing {
+                commands: vec![cmd(&[b"SET", b"k", b"v"])],
+                dirty: false,
+            }
+        );
+    }
+
+    #[test]
+    fn an_unknown_command_while_queuing_marks_the_transaction_dirty() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let replication = ReplicationHandle::default();
+        let session = Session::new();
+        dispatch_and_log(&engine, &aof, &replication, cmd(&[b"MULTI"]), &session, 1);
+        let reply = dispatch_and_log(&engine, &aof, &replication, cmd(&[b"NOPE"]), &session, 1);
+        assert_eq!(reply, Frame::Error("ERR unknown command 'NOPE'".into()));
+        assert_eq!(
+            session.tx_state_for_test(),
+            TransactionState::Queuing {
+                commands: vec![],
+                dirty: true
+            }
+        );
+    }
+
+    #[test]
+    fn discard_without_multi_errors() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let replication = ReplicationHandle::default();
+        let session = Session::new();
+        let reply = dispatch_and_log(&engine, &aof, &replication, cmd(&[b"DISCARD"]), &session, 1);
+        assert_eq!(reply, Frame::Error("ERR DISCARD without MULTI".into()));
+    }
+
+    #[test]
+    fn discard_clears_the_queue_and_replies_ok() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let replication = ReplicationHandle::default();
+        let session = Session::new();
+        dispatch_and_log(&engine, &aof, &replication, cmd(&[b"MULTI"]), &session, 1);
+        dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"SET", b"k", b"v"]),
+            &session,
+            1,
+        );
+        let reply = dispatch_and_log(&engine, &aof, &replication, cmd(&[b"DISCARD"]), &session, 1);
+        assert_eq!(reply, Frame::Simple("OK".into()));
+        assert_eq!(session.tx_state_for_test(), TransactionState::Idle);
+        assert!(!session
+            .in_transaction
+            .load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn a_connection_that_never_opens_a_transaction_never_locks_the_tx_mutex() {
+        // Not a timing test -- a correctness one. If intercept_for_transaction ever locked
+        // `tx` before checking `in_transaction`, this would still pass; it exists to document
+        // the invariant Plan 01's Performance section depends on, for the next reader.
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let replication = ReplicationHandle::default();
+        let session = Session::new();
+        let reply = dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"SET", b"k", b"v"]),
+            &session,
+            1,
+        );
+        assert_eq!(reply, Frame::Simple("OK".into()));
+        assert_eq!(session.tx_state_for_test(), TransactionState::Idle);
     }
 
     #[test]
