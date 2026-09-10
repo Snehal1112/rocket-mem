@@ -2024,19 +2024,37 @@ fn info_text(
             ));
         } else {
             out.push_str("role:master\r\n");
-            let addrs = replication.registry.addrs();
-            out.push_str(&format!("connected_slaves:{}\r\n", addrs.len()));
+            let states = replication.registry.states();
+            out.push_str(&format!("connected_slaves:{}\r\n", states.len()));
+            let now = crate::replication::unix_now_secs();
             // One `slaveN:` line per connected replica, real Redis's format -- `ip`/`port` come
             // from the address the replica advertised in its own `PSYNC` (see
             // `ReplicationHandle::own_addr`'s doc comment), not this connection's ephemeral
             // source port. `ip=?,port=0` for a replica that advertised none (a bare `PSYNC`,
             // from an old client or a test) rather than silently omitting the line.
-            for (i, addr) in addrs.iter().enumerate() {
-                let (ip, port) = match addr {
+            //
+            // `offset` is the last position this replica acknowledged, and `lag` is whole
+            // seconds since it did. A replica that has never acked -- an older follower build,
+            // or one that has only just attached -- reports `offset=0,lag=-1`. The `-1` means
+            // "unknown" and must never be read as "zero lag"; that distinction is the entire
+            // reason this line was extended. `state` is untouched by that: it still reports
+            // only that the replica is registered, not that it is healthy.
+            for (i, state) in states.iter().enumerate() {
+                let (ip, port) = match &state.addr {
                     Some(a) => split_addr(a),
                     None => ("?", 0),
                 };
-                out.push_str(&format!("slave{i}:ip={ip},port={port},state=online\r\n"));
+                let lag = if state.last_ack_unix == 0 {
+                    -1
+                } else {
+                    // Clamped at 0 so a clock that stepped backwards reports "caught up"
+                    // rather than a negative lag that reads as the unknown sentinel.
+                    now.saturating_sub(state.last_ack_unix).max(0)
+                };
+                out.push_str(&format!(
+                    "slave{i}:ip={ip},port={port},state=online,offset={},lag={lag}\r\n",
+                    state.ack_offset
+                ));
             }
             // After the per-replica lines, matching real Redis's own field order. This is a
             // count of replication-stream bytes this leader has produced, so it is non-zero on
@@ -5848,12 +5866,56 @@ mod tests {
         let text = info_text_for(&replication, &engine, &[b"replication"]);
 
         assert!(text.contains("connected_slaves:2\r\n"), "{text}");
+        // Neither replica has acked, so both report the unknown sentinel. `lag=-1` is
+        // deliberately not `lag=0`: "we have never heard from this replica" must not render as
+        // "this replica is perfectly caught up".
         assert!(
-            text.contains("slave0:ip=127.0.0.1,port=6480,state=online\r\n"),
+            text.contains("slave0:ip=127.0.0.1,port=6480,state=online,offset=0,lag=-1\r\n"),
             "{text}"
         );
         assert!(
-            text.contains("slave1:ip=?,port=0,state=online\r\n"),
+            text.contains("slave1:ip=?,port=0,state=online,offset=0,lag=-1\r\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn info_reports_a_replicas_acked_offset_and_lag() {
+        let engine = Engine::new();
+        let replication = ReplicationHandle::default();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let entry = replication
+            .registry
+            .register(Some("127.0.0.1:6480".to_string()), tx);
+        entry.record_ack(4096);
+
+        let text = info_text_for(&replication, &engine, &[b"replication"]);
+
+        // Acked this instant, so the lag is 0 seconds -- a real 0, not the -1 sentinel.
+        assert!(
+            text.contains("slave0:ip=127.0.0.1,port=6480,state=online,offset=4096,lag=0\r\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn info_reports_a_stale_replicas_lag_in_whole_seconds() {
+        let engine = Engine::new();
+        let replication = ReplicationHandle::default();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let entry = replication.registry.register(None, tx);
+        entry.record_ack(10);
+        // Backdated rather than slept for: the lag is derived from the stamp, so moving the
+        // stamp is the whole experiment.
+        entry.last_ack_unix.store(
+            crate::replication::unix_now_secs() - 42,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+
+        let text = info_text_for(&replication, &engine, &[b"replication"]);
+
+        assert!(
+            text.contains("slave0:ip=?,port=0,state=online,offset=10,lag=42\r\n"),
             "{text}"
         );
     }

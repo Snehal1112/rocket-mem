@@ -6,9 +6,10 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering}
 use std::sync::{Arc, Mutex};
 
 /// Unix seconds now, or 0 if the system clock is somehow before the epoch. Never panics: a
-/// bogus clock must not take down a server over a metrics field. Used by `record_save` and by
-/// `sync_once`'s last-apply stamp, so there is exactly one implementation of this expression.
-fn unix_now_secs() -> i64 {
+/// bogus clock must not take down a server over a metrics field. Used by `record_save`, by
+/// `sync_once`'s last-apply stamp, by `ReplicaEntry::record_ack`, and by `info_text`'s replica
+/// lag calculation, so there is exactly one implementation of this expression.
+pub(crate) fn unix_now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
