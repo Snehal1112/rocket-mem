@@ -37,6 +37,17 @@ pub struct Config {
     /// `[[acl.users]]`'s own `password` field -- there is no encryption-at-rest for config
     /// secrets anywhere in this project today.
     pub replicaof_auth_password: Option<String>,
+    /// The address this node advertises to its leader in its `PSYNC <addr>` frame, and which the
+    /// leader then reports in `INFO REPLICATION`'s `slaveN:ip=...,port=...` lines. Unset means
+    /// `addr` -- today's behaviour byte for byte, for every deployment that predates this field.
+    ///
+    /// Set it when the address a peer must dial differs from the address this node binds: a TLS
+    /// deployment (announce `tls_resp_addr`, since `addr` is the plaintext port), or NAT and
+    /// container port mapping (announce the externally reachable `host:port`). Shape-validated at
+    /// startup by `validate_replica_announce_addr`; never checked for reachability, because this
+    /// node cannot know how a peer routes to it. See
+    /// `docs/superpowers/specs/2026-09-10-replica-announce-addr-spec.md`.
+    pub replica_announce_addr: Option<String>,
     pub acl: AclBootstrapConfig,
     /// Log level filter, e.g. "info", "debug", "rocket_mem=debug,warn" -- same syntax as
     /// `RUST_LOG`. Overridden by the `RUST_LOG` env var when it's set (see
@@ -70,6 +81,7 @@ impl Default for Config {
             replicaof: None,
             replicaof_auth_username: None,
             replicaof_auth_password: None,
+            replica_announce_addr: None,
             acl: AclBootstrapConfig::default(),
             log_level: "info".to_string(),
             log_value_max_bytes: 128,
@@ -116,6 +128,7 @@ impl std::fmt::Debug for Config {
             replicaof,
             replicaof_auth_username,
             replicaof_auth_password,
+            replica_announce_addr,
             acl,
             log_level,
             log_value_max_bytes,
@@ -144,6 +157,7 @@ impl std::fmt::Debug for Config {
             .field("replicaof", replicaof)
             .field("replicaof_auth_username", replicaof_auth_username)
             .field("replicaof_auth_password", &replicaof_auth_password)
+            .field("replica_announce_addr", replica_announce_addr)
             .field("acl", acl)
             .field("log_level", log_level)
             .field("log_value_max_bytes", log_value_max_bytes)
@@ -304,6 +318,10 @@ pub struct Cli {
     /// Password for the AUTH clause sent before PSYNC to --replicaof's leader [default: unset]
     #[arg(long)]
     pub replicaof_auth_password: Option<String>,
+    /// `host:port` this node advertises to its leader in PSYNC, when the address a peer must dial
+    /// differs from --addr [default: unset, announces --addr]
+    #[arg(long)]
+    pub replica_announce_addr: Option<String>,
     /// Log level filter, e.g. "info", "debug", "rocket_mem=debug,warn" [default: info]
     #[arg(long)]
     pub log_level: Option<String>,
@@ -354,6 +372,7 @@ fn cli_overrides(
     set!(replicaof);
     set!(replicaof_auth_username);
     set!(replicaof_auth_password);
+    set!(replica_announce_addr);
     set!(log_level);
     if let Some(v) = cli.slowlog_threshold_micros {
         map.insert("slowlog_threshold_micros", Value::from(v));
@@ -430,6 +449,48 @@ pub fn validate_replicaof(config: &Config) -> Result<(), std::io::Error> {
     Ok(())
 }
 
+/// Enforces that `replica_announce_addr`, when set, is at least *shaped* like something a peer
+/// could dial: `host:port`, with a non-empty host and a port that parses as a `u16`. Follows
+/// `validate_replicaof`/`validate_tls`'s precedent of rejecting a malformed value at startup,
+/// before anything binds, rather than degrading at display time. Today a bad value survives all
+/// the way to `INFO REPLICATION`'s `split_addr`, which falls back to `("?", 0)` -- an operator
+/// then sees `ip=?,port=0` and has nothing to grep for. A startup failure naming the field is
+/// strictly more useful. `main.rs` calls this alongside the other two validators.
+///
+/// **A shape check, never a reachability check.** This node cannot know whether a *peer* can
+/// reach an address, and pretending to check would be worse than not checking. The host half is
+/// therefore not resolved either: a hostname whose DNS record lands after this process starts is
+/// a legitimate value.
+///
+/// `rsplit_once(':')` deliberately matches `dispatcher.rs`'s `split_addr`, the function that
+/// consumes this value downstream, so a value this accepts is exactly a value `split_addr`
+/// renders correctly -- including the bracketed IPv6 form `[::1]:16479`, whose last colon is
+/// still the separator.
+pub fn validate_replica_announce_addr(config: &Config) -> Result<(), std::io::Error> {
+    let Some(addr) = &config.replica_announce_addr else {
+        return Ok(());
+    };
+    let invalid = |reason: &str| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "replica_announce_addr '{addr}' {reason} -- it must be host:port, \
+                 e.g. \"10.0.0.7:16379\""
+            ),
+        )
+    };
+    let Some((host, port)) = addr.rsplit_once(':') else {
+        return Err(invalid("has no ':' port separator"));
+    };
+    if host.is_empty() {
+        return Err(invalid("has an empty host"));
+    }
+    if port.parse::<u16>().is_err() {
+        return Err(invalid("has a port that is not a number in 0..=65535"));
+    }
+    Ok(())
+}
+
 /// Derives the AUTH tuple `start_replicating_with_auth` needs from a `Config`'s
 /// `replicaof_auth_username`/`replicaof_auth_password` fields -- `None` unless both are set.
 /// `validate_replicaof` guarantees these two fields are never partially set by the time startup
@@ -445,6 +506,55 @@ pub fn replicaof_auth(config: &Config) -> Option<(String, String)> {
         (Some(u), Some(p)) => Some((u.clone(), p.clone())),
         _ => None,
     }
+}
+
+/// The address this node announces to its leader in `PSYNC`: `replica_announce_addr` when set,
+/// otherwise `addr`. Unset therefore means today's behaviour byte for byte -- see the field's own
+/// doc comment for when to set it.
+///
+/// Pulled out as its own function for the same reason `replicaof_auth` is: it makes the `Config`
+/// -> announced-address mapping exercisable from a test without hand-building `main.rs`'s whole
+/// startup path, and it keeps the fallback in one place instead of inline at the single builder
+/// call site. `main.rs`'s `.with_own_addr(...)` is the only production caller.
+///
+/// Deliberately dumb: it never consults `tls_resp_addr`, `tls_rmp_addr`, or the cluster topology.
+/// The spec rejected both of those as defaults -- deriving from the cluster config announces the
+/// *leader's* address on a replica whose `cluster_node_id` names its leader, and defaulting to
+/// `tls_resp_addr` silently changes what every existing follower reports the moment TLS is
+/// switched on, while still assuming the reachable address is one this node binds locally (false
+/// under NAT, container port mapping, or a load balancer). The misconfiguration those defaults
+/// would have papered over is surfaced by `should_warn_plaintext_announce` instead.
+pub fn announce_addr(config: &Config) -> String {
+    config
+        .replica_announce_addr
+        .clone()
+        .unwrap_or_else(|| config.addr.clone())
+}
+
+/// Whether startup should warn that this node is about to announce its *plaintext* address to its
+/// leader. True when all three of the spec's conditions hold at once: this node is configured as a
+/// follower, it serves at least one TLS listener, and `replica_announce_addr` is unset -- so
+/// `announce_addr` falls back to `addr`, the plaintext RESP listen address, on a deployment that
+/// clearly intended TLS. See
+/// `docs/superpowers/specs/2026-09-10-replica-announce-addr-spec.md`'s "Warn when the announced
+/// address contradicts the transport".
+///
+/// This is the visibility that pays for `announce_addr` being deliberately dumb. The spec rejected
+/// silently defaulting to `tls_resp_addr`, because that changes what every existing follower
+/// reports the moment TLS is switched on and still assumes the reachable address is one this node
+/// binds locally -- false under NAT, container port mapping, or a load balancer. Making the
+/// mismatch loud is the honest alternative to guessing at it.
+///
+/// **Deliberately startup-only, and deliberately keyed on the `replicaof` config field rather than
+/// on live follower state.** The spec asks for one line at startup and never one per command, and
+/// a node made a follower later by a live `REPLICAOF` has no startup moment to warn at. A
+/// TLS-serving, announce-address-less node that only ever becomes a follower via the live command
+/// is therefore not warned about. That is accepted, and it is why this is a `&Config` predicate
+/// rather than a check inside `handle_replicaof`.
+pub fn should_warn_plaintext_announce(config: &Config) -> bool {
+    config.replicaof.is_some()
+        && (config.tls_resp_addr.is_some() || config.tls_rmp_addr.is_some())
+        && config.replica_announce_addr.is_none()
 }
 
 /// Resolves the log filter directive: `RUST_LOG`, when set, wins over `log_level` -- the
@@ -478,6 +588,7 @@ mod tests {
         assert_eq!(cfg.tls_cert_path, None);
         assert_eq!(cfg.tls_key_path, None);
         assert_eq!(cfg.tls_ca_path, None);
+        assert_eq!(cfg.replica_announce_addr, None);
         assert_eq!(cfg.log_level, "info");
         assert!(cfg.acl.users.is_empty());
     }
@@ -696,6 +807,7 @@ mod tests {
             replicaof: Some("1.1.1.1:6".to_string()),
             replicaof_auth_username: Some("zzuser".to_string()),
             replicaof_auth_password: Some("zzleaderpassword".to_string()),
+            replica_announce_addr: Some("1.1.1.1:7".to_string()),
             acl: AclBootstrapConfig::default(),
             log_level: "zzlevel".to_string(),
             log_value_max_bytes: 4322,
@@ -721,6 +833,7 @@ mod tests {
             "/zz/ca.pem",
             "1.1.1.1:6",
             "zzuser",
+            "1.1.1.1:7",
             "acl",
             "zzlevel",
             "4322",
@@ -821,6 +934,62 @@ mod tests {
             assert_eq!(cfg.replicaof.as_deref(), Some("127.0.0.1:1111"));
             assert_eq!(cfg.replicaof_auth_username.as_deref(), Some("cliuser"));
             assert_eq!(cfg.replicaof_auth_password.as_deref(), Some("clipass"));
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn default_config_has_no_replica_announce_addr() {
+        // Unset is the whole compatibility guarantee: a node with no `replica_announce_addr`
+        // must announce `addr`, exactly as every deployment did before this field existed.
+        assert_eq!(Config::default().replica_announce_addr, None);
+    }
+
+    #[test]
+    fn replica_announce_addr_is_layered_like_every_other_optional_string_field() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "rocket-mem.toml",
+                "replica_announce_addr = \"numericlabs.lxd:16479\"\n",
+            )?;
+            let cfg = load_layered(Some(std::path::Path::new("rocket-mem.toml"))).unwrap();
+            assert_eq!(
+                cfg.replica_announce_addr.as_deref(),
+                Some("numericlabs.lxd:16479"),
+                "file overrides default"
+            );
+
+            jail.set_env("ROCKET_MEM_REPLICA_ANNOUNCE_ADDR", "numericlabs.lxd:26479");
+            let cfg = load_layered(Some(std::path::Path::new("rocket-mem.toml"))).unwrap();
+            assert_eq!(
+                cfg.replica_announce_addr.as_deref(),
+                Some("numericlabs.lxd:26479"),
+                "env overrides file"
+            );
+
+            let cli = Cli::parse_from([
+                "rocket-mem",
+                "--config",
+                "rocket-mem.toml",
+                "--replica-announce-addr",
+                "numericlabs.lxd:36479",
+            ]);
+            let cfg = load_with_cli(cli).unwrap();
+            assert_eq!(
+                cfg.replica_announce_addr.as_deref(),
+                Some("numericlabs.lxd:36479"),
+                "CLI overrides env"
+            );
+
+            // The layer that is easiest to break by forgetting a `set!` line: an unset flag must
+            // leave the env value alone rather than clobbering it with `None`.
+            let cli = Cli::parse_from(["rocket-mem", "--config", "rocket-mem.toml"]);
+            let cfg = load_with_cli(cli).unwrap();
+            assert_eq!(
+                cfg.replica_announce_addr.as_deref(),
+                Some("numericlabs.lxd:26479"),
+                "an unset CLI flag must not clobber the env value"
+            );
             Ok(())
         });
     }
@@ -1023,6 +1192,96 @@ mod tests {
         );
     }
 
+    /// The compatibility guarantee in one assertion: unset means `addr`, so a deployment that
+    /// never sets the new field announces exactly what it announced before the field existed.
+    #[test]
+    fn announce_addr_falls_back_to_addr_when_the_field_is_unset() {
+        let cfg = Config {
+            addr: "127.0.0.1:6479".to_string(),
+            ..Config::default()
+        };
+        assert_eq!(announce_addr(&cfg), "127.0.0.1:6479");
+    }
+
+    #[test]
+    fn announce_addr_prefers_the_configured_announce_address_over_addr() {
+        let cfg = Config {
+            addr: "127.0.0.1:6479".to_string(),
+            replica_announce_addr: Some("numericlabs.lxd:16479".to_string()),
+            ..Config::default()
+        };
+        assert_eq!(
+            announce_addr(&cfg),
+            "numericlabs.lxd:16479",
+            "the announced address must be independent of the bound one -- the whole point of the \
+             field is a NAT, container, or TLS deployment where they differ"
+        );
+    }
+
+    /// A config where all three of the spec's warn conditions hold at once: this node is a
+    /// follower, it serves a TLS listener, and it announces nothing. Each negative test below
+    /// flips exactly one of them, so a passing negative can only mean that one condition matters.
+    fn warnable() -> Config {
+        Config {
+            addr: "127.0.0.1:6479".to_string(),
+            replicaof: Some("127.0.0.1:6379".to_string()),
+            tls_resp_addr: Some("127.0.0.1:16479".to_string()),
+            tls_cert_path: Some("/certs/cert.pem".to_string()),
+            tls_key_path: Some("/certs/key.pem".to_string()),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn should_warn_plaintext_announce_fires_for_a_tls_follower_that_announces_nothing() {
+        assert!(should_warn_plaintext_announce(&warnable()));
+
+        // An RMP TLS listener counts too. Either address means this deployment intended TLS, and
+        // `main.rs`'s own `tls_enabled` summary field is derived the same way.
+        let rmp_only = Config {
+            tls_resp_addr: None,
+            tls_rmp_addr: Some("127.0.0.1:17479".to_string()),
+            ..warnable()
+        };
+        assert!(should_warn_plaintext_announce(&rmp_only));
+    }
+
+    #[test]
+    fn should_warn_plaintext_announce_is_silent_when_any_single_condition_is_missing() {
+        let not_a_follower = Config {
+            replicaof: None,
+            ..warnable()
+        };
+        assert!(
+            !should_warn_plaintext_announce(&not_a_follower),
+            "a leader announces nothing to anyone -- there is nothing to warn about"
+        );
+
+        let no_tls = Config {
+            tls_resp_addr: None,
+            tls_rmp_addr: None,
+            ..warnable()
+        };
+        assert!(
+            !should_warn_plaintext_announce(&no_tls),
+            "a plaintext follower announcing its plaintext address is correct, not a mistake"
+        );
+
+        let announced = Config {
+            replica_announce_addr: Some("127.0.0.1:16479".to_string()),
+            ..warnable()
+        };
+        assert!(
+            !should_warn_plaintext_announce(&announced),
+            "the operator has already said where a peer must dial -- warning again is noise"
+        );
+
+        assert!(
+            !should_warn_plaintext_announce(&Config::default()),
+            "the all-defaults standalone case must be silent"
+        );
+    }
+
     #[test]
     fn validate_replicaof_accepts_no_auth_at_all() {
         let cfg = Config {
@@ -1033,5 +1292,67 @@ mod tests {
             validate_replicaof(&cfg).is_ok(),
             "replicaof with no ACL-protected leader needs no auth fields at all"
         );
+    }
+
+    /// A helper rather than four near-identical literals: every case below differs only in the
+    /// one field under test.
+    fn with_announce(addr: &str) -> Config {
+        Config {
+            replica_announce_addr: Some(addr.to_string()),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn validate_replica_announce_addr_accepts_unset_and_well_shaped_values() {
+        assert!(
+            validate_replica_announce_addr(&Config::default()).is_ok(),
+            "unset is the default and must never fail startup"
+        );
+        for good in [
+            "numericlabs.lxd:16479",
+            "127.0.0.1:6479",
+            "10.0.0.7:1",
+            "host:0",
+            "host:65535",
+            // The bracketed IPv6 form. `rsplit_once(':')` splits on the LAST colon, so the
+            // bracketed host survives intact -- exactly as `dispatcher.rs`'s `split_addr`, the
+            // consumer of this value, will later split it.
+            "[::1]:16479",
+        ] {
+            assert!(
+                validate_replica_announce_addr(&with_announce(good)).is_ok(),
+                "{good:?} must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_replica_announce_addr_rejects_a_value_split_addr_would_render_as_ip_question_port_zero(
+    ) {
+        for (bad, why) in [
+            (
+                "numericlabs.lxd",
+                "no ':' separator, so there is no port at all",
+            ),
+            ("numericlabs.lxd:", "empty port"),
+            ("numericlabs.lxd:notaport", "non-numeric port"),
+            ("numericlabs.lxd:99999", "port above u16::MAX"),
+            ("numericlabs.lxd:-1", "negative port"),
+            (":16479", "empty host"),
+        ] {
+            let err = validate_replica_announce_addr(&with_announce(bad))
+                .expect_err(&format!("{bad:?} must be rejected: {why}"));
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            let msg = err.to_string();
+            assert!(
+                msg.contains("replica_announce_addr"),
+                "the error must name the field so an operator has something to grep for, got: {msg}"
+            );
+            assert!(
+                msg.contains(bad),
+                "the error must echo the offending value, got: {msg}"
+            );
+        }
     }
 }

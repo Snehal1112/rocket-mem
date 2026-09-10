@@ -822,3 +822,65 @@ async fn a_leader_reports_its_followers_advancing_offset_and_small_lag_in_info()
         "the leader's recorded ack must match the follower's own position: {second_line}"
     );
 }
+
+/// The whole path the announce-address spec cares about, end to end: a `Config` carrying
+/// `replica_announce_addr` -> `config::announce_addr` -> `with_own_addr` -> the follower's
+/// `PSYNC <addr>` frame -> the leader's `ReplicaRegistry` -> the leader's `INFO REPLICATION`
+/// `slaveN:` line. Driving the composed expression `main.rs` uses, rather than re-testing
+/// `announce_addr` (unit-tested in config.rs) or `sync_once`'s outgoing PSYNC frame (pinned in
+/// replication.rs) in isolation -- neither of those would catch `main.rs` passing `config.addr`.
+#[tokio::test]
+async fn a_configured_replica_announce_addr_is_what_the_leader_reports_in_info_replication() {
+    let (_leader_dir, _leader_engine, _leader_aof, _leader_replication, leader_addr) =
+        spawn_node().await;
+
+    let follower_dir = tempfile::tempdir().unwrap();
+    let follower_engine = Arc::new(engine::Engine::new());
+    let config = rocket_mem::config::Config {
+        // Deliberately three different values. `addr` is what a pre-this-feature node would have
+        // announced; `replica_announce_addr` is what it must announce now; neither is the
+        // ephemeral source port of the connection the leader actually sees. Nothing binds either
+        // one -- the announced address is informational, so an unbound value is a legitimate
+        // configuration and makes the assertion below unambiguous.
+        addr: "127.0.0.1:6479".to_string(),
+        replicaof: Some(leader_addr.clone()),
+        replica_announce_addr: Some("announced.example:16479".to_string()),
+        ..rocket_mem::config::Config::default()
+    };
+    let follower_replication = Arc::new(
+        rocket_mem::replication::ReplicationHandle::new(
+            Arc::clone(&follower_engine),
+            follower_dir.path().join("follower.snapshot"),
+        )
+        .with_own_addr(rocket_mem::config::announce_addr(&config)),
+    );
+    follower_replication.start_replicating_from_config(&config);
+
+    let client = redis::Client::open(format!("redis://{leader_addr}")).unwrap();
+    let mut con = client.get_multiplexed_async_connection().await.unwrap();
+
+    // A bounded poll, not a fixed sleep: registration happens when the leader handles the PSYNC,
+    // which is a scheduling race with this connection. `let info = loop { ... break info; }`
+    // rather than a `let mut` seeded with an empty String, which would trip rustc's
+    // `unused_assignments` lint and so fail the `-D warnings` gate.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    let info = loop {
+        let info: String = redis::cmd("INFO")
+            .arg("replication")
+            .query_async(&mut con)
+            .await
+            .unwrap();
+        if info.contains("slave0:ip=announced.example,port=16479,state=online") {
+            break info;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the leader never reported the follower's announced address, last INFO was:\n{info}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    };
+    assert!(
+        !info.contains("port=6479"),
+        "the bound `addr` must not be what gets announced once the field is set, got:\n{info}"
+    );
+}

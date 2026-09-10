@@ -275,6 +275,7 @@ Configuration is layered, each level overriding the one before: built-in default
 | `slowlog_threshold_micros` | `10000` | Commands at or over this are recorded; `0` disables |
 | `log_level` | `info` | Log level filter for `tracing`; `RUST_LOG` env var always overrides it |
 | `log_value_max_bytes` | `128` | Max bytes of a value rendered into a `trace` log line; `trace` logs your data in plaintext |
+| `replica_announce_addr` | `addr` | `host:port` this node advertises to its leader in `PSYNC`; set it when a peer must dial an address other than `addr`, e.g. a TLS deployment |
 
 Every field, with its TOML key, environment variable, CLI flag, and ACL bootstrap format, is in
 [`docs/config-reference.md`](docs/config-reference.md).

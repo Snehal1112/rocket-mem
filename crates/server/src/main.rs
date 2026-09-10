@@ -294,7 +294,12 @@ async fn main() -> std::io::Result<()> {
         snapshot_path.to_path_buf(),
     )
     .with_aof(Arc::clone(&aof))
-    .with_own_addr(config.addr.clone())
+    // Not `config.addr`: that is the *plaintext* RESP listen address unconditionally, so a TLS
+    // deployment used to advertise a port a TLS peer must not dial. `announce_addr` falls back to
+    // `config.addr` when `replica_announce_addr` is unset, so this is byte-for-byte the old
+    // behaviour for every deployment that does not set the new field. See
+    // docs/superpowers/specs/2026-09-10-replica-announce-addr-spec.md.
+    .with_own_addr(rocket_mem::config::announce_addr(&config))
     .with_slowlog_threshold(slowlog_threshold)
     .with_log_value_max_bytes(config.log_value_max_bytes)
     .with_acl_bootstrap(acl_users);
@@ -317,6 +322,30 @@ async fn main() -> std::io::Result<()> {
     // into this node's engine and append to its own AOF.
     rocket_mem::config::validate_replicaof(&config)?;
     rocket_mem::config::validate_tls(&config)?;
+    // Same reasoning as the two above, and the same placement: a pure function of `&Config` whose
+    // failure must abort before anything binds. An unparseable announced address would otherwise
+    // survive to the leader's `INFO REPLICATION`, which renders it as `ip=?,port=0` -- an operator
+    // sees a broken-looking replica and has nothing to grep for.
+    rocket_mem::config::validate_replica_announce_addr(&config)?;
+
+    // The misconfiguration the announce-address spec exists to make visible: a follower serving
+    // TLS still tells its leader to find it at `addr`, the plaintext RESP listen address, because
+    // `announce_addr` is deliberately dumb rather than guessing at `tls_resp_addr`. One line, at
+    // startup, above every bind -- never per-command. See
+    // docs/superpowers/specs/2026-09-10-replica-announce-addr-spec.md's "Warn when the announced
+    // address contradicts the transport".
+    //
+    // `config.addr` is rendered unescaped, matching the `addr = %config.addr` field in the
+    // resolved-config summary above. It is an operator-supplied local config value, not the
+    // network-supplied `PSYNC` bulk that `connection.rs` routes through `logging::escape_ident` --
+    // no remote party can put bytes here.
+    if rocket_mem::config::should_warn_plaintext_announce(&config) {
+        tracing::warn!(
+            announced = %config.addr,
+            "replica_announce_addr is unset while a TLS listener is configured -- this node \
+             advertises its plaintext address to its leader"
+        );
+    }
 
     // A configured `replicaof` auto-connects on every startup, closing the "restarted follower
     // silently comes back as standalone" footgun documented in
