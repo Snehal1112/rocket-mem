@@ -1796,21 +1796,40 @@ fn cluster_nodes_text(
 }
 
 /// `CLUSTER SHARDS`'s reply: one entry per configured node, each an `Array` of alternating
-/// key/value frames rather than a `Map`, so RESP2 and RESP3 clients see identical output and
-/// this helper needs no `Protocol` state. `role` is always `master` and each shard has exactly
-/// one node: this sprint's cluster has no shard-level replicas. `replication-offset` is 0
-/// because this project has no replication offsets at all (Sprint 5 made every resync a full
-/// one), and the field is present only because clients parse for it.
-fn cluster_shards_reply(cluster: Option<&std::sync::Arc<crate::cluster::ClusterConfig>>) -> Frame {
+/// key/value frames rather than a `Map`, so RESP2 and RESP3 clients see identical output and this
+/// helper needs no `Protocol` state. Each shard still has exactly one node: `cluster.conf`'s
+/// four-field format has no field for a replica, so the topology cannot express one.
+///
+/// `role` is always `master` -- a node that stopped answering is still configured as a master,
+/// and `health` is the field that carries liveness. `health` is `online` for a peer answering
+/// probes and `failed` for one that has not answered within `cluster_node_timeout_secs`; with no
+/// prober running, every node reports `online`, exactly as before the prober existed.
+///
+/// `replication-offset` reports this node's real `master_repl_offset` for its own entry, and `0`
+/// for every peer. A peer's offset is genuinely unknown here: there is no cluster bus to carry it,
+/// and echoing this node's own number under a peer's name would be a fabrication of exactly the
+/// kind this reply is being fixed to stop.
+fn cluster_shards_reply(
+    cluster: Option<&std::sync::Arc<crate::cluster::ClusterConfig>>,
+    health: Option<&std::sync::Arc<crate::cluster_health::PeerHealth>>,
+    my_repl_offset: u64,
+) -> Frame {
     let Some(cluster) = cluster else {
         return Frame::Array(vec![]);
     };
+    let my_id = &cluster.myself().id;
     Frame::Array(
         cluster
             .nodes()
             .iter()
             .map(|n| {
                 let (host, port) = split_addr(&n.addr);
+                let reachable = node_is_reachable(n, my_id, health);
+                let offset = if &n.id == my_id {
+                    my_repl_offset as i64
+                } else {
+                    0
+                };
                 let node = Frame::Array(vec![
                     Frame::Bulk(Bytes::from_static(b"id")),
                     Frame::Bulk(Bytes::from(n.id.clone())),
@@ -1823,9 +1842,13 @@ fn cluster_shards_reply(cluster: Option<&std::sync::Arc<crate::cluster::ClusterC
                     Frame::Bulk(Bytes::from_static(b"role")),
                     Frame::Bulk(Bytes::from_static(b"master")),
                     Frame::Bulk(Bytes::from_static(b"replication-offset")),
-                    Frame::Integer(0),
+                    Frame::Integer(offset),
                     Frame::Bulk(Bytes::from_static(b"health")),
-                    Frame::Bulk(Bytes::from_static(b"online")),
+                    Frame::Bulk(if reachable {
+                        Bytes::from_static(b"online")
+                    } else {
+                        Bytes::from_static(b"failed")
+                    }),
                 ]);
                 Frame::Array(vec![
                     Frame::Bulk(Bytes::from_static(b"slots")),
@@ -1913,7 +1936,7 @@ fn handle_cluster(
             None => Bytes::from("0".repeat(40)),
         }),
         "INFO" => Frame::Bulk(Bytes::from(cluster_info_text(cluster))),
-        "SHARDS" => cluster_shards_reply(cluster),
+        "SHARDS" => cluster_shards_reply(cluster, health, replication.master_repl_offset()),
         "SLOTS" => cluster_slots_reply(cluster),
         "NODES" => Frame::Bulk(Bytes::from(cluster_nodes_text(cluster, health))),
         _ => Frame::Error(format!("ERR unknown CLUSTER subcommand '{sub}'")),
@@ -11038,6 +11061,93 @@ mod tests {
         );
     }
 
+    /// Pulls one alternating key/value pair out of a `CLUSTER SHARDS` entry's single node, so a
+    /// test can name the field it cares about instead of counting array indexes.
+    fn shard_node_field(shard: &Frame, key: &[u8]) -> Frame {
+        let Frame::Array(entry) = shard else {
+            panic!("expected a shard Array")
+        };
+        let Frame::Array(nodes) = &entry[3] else {
+            panic!("expected a nodes Array")
+        };
+        let Frame::Array(node) = &nodes[0] else {
+            panic!("expected a node Array")
+        };
+        node.chunks(2)
+            .find(|pair| pair[0] == Frame::Bulk(Bytes::copy_from_slice(key)))
+            .map(|pair| pair[1].clone())
+            .unwrap_or_else(|| panic!("no field named {}", String::from_utf8_lossy(key)))
+    }
+
+    #[test]
+    fn cluster_shards_reports_an_unreachable_peer_as_failed() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let Frame::Array(shards) = dispatch_and_log(
+            &engine,
+            &aof,
+            &cluster_handle_with_dead("shard-a", &["shard-c"]),
+            cmd(&[b"CLUSTER", b"SHARDS"]),
+            &Session::new(),
+            1,
+        ) else {
+            panic!("expected Array")
+        };
+        assert_eq!(shards.len(), 3);
+        assert_eq!(
+            shard_node_field(&shards[0], b"health"),
+            Frame::Bulk(Bytes::from_static(b"online")),
+            "this node is answering, so it is online"
+        );
+        assert_eq!(
+            shard_node_field(&shards[1], b"health"),
+            Frame::Bulk(Bytes::from_static(b"online"))
+        );
+        assert_eq!(
+            shard_node_field(&shards[2], b"health"),
+            Frame::Bulk(Bytes::from_static(b"failed"))
+        );
+        // A failed master is still a master. `role` reports what the node is configured as, not
+        // whether it is answering -- `health` is the field that carries liveness.
+        assert_eq!(
+            shard_node_field(&shards[2], b"role"),
+            Frame::Bulk(Bytes::from_static(b"master"))
+        );
+    }
+
+    #[test]
+    fn cluster_shards_reports_this_nodes_real_replication_offset_and_zero_for_peers() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let handle = cluster_handle_with_dead("shard-a", &[]);
+        handle.advance_master_repl_offset(4096);
+        let Frame::Array(shards) = dispatch_and_log(
+            &engine,
+            &aof,
+            &handle,
+            cmd(&[b"CLUSTER", b"SHARDS"]),
+            &Session::new(),
+            1,
+        ) else {
+            panic!("expected Array")
+        };
+        assert_eq!(
+            shard_node_field(&shards[0], b"replication-offset"),
+            Frame::Integer(4096),
+            "shard-a is myself, and its offset is knowable"
+        );
+        // A peer's offset stays 0: there is no cluster bus, so this node genuinely does not know
+        // it. Reporting its own offset for a peer would be a fabrication.
+        assert_eq!(
+            shard_node_field(&shards[1], b"replication-offset"),
+            Frame::Integer(0)
+        );
+        assert_eq!(
+            shard_node_field(&shards[2], b"replication-offset"),
+            Frame::Integer(0)
+        );
+    }
+
     #[test]
     fn cluster_shards_describes_every_shards_slots_and_its_one_node() {
         let engine = Engine::new();
@@ -11083,6 +11193,8 @@ mod tests {
             node[10],
             Frame::Bulk(Bytes::from_static(b"replication-offset"))
         );
+        // `cluster_handle` never wrote anything, so this node's own `master_repl_offset` is
+        // genuinely 0 -- not the hardcoded literal it used to be.
         assert_eq!(node[11], Frame::Integer(0));
         assert_eq!(node[12], Frame::Bulk(Bytes::from_static(b"health")));
         assert_eq!(node[13], Frame::Bulk(Bytes::from_static(b"online")));
