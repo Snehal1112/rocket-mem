@@ -531,6 +531,32 @@ pub fn announce_addr(config: &Config) -> String {
         .unwrap_or_else(|| config.addr.clone())
 }
 
+/// Whether startup should warn that this node is about to announce its *plaintext* address to its
+/// leader. True when all three of the spec's conditions hold at once: this node is configured as a
+/// follower, it serves at least one TLS listener, and `replica_announce_addr` is unset -- so
+/// `announce_addr` falls back to `addr`, the plaintext RESP listen address, on a deployment that
+/// clearly intended TLS. See
+/// `docs/superpowers/specs/2026-09-10-replica-announce-addr-spec.md`'s "Warn when the announced
+/// address contradicts the transport".
+///
+/// This is the visibility that pays for `announce_addr` being deliberately dumb. The spec rejected
+/// silently defaulting to `tls_resp_addr`, because that changes what every existing follower
+/// reports the moment TLS is switched on and still assumes the reachable address is one this node
+/// binds locally -- false under NAT, container port mapping, or a load balancer. Making the
+/// mismatch loud is the honest alternative to guessing at it.
+///
+/// **Deliberately startup-only, and deliberately keyed on the `replicaof` config field rather than
+/// on live follower state.** The spec asks for one line at startup and never one per command, and
+/// a node made a follower later by a live `REPLICAOF` has no startup moment to warn at. A
+/// TLS-serving, announce-address-less node that only ever becomes a follower via the live command
+/// is therefore not warned about. That is accepted, and it is why this is a `&Config` predicate
+/// rather than a check inside `handle_replicaof`.
+pub fn should_warn_plaintext_announce(config: &Config) -> bool {
+    config.replicaof.is_some()
+        && (config.tls_resp_addr.is_some() || config.tls_rmp_addr.is_some())
+        && config.replica_announce_addr.is_none()
+}
+
 /// Resolves the log filter directive: `RUST_LOG`, when set, wins over `log_level` -- the
 /// standard `tracing` convention of letting an operator's env var override any code- or
 /// config-file-supplied default. Returns a plain `String` (not an `EnvFilter`) so this stays
@@ -1189,6 +1215,70 @@ mod tests {
             "numericlabs.lxd:16479",
             "the announced address must be independent of the bound one -- the whole point of the \
              field is a NAT, container, or TLS deployment where they differ"
+        );
+    }
+
+    /// A config where all three of the spec's warn conditions hold at once: this node is a
+    /// follower, it serves a TLS listener, and it announces nothing. Each negative test below
+    /// flips exactly one of them, so a passing negative can only mean that one condition matters.
+    fn warnable() -> Config {
+        Config {
+            addr: "127.0.0.1:6479".to_string(),
+            replicaof: Some("127.0.0.1:6379".to_string()),
+            tls_resp_addr: Some("127.0.0.1:16479".to_string()),
+            tls_cert_path: Some("/certs/cert.pem".to_string()),
+            tls_key_path: Some("/certs/key.pem".to_string()),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn should_warn_plaintext_announce_fires_for_a_tls_follower_that_announces_nothing() {
+        assert!(should_warn_plaintext_announce(&warnable()));
+
+        // An RMP TLS listener counts too. Either address means this deployment intended TLS, and
+        // `main.rs`'s own `tls_enabled` summary field is derived the same way.
+        let rmp_only = Config {
+            tls_resp_addr: None,
+            tls_rmp_addr: Some("127.0.0.1:17479".to_string()),
+            ..warnable()
+        };
+        assert!(should_warn_plaintext_announce(&rmp_only));
+    }
+
+    #[test]
+    fn should_warn_plaintext_announce_is_silent_when_any_single_condition_is_missing() {
+        let not_a_follower = Config {
+            replicaof: None,
+            ..warnable()
+        };
+        assert!(
+            !should_warn_plaintext_announce(&not_a_follower),
+            "a leader announces nothing to anyone -- there is nothing to warn about"
+        );
+
+        let no_tls = Config {
+            tls_resp_addr: None,
+            tls_rmp_addr: None,
+            ..warnable()
+        };
+        assert!(
+            !should_warn_plaintext_announce(&no_tls),
+            "a plaintext follower announcing its plaintext address is correct, not a mistake"
+        );
+
+        let announced = Config {
+            replica_announce_addr: Some("127.0.0.1:16479".to_string()),
+            ..warnable()
+        };
+        assert!(
+            !should_warn_plaintext_announce(&announced),
+            "the operator has already said where a peer must dial -- warning again is noise"
+        );
+
+        assert!(
+            !should_warn_plaintext_announce(&Config::default()),
+            "the all-defaults standalone case must be silent"
         );
     }
 
