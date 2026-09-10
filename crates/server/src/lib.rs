@@ -1,6 +1,7 @@
 pub mod acl;
 pub mod aof;
 pub mod cluster;
+pub mod cluster_health;
 pub mod config;
 pub mod connection;
 pub mod dispatcher;

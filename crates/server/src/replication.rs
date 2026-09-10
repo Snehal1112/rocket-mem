@@ -7,8 +7,9 @@ use std::sync::{Arc, Mutex};
 
 /// Unix seconds now, or 0 if the system clock is somehow before the epoch. Never panics: a
 /// bogus clock must not take down a server over a metrics field. Used by `record_save`, by
-/// `sync_once`'s last-apply stamp, by `ReplicaEntry::record_ack`, and by `info_text`'s replica
-/// lag calculation, so there is exactly one implementation of this expression.
+/// `sync_once`'s last-apply stamp, by `ReplicaEntry::record_ack`, by `info_text`'s replica lag
+/// calculation, and by `cluster_health`'s probe stamps, so there is exactly one implementation
+/// of this expression.
 pub(crate) fn unix_now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -270,6 +271,15 @@ pub struct ReplicationHandle {
     /// `ServerState` is deferred to Sprint 7, whose dual-protocol work has to touch these
     /// signatures anyway; see ../../docs/superpowers/specs/2026-08-30-sprint-6-spec.md.
     cluster: Option<Arc<crate::cluster::ClusterConfig>>,
+    /// Live liveness of this cluster's *other* nodes, when a prober is running -- `main.rs`
+    /// starts one whenever cluster mode is on. `None`, the default for `new`/`Default` and so for
+    /// every existing test and every standalone deployment, means no liveness information exists
+    /// at all, and the `CLUSTER` reply builders fall back to reporting the topology exactly as
+    /// configured -- what they did before the prober existed. Deliberately a sibling of `cluster`
+    /// rather than a field inside `ClusterConfig`: that type promises it "never changes for the
+    /// life of the process" and several readers depend on that, so it gets no interior
+    /// mutability. See the failover-safety design contract, §2.6.
+    peer_health: Option<Arc<crate::cluster_health::PeerHealth>>,
     /// Live client connections, kept by a Drop guard in `handle_connection` so it is decremented
     /// on every one of that function's early returns, including the `serve_replica` path.
     connected_clients: AtomicUsize,
@@ -378,6 +388,7 @@ impl ReplicationHandle {
             aof: None,
             replication_tls_client_config: None,
             cluster: None,
+            peer_health: None,
             connected_clients: AtomicUsize::new(0),
             total_connections: AtomicU64::new(0),
             total_commands: AtomicU64::new(0),
@@ -434,6 +445,14 @@ impl ReplicationHandle {
     /// `crates/server/tests/cluster.rs` call this; everything else leaves cluster mode off.
     pub fn with_cluster(mut self, cluster: Arc<crate::cluster::ClusterConfig>) -> Self {
         self.cluster = Some(cluster);
+        self
+    }
+
+    /// Attaches the peer-health map a running prober maintains. Only `main.rs` (in cluster mode)
+    /// and cluster tests call this; everything else leaves it `None`. Mirrors `with_cluster`, and
+    /// for the same reason: the ~25 existing `ReplicationHandle::new` call sites stay untouched.
+    pub fn with_peer_health(mut self, health: Arc<crate::cluster_health::PeerHealth>) -> Self {
+        self.peer_health = Some(health);
         self
     }
 
@@ -499,6 +518,12 @@ impl ReplicationHandle {
     /// this before extracting any key, so a standalone node pays one `Option` check per command.
     pub fn cluster(&self) -> Option<&Arc<crate::cluster::ClusterConfig>> {
         self.cluster.as_ref()
+    }
+
+    /// `None` when no prober is running, which the `CLUSTER` reply builders read as "no liveness
+    /// information", never as "failed".
+    pub fn peer_health(&self) -> Option<&Arc<crate::cluster_health::PeerHealth>> {
+        self.peer_health.as_ref()
     }
 
     /// The `trace`-level argument truncation cap, read once per command by `dispatch_and_log`
