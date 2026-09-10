@@ -449,6 +449,48 @@ pub fn validate_replicaof(config: &Config) -> Result<(), std::io::Error> {
     Ok(())
 }
 
+/// Enforces that `replica_announce_addr`, when set, is at least *shaped* like something a peer
+/// could dial: `host:port`, with a non-empty host and a port that parses as a `u16`. Follows
+/// `validate_replicaof`/`validate_tls`'s precedent of rejecting a malformed value at startup,
+/// before anything binds, rather than degrading at display time. Today a bad value survives all
+/// the way to `INFO REPLICATION`'s `split_addr`, which falls back to `("?", 0)` -- an operator
+/// then sees `ip=?,port=0` and has nothing to grep for. A startup failure naming the field is
+/// strictly more useful. `main.rs` calls this alongside the other two validators.
+///
+/// **A shape check, never a reachability check.** This node cannot know whether a *peer* can
+/// reach an address, and pretending to check would be worse than not checking. The host half is
+/// therefore not resolved either: a hostname whose DNS record lands after this process starts is
+/// a legitimate value.
+///
+/// `rsplit_once(':')` deliberately matches `dispatcher.rs`'s `split_addr`, the function that
+/// consumes this value downstream, so a value this accepts is exactly a value `split_addr`
+/// renders correctly -- including the bracketed IPv6 form `[::1]:16479`, whose last colon is
+/// still the separator.
+pub fn validate_replica_announce_addr(config: &Config) -> Result<(), std::io::Error> {
+    let Some(addr) = &config.replica_announce_addr else {
+        return Ok(());
+    };
+    let invalid = |reason: &str| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "replica_announce_addr '{addr}' {reason} -- it must be host:port, \
+                 e.g. \"10.0.0.7:16379\""
+            ),
+        )
+    };
+    let Some((host, port)) = addr.rsplit_once(':') else {
+        return Err(invalid("has no ':' port separator"));
+    };
+    if host.is_empty() {
+        return Err(invalid("has an empty host"));
+    }
+    if port.parse::<u16>().is_err() {
+        return Err(invalid("has a port that is not a number in 0..=65535"));
+    }
+    Ok(())
+}
+
 /// Derives the AUTH tuple `start_replicating_with_auth` needs from a `Config`'s
 /// `replicaof_auth_username`/`replicaof_auth_password` fields -- `None` unless both are set.
 /// `validate_replicaof` guarantees these two fields are never partially set by the time startup
@@ -1111,5 +1153,67 @@ mod tests {
             validate_replicaof(&cfg).is_ok(),
             "replicaof with no ACL-protected leader needs no auth fields at all"
         );
+    }
+
+    /// A helper rather than four near-identical literals: every case below differs only in the
+    /// one field under test.
+    fn with_announce(addr: &str) -> Config {
+        Config {
+            replica_announce_addr: Some(addr.to_string()),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn validate_replica_announce_addr_accepts_unset_and_well_shaped_values() {
+        assert!(
+            validate_replica_announce_addr(&Config::default()).is_ok(),
+            "unset is the default and must never fail startup"
+        );
+        for good in [
+            "numericlabs.lxd:16479",
+            "127.0.0.1:6479",
+            "10.0.0.7:1",
+            "host:0",
+            "host:65535",
+            // The bracketed IPv6 form. `rsplit_once(':')` splits on the LAST colon, so the
+            // bracketed host survives intact -- exactly as `dispatcher.rs`'s `split_addr`, the
+            // consumer of this value, will later split it.
+            "[::1]:16479",
+        ] {
+            assert!(
+                validate_replica_announce_addr(&with_announce(good)).is_ok(),
+                "{good:?} must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_replica_announce_addr_rejects_a_value_split_addr_would_render_as_ip_question_port_zero(
+    ) {
+        for (bad, why) in [
+            (
+                "numericlabs.lxd",
+                "no ':' separator, so there is no port at all",
+            ),
+            ("numericlabs.lxd:", "empty port"),
+            ("numericlabs.lxd:notaport", "non-numeric port"),
+            ("numericlabs.lxd:99999", "port above u16::MAX"),
+            ("numericlabs.lxd:-1", "negative port"),
+            (":16479", "empty host"),
+        ] {
+            let err = validate_replica_announce_addr(&with_announce(bad))
+                .expect_err(&format!("{bad:?} must be rejected: {why}"));
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            let msg = err.to_string();
+            assert!(
+                msg.contains("replica_announce_addr"),
+                "the error must name the field so an operator has something to grep for, got: {msg}"
+            );
+            assert!(
+                msg.contains(bad),
+                "the error must echo the offending value, got: {msg}"
+            );
+        }
     }
 }
