@@ -630,6 +630,35 @@ redis-cli -p 6401 replicaof no one      # promote back to standalone
 kill %1 %2
 ```
 
+### `replica_announce_addr`: what a TLS follower tells its leader
+
+A follower's `PSYNC` frame carries an address for the leader to advertise back out in `INFO
+REPLICATION` and to log in the `repl` tracing span. By default that's `addr` -- the plaintext
+RESP listen address -- even when replication itself runs over TLS. If you see a log line like
+this and it looks wrong, it isn't a bug, it's this default:
+
+```
+INFO conn{... protocol=RESP tls=true}:repl{host_port=numericlabs.lxd:6479}: replica registered
+```
+
+`tls=true` (the connection) and `host_port=numericlabs.lxd:6479` (the plaintext port) are both
+accurate -- they're just answering different questions. The follower connected over TLS, but it
+told its leader to reach it back at its plaintext port, because nothing said otherwise.
+
+Set `replica_announce_addr` to the follower's own TLS address to make the two agree:
+
+```toml
+addr = "numericlabs.lxd:6479"
+tls_resp_addr = "numericlabs.lxd:16479"
+replicaof = "numericlabs.lxd:16379"
+replica_announce_addr = "numericlabs.lxd:16479"
+```
+
+With that set, the leader's `INFO REPLICATION` and the `repl` span both report `16479`, matching
+the TLS transport the connection actually used. Leaving it unset on a TLS follower now also
+prints one `WARN` at startup naming the plaintext address it's about to announce -- see
+`docs/superpowers/specs/2026-09-10-replica-announce-addr-spec.md`.
+
 ## Cluster mode
 
 Needs a topology file — the one real "config file" this project has. Plain text,

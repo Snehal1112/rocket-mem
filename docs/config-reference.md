@@ -32,6 +32,7 @@ want to change from the default.
 | `replicaof` | `ROCKET_MEM_REPLICAOF` | `--replicaof` | unset | `host:port` of a leader to auto-connect to as a follower on every startup. Unset means standalone (or purely live-`REPLICAOF`-driven) operation. |
 | `replicaof_auth_username` | `ROCKET_MEM_REPLICAOF_AUTH_USERNAME` | `--replicaof-auth-username` | unset | Username sent in `AUTH` before `PSYNC`, when `replicaof`'s leader has ACL users configured. Must be set together with `replicaof_auth_password`, or neither. |
 | `replicaof_auth_password` | `ROCKET_MEM_REPLICAOF_AUTH_PASSWORD` | `--replicaof-auth-password` | unset | Password sent in `AUTH` before `PSYNC`. Plaintext in the TOML file, same as `[[acl.users]]`'s own `password` field. |
+| `replica_announce_addr` | `ROCKET_MEM_REPLICA_ANNOUNCE_ADDR` | `--replica-announce-addr` | `addr` | The `host:port` this node advertises to its leader in `PSYNC`, and which the leader reports in `INFO REPLICATION`'s `slaveN:` lines. Defaults to `addr`. Set it when the address a peer must dial differs from the address this node binds — a TLS deployment, or NAT and container port mapping. |
 | `[[acl.users]]` | *(file-only — no flat env var for an array)* | *(file-only)* | empty | Bootstrap ACL users, loaded once at startup. See "The `[[acl.users]]` array" below. |
 
 > **`trace` writes your data to disk.** At `trace`, rocket-mem logs command arguments and
@@ -65,6 +66,23 @@ soft — the node starts normally, and its background reconnect loop retries onc
 forever, exactly as it would for a leader that later becomes unreachable. This mirrors the
 live `REPLICAOF` command's existing behavior; see `.claude/manual-testing.md`'s "Replication
 (`REPLICAOF`)" section.
+
+### `replica_announce_addr` is shape-checked, not reachability-checked
+
+Left unset, a node announces `addr` to its leader — today's behavior for every deployment
+that predates this field. Set `replica_announce_addr` when the address a peer must dial
+differs from the address this node binds: a TLS deployment (announce `tls_resp_addr`, since
+`addr` is the plaintext port), or NAT and container port mapping (announce the externally
+reachable `host:port`).
+
+Like `replicaof`, only the *shape* is validated at startup — `host:port`, with a non-empty
+host and a port that parses as a `u16` — never whether a peer can actually reach it. This
+node cannot know how a peer routes to it, so a startup check on that would be meaningless.
+
+Nothing dials this address today: it is reported by `INFO REPLICATION`'s `slaveN:` lines,
+the `repl` tracing span's `host_port` field, and the startup banner's `slaveN` rows. Future
+failover tooling (see `docs/superpowers/specs/2026-09-09-sentinel-failover-spec.md`) is
+expected to dial it to reach a follower directly.
 
 ### Malformed values fail startup, not silently
 
