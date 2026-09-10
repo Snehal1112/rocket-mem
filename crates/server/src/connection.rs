@@ -6,7 +6,7 @@ use futures_util::{FutureExt, SinkExt, StreamExt};
 use protocol::codec::RespCodec;
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use tokio_util::codec::Framed;
+use tokio_util::codec::{Framed, FramedRead};
 
 pub async fn serve(
     listener: TcpListener,
@@ -353,6 +353,11 @@ fn psync_advertised_addr(frame: &protocol::Frame) -> Option<String> {
 /// connection dies. `PSYNC` has no reply frame of its own — the length-prefixed snapshot blob
 /// (not a RESP value) stands in for one.
 ///
+/// The connection is bidirectional. The leader streams replicated writes down it and reads
+/// frames back up it, which is what lets a follower report how caught up it is via `REPLCONF
+/// ACK <offset>` on this same socket -- no second port and no second connection. See the
+/// failover-safety design contract's §2.3.
+///
 /// The `repl` span is the correlation backbone for every replication log line on the leader
 /// side, matching `replication.rs`'s follower-side span of the same name. `host_port` is the
 /// address this replica advertised in its own `PSYNC <addr>` frame, or the fixed sentinel
@@ -379,7 +384,7 @@ async fn serve_replica<S>(
     replication: &crate::replication::ReplicationHandle,
     advertised_addr: Option<String>,
 ) where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
     use tokio::io::AsyncWriteExt;
 
@@ -412,36 +417,73 @@ async fn serve_replica<S>(
         (bytes, rx)
     };
 
-    // Reclaim the raw socket. Any bytes already buffered for a reply this connection never
-    // got to send (there shouldn't be any at this point -- PSYNC is answered with the blob
-    // below, not a normal `feed`/`flush` reply -- but flushing defensively costs nothing) are
-    // written out first so nothing already-queued is silently dropped.
-    let mut parts = framed.into_parts();
-    if !parts.write_buf.is_empty() && parts.io.write_all(&parts.write_buf).await.is_err() {
+    // Reclaim the raw socket and split it, because this connection now reads as well as
+    // writes. The write half does exactly what the single `parts.io` handle used to; the read
+    // half becomes a RESP frame stream.
+    let parts = framed.into_parts();
+    let (rd, mut wr) = tokio::io::split(parts.io);
+    let mut inbound = FramedRead::new(rd, RespCodec::default());
+    // Carry over whatever the codec had already read ahead of `PSYNC`. Those bytes are gone
+    // from the socket, so a fresh empty buffer would silently swallow anything the follower
+    // pipelined behind its PSYNC -- its first ack, most likely.
+    *inbound.read_buffer_mut() = parts.read_buf;
+
+    // Any bytes already buffered for a reply this connection never got to send (there
+    // shouldn't be any at this point -- PSYNC is answered with the blob below, not a normal
+    // `feed`/`flush` reply -- but flushing defensively costs nothing) are written out first so
+    // nothing already-queued is silently dropped.
+    if !parts.write_buf.is_empty() && wr.write_all(&parts.write_buf).await.is_err() {
         return;
     }
-    let io = &mut parts.io;
 
-    if io
+    if wr
         .write_all(&(snapshot_bytes.len() as u64).to_le_bytes())
         .await
         .is_err()
     {
         return;
     }
-    if io.write_all(&snapshot_bytes).await.is_err() {
+    if wr.write_all(&snapshot_bytes).await.is_err() {
         return;
     }
 
-    // Drain replicated writes onto the raw socket forever -- this connection never reads
-    // again once PSYNC has been handled. A closed channel (this task's own sender side was
-    // dropped, e.g. the process is shutting down) ends the loop cleanly; a write error means
-    // the replica disconnected, which `ReplicaRegistry::broadcast`'s retain-based pruning
-    // already handles from the registry's side on its next send -- this loop returning is
-    // this connection's own half of that same cleanup.
-    while let Some(bytes) = rx.recv().await {
-        if io.write_all(&bytes).await.is_err() {
-            return;
+    // Drain replicated writes onto the socket while simultaneously reading whatever the
+    // follower sends back. Both branch futures are cancel-safe, which is what makes them legal
+    // `select!` arms; the writes themselves happen in the arm bodies, after the other future
+    // has been dropped.
+    loop {
+        tokio::select! {
+            outbound = rx.recv() => match outbound {
+                Some(bytes) => {
+                    // A write error means the replica disconnected, which
+                    // `ReplicaRegistry::broadcast`'s retain-based pruning already handles from
+                    // the registry's side on its next send -- this loop returning is this
+                    // connection's own half of that same cleanup.
+                    if wr.write_all(&bytes).await.is_err() {
+                        return;
+                    }
+                }
+                // Every sender for this replica has been dropped: the registry pruned this
+                // entry, or the process is shutting down. Nothing will ever be streamed here
+                // again, so end the connection rather than parking on it forever.
+                None => return,
+            },
+            incoming = inbound.next() => match incoming {
+                // Nothing interprets inbound frames yet, so logging and dropping is the whole
+                // handler for now. That is deliberate: an unrecognised frame must never draw
+                // an error reply and must never cost the follower its connection. Ack
+                // tracking will replace this arm's body with `REPLCONF ACK` parsing.
+                Some(Ok(frame)) => {
+                    tracing::debug!(?frame, "ignoring inbound frame from a replica");
+                }
+                Some(Err(e)) => {
+                    tracing::debug!(error = %e, "replica connection decode error");
+                    return;
+                }
+                // The follower closed its side. Return so this task's `ClientGuard` drops and
+                // its sender goes with it, instead of waiting for some later broadcast to fail.
+                None => return,
+            },
         }
     }
 }
@@ -922,6 +964,65 @@ mod tests {
             ping.next().await.unwrap().unwrap(),
             Frame::Simple("PONG".into())
         );
+    }
+
+    /// The one thing a write-only replica connection cannot do: notice its follower is gone.
+    /// Before this plan, `serve_replica` parked on `rx.recv()` forever after handing over the
+    /// snapshot, so a departed replica's connection task stayed alive -- and its `ClientGuard`
+    /// undropped -- until some later broadcast happened to fail on the dead socket. That is why
+    /// `a_registered_replica_is_pruned_after_its_connection_drops` has to drive two writes to
+    /// observe pruning at all. Reading the connection makes the disconnect observable with no
+    /// write traffic whatsoever, which is what this test pins.
+    #[tokio::test]
+    async fn a_replica_connection_is_released_as_soon_as_the_follower_disconnects() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let engine = Arc::new(Engine::new());
+        let (_dir, aof) = test_aof();
+        let replication = Arc::new(crate::replication::ReplicationHandle::new(
+            Arc::clone(&engine),
+            std::env::temp_dir().join("psync-disconnect-unused.snapshot"),
+        ));
+        tokio::spawn(serve(
+            listener,
+            Arc::clone(&engine),
+            Arc::clone(&aof),
+            Arc::clone(&replication),
+        ));
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let mut framed = Framed::new(stream, RespCodec::default());
+        framed
+            .send(Frame::Array(vec![Frame::Bulk(Bytes::from_static(
+                b"PSYNC",
+            ))]))
+            .await
+            .unwrap();
+        let mut parts = framed.into_parts();
+
+        // Drain the whole handshake first, so `serve_replica` is provably past its three
+        // `write_all` calls and parked in its main loop. Dropping the socket before that could
+        // end the connection through a failed write instead, which would prove nothing.
+        use tokio::io::AsyncReadExt;
+        let mut len_buf = [0u8; 8];
+        parts.io.read_exact(&mut len_buf).await.unwrap();
+        let mut blob = vec![0u8; u64::from_le_bytes(len_buf) as usize];
+        parts.io.read_exact(&mut blob).await.unwrap();
+        assert_eq!(replication.connected_clients(), 1);
+
+        drop(parts.io); // the follower goes away, and nothing is ever written to it again
+
+        // Bounded poll, not a fixed sleep: the deadline is what makes the old write-only
+        // behavior (which never notices, ever) a failure rather than a slow pass.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while replication.connected_clients() != 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the leader never released the replica connection after the follower \
+                 disconnected; it is still write-only"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 
     use crate::logging::test_support::CapturedLogs;
