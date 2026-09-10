@@ -1367,6 +1367,72 @@ mod tests {
         );
     }
 
+    /// Pins the rule that the offset counts bytes taken off the stream, not writes that
+    /// succeeded. A frame whose apply fails still consumed those bytes, so skipping them would
+    /// report this follower as permanently behind a leader it is actually level with. Without
+    /// this test, tidying the apply loop into a match that `continue`s on an error would move
+    /// the advance behind the success path and CI would stay green.
+    #[tokio::test]
+    async fn sync_once_advances_the_follower_offset_even_when_the_apply_errors() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // `SET` with one argument instead of two: a well-formed frame the dispatcher rejects,
+        // so the bytes are consumed but nothing is written.
+        const STREAMED: &[u8] = b"*2\r\n$3\r\nSET\r\n$1\r\nk\r\n";
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let fake_leader = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut psync_bytes = [0u8; 15];
+            socket.read_exact(&mut psync_bytes).await.unwrap();
+
+            let blob = engine::Engine::new().snapshot(500);
+            socket
+                .write_all(&(blob.len() as u64).to_le_bytes())
+                .await
+                .unwrap();
+            socket.write_all(&blob).await.unwrap();
+            socket.write_all(STREAMED).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        });
+
+        let engine = engine::Engine::new();
+        let slave_offset = AtomicU64::new(0);
+        let generation = Arc::new(AtomicU64::new(0));
+        let stream = tokio::net::TcpStream::connect(&addr.to_string())
+            .await
+            .unwrap();
+        sync_once(
+            stream,
+            &engine,
+            &generation,
+            0,
+            None,
+            FollowerStatus {
+                last_apply: &AtomicI64::new(0),
+                link_up: &AtomicBool::new(false),
+                slave_offset: &slave_offset,
+            },
+            &FollowerIdentity::default(),
+        )
+        .await
+        .unwrap();
+
+        fake_leader.await.unwrap();
+        assert_eq!(
+            engine.get(b"k"),
+            None,
+            "the malformed command must not have been applied"
+        );
+        assert_eq!(
+            slave_offset.load(Ordering::Relaxed),
+            500 + STREAMED.len() as u64,
+            "the offset must advance by the errored frame's wire length anyway"
+        );
+    }
+
     #[test]
     fn advance_slave_repl_offset_accumulates_from_the_seeded_position() {
         let h = ReplicationHandle::default();
