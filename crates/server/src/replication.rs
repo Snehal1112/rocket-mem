@@ -1099,12 +1099,20 @@ where
         ))
         .await?;
     let mut frames_applied: u64 = 0; // per-session counter, not persisted or shared -- see Global Constraints
-                                     // `interval_at`, not `interval`: `interval`'s first tick completes immediately, which would
-                                     // duplicate the ack just sent above. The first tick belongs one interval out.
+
+    // `interval_at`, not `interval`: `interval`'s first tick completes immediately, which would
+    // duplicate the ack just sent above. The first tick belongs one interval out.
     let mut acks =
         tokio::time::interval_at(tokio::time::Instant::now() + ACK_INTERVAL, ACK_INTERVAL);
-    // A tick missed because the apply loop was busy must not become a burst of catch-up acks
-    // the instant it frees up -- one ack per interval is the whole point of having an interval.
+    // A tick missed because the apply loop was busy must not become a burst of catch-up acks the
+    // instant it frees up -- one ack per interval is the whole point of having an interval.
+    //
+    // NOT COVERED BY A TEST, deliberately: deleting this line leaves the whole suite green,
+    // because the default `Burst` only shows up under a stall long enough to miss several ticks,
+    // and reproducing that against real sockets needs a paused clock plus a controlled stall --
+    // a test fragile enough to cost more than it protects. So this comment is the guard. If you
+    // are refactoring this and wondering whether the line matters: it does, and nothing will tell
+    // you if you drop it.
     acks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
@@ -1175,9 +1183,18 @@ where
                 //
                 // Awaited inline, in the same task as the apply loop, which is correct for a
                 // leader that drains: `serve_replica` reads this socket and parses every ack.
-                // A leader that stopped draining would eventually fill its receive buffer and
-                // block this send, stalling the apply loop -- so a future change that lets a
-                // leader stop reading must revisit this, not this send.
+                //
+                // A leader that stopped draining fills its receive buffer, blocks this send, and
+                // stalls the apply loop -- and the damage is worse on the leader than here. Its
+                // write to this replica blocks inside a `select!` arm body, so it stops polling
+                // that replica's outbound channel, and the channel is unbounded: every later
+                // replicated write piles up in memory with nothing to bound it. The follower goes
+                // quiet while still reporting `link_up`; the leader grows.
+                //
+                // Reachable today only through `connection.rs`'s `inbound_open`, which a decode
+                // error clears permanently -- a replica that once sent unparseable bytes has a
+                // leader that will never read it again. A change that lets a leader stop reading
+                // for any other reason must revisit that channel's bound, not this send.
                 framed
                     .send(replconf_ack_frame(
                         status.slave_offset.load(Ordering::Relaxed),
