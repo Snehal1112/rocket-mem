@@ -48,6 +48,17 @@ pub struct Config {
     /// node cannot know how a peer routes to it. See
     /// `docs/superpowers/specs/2026-09-10-replica-announce-addr-spec.md`.
     pub replica_announce_addr: Option<String>,
+    /// Minimum number of replicas that must have acked within `min_replicas_max_lag_secs` for this
+    /// node to accept a write. `0` disables fencing entirely, which is the default and matches
+    /// every deployment that predates this field. Enforcement lives in the dispatcher, wired via
+    /// `ReplicationHandle::with_min_replicas`, not in this struct -- see
+    /// `docs/superpowers/plans/2026-09-09-failover-safety-primitives/00-design-contract.md` §2.5.
+    pub min_replicas_to_write: u64,
+    /// How many seconds old a replica's last acked offset may be and still count as "good" for
+    /// `min_replicas_to_write`. Ignored while `min_replicas_to_write` is `0`.
+    /// `validate_min_replicas` rejects a nonzero `min_replicas_to_write` paired with `0` here,
+    /// because no replica could ever qualify and every write would be refused forever.
+    pub min_replicas_max_lag_secs: u64,
     pub acl: AclBootstrapConfig,
     /// Log level filter, e.g. "info", "debug", "rocket_mem=debug,warn" -- same syntax as
     /// `RUST_LOG`. Overridden by the `RUST_LOG` env var when it's set (see
@@ -82,6 +93,8 @@ impl Default for Config {
             replicaof_auth_username: None,
             replicaof_auth_password: None,
             replica_announce_addr: None,
+            min_replicas_to_write: 0,
+            min_replicas_max_lag_secs: 10,
             acl: AclBootstrapConfig::default(),
             log_level: "info".to_string(),
             log_value_max_bytes: 128,
@@ -129,6 +142,8 @@ impl std::fmt::Debug for Config {
             replicaof_auth_username,
             replicaof_auth_password,
             replica_announce_addr,
+            min_replicas_to_write,
+            min_replicas_max_lag_secs,
             acl,
             log_level,
             log_value_max_bytes,
@@ -158,6 +173,10 @@ impl std::fmt::Debug for Config {
             .field("replicaof_auth_username", replicaof_auth_username)
             .field("replicaof_auth_password", &replicaof_auth_password)
             .field("replica_announce_addr", replica_announce_addr)
+            // Both fencing thresholds are plain operational numbers, not key material, so they
+            // render in full. A hidden threshold would only make a write outage harder to explain.
+            .field("min_replicas_to_write", min_replicas_to_write)
+            .field("min_replicas_max_lag_secs", min_replicas_max_lag_secs)
             .field("acl", acl)
             .field("log_level", log_level)
             .field("log_value_max_bytes", log_value_max_bytes)
@@ -322,6 +341,14 @@ pub struct Cli {
     /// differs from --addr [default: unset, announces --addr]
     #[arg(long)]
     pub replica_announce_addr: Option<String>,
+    /// Minimum number of replicas that must have acked within --min-replicas-max-lag-secs for
+    /// this node to accept writes; 0 disables fencing entirely [default: 0]
+    #[arg(long)]
+    pub min_replicas_to_write: Option<u64>,
+    /// How many seconds old a replica's last ack may be and still count as "good" for
+    /// --min-replicas-to-write [default: 10]
+    #[arg(long)]
+    pub min_replicas_max_lag_secs: Option<u64>,
     /// Log level filter, e.g. "info", "debug", "rocket_mem=debug,warn" [default: info]
     #[arg(long)]
     pub log_level: Option<String>,
@@ -379,6 +406,12 @@ fn cli_overrides(
     }
     if let Some(v) = cli.log_value_max_bytes {
         map.insert("log_value_max_bytes", Value::from(v));
+    }
+    if let Some(v) = cli.min_replicas_to_write {
+        map.insert("min_replicas_to_write", Value::from(v));
+    }
+    if let Some(v) = cli.min_replicas_max_lag_secs {
+        map.insert("min_replicas_max_lag_secs", Value::from(v));
     }
     Serialized::defaults(map)
 }
@@ -808,6 +841,8 @@ mod tests {
             replicaof_auth_username: Some("zzuser".to_string()),
             replicaof_auth_password: Some("zzleaderpassword".to_string()),
             replica_announce_addr: Some("1.1.1.1:7".to_string()),
+            min_replicas_to_write: 4323,
+            min_replicas_max_lag_secs: 4324,
             acl: AclBootstrapConfig::default(),
             log_level: "zzlevel".to_string(),
             log_value_max_bytes: 4322,
@@ -834,6 +869,10 @@ mod tests {
             "1.1.1.1:6",
             "zzuser",
             "1.1.1.1:7",
+            // The fencing thresholds are operational numbers, not key material. A hidden
+            // threshold would only make a write outage harder to explain.
+            "4323",
+            "4324",
             "acl",
             "zzlevel",
             "4322",
@@ -934,6 +973,63 @@ mod tests {
             assert_eq!(cfg.replicaof.as_deref(), Some("127.0.0.1:1111"));
             assert_eq!(cfg.replicaof_auth_username.as_deref(), Some("cliuser"));
             assert_eq!(cfg.replicaof_auth_password.as_deref(), Some("clipass"));
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn default_config_disables_replica_fencing() {
+        let cfg = Config::default();
+        assert_eq!(
+            cfg.min_replicas_to_write, 0,
+            "fencing must be off by default -- every deployment before this field existed must be unaffected"
+        );
+        assert_eq!(cfg.min_replicas_max_lag_secs, 10);
+    }
+
+    #[test]
+    fn min_replicas_fields_are_layered_like_every_other_numeric_field() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "rocket-mem.toml",
+                "min_replicas_to_write = 1\nmin_replicas_max_lag_secs = 20\n",
+            )?;
+            let cfg = load_layered(Some(std::path::Path::new("rocket-mem.toml"))).unwrap();
+            assert_eq!(cfg.min_replicas_to_write, 1, "file overrides default");
+            assert_eq!(cfg.min_replicas_max_lag_secs, 20, "file overrides default");
+
+            jail.set_env("ROCKET_MEM_MIN_REPLICAS_TO_WRITE", "2"); // env beats file
+            jail.set_env("ROCKET_MEM_MIN_REPLICAS_MAX_LAG_SECS", "30"); // env beats file
+            let cfg = load_layered(Some(std::path::Path::new("rocket-mem.toml"))).unwrap();
+            assert_eq!(cfg.min_replicas_to_write, 2, "env overrides file");
+            assert_eq!(cfg.min_replicas_max_lag_secs, 30, "env overrides file");
+
+            let cli = Cli::parse_from([
+                "rocket-mem",
+                "--config",
+                "rocket-mem.toml",
+                "--min-replicas-to-write",
+                "3", // CLI beats env
+                "--min-replicas-max-lag-secs",
+                "40", // CLI beats env
+            ]);
+            let cfg = load_with_cli(cli).unwrap();
+            assert_eq!(cfg.min_replicas_to_write, 3, "CLI overrides env");
+            assert_eq!(cfg.min_replicas_max_lag_secs, 40, "CLI overrides env");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn cli_flags_left_unset_do_not_override_lower_layers_for_min_replicas_fields() {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("ROCKET_MEM_MIN_REPLICAS_TO_WRITE", "1");
+            let cli = Cli::parse_from(["rocket-mem"]); // no flags at all
+            let cfg = load_with_cli(cli).unwrap();
+            assert_eq!(
+                cfg.min_replicas_to_write, 1,
+                "an unset CLI flag must not clobber the env value with the default"
+            );
             Ok(())
         });
     }
