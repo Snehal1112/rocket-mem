@@ -16,6 +16,12 @@ pub(crate) fn unix_now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+/// How often a linked follower tells its leader where it is in the replication stream. One
+/// second matches real Redis's `REPLCONF ACK` cadence. Per-frame acks were considered and
+/// rejected: they would double the replication stream's packet count for a number nothing reads
+/// more often than this, and the leader's `lag` field only has one-second resolution anyway.
+const ACK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// One connected replica, from the leader's side: the outbound channel its `serve_replica` task
 /// drains, the address (if any) it advertised in its `PSYNC` -- see `ReplicationHandle::own_addr`'s
 /// doc comment -- and how caught up it last told this leader it was.
@@ -1093,58 +1099,93 @@ where
         ))
         .await?;
     let mut frames_applied: u64 = 0; // per-session counter, not persisted or shared -- see Global Constraints
-    while let Some(result) = framed.next().await {
-        if generation.load(Ordering::SeqCst) != my_generation {
-            return Ok(()); // superseded -- stop applying frames to state a newer task now owns
+                                     // `interval_at`, not `interval`: `interval`'s first tick completes immediately, which would
+                                     // duplicate the ack just sent above. The first tick belongs one interval out.
+    let mut acks =
+        tokio::time::interval_at(tokio::time::Instant::now() + ACK_INTERVAL, ACK_INTERVAL);
+    // A tick missed because the apply loop was busy must not become a burst of catch-up acks
+    // the instant it frees up -- one ack per interval is the whole point of having an interval.
+    acks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            incoming = framed.next() => {
+                let Some(result) = incoming else {
+                    return Ok(()); // the leader closed the stream
+                };
+                if generation.load(Ordering::SeqCst) != my_generation {
+                    return Ok(()); // superseded -- stop applying frames to state a newer task now owns
+                }
+                let frame = result?;
+                frames_applied += 1;
+                let name = replicated_command_name(&frame);
+                // Re-encode to learn this frame's replication-stream length, before the frame is moved
+                // into `dispatch` below. This is byte-exact, not an approximation, and the exactness is
+                // load-bearing: it is what makes this follower's offset directly comparable to the
+                // leader's `master_repl_offset`, which counted the same bytes on the way out. It holds
+                // because only `aof::WRITE_COMMANDS` frames are ever replicated, and those are always a
+                // Frame::Array of Frame::Bulk -- a shape whose RESP encoding is identical under RESP2
+                // and RESP3. (Frame::Null and Frame::Map do encode differently per protocol version;
+                // neither can appear in a replicated write command.) Do not replace this with a
+                // decoder-side byte count or a frame count: widening what gets replicated is what would
+                // break the invariant, not this re-encode.
+                let frame_len = crate::aof::encode_frame(&frame)?.len() as u64;
+                let mut protocol = protocol::codec::Protocol::default();
+                // Mutual exclusion with a concurrent SAVE on this same node: SAVE's shard-by-shard
+                // snapshot walk (Store::snapshot_entries) must not observe a multi-key replicated
+                // command (MSET, RENAME, SINTERSTORE, ...) half-applied across shards. Holding the same
+                // lock_for_ordering() handle_save already takes closes that race. Deliberately wraps
+                // only the dispatch call — not the framed.next() await, not the generation check —
+                // matching handle_save's own pattern of holding the lock across the mutating work and
+                // nothing else. None when this node has no AofWriter configured (test-only handles),
+                // which matches the pre-fix behavior for those.
+                let _order_guard = aof.map(|a| a.lock_all_shards());
+                let reply = crate::dispatcher::dispatch(engine, frame, &mut protocol, 0);
+                // Escaped: `replicated_command_name` is a lossy decode of whatever bytes the leader put
+                // in the frame's first bulk, with no length or character restriction of its own.
+                tracing::debug!(cmd = %crate::logging::escape_ident(&name), "applied replicated command");
+                // A leader only ever fans out a command whose local execution already succeeded, so
+                // an error applying it here means the two sides have genuinely diverged (a bug, or
+                // version skew) — logged and skipped, not a reason to tear down and resync, which
+                // would just reproduce the same error against the same divergence.
+                if let protocol::Frame::Error(e) = reply {
+                    tracing::error!(error = %e, "failed to apply replicated command");
+                }
+                status.last_apply.store(unix_now_secs(), Ordering::Relaxed);
+                // Advanced even when the apply above errored: those bytes were still consumed from the
+                // stream, and an offset that skipped them would report this follower as permanently
+                // behind a leader it is actually level with.
+                let offset = status.slave_offset.fetch_add(frame_len, Ordering::Relaxed) + frame_len;
+                // Logged here rather than before the apply, so both the message and the `offset` field
+                // are true when they are written: the stream really has advanced, and `offset` is the
+                // byte position this follower has now reached. `frames_applied` is the per-session frame
+                // count, which is a different quantity -- see the design contract's rule that the
+                // replication offset counts bytes, not frames.
+                tracing::trace!(frames_applied, offset, "replication stream advanced");
+            }
+            _ = acks.tick() => {
+                // `framed` is a Sink as well as a Stream, so the ack goes back up the same
+                // socket the frames arrive on. Both branch futures are cancel-safe, and this
+                // send runs only after the other one has been dropped, which is what lets a
+                // single `&mut framed` serve both arms.
+                //
+                // A send failure is the connection dying. Returning the error hands control to
+                // `replication_client_loop`'s existing reconnect backoff, rather than leaving
+                // this follower silently ack-less on a half-dead socket -- which would read on
+                // the leader as a healthy replica that has simply gone quiet.
+                //
+                // Awaited inline, in the same task as the apply loop, which is correct for a
+                // leader that drains: `serve_replica` reads this socket and parses every ack.
+                // A leader that stopped draining would eventually fill its receive buffer and
+                // block this send, stalling the apply loop -- so a future change that lets a
+                // leader stop reading must revisit this, not this send.
+                framed
+                    .send(replconf_ack_frame(
+                        status.slave_offset.load(Ordering::Relaxed),
+                    ))
+                    .await?;
+            }
         }
-        let frame = result?;
-        frames_applied += 1;
-        let name = replicated_command_name(&frame);
-        // Re-encode to learn this frame's replication-stream length, before the frame is moved
-        // into `dispatch` below. This is byte-exact, not an approximation, and the exactness is
-        // load-bearing: it is what makes this follower's offset directly comparable to the
-        // leader's `master_repl_offset`, which counted the same bytes on the way out. It holds
-        // because only `aof::WRITE_COMMANDS` frames are ever replicated, and those are always a
-        // Frame::Array of Frame::Bulk -- a shape whose RESP encoding is identical under RESP2
-        // and RESP3. (Frame::Null and Frame::Map do encode differently per protocol version;
-        // neither can appear in a replicated write command.) Do not replace this with a
-        // decoder-side byte count or a frame count: widening what gets replicated is what would
-        // break the invariant, not this re-encode.
-        let frame_len = crate::aof::encode_frame(&frame)?.len() as u64;
-        let mut protocol = protocol::codec::Protocol::default();
-        // Mutual exclusion with a concurrent SAVE on this same node: SAVE's shard-by-shard
-        // snapshot walk (Store::snapshot_entries) must not observe a multi-key replicated
-        // command (MSET, RENAME, SINTERSTORE, ...) half-applied across shards. Holding the same
-        // lock_for_ordering() handle_save already takes closes that race. Deliberately wraps
-        // only the dispatch call — not the framed.next() await, not the generation check —
-        // matching handle_save's own pattern of holding the lock across the mutating work and
-        // nothing else. None when this node has no AofWriter configured (test-only handles),
-        // which matches the pre-fix behavior for those.
-        let _order_guard = aof.map(|a| a.lock_all_shards());
-        let reply = crate::dispatcher::dispatch(engine, frame, &mut protocol, 0);
-        // Escaped: `replicated_command_name` is a lossy decode of whatever bytes the leader put
-        // in the frame's first bulk, with no length or character restriction of its own.
-        tracing::debug!(cmd = %crate::logging::escape_ident(&name), "applied replicated command");
-        // A leader only ever fans out a command whose local execution already succeeded, so
-        // an error applying it here means the two sides have genuinely diverged (a bug, or
-        // version skew) — logged and skipped, not a reason to tear down and resync, which
-        // would just reproduce the same error against the same divergence.
-        if let protocol::Frame::Error(e) = reply {
-            tracing::error!(error = %e, "failed to apply replicated command");
-        }
-        status.last_apply.store(unix_now_secs(), Ordering::Relaxed);
-        // Advanced even when the apply above errored: those bytes were still consumed from the
-        // stream, and an offset that skipped them would report this follower as permanently
-        // behind a leader it is actually level with.
-        let offset = status.slave_offset.fetch_add(frame_len, Ordering::Relaxed) + frame_len;
-        // Logged here rather than before the apply, so both the message and the `offset` field
-        // are true when they are written: the stream really has advanced, and `offset` is the
-        // byte position this follower has now reached. `frames_applied` is the per-session frame
-        // count, which is a different quantity -- see the design contract's rule that the
-        // replication offset counts bytes, not frames.
-        tracing::trace!(frames_applied, offset, "replication stream advanced");
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1544,6 +1585,116 @@ mod tests {
                 protocol::Frame::Bulk(bytes::Bytes::from_static(b"4096")),
             ]),
             "the follower must ack the offset its snapshot was stamped with"
+        );
+    }
+
+    /// One ack at sync time is not enough: the leader's `lag` field goes stale the moment the
+    /// follower stops talking, and `min-replicas-to-write` fencing would fence a perfectly
+    /// healthy replica within its own max-lag window. This pins the steady cadence -- a second
+    /// ack, carrying an offset advanced by exactly the frame that was applied in between.
+    #[tokio::test]
+    async fn sync_once_keeps_acking_on_a_timer_as_it_applies_frames() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let set_frame = protocol::Frame::Array(vec![
+            protocol::Frame::Bulk(bytes::Bytes::from_static(b"SET")),
+            protocol::Frame::Bulk(bytes::Bytes::from_static(b"k")),
+            protocol::Frame::Bulk(bytes::Bytes::from_static(b"v")),
+        ]);
+        // The leader counts encoded bytes, and the follower re-encodes each applied frame to
+        // learn the same number. Computing it here rather than hardcoding 27 keeps this test
+        // honest if the encoding ever changes.
+        let streamed_len = crate::aof::encode_frame(&set_frame).unwrap().len() as u64;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let fake_leader = {
+            let set_frame = set_frame.clone();
+            tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut psync_bytes = [0u8; 15];
+                socket.read_exact(&mut psync_bytes).await.unwrap();
+
+                let blob = engine::Engine::new().snapshot(0);
+                socket
+                    .write_all(&(blob.len() as u64).to_le_bytes())
+                    .await
+                    .unwrap();
+                socket.write_all(&blob).await.unwrap();
+
+                let mut framed =
+                    tokio_util::codec::Framed::new(socket, protocol::codec::RespCodec::default());
+                let first = tokio::time::timeout(std::time::Duration::from_secs(5), framed.next())
+                    .await
+                    .expect("no ack after the snapshot")
+                    .expect("connection ended before the first ack")
+                    .unwrap();
+
+                // Stream one write, then wait for the *next* ack. The interval is one second,
+                // so five is generous headroom on a loaded CI box.
+                framed.send(set_frame).await.unwrap();
+                let second = tokio::time::timeout(std::time::Duration::from_secs(5), framed.next())
+                    .await
+                    .expect("the follower stopped acking after its first ack")
+                    .expect("connection ended before the second ack")
+                    .unwrap();
+
+                (first, second)
+            })
+        };
+
+        let engine = Arc::new(engine::Engine::new());
+        let host_port = addr.to_string();
+        let generation = Arc::new(AtomicU64::new(0));
+        let slave_offset = Arc::new(AtomicU64::new(0));
+        let sync_task = {
+            let engine = Arc::clone(&engine);
+            let generation = Arc::clone(&generation);
+            let slave_offset = Arc::clone(&slave_offset);
+            tokio::spawn(async move {
+                let stream = tokio::net::TcpStream::connect(&host_port).await.unwrap();
+                sync_once(
+                    stream,
+                    &engine,
+                    &generation,
+                    0,
+                    None,
+                    FollowerStatus {
+                        last_apply: &AtomicI64::new(0),
+                        link_up: &AtomicBool::new(false),
+                        slave_offset: &slave_offset,
+                    },
+                    &FollowerIdentity::default(),
+                )
+                .await
+            })
+        };
+
+        let (first, second) = fake_leader.await.unwrap();
+        sync_task.abort();
+
+        assert_eq!(
+            first,
+            protocol::Frame::Array(vec![
+                protocol::Frame::Bulk(bytes::Bytes::from_static(b"REPLCONF")),
+                protocol::Frame::Bulk(bytes::Bytes::from_static(b"ACK")),
+                protocol::Frame::Bulk(bytes::Bytes::from_static(b"0")),
+            ])
+        );
+        assert_eq!(
+            second,
+            protocol::Frame::Array(vec![
+                protocol::Frame::Bulk(bytes::Bytes::from_static(b"REPLCONF")),
+                protocol::Frame::Bulk(bytes::Bytes::from_static(b"ACK")),
+                protocol::Frame::Bulk(bytes::Bytes::from(streamed_len.to_string())),
+            ]),
+            "the second ack must carry the offset the applied frame advanced it to"
+        );
+        // The frame really was applied, so the ack is reporting work, not just ticking.
+        assert_eq!(
+            engine.get(b"k"),
+            Some(engine::Value::String(bytes::Bytes::from_static(b"v")))
         );
     }
 
