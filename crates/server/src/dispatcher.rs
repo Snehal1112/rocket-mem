@@ -4676,6 +4676,153 @@ mod tests {
     }
 
     #[test]
+    fn a_write_to_the_same_key_blocks_until_exec_releases_its_batch_guard_but_a_read_does_not() {
+        let engine = std::sync::Arc::new(Engine::new());
+        let (_dir, aof) = test_aof();
+        let aof = std::sync::Arc::new(aof);
+        let replication = std::sync::Arc::new(ReplicationHandle::default());
+
+        dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"SET", b"k", b"first"]),
+            &Session::new(),
+            1,
+        );
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let engine2 = std::sync::Arc::clone(&engine);
+        let aof2 = std::sync::Arc::clone(&aof);
+        let replication2 = std::sync::Arc::clone(&replication);
+        let exec_thread = std::thread::spawn(move || {
+            let session = Session::new();
+            dispatch_and_log(
+                &engine2,
+                &aof2,
+                &replication2,
+                cmd(&[b"MULTI"]),
+                &session,
+                2,
+            );
+            dispatch_and_log(
+                &engine2,
+                &aof2,
+                &replication2,
+                cmd(&[b"SET", b"k", b"from-exec"]),
+                &session,
+                2,
+            );
+            dispatch_and_log(
+                &engine2,
+                &aof2,
+                &replication2,
+                cmd(&[b"DEBUG", b"SLEEP", b"0.4"]),
+                &session,
+                2,
+            );
+            started_tx.send(()).expect("receiver still waiting");
+            dispatch_and_log(&engine2, &aof2, &replication2, cmd(&[b"EXEC"]), &session, 2)
+        });
+
+        started_rx
+            .recv()
+            .expect("exec thread panicked before signaling");
+        // Margin for "signal sent" to become "guard actually held" -- a handful of instructions,
+        // not a rendezvous; generous relative to that gap without eating into the 400ms sleep
+        // the blocking assertion below depends on.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let read_started = std::time::Instant::now();
+        let read_reply = dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"GET", b"k"]),
+            &Session::new(),
+            3,
+        );
+        assert!(
+            matches!(read_reply, Frame::Bulk(_)),
+            "a concurrent read must not be blocked by the transaction's batch guard"
+        );
+        assert!(
+            read_started.elapsed() < std::time::Duration::from_millis(200),
+            "a concurrent read must not wait on the transaction's guard, took {:?}",
+            read_started.elapsed()
+        );
+
+        let write_started = std::time::Instant::now();
+        let write_reply = dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"SET", b"k", b"from-outside"]),
+            &Session::new(),
+            4,
+        );
+        assert_eq!(write_reply, Frame::Simple("OK".into()));
+        assert!(
+            write_started.elapsed() >= std::time::Duration::from_millis(200),
+            "a concurrent write to the same key must block until EXEC releases its batch guard, \
+             only waited {:?}",
+            write_started.elapsed()
+        );
+
+        let exec_reply = exec_thread.join().expect("exec thread panicked");
+        assert_eq!(
+            exec_reply,
+            Frame::Array(vec![Frame::Simple("OK".into()), Frame::Simple("OK".into())])
+        );
+    }
+
+    #[test]
+    fn a_queued_write_against_a_read_only_replica_errors_without_aborting_the_rest_of_the_batch() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let replication = ReplicationHandle::default();
+        let session = Session::new();
+        // Queue while still a normal (non-replica) connection -- queuing itself never touches
+        // the READONLY gate, per the spec's "Gate timing" section.
+        dispatch_and_log(&engine, &aof, &replication, cmd(&[b"MULTI"]), &session, 1);
+        dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"SET", b"k", b"v"]),
+            &session,
+            1,
+        );
+        dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"GET", b"k"]),
+            &session,
+            1,
+        );
+
+        // Only now does this connection's node become a read-only replica -- simulating a
+        // REPLICAOF issued between this connection's MULTI and its EXEC.
+        replication
+            .is_replica
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let reply = dispatch_and_log(&engine, &aof, &replication, cmd(&[b"EXEC"]), &session, 1);
+        let Frame::Array(replies) = reply else {
+            panic!("EXEC must reply with an array");
+        };
+        assert_eq!(replies.len(), 2);
+        assert_eq!(
+            replies[0],
+            Frame::Error("READONLY You can't write against a read only replica.".into())
+        );
+        // The GET is unaffected: READONLY only gates writes, and one queued command's gate
+        // rejection must not abort the rest of the batch (same rule as a runtime error).
+        assert!(matches!(replies[1], Frame::Null | Frame::Bulk(_)));
+    }
+
+    #[test]
     fn a_mutation_through_one_arc_clone_is_visible_through_another() {
         // The property plan 07 depends on: several tasks holding independent Arc<Session> clones
         // (one per spawned RMP request) must all see the same underlying state.
