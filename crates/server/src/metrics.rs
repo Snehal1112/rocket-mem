@@ -60,6 +60,33 @@ pub fn refresh_sampled_gauges(engine: &Engine, replication: &ReplicationHandle) 
     // Zero on a node that has never been a follower. `INFO` hides this behind `role:slave`;
     // a gauge cannot, so it simply reads 0 there, which is the honest value.
     ::metrics::gauge!("rocket_mem_slave_repl_offset").set(replication.slave_repl_offset() as f64);
+    // Reported unconditionally, whether or not fencing is enabled -- "how many replicas are
+    // currently good" is useful information on its own, and it's the exact input the
+    // NOREPLICAS gate in dispatch_and_log_inner compares against min_replicas_to_write.
+    ::metrics::gauge!("rocket_mem_good_replicas").set(
+        replication
+            .registry
+            .good_replicas(replication.min_replicas_max_lag()) as f64,
+    );
+    // The furthest-behind connected replica's acked offset -- paired with
+    // rocket_mem_master_repl_offset above, this makes replication lag in bytes computable
+    // without parsing INFO text. Reported unconditionally, exactly like rocket_mem_good_replicas
+    // above: observability must not depend on whether the operator opted into fencing. Defaults
+    // to 0 with no replicas connected -- never master_repl_offset or another sentinel, since a 0
+    // here alongside rocket_mem_connected_replicas == 0 is unambiguous, and any nonzero value
+    // would wrongly imply a replica exists. A replica that has never acked has ack_offset == 0,
+    // which correctly drags this minimum to 0 and must NOT be filtered out: an un-acked replica
+    // IS maximally behind as far as the leader can prove, and filtering it out would report
+    // healthy lag while a silent replica falls arbitrarily far behind -- exactly the blind spot
+    // this metric exists to close.
+    let min_ack_offset = replication
+        .registry
+        .states()
+        .iter()
+        .map(|s| s.ack_offset)
+        .min()
+        .unwrap_or(0);
+    ::metrics::gauge!("rocket_mem_replica_min_ack_offset").set(min_ack_offset as f64);
     ::metrics::counter!("rocket_mem_evicted_keys_total").absolute(engine.eviction_count() as u64);
     ::metrics::counter!("rocket_mem_expired_keys_total").absolute(replication.expired_keys());
     ::metrics::counter!("rocket_mem_connections_total").absolute(replication.total_connections());
@@ -145,6 +172,21 @@ async fn serve_one_scrape(
 mod tests {
     use super::*;
 
+    /// Every sampled gauge (`rocket_mem_keys`, `rocket_mem_good_replicas`,
+    /// `rocket_mem_replica_min_ack_offset`, ...) lives on the one process-wide recorder
+    /// `recorder_handle` installs, and `refresh_sampled_gauges` overwrites *all* of them in one
+    /// call -- not just whichever one a given test cares about. `cargo test` runs this file's
+    /// tests concurrently by default, so any two tests that call `refresh_sampled_gauges` (or
+    /// trigger it indirectly, as `the_metrics_endpoint_...` does through `serve_metrics` on
+    /// every scrape) race: one test's call can land between another's set and its own read of
+    /// the same gauge, so a test asserting an exact value can observe a value a sibling test's
+    /// unrelated `Engine`/`ReplicationHandle` wrote. `tokio::sync::Mutex`, not `std::sync`,
+    /// because `the_metrics_endpoint_...` is a `#[tokio::test]` that must hold this across an
+    /// `.await` (the GET that triggers the scrape); plain `#[test]`s use `blocking_lock()`.
+    /// Held only across each test's own set/scrape-then-read window, so this serializes just
+    /// the tests that touch sampled gauges, not the whole suite.
+    static GAUGE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[test]
     fn recorder_handle_is_idempotent_and_renders_what_was_recorded() {
         let first = recorder_handle();
@@ -156,6 +198,102 @@ mod tests {
             "counter missing from render:\n{rendered}"
         );
         assert!(first.render().contains("rocket_mem_test_counter"));
+    }
+
+    #[test]
+    fn refresh_sampled_gauges_reports_good_replicas() {
+        let _guard = GAUGE_TEST_LOCK.blocking_lock();
+        let handle = recorder_handle();
+        let engine = std::sync::Arc::new(engine::Engine::new());
+        let replication = std::sync::Arc::new(
+            crate::replication::ReplicationHandle::new(
+                std::sync::Arc::clone(&engine),
+                "/tmp/unused.snapshot".into(),
+            )
+            .with_min_replicas(1, std::time::Duration::from_secs(10)),
+        );
+
+        refresh_sampled_gauges(&engine, &replication);
+        let rendered = handle.render();
+        assert!(
+            rendered.contains("rocket_mem_good_replicas 0"),
+            "expected 0 good replicas with none connected:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn refresh_sampled_gauges_reports_replica_min_ack_offset_as_zero_with_no_replicas() {
+        let _guard = GAUGE_TEST_LOCK.blocking_lock();
+        let handle = recorder_handle();
+        let engine = std::sync::Arc::new(engine::Engine::new());
+        let replication = std::sync::Arc::new(crate::replication::ReplicationHandle::new(
+            std::sync::Arc::clone(&engine),
+            "/tmp/unused.snapshot".into(),
+        ));
+
+        refresh_sampled_gauges(&engine, &replication);
+        let rendered = handle.render();
+        assert!(
+            rendered.contains("rocket_mem_replica_min_ack_offset 0"),
+            "expected 0 with no replicas connected, not master_repl_offset or a sentinel:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn refresh_sampled_gauges_reports_replica_min_ack_offset_for_one_acked_replica() {
+        let _guard = GAUGE_TEST_LOCK.blocking_lock();
+        let handle = recorder_handle();
+        let engine = std::sync::Arc::new(engine::Engine::new());
+        let replication = std::sync::Arc::new(crate::replication::ReplicationHandle::new(
+            std::sync::Arc::clone(&engine),
+            "/tmp/unused.snapshot".into(),
+        ));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<bytes::Bytes>();
+        let entry = replication
+            .registry
+            .register(Some("127.0.0.1:1".to_string()), tx);
+        entry
+            .ack_offset
+            .store(150, std::sync::atomic::Ordering::Relaxed);
+
+        refresh_sampled_gauges(&engine, &replication);
+        let rendered = handle.render();
+        assert!(
+            rendered.contains("rocket_mem_replica_min_ack_offset 150"),
+            "expected the single replica's own ack_offset:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn refresh_sampled_gauges_reports_the_lower_of_two_replicas_ack_offsets() {
+        let _guard = GAUGE_TEST_LOCK.blocking_lock();
+        let handle = recorder_handle();
+        let engine = std::sync::Arc::new(engine::Engine::new());
+        let replication = std::sync::Arc::new(crate::replication::ReplicationHandle::new(
+            std::sync::Arc::clone(&engine),
+            "/tmp/unused.snapshot".into(),
+        ));
+        let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel::<bytes::Bytes>();
+        let entry1 = replication
+            .registry
+            .register(Some("127.0.0.1:1".to_string()), tx1);
+        entry1
+            .ack_offset
+            .store(500, std::sync::atomic::Ordering::Relaxed);
+        let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel::<bytes::Bytes>();
+        let entry2 = replication
+            .registry
+            .register(Some("127.0.0.1:2".to_string()), tx2);
+        entry2
+            .ack_offset
+            .store(200, std::sync::atomic::Ordering::Relaxed);
+
+        refresh_sampled_gauges(&engine, &replication);
+        let rendered = handle.render();
+        assert!(
+            rendered.contains("rocket_mem_replica_min_ack_offset 200"),
+            "expected the lower of the two replicas' ack_offsets to win:\n{rendered}"
+        );
     }
 
     #[tokio::test]
@@ -194,7 +332,13 @@ mod tests {
         // A different number from the leader offset above, on purpose: identical values would
         // let a gauge wired to the wrong accessor pass this test.
         replication.set_slave_repl_offset(4134);
-        let body = get(addr, "/metrics").await;
+        // Held across this one scrape only: it's the only request below whose assertions pin
+        // exact sampled-gauge values, so it's the only one that can race against the other
+        // gauge tests in this module -- see GAUGE_TEST_LOCK's doc comment.
+        let body = {
+            let _guard = GAUGE_TEST_LOCK.lock().await;
+            get(addr, "/metrics").await
+        };
         assert!(body.starts_with("HTTP/1.1 200 OK\r\n"), "{body}");
         assert!(
             body.contains("Content-Type: text/plain; version=0.0.4"),
