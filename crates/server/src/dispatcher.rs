@@ -1721,13 +1721,45 @@ fn cluster_info_text(cluster: Option<&std::sync::Arc<crate::cluster::ClusterConf
     )
 }
 
+/// Whether `node` should be reported as up.
+///
+/// This process's own entry is always reachable -- it is the one answering the command. With no
+/// health map (cluster mode off, or a build with no prober running) every node reports reachable,
+/// which is exactly what these builders did before the prober existed: absence of information is
+/// reported as "the topology as configured", never as "failed".
+fn node_is_reachable(
+    node: &crate::cluster::ClusterNode,
+    my_id: &str,
+    health: Option<&std::sync::Arc<crate::cluster_health::PeerHealth>>,
+) -> bool {
+    if node.id == my_id {
+        return true;
+    }
+    match health {
+        Some(health) => health.is_reachable(&node.id),
+        None => true,
+    }
+}
+
 /// `CLUSTER NODES`'s body, one `\n`-terminated line per node in real Redis's space-separated
 /// format (that payload uses `\n`, not `\r\n`, inside the bulk string). The `@<cport>` cluster-bus
 /// port is the Redis convention of `port + 10000`; it is **advertised but never bound**, because
 /// there is no cluster bus -- the field is not optional in the grammar clients parse, so the
-/// conventional value is emitted and the caveat is recorded in the README. `connected` is
-/// likewise unconditional: nothing here can observe a peer disconnecting.
-fn cluster_nodes_text(cluster: Option<&std::sync::Arc<crate::cluster::ClusterConfig>>) -> String {
+/// conventional value is emitted and the caveat is recorded in the README.
+///
+/// The link state and the `fail?` flag come from `health`, the map the peer prober maintains: a
+/// peer that has not answered a probe within `cluster_node_timeout_secs` is reported
+/// `master,fail?` and `disconnected`. `fail?` is Redis's spelling for *pfail* -- one node's own
+/// suspicion. It never becomes a plain `fail` here, because promoting a suspicion to an agreed
+/// failure needs a quorum over a cluster bus this project does not have.
+///
+/// Nothing about this changes routing: `cluster_redirect` still sends clients to a dead node's
+/// configured address, because picking a different owner is a topology decision nothing here can
+/// agree on. This line is how an operator finds out, not a failover.
+fn cluster_nodes_text(
+    cluster: Option<&std::sync::Arc<crate::cluster::ClusterConfig>>,
+    health: Option<&std::sync::Arc<crate::cluster_health::PeerHealth>>,
+) -> String {
     let Some(cluster) = cluster else {
         return String::new();
     };
@@ -1737,13 +1769,21 @@ fn cluster_nodes_text(cluster: Option<&std::sync::Arc<crate::cluster::ClusterCon
         .iter()
         .map(|n| {
             let (_, port) = split_addr(&n.addr);
+            let reachable = node_is_reachable(n, my_id, health);
             let flags = if &n.id == my_id {
                 "myself,master"
-            } else {
+            } else if reachable {
                 "master"
+            } else {
+                "master,fail?"
+            };
+            let link = if reachable {
+                "connected"
+            } else {
+                "disconnected"
             };
             format!(
-                "{} {}@{} {} - 0 0 0 connected {}-{}\n",
+                "{} {}@{} {} - 0 0 0 {link} {}-{}\n",
                 n.id,
                 n.addr,
                 port + 10000,
@@ -1859,6 +1899,7 @@ fn handle_cluster(
     };
     let sub = String::from_utf8_lossy(sub_bytes).to_ascii_uppercase();
     let cluster = replication.cluster();
+    let health = replication.peer_health();
     Some(match sub.as_str() {
         "KEYSLOT" => match items.get(2) {
             Some(Frame::Bulk(key)) if items.len() == 3 => {
@@ -1874,7 +1915,7 @@ fn handle_cluster(
         "INFO" => Frame::Bulk(Bytes::from(cluster_info_text(cluster))),
         "SHARDS" => cluster_shards_reply(cluster),
         "SLOTS" => cluster_slots_reply(cluster),
-        "NODES" => Frame::Bulk(Bytes::from(cluster_nodes_text(cluster))),
+        "NODES" => Frame::Bulk(Bytes::from(cluster_nodes_text(cluster, health))),
         _ => Frame::Error(format!("ERR unknown CLUSTER subcommand '{sub}'")),
     })
 }
@@ -10678,6 +10719,31 @@ mod tests {
         ReplicationHandle::default().with_cluster(std::sync::Arc::new(config))
     }
 
+    /// A cluster-mode handle whose peer-health map reports every node named in `dead` as failed.
+    /// The stamps are pushed an hour into the past rather than waiting out a real node timeout,
+    /// so these tests are instant and can never flake on timing.
+    fn cluster_handle_with_dead(node_id: &str, dead: &[&str]) -> ReplicationHandle {
+        let config = std::sync::Arc::new(
+            crate::cluster::ClusterConfig::parse(
+                "shard-a 127.0.0.1:7001 0 5460\n\
+                 shard-b 127.0.0.1:7002 5461 10922\n\
+                 shard-c 127.0.0.1:7003 10923 16383\n",
+                node_id,
+            )
+            .unwrap(),
+        );
+        let health = std::sync::Arc::new(crate::cluster_health::PeerHealth::for_cluster(
+            &config,
+            std::time::Duration::from_secs(15),
+        ));
+        for id in dead {
+            health.set_last_ok_unix(id, crate::replication::unix_now_secs() - 3600);
+        }
+        ReplicationHandle::default()
+            .with_cluster(config)
+            .with_peer_health(health)
+    }
+
     #[test]
     fn cluster_keyslot_answers_the_reference_slot_even_with_cluster_mode_off() {
         let engine = Engine::new();
@@ -10849,6 +10915,9 @@ mod tests {
     fn cluster_nodes_lists_every_node_with_myself_flagged() {
         let engine = Engine::new();
         let (_dir, aof) = test_aof();
+        // `cluster_handle` attaches no peer-health map, so this is the no-prober case: with no
+        // liveness information at all, every node is reported exactly as configured. That is the
+        // backward-compatibility guarantee, not a leftover hardcoded `connected`.
         let Frame::Bulk(text) = dispatch_and_log(
             &engine,
             &aof,
@@ -10890,6 +10959,82 @@ mod tests {
                 1
             ),
             Frame::Bulk(Bytes::from_static(b""))
+        );
+    }
+
+    #[test]
+    fn cluster_nodes_reports_an_unreachable_peer_as_disconnected_and_flagged_fail() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let Frame::Bulk(text) = dispatch_and_log(
+            &engine,
+            &aof,
+            &cluster_handle_with_dead("shard-b", &["shard-a"]),
+            cmd(&[b"CLUSTER", b"NODES"]),
+            &Session::new(),
+            1,
+        ) else {
+            panic!("expected Bulk")
+        };
+        let text = String::from_utf8(text.to_vec()).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines[0],
+            "shard-a 127.0.0.1:7001@17001 master,fail? - 0 0 0 disconnected 0-5460"
+        );
+        assert_eq!(
+            lines[1],
+            "shard-b 127.0.0.1:7002@17002 myself,master - 0 0 0 connected 5461-10922"
+        );
+        assert_eq!(
+            lines[2],
+            "shard-c 127.0.0.1:7003@17003 master - 0 0 0 connected 10923-16383"
+        );
+    }
+
+    #[test]
+    fn cluster_nodes_never_reports_this_node_as_disconnected_from_itself() {
+        // A node answering this command is trivially alive. `PeerHealth::for_cluster` holds no
+        // entry for it at all, and `node_is_reachable` short-circuits on the id too -- this pins
+        // both layers, so neither can regress alone.
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let Frame::Bulk(text) = dispatch_and_log(
+            &engine,
+            &aof,
+            &cluster_handle_with_dead("shard-b", &["shard-b"]),
+            cmd(&[b"CLUSTER", b"NODES"]),
+            &Session::new(),
+            1,
+        ) else {
+            panic!("expected Bulk")
+        };
+        let text = String::from_utf8(text.to_vec()).unwrap();
+        assert_eq!(
+            text.lines().nth(1).unwrap(),
+            "shard-b 127.0.0.1:7002@17002 myself,master - 0 0 0 connected 5461-10922"
+        );
+    }
+
+    #[test]
+    fn cluster_nodes_reports_every_peer_connected_when_the_whole_cluster_answers() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let Frame::Bulk(text) = dispatch_and_log(
+            &engine,
+            &aof,
+            &cluster_handle_with_dead("shard-b", &[]),
+            cmd(&[b"CLUSTER", b"NODES"]),
+            &Session::new(),
+            1,
+        ) else {
+            panic!("expected Bulk")
+        };
+        let text = String::from_utf8(text.to_vec()).unwrap();
+        assert_eq!(text.lines().filter(|l| l.contains("fail?")).count(), 0);
+        assert_eq!(
+            text.lines().filter(|l| l.contains(" connected ")).count(),
+            3
         );
     }
 
