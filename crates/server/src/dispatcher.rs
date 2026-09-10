@@ -2013,6 +2013,15 @@ fn info_text(
                 "master_link_status:{}\r\n",
                 if replication.link_up() { "up" } else { "down" }
             ));
+            // The same number twice, exactly as real Redis does. `slave_repl_offset` is how far
+            // this node has processed; `master_repl_offset` is the leader position that
+            // corresponds to, and it is the only leader position this node can honestly claim
+            // to know -- nothing tells a follower how far ahead its leader has since run. Both
+            // are seeded from the snapshot header at sync time and advanced per applied frame.
+            let offset = replication.slave_repl_offset();
+            out.push_str(&format!(
+                "slave_repl_offset:{offset}\r\nmaster_repl_offset:{offset}\r\n"
+            ));
         } else {
             out.push_str("role:master\r\n");
             let addrs = replication.registry.addrs();
@@ -5789,7 +5798,27 @@ mod tests {
         let text = info_text_for(&replication, &engine, &[b"replication"]);
         assert!(text.contains("role:slave\r\n"), "{text}");
         assert!(text.contains("master_link_status:down\r\n"), "{text}");
+        assert!(text.contains("slave_repl_offset:0\r\n"), "{text}");
+        assert!(text.contains("master_repl_offset:0\r\n"), "{text}");
         assert!(!text.contains("connected_slaves:"), "{text}");
+    }
+
+    /// A follower reports the same number under both keys, exactly as real Redis does: it is
+    /// this node's own processed position, and the only leader position it can honestly claim to
+    /// know. The leader-side counter is irrelevant here and must not leak into the slave lines.
+    #[test]
+    fn info_on_a_follower_reports_the_same_offset_under_both_keys() {
+        let engine = Engine::new();
+        let replication = ReplicationHandle::default();
+        replication
+            .is_replica
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        replication.set_slave_repl_offset(4134);
+
+        let text = info_text_for(&replication, &engine, &[b"replication"]);
+
+        assert!(text.contains("slave_repl_offset:4134\r\n"), "{text}");
+        assert!(text.contains("master_repl_offset:4134\r\n"), "{text}");
     }
 
     #[test]
