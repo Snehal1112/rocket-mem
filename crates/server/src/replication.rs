@@ -210,8 +210,8 @@ pub struct ReplicationHandle {
     master_repl_offset: Arc<AtomicU64>,
     /// Follower side: how far into the leader's replication stream this node has processed.
     /// Seeded by `sync_once` from the snapshot header the leader stamped its own live
-    /// `master_repl_offset` into, then advanced per applied frame by
-    /// `03-follower-replication-offset.md`. An `Arc` because the spawned follower task is
+    /// `master_repl_offset` into, then advanced by that function's apply loop, by the wire
+    /// length of each frame it applies. An `Arc` because the spawned follower task is
     /// `'static` and needs its own handle -- the same reason `last_apply_unix` and `link_up`
     /// are `Arc`s. Meaningless while this node is a leader, and `INFO` only reports it under
     /// `role:slave`, so a value left over from a previous `REPLICAOF` is never rendered.
@@ -615,6 +615,13 @@ impl ReplicationHandle {
     pub fn slave_repl_offset_slot(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.slave_repl_offset)
     }
+
+    /// Adds `bytes` to the follower offset and returns the new value. The apply loop writes the
+    /// shared slot directly (it holds only an `&AtomicU64`, like `last_apply` and `link_up`);
+    /// this is the same operation for a caller that holds the whole handle.
+    pub fn advance_slave_repl_offset(&self, bytes: u64) -> u64 {
+        self.slave_repl_offset.fetch_add(bytes, Ordering::Relaxed) + bytes
+    }
 }
 
 /// An idle handle: no replicas registered, not a replica, no follower task running, its own
@@ -928,6 +935,15 @@ where
     let snapshot_offset = engine
         .load_snapshot(&blob)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    // Re-checked here, not just before `load_snapshot` above: that call deserializes the whole
+    // dataset, so a `REPLICAOF` arriving during it would leave this task about to seed a stale
+    // position. That was harmless before there was a per-frame advance, because the next sync
+    // overwrote it. It is not harmless now -- a newer task may already be advancing from its own
+    // correct seed, and this store would leave it accumulating on a stale base until the next
+    // full resync.
+    if generation.load(Ordering::SeqCst) != my_generation {
+        return Ok(()); // superseded while loading the snapshot -- a newer task owns the offset
+    }
     status
         .slave_offset
         .store(snapshot_offset, Ordering::Relaxed);
@@ -956,8 +972,18 @@ where
         }
         let frame = result?;
         frames_applied += 1;
-        tracing::trace!(offset = frames_applied, "replication stream advanced");
         let name = replicated_command_name(&frame);
+        // Re-encode to learn this frame's replication-stream length, before the frame is moved
+        // into `dispatch` below. This is byte-exact, not an approximation, and the exactness is
+        // load-bearing: it is what makes this follower's offset directly comparable to the
+        // leader's `master_repl_offset`, which counted the same bytes on the way out. It holds
+        // because only `aof::WRITE_COMMANDS` frames are ever replicated, and those are always a
+        // Frame::Array of Frame::Bulk -- a shape whose RESP encoding is identical under RESP2
+        // and RESP3. (Frame::Null and Frame::Map do encode differently per protocol version;
+        // neither can appear in a replicated write command.) Do not replace this with a
+        // decoder-side byte count or a frame count: widening what gets replicated is what would
+        // break the invariant, not this re-encode.
+        let frame_len = crate::aof::encode_frame(&frame)?.len() as u64;
         let mut protocol = protocol::codec::Protocol::default();
         // Mutual exclusion with a concurrent SAVE on this same node: SAVE's shard-by-shard
         // snapshot walk (Store::snapshot_entries) must not observe a multi-key replicated
@@ -980,6 +1006,16 @@ where
             tracing::error!(error = %e, "failed to apply replicated command");
         }
         status.last_apply.store(unix_now_secs(), Ordering::Relaxed);
+        // Advanced even when the apply above errored: those bytes were still consumed from the
+        // stream, and an offset that skipped them would report this follower as permanently
+        // behind a leader it is actually level with.
+        let offset = status.slave_offset.fetch_add(frame_len, Ordering::Relaxed) + frame_len;
+        // Logged here rather than before the apply, so both the message and the `offset` field
+        // are true when they are written: the stream really has advanced, and `offset` is the
+        // byte position this follower has now reached. `frames_applied` is the per-session frame
+        // count, which is a different quantity -- see the design contract's rule that the
+        // replication offset counts bytes, not frames.
+        tracing::trace!(frames_applied, offset, "replication stream advanced");
     }
     Ok(())
 }
@@ -1263,6 +1299,81 @@ mod tests {
             4096,
             "the follower must seed its offset from the snapshot header, not start at 0"
         );
+    }
+
+    /// Proves the follower's byte count is exact, not approximate: it asserts the offset equals
+    /// the header seed plus the *literal wire length* of the frame the leader wrote. If the
+    /// re-encode in the apply loop ever stopped reproducing the leader's bytes, this would fail
+    /// by exactly the drift.
+    #[tokio::test]
+    async fn sync_once_advances_the_follower_offset_by_each_applied_frames_wire_length() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const STREAMED: &[u8] = b"*3\r\n$3\r\nSET\r\n$11\r\nfrom-stream\r\n$1\r\nv\r\n";
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let fake_leader = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut psync_bytes = [0u8; 15];
+            socket.read_exact(&mut psync_bytes).await.unwrap();
+
+            // 1000: this leader had already produced 1000 bytes of stream before the follower
+            // attached, so the test proves the seed and the per-frame advance compose.
+            let blob = engine::Engine::new().snapshot(1000);
+            socket
+                .write_all(&(blob.len() as u64).to_le_bytes())
+                .await
+                .unwrap();
+            socket.write_all(&blob).await.unwrap();
+            socket.write_all(STREAMED).await.unwrap();
+            // Hold the socket open long enough for the follower to read and apply the frame,
+            // then drop it so `sync_once` returns on its own instead of needing a timeout.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        });
+
+        let engine = engine::Engine::new();
+        let slave_offset = AtomicU64::new(0);
+        let host_port = addr.to_string();
+        let generation = Arc::new(AtomicU64::new(0));
+        let stream = tokio::net::TcpStream::connect(&host_port).await.unwrap();
+        sync_once(
+            stream,
+            &engine,
+            &generation,
+            0,
+            None,
+            FollowerStatus {
+                last_apply: &AtomicI64::new(0),
+                link_up: &AtomicBool::new(false),
+                slave_offset: &slave_offset,
+            },
+            &FollowerIdentity::default(),
+        )
+        .await
+        .unwrap();
+
+        fake_leader.await.unwrap();
+        assert_eq!(
+            engine.get(b"from-stream"),
+            Some(engine::Value::String(bytes::Bytes::from_static(b"v"))),
+            "the streamed frame must actually have been applied"
+        );
+        assert_eq!(
+            slave_offset.load(Ordering::Relaxed),
+            1000 + STREAMED.len() as u64,
+            "the follower must advance by the applied frame's exact wire length"
+        );
+    }
+
+    #[test]
+    fn advance_slave_repl_offset_accumulates_from_the_seeded_position() {
+        let h = ReplicationHandle::default();
+        h.set_slave_repl_offset(1000);
+        assert_eq!(h.advance_slave_repl_offset(38), 1038);
+        assert_eq!(h.advance_slave_repl_offset(2), 1040);
+        assert_eq!(h.slave_repl_offset(), 1040);
     }
 
     #[tokio::test]
