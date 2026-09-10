@@ -155,3 +155,155 @@ not automatically discover the promotion.
 **In today's topology this step has nothing to do**, because shard-a has exactly one
 replica and it is the node just promoted in Section 3. This section exists for when a shard
 gains a second replica; do not skip reading it just because it is currently a no-op.
+
+---
+
+## 5. Cluster mode: hand-edit `cluster.conf` on every node, and restart every node
+
+rocket-mem's cluster mode has no live topology-reload path: `ClusterConfig` is parsed once
+at startup and, by its own doc comment, "never changes for the life of the process." A
+promoted replica's writes stay unroutable cluster-wide until every node's `cluster.conf` is
+edited and every node is restarted. There is no partial or gradual version of this step.
+
+**5a. Edit `cluster.conf` identically on every cluster-member host.** This file lives at
+`/home/numericlabs/data/rocket/rocket-mem/cluster.conf` (in this single-host deployment
+there is only one copy to edit). Change the failed shard's line to the promoted node's
+address:
+
+Before:
+```
+shard-a numericlabs.lxd:16379 0     5460
+shard-b numericlabs.lxd:16380 5461  10922
+shard-c numericlabs.lxd:16381 10923 16383
+```
+
+After:
+```
+shard-a numericlabs.lxd:16479 0     5460
+shard-b numericlabs.lxd:16380 5461  10922
+shard-c numericlabs.lxd:16381 10923 16383
+```
+
+(`16479` is shard-a-replica's TLS RESP port — `cluster.conf` must advertise the same *kind*
+of port every other node advertises, matching the TLS convention
+`rocket-mem-shard-b.toml`/`rocket-mem-shard-c.toml`'s own comments already document.)
+
+This file must be byte-for-byte identical on every node. A partial edit leaves nodes
+disagreeing about who owns shard-a's slots, and nothing in this project detects that
+disagreement — there is no `configEpoch`, no cluster bus, no gossip (see the design
+contract, §2.6, and the spec's "cheapest honest first step" paragraph).
+
+**5b. The promoted node was a replica, not a cluster member — give it cluster fields
+before restarting it as one.** `rocket-mem-shard-a-replica.toml` has no
+`cluster_config`/`cluster_node_id` (replicas in this deployment are deliberately not
+cluster members). Left as-is, the promoted node will happily serve direct reads/writes for
+shard-a's keys (nothing in rocket-mem enforces slot ownership on a node with no cluster
+config at all), but it will not answer `CLUSTER NODES`/`CLUSTER SHARDS` correctly, and it
+will not redirect a client that mistakenly sends it a shard-b or shard-c key. Stop the
+promoted process and restart it with cluster fields added — either edit a copy of its
+config:
+
+```toml
+# added to a copy of rocket-mem-shard-a-replica.toml; remove/comment out replicaof and its
+# auth fields too -- this node is a promoted standalone leader now, not a follower.
+cluster_config = "/home/numericlabs/data/rocket/rocket-mem/cluster.conf"
+cluster_node_id = "shard-a"
+```
+
+or pass the equivalent CLI flags on its next start:
+
+```bash
+./target/release/rocket-mem --config rocket-mem-shard-a-replica.toml \
+  --cluster-config /home/numericlabs/data/rocket/rocket-mem/cluster.conf \
+  --cluster-node-id shard-a &
+```
+
+**5c. Restart the other cluster members so they pick up the edited `cluster.conf`:**
+
+```bash
+systemctl --user restart rocket-mem-shard-b rocket-mem-shard-c
+```
+
+**5d. Do NOT restart `rocket-mem-shard-a.service`.** That unit still describes the dead
+leader's identity — `rocket-mem.toml`, bound to `numericlabs.lxd:16379`/`6379`. Restarting
+it would put a second, stale process on the network simultaneously claiming to be part of
+this cluster, right alongside the promoted node now actually serving as shard-a. If the
+original host is only temporarily down and might come back on its own (this unit's
+`WantedBy=default.target` means it auto-starts on the next login/boot), disable it until
+you have deliberately decided what to do with it:
+
+```bash
+systemctl --user disable --now rocket-mem-shard-a
+```
+
+**5e. Verify from a surviving node:**
+
+```bash
+redis-cli --tls --cacert /home/numericlabs/data/tls/root_ca-numericlabs.crt \
+  -h numericlabs.lxd -p 16380 cluster nodes
+# -> shard-a's slot range (0-5460) shown against numericlabs.lxd:16479, not :16379
+
+redis-cli --tls --cacert /home/numericlabs/data/tls/root_ca-numericlabs.crt \
+  --user app --pass changeme -h numericlabs.lxd -p 16479 set drill-marker post-promotion
+# -> OK, direct write to the promoted node succeeds
+```
+
+`CLUSTER NODES`/`CLUSTER SHARDS` on this project report every configured node as
+`connected`/`online` unconditionally (see the spec's "zero health-awareness" finding,
+live-verified 2026-09-09) — a stale entry for the disabled old shard-a would look identical
+to a healthy one if you had left its line unedited. The edit in 5a is what actually fixes
+routing, not anything `CLUSTER NODES` tells you on its own.
+
+---
+
+## 6. Failback hazard — read this before you ever point anything back at a restored original leader
+
+**Do not run `REPLICAOF numericlabs.lxd 16379` against the promoted node
+(`numericlabs.lxd:16479`) once the original shard-a host comes back, expecting to "restore"
+the old topology. This destroys every write the promoted node has accepted since
+promotion, silently.**
+
+The mechanism: `sync_once` performs a full resync unconditionally on every `REPLICAOF`
+connect. It calls `Engine::load_snapshot`, and `Store::load_snapshot_entries` clears all 16 shards
+before loading the new leader's snapshot. There is no partial sync, no merge, no conflict
+detection — the promoted node's entire keyspace is wiped and replaced with whatever the
+restored old leader has. No error, no log line, no offset-mismatch warning: none of that
+machinery exists in this project today.
+
+If you must fail back, treat it as a second, deliberate migration — never a "revert":
+
+1. Stop writes to the promoted node (application-level, or by disconnecting clients).
+2. Decide which side's data should win. It is almost always the promoted node's — it has
+   been the live, accepting-writes side since the incident, and the restored original
+   leader's data is frozen at the moment it died.
+3. If the promoted node's data should win: make the *restored old node* a replica of the
+   *promoted node* (`REPLICAOF numericlabs.lxd 16479` run against the restored shard-a, not
+   the other way around), then repeat Section 5's cluster.conf-edit-and-restart-every-node
+   dance in reverse only once you deliberately decide to switch the "canonical" address
+   back — and only if you ever decide to. There is no requirement to ever switch back; the
+   promoted node can simply remain shard-a going forward.
+4. If the old node's data should win for some reason (rare — this means discarding
+   everything accepted since promotion, on purpose): that is exactly what re-pointing the
+   promoted node at the restored leader does. Confirm this is really what you want, in
+   writing, before running it — this project gives you no undo.
+
+---
+
+## 7. Split-brain — the old leader might not really be dead
+
+This restates and sharpens Section 1's warning, because it is the failure mode this whole
+runbook exists to avoid, not just note in passing.
+
+A partitioned-but-still-alive old leader keeps accepting and "succeeding" writes from
+clients on its side of the partition indefinitely. There is no quorum in this project, no
+consensus, and (unless `min_replicas_to_write` was explicitly configured beforehand) no
+self-fencing — the old leader has no way to know it has been abandoned. If you promote a
+replica while the old leader might still be reachable by even one client, you now have two
+nodes both claiming to own the same slot range, accepting divergent writes, with no
+reconciliation mechanism in this project to ever merge them back. Whichever side loses the
+eventual failback decision (Section 6) loses its divergent writes, permanently.
+
+**The only real defense is Section 1's confirmation step, done properly, every time.** "I
+can't reach it" is a symptom. "It is provably not running" (a `systemctl --user status` on
+its own host showing `inactive (dead)`, or a corroborating loss of `PONG` from every
+vantage point you have) is the bar for promoting anything.
