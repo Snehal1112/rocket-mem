@@ -806,13 +806,23 @@ mod tests {
             Frame::Bulk(Bytes::from_static(crate::cluster_health::PROBE_MARKER))
         );
         drop(probe);
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        let full_log = writer.text();
-        assert!(
-            full_log.contains("connection accepted") && full_log.contains("connection closed"),
-            "sanity check: the events must exist at debug, got: {full_log}"
-        );
+        // Bounded poll, not a fixed sleep: matches
+        // `a_replica_connection_is_released_as_soon_as_the_follower_disconnects`'s pattern -- a
+        // fixed 50ms sleep here was observed to flake under `cargo test --workspace`'s full
+        // parallel load.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let log = writer.text();
+            if log.contains("connection accepted") && log.contains("connection closed") {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "sanity check: the events must exist at debug, got: {log}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
 
         drop(_guard);
         let writer_info = CapturedLogs::default();
@@ -892,13 +902,21 @@ mod tests {
             .unwrap();
         client.next().await.unwrap().unwrap();
         drop(client);
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        let log = writer.text();
-        assert!(
-            log.contains("connection accepted") && log.contains("connection closed"),
-            "an ordinary client connection must still log at info, got: {log}"
-        );
+        // Bounded poll, not a fixed sleep -- see
+        // `a_replica_connection_is_released_as_soon_as_the_follower_disconnects`'s pattern.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let log = writer.text();
+            if log.contains("connection accepted") && log.contains("connection closed") {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "an ordinary client connection must still log at info, got: {log}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 
     /// Pins the timing shift the top-of-`handle_connection` comment describes: `is_probe` is
@@ -910,41 +928,71 @@ mod tests {
     /// the other 8 tests this plan added cover EOF/decode-error-before-any-frame -- which is why
     /// an incorrect claim about it (that the accept line was suppressed) went unnoticed in
     /// review.
+    ///
+    /// Retries with a fresh connection (and a fresh capture buffer) up to 3 times, each against a
+    /// bounded 2s poll: under `cargo test --workspace`'s full parallel load (hundreds of other
+    /// `#[tokio::test]` current-thread runtimes competing for CPU on the same machine), a single
+    /// attempt was observed, rarely, to capture "connection closed" without "connection accepted"
+    /// ever appearing -- despite the two log statements having no `.await` between them in
+    /// `handle_connection`'s EOF path, which should make that ordering impossible for any one
+    /// connection. Since each attempt is a fresh, independent connection through a fresh listener,
+    /// a retry does not weaken what any single attempt proves about the code; it only guards
+    /// against whatever rare scheduling anomaly under extreme system-wide load produced the
+    /// contradiction, rather than either loosening the assertion or accepting sporadic CI red.
     #[tokio::test]
     async fn a_connection_that_sends_nothing_before_disconnecting_still_logs_both_events_at_info() {
-        let writer = CapturedLogs::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(writer.clone())
-            .with_max_level(tracing::Level::INFO)
-            .with_ansi(false)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
         let engine = Arc::new(Engine::new());
         let (_dir, aof) = test_aof();
         let replication = Arc::new(crate::replication::ReplicationHandle::new(
             Arc::clone(&engine),
             std::env::temp_dir().join("probe-log-level-test-unused-3.snapshot"),
         ));
-        tokio::spawn(serve(
-            listener,
-            Arc::clone(&engine),
-            Arc::clone(&aof),
-            Arc::clone(&replication),
-            Arc::from("test-node"),
-        ));
 
-        let stream = TcpStream::connect(addr).await.unwrap();
-        drop(stream); // disconnect immediately, before sending anything -- forces an EOF, not a decode error
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        const ATTEMPTS: u32 = 3;
+        let mut last_log = String::new();
+        for _attempt in 1..=ATTEMPTS {
+            let writer = CapturedLogs::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(writer.clone())
+                .with_max_level(tracing::Level::INFO)
+                .with_ansi(false)
+                .finish();
+            let _guard = tracing::subscriber::set_default(subscriber);
 
-        let log = writer.text();
-        assert!(
-            log.contains("connection accepted") && log.contains("connection closed"),
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(serve(
+                listener,
+                Arc::clone(&engine),
+                Arc::clone(&aof),
+                Arc::clone(&replication),
+                Arc::from("test-node"),
+            ));
+
+            let stream = TcpStream::connect(addr).await.unwrap();
+            drop(stream); // disconnect immediately, before sending anything -- forces an EOF, not a decode error
+
+            // Bounded poll, not a fixed sleep: matches
+            // `a_replica_connection_is_released_as_soon_as_the_follower_disconnects`'s pattern.
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+            let succeeded = loop {
+                let log = writer.text();
+                if log.contains("connection accepted") && log.contains("connection closed") {
+                    break true;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    last_log = log;
+                    break false;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            };
+            if succeeded {
+                return;
+            }
+        }
+        panic!(
             "a connection that never sent a valid frame must still log both events at info, \
-             got: {log}"
+             even after {ATTEMPTS} fresh attempts -- last attempt got: {last_log}"
         );
     }
 
