@@ -87,6 +87,10 @@ loop would otherwise log a `connection accepted`/`connection closed` pair at `in
 round regardless of this section's "once per change" behavior — rocket-mem recognizes its own
 probe traffic and logs that pair at `debug` instead, so a healthy, unchanging cluster stays
 quiet at the `info` default. See `crates/server/src/cluster_health.rs`'s `PROBE_MARKER`.
+"Connection accepted" now logs on the connection's first frame rather than at TCP accept, so
+an idle-holding connection that never sends anything (an L4 health checker, a connection-pool
+pre-open) produces no accept line until it does — or never, if it never sends anything;
+`rocket_mem_connected_clients` remains the immediate signal for a live connection count.
 
 `cluster_slots_fail` stays `0` even then, and that is correct rather than a bug. Redis's *pfail*
 (`fail?`) means one node suspects a peer; *fail* means a majority agreed over the cluster bus.

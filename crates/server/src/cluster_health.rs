@@ -192,7 +192,7 @@ async fn probe_ping<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
     mut socket: S,
 ) -> Option<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut request = Vec::with_capacity(16 + PROBE_MARKER.len());
+    let mut request = Vec::with_capacity(24 + PROBE_MARKER.len());
     request.extend_from_slice(b"*2\r\n$4\r\nPING\r\n$");
     request.extend_from_slice(PROBE_MARKER.len().to_string().as_bytes());
     request.extend_from_slice(b"\r\n");
@@ -206,7 +206,8 @@ async fn probe_ping<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
     // success prefix. `+`/`-` stay accepted too, for robustness against a peer that doesn't
     // recognize rocket-mem's own marker at all (a plain RESP server, or a future protocol
     // change) and just answers with an ordinary PONG or an error — either still proves the peer
-    // is alive and speaking RESP, which is all this check is for.
+    // is alive and speaking RESP, which is all this check is for. A zero-length read is the peer
+    // closing the connection, not answering it, hence the `read > 0` check.
     let answered = read > 0 && matches!(buf[0], b'+' | b'-' | b'$');
     // Best-effort graceful close. Over TLS this sends a `close_notify` alert before the socket
     // closes; dropping the stream without it leaves the peer's rustls session reading a bare TCP

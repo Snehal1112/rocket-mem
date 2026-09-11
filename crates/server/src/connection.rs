@@ -305,6 +305,12 @@ async fn handle_connection<S>(
 {
     replication.connection_opened();
     let _client_guard = ClientGuard(Arc::clone(&replication), client_id);
+    // Constructed here, at the original pre-Task-2 position, so `started_at` still covers the
+    // full connection lifetime -- including the first-frame read below -- rather than starting
+    // only once that read completes. `is_probe` starts false and is corrected in place once the
+    // first frame reveals whether this is a peer probe; `ConnectionStats` is private to this
+    // module, so a plain field assignment is enough, no setter needed.
+    let mut conn_stats = ConnectionStats::new(false);
     let mut framed = Framed::new(socket, RespCodec::default());
     let session = dispatcher::Session::with_peer_addr(peer);
     // Read the first frame before deciding "connection accepted"'s log level, so a peer-probe
@@ -320,12 +326,12 @@ async fn handle_connection<S>(
     // cleanup keep their exact existing timing.
     let first = framed.next().await;
     let is_probe = matches!(&first, Some(Ok(frame)) if is_probe_ping(frame));
+    conn_stats.is_probe = is_probe;
     if is_probe {
         tracing::debug!("connection accepted");
     } else {
         tracing::info!("connection accepted");
     }
-    let mut conn_stats = ConnectionStats::new(is_probe);
     // Carries a frame pulled ahead -- either the pre-read `first` above, or the pipelining peek
     // further down -- so it isn't re-read.
     let mut pending: Option<Option<std::io::Result<protocol::Frame>>> = Some(first);
@@ -759,7 +765,7 @@ mod tests {
     /// unlike `capture_logs_at` above (fine for the synchronous `is_probe_ping` unit tests,
     /// wrong tool for anything spanning a `.await` across a spawned task).
     #[tokio::test]
-    async fn a_probe_connections_accept_and_close_log_at_debug_not_info() {
+    async fn a_probe_connection_logs_accept_and_close_at_debug_not_info() {
         let writer = CapturedLogs::default();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(writer.clone())
@@ -851,7 +857,7 @@ mod tests {
     /// Regression guard for real clients: an ordinary bare `PING` (no marker) must keep logging
     /// its accept/close pair at `info`, exactly as before this plan.
     #[tokio::test]
-    async fn an_ordinary_connections_accept_and_close_log_at_info() {
+    async fn an_ordinary_connection_logs_accept_and_close_at_info() {
         let writer = CapturedLogs::default();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(writer.clone())
