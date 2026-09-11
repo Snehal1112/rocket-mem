@@ -308,12 +308,16 @@ async fn handle_connection<S>(
     let mut framed = Framed::new(socket, RespCodec::default());
     let session = dispatcher::Session::with_peer_addr(peer);
     // Read the first frame before deciding "connection accepted"'s log level, so a peer-probe
-    // connection (see `is_probe_ping`) can log at `debug` instead of `info` -- this is the one
-    // behavior change for every OTHER connection too: a connection that disconnects (EOF or a
-    // decode error) before ever sending a valid frame no longer gets an "connection accepted"
-    // line at all, since there was never anything to inspect. `replication.connection_opened()`
-    // and `_client_guard` above are unaffected -- they still fire immediately and unconditionally,
-    // so the connected-clients gauge and pub/sub cleanup keep their exact existing timing.
+    // connection (see `is_probe_ping`) can log at `debug` instead of `info`. This is a timing
+    // shift for every OTHER connection too, not a suppression: `is_probe` is false for both EOF
+    // (`None`) and a decode error (`Some(Err(_))`) here, same as for a real command, so the
+    // `info` branch below still always fires for them -- but now only once the first-frame read
+    // returns, instead of immediately at TCP accept. A connection that sends nothing before
+    // disconnecting therefore logs "connection accepted" and "connection closed" back-to-back at
+    // disconnect time, both still at `info`, rather than "accepted" at connect time and "closed"
+    // later. `replication.connection_opened()` and `_client_guard` above are unaffected -- they
+    // still fire immediately and unconditionally, so the connected-clients gauge and pub/sub
+    // cleanup keep their exact existing timing.
     let first = framed.next().await;
     let is_probe = matches!(&first, Some(Ok(frame)) if is_probe_ping(frame));
     if is_probe {
@@ -888,6 +892,53 @@ mod tests {
         assert!(
             log.contains("connection accepted") && log.contains("connection closed"),
             "an ordinary client connection must still log at info, got: {log}"
+        );
+    }
+
+    /// Pins the timing shift the top-of-`handle_connection` comment describes: `is_probe` is
+    /// false for an EOF (`None`) just as it is for a real command, so the `info` branch still
+    /// always fires for a connection that never sends a valid frame -- it is never suppressed.
+    /// What changes is *when*: both "connection accepted" and "connection closed" now fire
+    /// back-to-back once the first-frame read returns EOF, instead of "accepted" at TCP accept
+    /// and "closed" later at teardown. Before this plan, this exact case was untested -- none of
+    /// the other 8 tests this plan added cover EOF/decode-error-before-any-frame -- which is why
+    /// an incorrect claim about it (that the accept line was suppressed) went unnoticed in
+    /// review.
+    #[tokio::test]
+    async fn a_connection_that_sends_nothing_before_disconnecting_still_logs_both_events_at_info() {
+        let writer = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(writer.clone())
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let engine = Arc::new(Engine::new());
+        let (_dir, aof) = test_aof();
+        let replication = Arc::new(crate::replication::ReplicationHandle::new(
+            Arc::clone(&engine),
+            std::env::temp_dir().join("probe-log-level-test-unused-3.snapshot"),
+        ));
+        tokio::spawn(serve(
+            listener,
+            Arc::clone(&engine),
+            Arc::clone(&aof),
+            Arc::clone(&replication),
+            Arc::from("test-node"),
+        ));
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        drop(stream); // disconnect immediately, before sending anything -- forces an EOF, not a decode error
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let log = writer.text();
+        assert!(
+            log.contains("connection accepted") && log.contains("connection closed"),
+            "a connection that never sent a valid frame must still log both events at info, \
+             got: {log}"
         );
     }
 
