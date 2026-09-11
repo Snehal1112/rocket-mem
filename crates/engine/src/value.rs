@@ -71,6 +71,19 @@ impl Value {
         }
     }
 
+    /// True for a List/Hash/Set/SortedSet mutated down to zero elements -- the point at which
+    /// real Redis deletes the key entirely rather than leaving an empty collection behind.
+    /// Always false for String, which has no such "emptied by mutation" state.
+    pub fn is_empty_collection(&self) -> bool {
+        match self {
+            Value::String(_) => false,
+            Value::List(l) => l.is_empty(),
+            Value::Hash(m) => m.is_empty(),
+            Value::Set(s) => s.is_empty(),
+            Value::SortedSet(z) => z.is_empty(),
+        }
+    }
+
     /// A rough byte-size estimate — not exact, not meant to be (see
     /// ../../docs/superpowers/specs/2026-08-30-sprint-4-spec.md's LRU/MAXMEMORY decision).
     pub fn approx_size(&self) -> usize {

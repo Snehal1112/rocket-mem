@@ -554,8 +554,10 @@ mod tests {
         spop(&engine, &key).unwrap();
         assert_memory_used_matches_recomputed_size(&engine, &key);
 
-        // spop: on the single remaining member
+        // spop: on the single remaining member -- empties the set, so the key itself is now
+        // deleted (matching real Redis) rather than left behind as an empty Set.
         spop(&engine, &key).unwrap();
-        assert_memory_used_matches_recomputed_size(&engine, &key);
+        assert_eq!(engine.get(&key), None);
+        assert_eq!(engine.memory_used(), 0);
     }
 }

@@ -270,6 +270,15 @@ impl Shard {
                     }
                     std::cmp::Ordering::Equal => {}
                 }
+                // A mutation that emptied a List/Hash/Set/SortedSet deletes the key entirely,
+                // under the same write lock, matching real Redis -- see `with_mut_delta` below,
+                // which every real command actually uses; this keeps the same invariant for
+                // this fallback path.
+                if entry.value.is_empty_collection() {
+                    let remaining = entry_size(key, &entry.value);
+                    guard.remove(key);
+                    self.bytes_used.fetch_sub(remaining, Ordering::Relaxed);
+                }
                 result
             }
             None => f(None),
@@ -311,6 +320,18 @@ impl Shard {
                             .fetch_sub(delta.unsigned_abs(), Ordering::Relaxed);
                     }
                     std::cmp::Ordering::Equal => {}
+                }
+                // A mutation that emptied a List/Hash/Set/SortedSet (e.g. the last SREM/SPOP/
+                // HDEL/LPOP/RPOP/ZREM on a key) deletes the key entirely here, under the same
+                // write lock, matching real Redis -- otherwise the key would survive forever as
+                // a live, empty collection. The reported `delta` already accounted for the
+                // removed element's own bytes; `remaining` is what's left uncounted (the entry's
+                // fixed overhead plus key length), computed the same way the expired-key sweep
+                // above does.
+                if entry.value.is_empty_collection() {
+                    let remaining = entry_size(key, &entry.value);
+                    guard.remove(key);
+                    self.bytes_used.fetch_sub(remaining, Ordering::Relaxed);
                 }
                 result
             }
@@ -732,6 +753,109 @@ mod tests {
         );
         shard.expire_at(b"a", Instant::now() - std::time::Duration::from_secs(1));
         assert!(shard.entries().is_empty());
+    }
+
+    #[test]
+    fn with_mut_delta_deletes_the_key_when_the_mutation_empties_the_collection() {
+        let shard = Shard::new();
+        let clock = AtomicU64::new(0);
+        shard.set(
+            Bytes::from_static(b"k"),
+            Value::List(std::collections::VecDeque::from(vec![Bytes::from_static(
+                b"only",
+            )])),
+            &clock,
+        );
+        shard.with_mut_delta(
+            b"k",
+            |v| {
+                if let Some(Value::List(list)) = v {
+                    list.pop_front();
+                    ((), -4isize)
+                } else {
+                    ((), 0)
+                }
+            },
+            &clock,
+        );
+        assert_eq!(shard.get(b"k", &clock), None);
+        assert!(shard.keys().is_empty());
+    }
+
+    #[test]
+    fn with_mut_delta_leaves_a_still_nonempty_collection_in_place() {
+        let shard = Shard::new();
+        let clock = AtomicU64::new(0);
+        shard.set(
+            Bytes::from_static(b"k"),
+            Value::List(std::collections::VecDeque::from(vec![
+                Bytes::from_static(b"a"),
+                Bytes::from_static(b"b"),
+            ])),
+            &clock,
+        );
+        shard.with_mut_delta(
+            b"k",
+            |v| {
+                if let Some(Value::List(list)) = v {
+                    list.pop_front();
+                    ((), -1isize)
+                } else {
+                    ((), 0)
+                }
+            },
+            &clock,
+        );
+        assert!(shard.get(b"k", &clock).is_some());
+    }
+
+    #[test]
+    fn with_mut_delta_emptying_a_collection_zeroes_out_its_remaining_byte_accounting() {
+        let shard = Shard::new();
+        let clock = AtomicU64::new(0);
+        shard.set(
+            Bytes::from_static(b"k"),
+            Value::List(std::collections::VecDeque::from(vec![Bytes::from_static(
+                b"only",
+            )])),
+            &clock,
+        );
+        shard.with_mut_delta(
+            b"k",
+            |v| {
+                if let Some(Value::List(list)) = v {
+                    list.pop_front();
+                    ((), -12isize) // "only".len() + 8, matching Value::approx_size's list formula
+                } else {
+                    ((), 0)
+                }
+            },
+            &clock,
+        );
+        assert_eq!(shard.bytes_used(), 0);
+    }
+
+    #[test]
+    fn with_mut_deletes_the_key_when_the_mutation_empties_the_collection() {
+        let shard = Shard::new();
+        let clock = AtomicU64::new(0);
+        shard.set(
+            Bytes::from_static(b"k"),
+            Value::Set(std::collections::HashSet::from([Bytes::from_static(
+                b"only",
+            )])),
+            &clock,
+        );
+        shard.with_mut(
+            b"k",
+            |v| {
+                if let Some(Value::Set(set)) = v {
+                    set.remove(&Bytes::from_static(b"only"));
+                }
+            },
+            &clock,
+        );
+        assert_eq!(shard.get(b"k", &clock), None);
     }
 
     #[test]
