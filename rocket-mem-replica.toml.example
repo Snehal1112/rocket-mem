@@ -96,6 +96,21 @@
 # checked for reachability.
 # replica_announce_addr = "10.0.0.7:16479"
 
+# Minimum number of replicas that must have acknowledged within min_replicas_max_lag_secs
+# below for this node to accept write commands once it is a leader. Dormant while this
+# node is replicating: a replica already rejects client writes with READONLY regardless
+# of this setting -- READONLY and fencing are independent gates, and READONLY always wins
+# on a replica. It takes effect the instant REPLICAOF NO ONE promotes this node, which is
+# exactly why it's worth setting here ahead of time rather than remembering to add it
+# during a failover. 0 disables write fencing entirely, which is the default.
+# min_replicas_to_write = 0
+
+# How many seconds old a replica's last acked offset may be and still count as "good"
+# for min_replicas_to_write above. Ignored while min_replicas_to_write is 0. Setting
+# min_replicas_to_write above 0 while leaving this at 0 is a startup error -- no
+# replica could ever qualify and every write would be refused forever.
+# min_replicas_max_lag_secs = 10
+
 # --- ACL / authentication -----------------------------------------------------
 # Must match the LEADER's [[acl.users]] username/password exactly: REPLICAOF's AUTH clause
 # (see "Wiring it up" below) authenticates this replica's connection to the leader with these

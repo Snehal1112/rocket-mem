@@ -69,7 +69,7 @@ snapshot_path = "./dump-shard-b.snapshot"
 # Minimum command duration, in microseconds, that gets recorded to the slow log.
 # 0 disables the slow log entirely.
 # Default: 10000 (10ms)
-slowlog_threshold_micros = 1000
+slowlog_threshold_micros = 10000
 
 # --- Logging -----------------------------------------------------------------
 
@@ -126,7 +126,7 @@ cluster_probe_interval_secs = 20
 # reports it failed in CLUSTER NODES/SHARDS/INFO. Reporting only -- nothing is
 # promoted, no topology is rewritten, and routing is unchanged. Must be at least 1.
 # Default: 15
-cluster_node_timeout_secs = 15
+cluster_node_timeout_secs = 90
 
 # --- ACL / User Authentication ------------------------------------------------
 # File-only: there is no flat ROCKET_MEM_* env var that can express an array of

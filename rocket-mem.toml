@@ -33,7 +33,7 @@ snapshot_path = "./dump.snapshot"
 # Minimum command duration, in microseconds, that gets recorded to the slow log.
 # 0 disables the slow log entirely.
 # Default: 10000 (10ms)
-slowlog_threshold_micros = 1000
+slowlog_threshold_micros = 10000
 
 # --- Logging -----------------------------------------------------------------
 # Tracing filter directive (e.g. "info", "debug", "trace", "rocket_mem=debug,warn").
@@ -68,7 +68,7 @@ cluster_probe_interval_secs = 20
 # reports it failed in CLUSTER NODES/SHARDS/INFO. Reporting only -- nothing is
 # promoted, no topology is rewritten, and routing is unchanged. Must be at least 1.
 # Default: 15
-cluster_node_timeout_secs = 15
+cluster_node_timeout_secs = 90
 
 # --- TLS ---------------------------------------------------------------------
 # TLS listeners run *alongside* the plaintext ones — they never replace addr/rmp_addr.
