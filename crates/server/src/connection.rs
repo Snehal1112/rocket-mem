@@ -916,7 +916,13 @@ mod tests {
         let engine = Arc::new(Engine::new());
         let (_dir, aof) = test_aof();
         let replication = Arc::new(crate::replication::ReplicationHandle::default());
-        tokio::spawn(serve(listener, engine, aof, Arc::clone(&replication)));
+        tokio::spawn(serve(
+            listener,
+            engine,
+            aof,
+            Arc::clone(&replication),
+            Arc::from("test-node"),
+        ));
 
         let mut subscriber = Framed::new(
             TcpStream::connect(addr).await.unwrap(),
@@ -1721,7 +1727,13 @@ mod tests {
         let engine = Arc::new(Engine::new());
         let (_dir, aof) = test_aof();
         let replication = Arc::new(crate::replication::ReplicationHandle::default());
-        tokio::spawn(serve(listener, engine, aof, Arc::clone(&replication)));
+        tokio::spawn(serve(
+            listener,
+            engine,
+            aof,
+            Arc::clone(&replication),
+            Arc::from("test-node"),
+        ));
 
         let mut subscriber = Framed::new(
             TcpStream::connect(addr).await.unwrap(),
@@ -1799,7 +1811,13 @@ mod tests {
         let engine = Arc::new(Engine::new());
         let (_dir, aof) = test_aof();
         let replication = Arc::new(crate::replication::ReplicationHandle::default());
-        tokio::spawn(serve(listener, engine, aof, Arc::clone(&replication)));
+        tokio::spawn(serve(
+            listener,
+            engine,
+            aof,
+            Arc::clone(&replication),
+            Arc::from("test-node"),
+        ));
 
         let mut subscriber = Framed::new(
             TcpStream::connect(addr).await.unwrap(),
