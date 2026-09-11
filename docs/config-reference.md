@@ -82,6 +82,16 @@ in `CLUSTER SHARDS`, and `cluster_state:fail` with a non-zero `cluster_slots_pfa
 `rocket_mem_cluster_peers_unreachable`, carry the same information, and each state change is
 logged once — once per change, not once per probe.
 
+Each probe round is also a real TCP connection to the peer, whose own `connection.rs` accept
+loop would otherwise log a `connection accepted`/`connection closed` pair at `info` every
+round regardless of this section's "once per change" behavior — rocket-mem recognizes its own
+probe traffic and logs that pair at `debug` instead, so a healthy, unchanging cluster stays
+quiet at the `info` default. See `crates/server/src/cluster_health.rs`'s `PROBE_MARKER`.
+"Connection accepted" now logs on the connection's first frame rather than at TCP accept, so
+an idle-holding connection that never sends anything (an L4 health checker, a connection-pool
+pre-open) produces no accept line until it does — or never, if it never sends anything;
+`rocket_mem_connected_clients` remains the immediate signal for a live connection count.
+
 `cluster_slots_fail` stays `0` even then, and that is correct rather than a bug. Redis's *pfail*
 (`fail?`) means one node suspects a peer; *fail* means a majority agreed over the cluster bus.
 `rocket-mem` has no cluster bus and no quorum, so a suspicion here can never be promoted — nothing

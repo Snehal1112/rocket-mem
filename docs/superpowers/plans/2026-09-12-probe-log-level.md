@@ -66,7 +66,7 @@ Add to `crates/server/src/cluster_health.rs`'s `mod tests`, near `spawn_ping_res
                 let n = socket.read(&mut buf).await.unwrap_or(0);
                 let _ = tx.send(buf[..n].to_vec());
                 let _ = socket
-                    .write_all(b"$26\r\n__rocket_mem_peer_probe__\r\n")
+                    .write_all(b"$25\r\n__rocket_mem_peer_probe__\r\n")
                     .await;
             }
         });
@@ -78,7 +78,7 @@ Add to `crates/server/src/cluster_health.rs`'s `mod tests`, near `spawn_ping_res
         let (addr, rx) = spawn_capturing_responder().await;
         assert!(probe_once(&addr, Duration::from_secs(1), None).await);
         let sent = rx.await.unwrap();
-        let expected = b"*2\r\n$4\r\nPING\r\n$26\r\n__rocket_mem_peer_probe__\r\n";
+        let expected = b"*2\r\n$4\r\nPING\r\n$25\r\n__rocket_mem_peer_probe__\r\n";
         assert_eq!(
             sent, expected,
             "expected the exact PING <PROBE_MARKER> wire encoding, got: {}",
@@ -88,10 +88,10 @@ Add to `crates/server/src/cluster_health.rs`'s `mod tests`, near `spawn_ping_res
 
     #[test]
     fn probe_marker_is_the_length_the_wire_encoding_assumes() {
-        // The test above hardcodes `$26\r\n` for the marker's RESP bulk-length prefix; this
+        // The test above hardcodes `$25\r\n` for the marker's RESP bulk-length prefix; this
         // guards that assumption so a future edit to PROBE_MARKER's text fails loudly here
         // instead of silently breaking the wire-format assertion above.
-        assert_eq!(PROBE_MARKER.len(), 26);
+        assert_eq!(PROBE_MARKER.len(), 25);
     }
 ```
 
