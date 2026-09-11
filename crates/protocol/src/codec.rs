@@ -74,6 +74,24 @@ impl Encoder<Frame> for RespCodec {
                     }
                 }
             },
+            Frame::Push(items) => match self.protocol {
+                Protocol::Resp2 => {
+                    dst.put_u8(b'*');
+                    dst.put_slice(items.len().to_string().as_bytes());
+                    dst.put_slice(b"\r\n");
+                    for item in items {
+                        self.encode(item, dst)?;
+                    }
+                }
+                Protocol::Resp3 => {
+                    dst.put_u8(b'>');
+                    dst.put_slice(items.len().to_string().as_bytes());
+                    dst.put_slice(b"\r\n");
+                    for item in items {
+                        self.encode(item, dst)?;
+                    }
+                }
+            },
         }
         Ok(())
     }
@@ -431,5 +449,36 @@ mod tests {
         };
         codec.encode(frame, &mut buf).unwrap();
         assert_eq!(&buf[..], b"%2\r\n$1\r\na\r\n:1\r\n$1\r\nb\r\n:2\r\n");
+    }
+
+    #[test]
+    fn encodes_push_as_flattened_array_under_resp2() {
+        let mut buf = BytesMut::new();
+        let frame = Frame::Push(vec![
+            Frame::Bulk(Bytes::from_static(b"message")),
+            Frame::Bulk(Bytes::from_static(b"chan")),
+        ]);
+        RespCodec::default().encode(frame, &mut buf).unwrap();
+        assert_eq!(
+            &buf[..],
+            b"*2\r\n$7\r\nmessage\r\n$4\r\nchan\r\n".as_slice()
+        );
+    }
+
+    #[test]
+    fn encodes_push_natively_under_resp3() {
+        let mut buf = BytesMut::new();
+        let frame = Frame::Push(vec![
+            Frame::Bulk(Bytes::from_static(b"message")),
+            Frame::Bulk(Bytes::from_static(b"chan")),
+        ]);
+        let mut codec = RespCodec {
+            protocol: Protocol::Resp3,
+        };
+        codec.encode(frame, &mut buf).unwrap();
+        assert_eq!(
+            &buf[..],
+            b">2\r\n$7\r\nmessage\r\n$4\r\nchan\r\n".as_slice()
+        );
     }
 }
