@@ -215,13 +215,15 @@ impl Drop for ClientGuard {
 struct ConnectionStats {
     started_at: std::time::Instant,
     commands_served: u64,
+    is_probe: bool,
 }
 
 impl ConnectionStats {
-    fn new() -> Self {
+    fn new(is_probe: bool) -> Self {
         Self {
             started_at: std::time::Instant::now(),
             commands_served: 0,
+            is_probe,
         }
     }
 
@@ -232,12 +234,39 @@ impl ConnectionStats {
 
 impl Drop for ConnectionStats {
     fn drop(&mut self) {
-        tracing::info!(
-            elapsed_us = self.started_at.elapsed().as_micros().min(u64::MAX as u128) as u64,
-            commands_served = self.commands_served,
-            "connection closed"
-        );
+        let elapsed_us = self.started_at.elapsed().as_micros().min(u64::MAX as u128) as u64;
+        // See `is_probe_ping`'s doc comment: a probe connection's accept/close pair moves to
+        // `debug` so `cluster_probe_interval_secs` no longer dictates how many `info` lines a
+        // healthy, unchanging cluster produces every round.
+        if self.is_probe {
+            tracing::debug!(
+                elapsed_us,
+                commands_served = self.commands_served,
+                "connection closed"
+            );
+        } else {
+            tracing::info!(
+                elapsed_us,
+                commands_served = self.commands_served,
+                "connection closed"
+            );
+        }
     }
+}
+
+/// True when `frame` is exactly the two-argument `PING <PROBE_MARKER>` this node's own
+/// cluster-peer-liveness prober sends (`cluster_health::probe_ping`) -- never a bare `PING` or
+/// any other real command. Used only to pick the log level for one connection's accept/close
+/// pair; matching by exact bytes is not, and must never become, an authentication or security
+/// boundary -- see `cluster_health::PROBE_MARKER`'s own doc comment.
+fn is_probe_ping(frame: &protocol::Frame) -> bool {
+    let protocol::Frame::Array(items) = frame else {
+        return false;
+    };
+    let [protocol::Frame::Bulk(name), protocol::Frame::Bulk(arg)] = items.as_slice() else {
+        return false;
+    };
+    name.eq_ignore_ascii_case(b"PING") && arg.as_ref() == crate::cluster_health::PROBE_MARKER
 }
 
 // `protocol = %"RESP"`, not `protocol = "resp"`. A bare `&str` field records through `Debug`, so
@@ -274,14 +303,28 @@ async fn handle_connection<S>(
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    tracing::info!("connection accepted");
     replication.connection_opened();
     let _client_guard = ClientGuard(Arc::clone(&replication), client_id);
-    let mut conn_stats = ConnectionStats::new();
     let mut framed = Framed::new(socket, RespCodec::default());
     let session = dispatcher::Session::with_peer_addr(peer);
-    // Carries a frame pulled ahead by the pipelining peek below, so it isn't re-read.
-    let mut pending: Option<Option<std::io::Result<protocol::Frame>>> = None;
+    // Read the first frame before deciding "connection accepted"'s log level, so a peer-probe
+    // connection (see `is_probe_ping`) can log at `debug` instead of `info` -- this is the one
+    // behavior change for every OTHER connection too: a connection that disconnects (EOF or a
+    // decode error) before ever sending a valid frame no longer gets an "connection accepted"
+    // line at all, since there was never anything to inspect. `replication.connection_opened()`
+    // and `_client_guard` above are unaffected -- they still fire immediately and unconditionally,
+    // so the connected-clients gauge and pub/sub cleanup keep their exact existing timing.
+    let first = framed.next().await;
+    let is_probe = matches!(&first, Some(Ok(frame)) if is_probe_ping(frame));
+    if is_probe {
+        tracing::debug!("connection accepted");
+    } else {
+        tracing::info!("connection accepted");
+    }
+    let mut conn_stats = ConnectionStats::new(is_probe);
+    // Carries a frame pulled ahead -- either the pre-read `first` above, or the pipelining peek
+    // further down -- so it isn't re-read.
+    let mut pending: Option<Option<std::io::Result<protocol::Frame>>> = Some(first);
     loop {
         let next = match pending.take() {
             Some(n) => n,
@@ -656,13 +699,205 @@ mod tests {
         (dir, Arc::new(writer))
     }
 
+    #[test]
+    fn is_probe_ping_recognizes_the_exact_marker() {
+        let frame = Frame::Array(vec![
+            Frame::Bulk(Bytes::from_static(b"PING")),
+            Frame::Bulk(Bytes::from_static(crate::cluster_health::PROBE_MARKER)),
+        ]);
+        assert!(is_probe_ping(&frame));
+    }
+
+    #[test]
+    fn is_probe_ping_is_case_insensitive_on_the_command_name() {
+        let frame = Frame::Array(vec![
+            Frame::Bulk(Bytes::from_static(b"ping")),
+            Frame::Bulk(Bytes::from_static(crate::cluster_health::PROBE_MARKER)),
+        ]);
+        assert!(is_probe_ping(&frame));
+    }
+
+    #[test]
+    fn is_probe_ping_rejects_a_bare_ping() {
+        let frame = Frame::Array(vec![Frame::Bulk(Bytes::from_static(b"PING"))]);
+        assert!(!is_probe_ping(&frame));
+    }
+
+    #[test]
+    fn is_probe_ping_rejects_an_unrelated_ping_message() {
+        let frame = Frame::Array(vec![
+            Frame::Bulk(Bytes::from_static(b"PING")),
+            Frame::Bulk(Bytes::from_static(b"hello")),
+        ]);
+        assert!(!is_probe_ping(&frame));
+    }
+
+    #[test]
+    fn is_probe_ping_rejects_a_non_ping_command_even_with_the_marker_as_an_argument() {
+        let frame = Frame::Array(vec![
+            Frame::Bulk(Bytes::from_static(b"ECHO")),
+            Frame::Bulk(Bytes::from_static(crate::cluster_health::PROBE_MARKER)),
+        ]);
+        assert!(!is_probe_ping(&frame));
+    }
+
+    #[test]
+    fn is_probe_ping_rejects_a_non_array_frame() {
+        assert!(!is_probe_ping(&Frame::Simple("PING".into())));
+    }
+
+    /// Reproduces the exact bug this plan fixes: before it, `handle_connection` logged
+    /// "connection accepted"/"connection closed" at `info` unconditionally, so every peer-probe
+    /// round (a real, if synthetic, TCP connection) produced two `info` lines regardless of
+    /// `cluster_health.rs`'s own "log only on reachability change" design. `#[tokio::test]`
+    /// defaults to a current-thread runtime, so the `tokio::spawn`ed connection task below runs
+    /// on the same OS thread this test's `tracing::subscriber::set_default` guard covers --
+    /// unlike `capture_logs_at` above (fine for the synchronous `is_probe_ping` unit tests,
+    /// wrong tool for anything spanning a `.await` across a spawned task).
+    #[tokio::test]
+    async fn a_probe_connections_accept_and_close_log_at_debug_not_info() {
+        let writer = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(writer.clone())
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let engine = Arc::new(Engine::new());
+        let (_dir, aof) = test_aof();
+        let replication = Arc::new(crate::replication::ReplicationHandle::new(
+            Arc::clone(&engine),
+            std::env::temp_dir().join("probe-log-level-test-unused.snapshot"),
+        ));
+        tokio::spawn(serve(
+            listener,
+            Arc::clone(&engine),
+            Arc::clone(&aof),
+            Arc::clone(&replication),
+            Arc::from("test-node"),
+        ));
+
+        let mut probe = Framed::new(
+            TcpStream::connect(addr).await.unwrap(),
+            RespCodec::default(),
+        );
+        probe
+            .send(Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"PING")),
+                Frame::Bulk(Bytes::from_static(crate::cluster_health::PROBE_MARKER)),
+            ]))
+            .await
+            .unwrap();
+        assert_eq!(
+            probe.next().await.unwrap().unwrap(),
+            Frame::Bulk(Bytes::from_static(crate::cluster_health::PROBE_MARKER))
+        );
+        drop(probe);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let full_log = writer.text();
+        assert!(
+            full_log.contains("connection accepted") && full_log.contains("connection closed"),
+            "sanity check: the events must exist at debug, got: {full_log}"
+        );
+
+        drop(_guard);
+        let writer_info = CapturedLogs::default();
+        let subscriber_info = tracing_subscriber::fmt()
+            .with_writer(writer_info.clone())
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .finish();
+        let _guard2 = tracing::subscriber::set_default(subscriber_info);
+
+        let listener2 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr2 = listener2.local_addr().unwrap();
+        tokio::spawn(serve(
+            listener2,
+            Arc::clone(&engine),
+            Arc::clone(&aof),
+            Arc::clone(&replication),
+            Arc::from("test-node"),
+        ));
+        let mut probe2 = Framed::new(
+            TcpStream::connect(addr2).await.unwrap(),
+            RespCodec::default(),
+        );
+        probe2
+            .send(Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"PING")),
+                Frame::Bulk(Bytes::from_static(crate::cluster_health::PROBE_MARKER)),
+            ]))
+            .await
+            .unwrap();
+        probe2.next().await.unwrap().unwrap();
+        drop(probe2);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let info_log = writer_info.text();
+        assert!(
+            !info_log.contains("connection accepted") && !info_log.contains("connection closed"),
+            "a probe connection's accept/close pair must not appear at info, got: {info_log}"
+        );
+    }
+
+    /// Regression guard for real clients: an ordinary bare `PING` (no marker) must keep logging
+    /// its accept/close pair at `info`, exactly as before this plan.
+    #[tokio::test]
+    async fn an_ordinary_connections_accept_and_close_log_at_info() {
+        let writer = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(writer.clone())
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let engine = Arc::new(Engine::new());
+        let (_dir, aof) = test_aof();
+        let replication = Arc::new(crate::replication::ReplicationHandle::new(
+            Arc::clone(&engine),
+            std::env::temp_dir().join("probe-log-level-test-unused-2.snapshot"),
+        ));
+        tokio::spawn(serve(
+            listener,
+            Arc::clone(&engine),
+            Arc::clone(&aof),
+            Arc::clone(&replication),
+            Arc::from("test-node"),
+        ));
+
+        let mut client = Framed::new(
+            TcpStream::connect(addr).await.unwrap(),
+            RespCodec::default(),
+        );
+        client
+            .send(Frame::Array(vec![Frame::Bulk(Bytes::from_static(b"PING"))]))
+            .await
+            .unwrap();
+        client.next().await.unwrap().unwrap();
+        drop(client);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let log = writer.text();
+        assert!(
+            log.contains("connection accepted") && log.contains("connection closed"),
+            "an ordinary client connection must still log at info, got: {log}"
+        );
+    }
+
     /// Covers the helper all four accept loops call (plaintext and TLS, for both RESP and RMP).
     /// It does not prove those loops call it: each moves its accepted socket straight into a
     /// connection task, so no test holds a handle on the server side of the connection. Nagle is
     /// on by default, so observing `nodelay() == true` here means the call really flipped it.
     #[test]
     fn connection_stats_counts_each_recorded_command() {
-        let mut stats = ConnectionStats::new();
+        let mut stats = ConnectionStats::new(false);
         stats.record_command();
         stats.record_command();
         stats.record_command();
