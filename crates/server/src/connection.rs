@@ -1690,23 +1690,20 @@ mod tests {
             ]))
             .await
             .unwrap();
-        // Two things differ here from the brief's literal snippet, both because this test never
-        // negotiates RESP3 (no `HELLO 3`), so the connection stays on the default `Protocol::Resp2`:
-        // (1) `intercept_for_pubsub`'s SUBSCRIBE handler always wraps its per-channel
-        // confirmations in an outer `Frame::Array`, even for a single channel -- see
-        // `subscribe_replies_with_one_push_frame_per_channel_naming_the_running_count` in
-        // dispatcher.rs's tests, the existing contract for this reply shape.
-        // (2) `RespCodec` encodes `Frame::Push` as a plain `*`-array under RESP2 (only RESP3 uses
-        // the `>` push marker), and its decoder has no case for `>` at all -- so nothing this
-        // test decodes off the wire can ever come back as `Frame::Push`; every push arrives here
-        // as the structurally-identical `Frame::Array`.
+        // This test never negotiates RESP3 (no `HELLO 3`), so the connection stays on the default
+        // `Protocol::Resp2`: `RespCodec` encodes `Frame::Push` as a plain `*`-array under RESP2
+        // (only RESP3 uses the `>` push marker), and its decoder has no case for `>` at all -- so
+        // nothing this test decodes off the wire can ever come back as `Frame::Push`; every push
+        // arrives here as the structurally-identical `Frame::Array`. A single-channel SUBSCRIBE's
+        // confirmation is that one bare array -- never batched inside an outer array (that would
+        // break every real RESP client's per-channel handshake, and is invalid RESP3 to boot).
         assert_eq!(
             subscriber.next().await.unwrap().unwrap(),
-            Frame::Array(vec![Frame::Array(vec![
+            Frame::Array(vec![
                 Frame::Bulk(Bytes::from_static(b"subscribe")),
                 Frame::Bulk(Bytes::from_static(b"news")),
                 Frame::Integer(1),
-            ])])
+            ])
         );
 
         let mut publisher = Framed::new(
@@ -1746,6 +1743,48 @@ mod tests {
         assert_eq!(
             subscriber.next().await.unwrap().unwrap(),
             Frame::Simple("PONG".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribing_to_two_channels_in_one_call_yields_two_separate_top_level_replies() {
+        // A real client issuing `SUBSCRIBE news sports` in one call must read back two
+        // independent, well-formed replies -- never one call yielding a single batched frame.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let engine = Arc::new(Engine::new());
+        let (_dir, aof) = test_aof();
+        let replication = Arc::new(crate::replication::ReplicationHandle::default());
+        tokio::spawn(serve(listener, engine, aof, Arc::clone(&replication)));
+
+        let mut subscriber = Framed::new(
+            TcpStream::connect(addr).await.unwrap(),
+            RespCodec::default(),
+        );
+        subscriber
+            .send(Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"SUBSCRIBE")),
+                Frame::Bulk(Bytes::from_static(b"news")),
+                Frame::Bulk(Bytes::from_static(b"sports")),
+            ]))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            subscriber.next().await.unwrap().unwrap(),
+            Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"subscribe")),
+                Frame::Bulk(Bytes::from_static(b"news")),
+                Frame::Integer(1),
+            ])
+        );
+        assert_eq!(
+            subscriber.next().await.unwrap().unwrap(),
+            Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"subscribe")),
+                Frame::Bulk(Bytes::from_static(b"sports")),
+                Frame::Integer(2),
+            ])
         );
     }
 }

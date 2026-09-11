@@ -51,7 +51,11 @@ impl PubSubRegistry {
             return 0;
         };
         subs.retain(|s| s.client_id != client_id);
-        subs.len()
+        let remaining = subs.len();
+        if remaining == 0 {
+            channels.remove(channel);
+        }
+        remaining
     }
 
     /// Registers `client_id`'s outbound channel under `pattern`, returning how many
@@ -79,7 +83,11 @@ impl PubSubRegistry {
             return 0;
         };
         subs.retain(|s| s.client_id != client_id);
-        subs.len()
+        let remaining = subs.len();
+        if remaining == 0 {
+            patterns.remove(pattern);
+        }
+        remaining
     }
 
     /// Returns the list of all channels that have at least one subscriber.
@@ -133,6 +141,10 @@ impl PubSubRegistry {
                     }
                     alive
                 });
+                let now_empty = subs.is_empty();
+                if now_empty {
+                    channels.remove(channel);
+                }
             }
         }
         {
@@ -361,6 +373,57 @@ mod tests {
             0
         );
         assert_eq!(registry.num_pat(), 0);
+    }
+
+    #[test]
+    fn unsubscribe_of_the_last_subscriber_removes_the_channel_map_entry() {
+        let registry = PubSubRegistry::default();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        registry.subscribe(Bytes::from_static(b"news"), 1, tx);
+
+        let remaining = registry.unsubscribe(b"news", 1);
+
+        assert_eq!(remaining, 0);
+        assert!(registry.channels().is_empty());
+
+        // A fresh subscribe/unsubscribe cycle must not accumulate stale entries either.
+        let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel();
+        registry.subscribe(Bytes::from_static(b"news"), 2, tx2);
+        registry.unsubscribe(b"news", 2);
+        assert!(registry.channels().is_empty());
+    }
+
+    #[test]
+    fn punsubscribe_of_the_last_subscriber_removes_the_pattern_map_entry() {
+        let registry = PubSubRegistry::default();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        registry.psubscribe(Bytes::from_static(b"news.*"), 1, tx);
+
+        let remaining = registry.punsubscribe(b"news.*", 1);
+
+        assert_eq!(remaining, 0);
+        assert_eq!(registry.num_pat(), 0);
+
+        let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel();
+        registry.psubscribe(Bytes::from_static(b"news.*"), 2, tx2);
+        registry.punsubscribe(b"news.*", 2);
+        assert_eq!(registry.num_pat(), 0);
+    }
+
+    #[test]
+    fn publish_prunes_a_now_empty_channel_entry_after_delivering_to_a_dead_receiver() {
+        let registry = PubSubRegistry::default();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(rx);
+        registry.subscribe(Bytes::from_static(b"news"), 1, tx);
+
+        let delivered = registry.publish(b"news", &Bytes::from_static(b"hello"));
+
+        assert_eq!(delivered, 0);
+        assert!(
+            !registry.channels().contains(&Bytes::from_static(b"news")),
+            "channel with only a dead subscriber must be pruned from the map, not left empty"
+        );
     }
 
     #[test]

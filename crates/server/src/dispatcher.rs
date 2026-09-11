@@ -79,6 +79,11 @@ pub struct Session {
     /// (not private): `connection.rs`'s `handle_connection` locks it directly each loop
     /// iteration to decide whether to race it against `framed.next()` in a `tokio::select!`.
     pub(crate) push_rx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<Frame>>>,
+    /// `true` for a session backed by an RMP connection. Pub/sub is RESP-only for v1 (see the
+    /// pub/sub spec's "Out of scope" section) -- checked at the top of `intercept_for_pubsub` so
+    /// an RMP client gets a clear error instead of a registration nothing ever drains, and a reply
+    /// frame RMP's own encoder cannot represent.
+    is_rmp: bool,
 }
 
 impl Session {
@@ -95,6 +100,7 @@ impl Session {
             subscription_count: std::sync::atomic::AtomicUsize::new(0),
             push_tx: std::sync::Mutex::new(None),
             push_rx: std::sync::Mutex::new(None),
+            is_rmp: false,
         }
     }
 
@@ -102,6 +108,15 @@ impl Session {
     pub fn with_peer_addr(peer_addr: std::net::SocketAddr) -> Self {
         Self {
             peer_addr: Some(peer_addr),
+            ..Self::new()
+        }
+    }
+
+    /// An RMP connection's `Session` -- see the `is_rmp` field's doc comment for why this needs to
+    /// be distinguishable from a RESP session at all.
+    pub fn new_for_rmp() -> Self {
+        Self {
+            is_rmp: true,
             ..Self::new()
         }
     }
@@ -3442,8 +3457,21 @@ fn intercept_for_pubsub(
         return None;
     };
     let name = upper_name(name_bytes)?;
+    if session.is_rmp
+        && matches!(
+            name.as_str(),
+            "SUBSCRIBE" | "UNSUBSCRIBE" | "PSUBSCRIBE" | "PUNSUBSCRIBE" | "PUBLISH" | "PUBSUB"
+        )
+    {
+        return Some(Frame::Error("ERR pub/sub is not supported over RMP".into()));
+    }
     match name.as_str() {
         "SUBSCRIBE" => {
+            if items.len() < 2 {
+                return Some(Frame::Error(
+                    "ERR wrong number of arguments for 'subscribe' command".into(),
+                ));
+            }
             let tx = ensure_push_channel(session);
             let mut replies = Vec::new();
             for item in &items[1..] {
@@ -3468,9 +3496,15 @@ fn intercept_for_pubsub(
                     Frame::Integer(count as i64),
                 ]));
             }
-            Some(Frame::Array(replies))
+            let mut iter = replies.into_iter();
+            let first = iter.next();
+            for extra in iter {
+                let _ = tx.send(extra);
+            }
+            first
         }
         "UNSUBSCRIBE" => {
+            let tx = ensure_push_channel(session);
             let explicit: Vec<Bytes> = items[1..]
                 .iter()
                 .filter_map(|f| match f {
@@ -3508,9 +3542,26 @@ fn intercept_for_pubsub(
                     Frame::Integer(count as i64),
                 ]));
             }
-            Some(Frame::Array(replies))
+            if replies.is_empty() {
+                replies.push(Frame::Push(vec![
+                    Frame::Bulk(Bytes::from_static(b"unsubscribe")),
+                    Frame::Null,
+                    Frame::Integer(0),
+                ]));
+            }
+            let mut iter = replies.into_iter();
+            let first = iter.next();
+            for extra in iter {
+                let _ = tx.send(extra);
+            }
+            first
         }
         "PSUBSCRIBE" => {
+            if items.len() < 2 {
+                return Some(Frame::Error(
+                    "ERR wrong number of arguments for 'psubscribe' command".into(),
+                ));
+            }
             let tx = ensure_push_channel(session);
             let mut replies = Vec::new();
             for item in &items[1..] {
@@ -3534,9 +3585,15 @@ fn intercept_for_pubsub(
                     Frame::Integer(count as i64),
                 ]));
             }
-            Some(Frame::Array(replies))
+            let mut iter = replies.into_iter();
+            let first = iter.next();
+            for extra in iter {
+                let _ = tx.send(extra);
+            }
+            first
         }
         "PUNSUBSCRIBE" => {
+            let tx = ensure_push_channel(session);
             let explicit: Vec<Bytes> = items[1..]
                 .iter()
                 .filter_map(|f| match f {
@@ -3574,7 +3631,19 @@ fn intercept_for_pubsub(
                     Frame::Integer(count as i64),
                 ]));
             }
-            Some(Frame::Array(replies))
+            if replies.is_empty() {
+                replies.push(Frame::Push(vec![
+                    Frame::Bulk(Bytes::from_static(b"punsubscribe")),
+                    Frame::Null,
+                    Frame::Integer(0),
+                ]));
+            }
+            let mut iter = replies.into_iter();
+            let first = iter.next();
+            for extra in iter {
+                let _ = tx.send(extra);
+            }
+            first
         }
         "PUBLISH" => {
             let (Some(Frame::Bulk(channel)), Some(Frame::Bulk(message))) =
@@ -3591,8 +3660,15 @@ fn intercept_for_pubsub(
             // receive it; see the spec's "Why not dispatch()" section for why the follower side
             // (Plan 06) intercepts this in its apply loop rather than routing it through
             // dispatch()'s engine-mutation path.
-            if let Ok(encoded) = crate::aof::encode_frame(frame) {
-                replication.registry.broadcast(Bytes::from(encoded));
+            match crate::aof::encode_frame(frame) {
+                Ok(encoded) => {
+                    let bytes = Bytes::from(encoded);
+                    replication.advance_master_repl_offset(bytes.len() as u64);
+                    replication.registry.broadcast(bytes);
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "aof encode failed for PUBLISH broadcast");
+                }
             }
             tracing::debug!(
                 channel = %crate::logging::escape_ident(&String::from_utf8_lossy(channel)),
@@ -5268,6 +5344,23 @@ mod tests {
         );
     }
 
+    /// Drains every frame currently queued on `session.push_rx`, in order, WITHOUT taking the
+    /// receiver out of the session (a real connection may still need to receive more pushes
+    /// afterward, and dropping the receiver would make every subsequent `tx.send` silently fail).
+    /// Used by dispatcher-level unit tests to observe the extra confirmations `intercept_for_pubsub`
+    /// queues on the push channel beyond the first, which it now returns directly as the reply.
+    fn drain_push_rx(session: &Session) -> Vec<Frame> {
+        let mut guard = session.push_rx.lock().unwrap_or_else(|e| e.into_inner());
+        let rx = guard
+            .as_mut()
+            .expect("push channel should have been created by a SUBSCRIBE/PSUBSCRIBE/UNSUBSCRIBE/PUNSUBSCRIBE call");
+        let mut frames = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            frames.push(frame);
+        }
+        frames
+    }
+
     #[test]
     fn subscribe_replies_with_one_push_frame_per_channel_naming_the_running_count() {
         let session = Session::new();
@@ -5279,19 +5372,82 @@ mod tests {
             1,
         )
         .unwrap();
+        // Only the FIRST channel's confirmation comes back as the direct reply -- never a
+        // batched array (that would break every real RESP client's per-channel handshake, and
+        // is invalid RESP3 to boot: a `>`-type push nested inside a `*`-type array).
         assert_eq!(
             reply,
-            Frame::Array(vec![
-                Frame::Push(vec![
-                    Frame::Bulk(Bytes::from_static(b"subscribe")),
-                    Frame::Bulk(Bytes::from_static(b"news")),
-                    Frame::Integer(1),
-                ]),
-                Frame::Push(vec![
-                    Frame::Bulk(Bytes::from_static(b"subscribe")),
-                    Frame::Bulk(Bytes::from_static(b"sports")),
-                    Frame::Integer(2),
-                ]),
+            Frame::Push(vec![
+                Frame::Bulk(Bytes::from_static(b"subscribe")),
+                Frame::Bulk(Bytes::from_static(b"news")),
+                Frame::Integer(1),
+            ])
+        );
+        // The second channel's confirmation arrives as an independent frame on the push channel.
+        assert_eq!(
+            drain_push_rx(&session),
+            vec![Frame::Push(vec![
+                Frame::Bulk(Bytes::from_static(b"subscribe")),
+                Frame::Bulk(Bytes::from_static(b"sports")),
+                Frame::Integer(2),
+            ])]
+        );
+    }
+
+    #[test]
+    fn subscribe_to_a_single_channel_yields_a_bare_push_frame_as_its_only_reply() {
+        // The core wire-compatibility fix: a real RESP2 client subscribing to one channel reads
+        // exactly one reply, and that reply's first element is literally the bulk string
+        // "subscribe" -- not an outer array wrapping it.
+        let session = Session::new();
+        let replication = crate::replication::ReplicationHandle::default();
+        let reply = intercept_for_pubsub(&cmd(&[b"SUBSCRIBE", b"news"]), &session, &replication, 1)
+            .unwrap();
+        assert_eq!(
+            reply,
+            Frame::Push(vec![
+                Frame::Bulk(Bytes::from_static(b"subscribe")),
+                Frame::Bulk(Bytes::from_static(b"news")),
+                Frame::Integer(1),
+            ])
+        );
+        assert!(
+            drain_push_rx(&session).is_empty(),
+            "a single-channel SUBSCRIBE must not queue any extra confirmations"
+        );
+    }
+
+    #[test]
+    fn subscribe_to_two_channels_yields_two_separate_well_formed_top_level_replies() {
+        let session = Session::new();
+        let replication = crate::replication::ReplicationHandle::default();
+        let first = intercept_for_pubsub(
+            &cmd(&[b"SUBSCRIBE", b"news", b"sports"]),
+            &session,
+            &replication,
+            1,
+        )
+        .unwrap();
+        let rest = drain_push_rx(&session);
+
+        // Both are independently well-formed Push frames -- neither nested inside the other.
+        assert!(matches!(first, Frame::Push(_)));
+        assert_eq!(rest.len(), 1);
+        assert!(matches!(rest[0], Frame::Push(_)));
+        assert_eq!(
+            first,
+            Frame::Push(vec![
+                Frame::Bulk(Bytes::from_static(b"subscribe")),
+                Frame::Bulk(Bytes::from_static(b"news")),
+                Frame::Integer(1),
+            ])
+        );
+        assert_eq!(
+            rest[0],
+            Frame::Push(vec![
+                Frame::Bulk(Bytes::from_static(b"subscribe")),
+                Frame::Bulk(Bytes::from_static(b"sports")),
+                Frame::Integer(2),
             ])
         );
     }
@@ -5318,6 +5474,9 @@ mod tests {
             &replication,
             1,
         );
+        // Drain the "sports" subscribe confirmation queued alongside the direct "news" reply,
+        // so it doesn't get mistaken for one of UNSUBSCRIBE's own queued replies below.
+        drain_push_rx(&session);
 
         let reply = intercept_for_pubsub(&cmd(&[b"UNSUBSCRIBE"]), &session, &replication, 1);
 
@@ -5335,20 +5494,22 @@ mod tests {
         );
         // Both channels' own reply frames are present, in subscription order, each counting
         // down: 1 remaining after leaving "news" (still on "sports"), 0 after leaving "sports".
+        // Only the first comes back as the direct reply; the second is queued on the push channel.
         assert_eq!(
             reply,
-            Some(Frame::Array(vec![
-                Frame::Push(vec![
-                    Frame::Bulk(Bytes::from_static(b"unsubscribe")),
-                    Frame::Bulk(Bytes::from_static(b"news")),
-                    Frame::Integer(1),
-                ]),
-                Frame::Push(vec![
-                    Frame::Bulk(Bytes::from_static(b"unsubscribe")),
-                    Frame::Bulk(Bytes::from_static(b"sports")),
-                    Frame::Integer(0),
-                ]),
+            Some(Frame::Push(vec![
+                Frame::Bulk(Bytes::from_static(b"unsubscribe")),
+                Frame::Bulk(Bytes::from_static(b"news")),
+                Frame::Integer(1),
             ]))
+        );
+        assert_eq!(
+            drain_push_rx(&session),
+            vec![Frame::Push(vec![
+                Frame::Bulk(Bytes::from_static(b"unsubscribe")),
+                Frame::Bulk(Bytes::from_static(b"sports")),
+                Frame::Integer(0),
+            ])]
         );
     }
 
@@ -5364,12 +5525,61 @@ mod tests {
         );
         assert_eq!(
             reply,
-            Some(Frame::Array(vec![Frame::Push(vec![
+            Some(Frame::Push(vec![
                 Frame::Bulk(Bytes::from_static(b"unsubscribe")),
                 Frame::Bulk(Bytes::from_static(b"never-subscribed")),
                 Frame::Integer(0),
-            ])]))
+            ]))
         );
+        assert!(drain_push_rx(&session).is_empty());
+    }
+
+    #[test]
+    fn subscribe_over_rmp_is_rejected_and_never_registers_anything() {
+        // Pub/sub is RESP-only for v1 (see the pub/sub spec's "Out of scope" section). An RMP
+        // session must get a clear error instead of a registration nothing ever drains, and a
+        // reply frame RMP's own encoder cannot represent.
+        let session = Session::new_for_rmp();
+        let replication = crate::replication::ReplicationHandle::default();
+
+        let reply = intercept_for_pubsub(&cmd(&[b"SUBSCRIBE", b"news"]), &session, &replication, 1);
+
+        assert_eq!(
+            reply,
+            Some(Frame::Error("ERR pub/sub is not supported over RMP".into()))
+        );
+        assert!(
+            session
+                .push_tx
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_none(),
+            "no push channel should have been created for a rejected RMP subscribe"
+        );
+        assert!(session
+            .push_rx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_none());
+        assert!(replication.pubsub.channels().is_empty());
+    }
+
+    #[test]
+    fn unsubscribe_with_no_arguments_and_no_active_subscriptions_replies_once_with_nil_channel() {
+        // Real Redis still sends exactly ONE reply here -- a nil channel, count 0 -- never
+        // nothing at all.
+        let session = Session::new();
+        let replication = crate::replication::ReplicationHandle::default();
+        let reply = intercept_for_pubsub(&cmd(&[b"UNSUBSCRIBE"]), &session, &replication, 1);
+        assert_eq!(
+            reply,
+            Some(Frame::Push(vec![
+                Frame::Bulk(Bytes::from_static(b"unsubscribe")),
+                Frame::Null,
+                Frame::Integer(0),
+            ]))
+        );
+        assert!(drain_push_rx(&session).is_empty());
     }
 
     #[test]
@@ -5450,6 +5660,38 @@ mod tests {
             bytes::Bytes::from(
                 crate::aof::encode_frame(&cmd(&[b"PUBLISH", b"news", b"hello"])).unwrap()
             )
+        );
+    }
+
+    /// A follower's `sync_once` apply loop advances its own offset by `frame_len` for every
+    /// decoded frame, `PUBLISH` included -- so the leader must advance its own
+    /// `master_repl_offset` by the exact same encoded length when it broadcasts a `PUBLISH`, or
+    /// a follower's offset silently drifts ahead of its leader's. Mirrors
+    /// `writes_advance_the_master_replication_offset_with_no_replicas_attached`.
+    #[test]
+    fn publish_advances_the_master_replication_offset_by_the_encoded_frame_length() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let replication = ReplicationHandle::default();
+        assert_eq!(replication.master_repl_offset(), 0);
+
+        dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"PUBLISH", b"news", b"hello"]),
+            &Session::new(),
+            1,
+        );
+
+        let encoded_len = crate::aof::encode_frame(&cmd(&[b"PUBLISH", b"news", b"hello"]))
+            .unwrap()
+            .len() as u64;
+        assert_eq!(
+            replication.master_repl_offset(),
+            encoded_len,
+            "PUBLISH must advance the offset by exactly the bytes it broadcast, just like an \
+             ordinary write, to keep a follower's offset from drifting ahead of the leader's"
         );
     }
 
