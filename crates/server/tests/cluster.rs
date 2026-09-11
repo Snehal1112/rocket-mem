@@ -380,6 +380,7 @@ async fn spawn_cluster_with_one_dead_node() -> (Vec<tempfile::TempDir>, Vec<Stri
             &cluster,
             std::time::Duration::from_millis(50),
             std::time::Duration::from_secs(1),
+            None,
         );
         let replication = Arc::new(
             rocket_mem::replication::ReplicationHandle::new(

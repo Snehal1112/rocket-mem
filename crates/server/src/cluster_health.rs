@@ -142,21 +142,59 @@ const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 /// The prober deliberately never authenticates: it needs liveness, not access, and giving this
 /// loop cluster-wide credentials would be a new secret to manage for no extra information. See
 /// the failover-safety design contract, §2.6.
-async fn probe_once(addr: &str, timeout: Duration) -> bool {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+///
+/// `tls_client_config` mirrors replication's own TLS gating (`tls::load_client_config`, built
+/// from this node's `tls_ca_path`): `None` dials `addr` in plaintext, `Some` wraps the connection
+/// in TLS first. This must match what `addr` actually is -- a plaintext PING sent straight at a
+/// TLS listener is not a valid TLS record, so the peer's handshake fails and this probe never
+/// sees a reply, permanently misreporting a healthy peer as down.
+async fn probe_once(
+    addr: &str,
+    timeout: Duration,
+    tls_client_config: Option<&Arc<rustls::ClientConfig>>,
+) -> bool {
     let probe = async {
-        let mut socket = tokio::net::TcpStream::connect(addr).await.ok()?;
-        socket.write_all(b"*1\r\n$4\r\nPING\r\n").await.ok()?;
-        let mut buf = [0u8; 32];
-        let read = socket.read(&mut buf).await.ok()?;
-        // A zero-length read is the peer closing the connection, not answering it.
-        (read > 0 && (buf[0] == b'+' || buf[0] == b'-')).then_some(())
+        let tcp = tokio::net::TcpStream::connect(addr).await.ok()?;
+        match tls_client_config {
+            Some(config) => {
+                let host = addr.rsplit_once(':').map_or(addr, |(h, _)| h);
+                let server_name = rustls::pki_types::ServerName::try_from(host.to_string()).ok()?;
+                let tls = tokio_rustls::TlsConnector::from(Arc::clone(config))
+                    .connect(server_name, tcp)
+                    .await
+                    .ok()?;
+                probe_ping(tls).await
+            }
+            None => probe_ping(tcp).await,
+        }
     };
     tokio::time::timeout(timeout, probe)
         .await
         .ok()
         .flatten()
         .is_some()
+}
+
+/// Sends one `PING` on `socket` and reads the first bytes of a reply. `true` means something
+/// answered. Generic over the stream type so `probe_once` can share this between its plaintext
+/// and TLS branches without a boxed trait object -- see `replication::connect_and_sync`'s
+/// `sync_once` for the same monomorphization-over-dynamic-dispatch choice in this codebase.
+async fn probe_ping<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    mut socket: S,
+) -> Option<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    socket.write_all(b"*1\r\n$4\r\nPING\r\n").await.ok()?;
+    let mut buf = [0u8; 32];
+    let read = socket.read(&mut buf).await.ok()?;
+    // A zero-length read is the peer closing the connection, not answering it.
+    let answered = read > 0 && (buf[0] == b'+' || buf[0] == b'-');
+    // Best-effort graceful close. Over TLS this sends a `close_notify` alert before the socket
+    // closes; dropping the stream without it leaves the peer's rustls session reading a bare TCP
+    // EOF, which it reports as an error ("peer closed connection without sending TLS
+    // close_notify") rather than a clean shutdown, once per probe. Harmless on the plaintext path
+    // (just shuts down the write half), so this runs unconditionally for both branches.
+    let _ = socket.shutdown().await;
+    answered.then_some(())
 }
 
 /// One probe round: probes every peer concurrently, records the successes, and returns the peers
@@ -177,13 +215,15 @@ async fn probe_round(
     peers: &[(String, String)],
     health: &PeerHealth,
     probe_timeout: Duration,
+    tls_client_config: Option<&Arc<rustls::ClientConfig>>,
     last_reported: &mut HashMap<String, bool>,
 ) -> Vec<(String, bool)> {
-    let results = futures_util::future::join_all(
-        peers
-            .iter()
-            .map(|(id, addr)| async move { (id.as_str(), probe_once(addr, probe_timeout).await) }),
-    )
+    let results = futures_util::future::join_all(peers.iter().map(|(id, addr)| async move {
+        (
+            id.as_str(),
+            probe_once(addr, probe_timeout, tls_client_config).await,
+        )
+    }))
     .await;
     let mut changed = Vec::new();
     for (id, answered) in results {
@@ -207,10 +247,16 @@ async fn probe_round(
 /// Observational only. It writes nothing but timestamps: no promotion, no `cluster.conf` rewrite,
 /// no routing change. A slot's configured owner stays its owner while it is dead, and
 /// `cluster_redirect` keeps sending clients there -- see this module's doc comment.
+///
+/// `tls_client_config` is `Some` exactly when this node's `tls_ca_path` is set, matching
+/// replication's own TLS gating -- see `probe_once`. Every peer is probed the same way: this
+/// project's TLS story is one shared trust cert across the whole deployment, not a per-peer
+/// setting, so there is no per-peer plaintext/TLS mix to account for.
 pub async fn run_peer_prober(
     cluster: Arc<ClusterConfig>,
     health: Arc<PeerHealth>,
     interval: Duration,
+    tls_client_config: Option<Arc<rustls::ClientConfig>>,
 ) {
     let my_id = cluster.myself().id.clone();
     // The peer list is snapshotted once: `ClusterConfig` never changes for the life of the
@@ -234,7 +280,14 @@ pub async fn run_peer_prober(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         ticker.tick().await;
-        for (id, reachable) in probe_round(&peers, &health, PROBE_TIMEOUT, &mut last_reported).await
+        for (id, reachable) in probe_round(
+            &peers,
+            &health,
+            PROBE_TIMEOUT,
+            tls_client_config.as_ref(),
+            &mut last_reported,
+        )
+        .await
         {
             if reachable {
                 tracing::info!(
@@ -260,16 +313,22 @@ pub async fn run_peer_prober(
 ///
 /// Called only in cluster mode: a standalone node has no peers, so it gets no map at all and its
 /// `CLUSTER` replies keep reporting exactly what they reported before this existed.
+///
+/// `tls_client_config` should be this node's own replication TLS client config (built from
+/// `tls_ca_path`) when it has one -- see `probe_once`'s doc comment for why the prober must match
+/// it rather than always dialing plaintext.
 pub fn spawn_peer_prober(
     cluster: &Arc<ClusterConfig>,
     probe_interval: Duration,
     node_timeout: Duration,
+    tls_client_config: Option<Arc<rustls::ClientConfig>>,
 ) -> Arc<PeerHealth> {
     let health = Arc::new(PeerHealth::for_cluster(cluster, node_timeout));
     tokio::spawn(run_peer_prober(
         Arc::clone(cluster),
         Arc::clone(&health),
         probe_interval,
+        tls_client_config,
     ));
     health
 }
@@ -407,13 +466,13 @@ shard-c 127.0.0.1:7003 10923 16383
     #[tokio::test]
     async fn a_probe_of_a_live_node_succeeds() {
         let addr = spawn_ping_responder().await;
-        assert!(probe_once(&addr, Duration::from_secs(1)).await);
+        assert!(probe_once(&addr, Duration::from_secs(1), None).await);
     }
 
     #[tokio::test]
     async fn a_probe_of_an_address_nothing_listens_on_fails() {
         let addr = dead_addr().await;
-        assert!(!probe_once(&addr, Duration::from_secs(1)).await);
+        assert!(!probe_once(&addr, Duration::from_secs(1), None).await);
     }
 
     #[tokio::test]
@@ -426,7 +485,100 @@ shard-c 127.0.0.1:7003 10923 16383
             let _accepted = listener.accept().await;
             std::future::pending::<()>().await; // hold the connection open, answer nothing
         });
-        assert!(!probe_once(&addr, Duration::from_millis(50)).await);
+        assert!(!probe_once(&addr, Duration::from_millis(50), None).await);
+    }
+
+    fn fixture(name: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(name)
+    }
+
+    /// A minimal TLS-wrapped responder: accepts a TLS handshake using the repo's self-signed test
+    /// cert, then answers one `PING` per connection with `+PONG\r\n` over the encrypted stream.
+    /// Returns a `host:port` string using the cert's `localhost` SAN, not the raw IP, since
+    /// `ServerName` validation needs a name the certificate actually covers.
+    async fn spawn_tls_ping_responder() -> (String, Arc<rustls::ClientConfig>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server_config =
+            crate::tls::load_server_config(&fixture("test-cert.pem"), &fixture("test-key.pem"))
+                .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    if let Ok(mut tls) = acceptor.accept(socket).await {
+                        let mut buf = [0u8; 64];
+                        if tls.read(&mut buf).await.unwrap_or(0) > 0 {
+                            let _ = tls.write_all(b"+PONG\r\n").await;
+                        }
+                    }
+                });
+            }
+        });
+        let client_config = crate::tls::load_client_config(&fixture("test-cert.pem")).unwrap();
+        (format!("localhost:{port}"), client_config)
+    }
+
+    #[tokio::test]
+    async fn a_probe_without_a_tls_client_config_fails_against_a_tls_listener() {
+        // Reproduces the bug: a plaintext PING sent straight at a TLS listener is not a valid TLS
+        // record, so the peer's handshake fails and the prober never sees a reply.
+        let (addr, _client_config) = spawn_tls_ping_responder().await;
+        assert!(!probe_once(&addr, Duration::from_secs(1), None).await);
+    }
+
+    #[tokio::test]
+    async fn a_probe_with_a_matching_tls_client_config_succeeds_against_a_tls_listener() {
+        let (addr, client_config) = spawn_tls_ping_responder().await;
+        assert!(probe_once(&addr, Duration::from_secs(1), Some(&client_config)).await);
+    }
+
+    /// Like `spawn_tls_ping_responder`, but after answering the `PING` it attempts one more read
+    /// and reports over `tx` whether that read saw a clean EOF (`Ok(0)`) or an error. A client that
+    /// drops its `TlsStream` without an explicit shutdown never sends a TLS `close_notify` alert,
+    /// which rustls surfaces on this side as an error rather than a graceful close -- exactly the
+    /// "peer closed connection without sending TLS close_notify" warning this test guards against.
+    async fn spawn_tls_ping_responder_reporting_shutdown() -> (
+        String,
+        Arc<rustls::ClientConfig>,
+        tokio::sync::oneshot::Receiver<bool>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server_config =
+            crate::tls::load_server_config(&fixture("test-cert.pem"), &fixture("test-key.pem"))
+                .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            if let Ok((socket, _)) = listener.accept().await {
+                if let Ok(mut tls) = acceptor.accept(socket).await {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 64];
+                    if tls.read(&mut buf).await.unwrap_or(0) > 0 {
+                        let _ = tls.write_all(b"+PONG\r\n").await;
+                    }
+                    let clean_close = matches!(tls.read(&mut buf).await, Ok(0));
+                    let _ = tx.send(clean_close);
+                }
+            }
+        });
+        let client_config = crate::tls::load_client_config(&fixture("test-cert.pem")).unwrap();
+        (format!("localhost:{port}"), client_config, rx)
+    }
+
+    #[tokio::test]
+    async fn a_tls_probe_closes_its_connection_with_a_close_notify() {
+        let (addr, client_config, rx) = spawn_tls_ping_responder_reporting_shutdown().await;
+        assert!(probe_once(&addr, Duration::from_secs(1), Some(&client_config)).await);
+        assert!(
+            rx.await.unwrap(),
+            "prober must send a TLS close_notify on shutdown, not just drop the connection"
+        );
     }
 
     #[tokio::test]
@@ -447,6 +599,7 @@ shard-c 127.0.0.1:7003 10923 16383
             std::sync::Arc::clone(&config),
             std::sync::Arc::clone(&health),
             Duration::from_millis(20),
+            None,
         ));
         tokio::time::sleep(Duration::from_millis(150)).await;
         task.abort();
@@ -473,6 +626,7 @@ shard-c 127.0.0.1:7003 10923 16383
             std::sync::Arc::clone(&config),
             std::sync::Arc::clone(&health),
             Duration::from_millis(20),
+            None,
         ));
         tokio::time::sleep(Duration::from_millis(150)).await;
         task.abort();
@@ -489,7 +643,12 @@ shard-c 127.0.0.1:7003 10923 16383
             )
             .unwrap(),
         );
-        let health = spawn_peer_prober(&config, Duration::from_millis(20), Duration::from_secs(1));
+        let health = spawn_peer_prober(
+            &config,
+            Duration::from_millis(20),
+            Duration::from_secs(1),
+            None,
+        );
         health.set_last_ok_unix("peer", unix_now_secs() - 3600);
         tokio::time::sleep(Duration::from_millis(150)).await;
         assert!(health.is_reachable("peer"));
@@ -510,6 +669,7 @@ shard-c 127.0.0.1:7003 10923 16383
             &peers,
             &health,
             Duration::from_millis(50),
+            None,
             &mut last_reported,
         )
         .await;
@@ -520,6 +680,7 @@ shard-c 127.0.0.1:7003 10923 16383
                 &peers,
                 &health,
                 Duration::from_millis(50),
+                None,
                 &mut last_reported,
             )
             .await;
@@ -542,6 +703,7 @@ shard-c 127.0.0.1:7003 10923 16383
             &peers,
             &health,
             Duration::from_millis(500),
+            None,
             &mut last_reported,
         )
         .await;
@@ -551,6 +713,7 @@ shard-c 127.0.0.1:7003 10923 16383
             &peers,
             &health,
             Duration::from_millis(500),
+            None,
             &mut last_reported,
         )
         .await;
@@ -571,6 +734,7 @@ shard-c 127.0.0.1:7003 10923 16383
                 &peers,
                 &health,
                 Duration::from_millis(500),
+                None,
                 &mut last_reported,
             )
             .await;

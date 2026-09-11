@@ -337,21 +337,33 @@ async fn main() -> std::io::Result<()> {
         config.min_replicas_to_write,
         std::time::Duration::from_secs(config.min_replicas_max_lag_secs),
     );
+    // Built before the cluster block below, not just before `with_replication_tls_client_config`:
+    // the peer prober needs this too. `tls_ca_path` is this node's one shared trust cert for
+    // every outbound connection it makes to another node in the deployment -- replication and
+    // peer-liveness probing alike -- not a replication-only setting.
+    let tls_client_config = config.tls_ca_path.as_ref().map(|ca_path| {
+        rocket_mem::tls::load_client_config(std::path::Path::new(ca_path))
+            .expect("failed to load replication TLS CA certificate")
+    });
     if let Some(cluster) = cluster {
         // Cluster mode only: the prober needs peers, and a standalone node has none. It is purely
         // observational -- it makes `CLUSTER NODES`/`SHARDS`/`INFO` tell the truth about which
         // peers are answering, and changes nothing about routing, promotion, or the topology
         // file. See docs/superpowers/plans/2026-09-09-failover-safety-primitives/.
+        //
+        // `tls_client_config` must match what `cluster.conf` actually names for each peer: when
+        // this node dials peers over TLS elsewhere, cluster.conf's addresses are expected to be
+        // those same TLS listeners, so the prober needs the same client config or every probe
+        // fails a TLS handshake against a peer that is, in fact, healthy.
         let peer_health = rocket_mem::cluster_health::spawn_peer_prober(
             &cluster,
             std::time::Duration::from_secs(config.cluster_probe_interval_secs),
             std::time::Duration::from_secs(config.cluster_node_timeout_secs),
+            tls_client_config.clone(),
         );
         handle = handle.with_cluster(cluster).with_peer_health(peer_health);
     }
-    if let Some(ca_path) = &config.tls_ca_path {
-        let client_config = rocket_mem::tls::load_client_config(std::path::Path::new(ca_path))
-            .expect("failed to load replication TLS CA certificate");
+    if let Some(client_config) = tls_client_config {
         handle = handle.with_replication_tls_client_config(client_config);
     }
     let replication = Arc::new(handle);
