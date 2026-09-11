@@ -158,6 +158,24 @@ impl PubSubRegistry {
         }
         delivered
     }
+
+    /// Removes `client_id`'s registration from every channel and pattern, wherever they are.
+    /// Called once by `ClientGuard::drop` on every connection-close path, so a disconnected
+    /// subscriber's entries don't linger until the next failed `publish` send happens to prune
+    /// them.
+    pub(crate) fn remove_all(&self, client_id: u64) {
+        let mut channels = self.channels.lock().unwrap_or_else(|e| e.into_inner());
+        channels.retain(|_, subs| {
+            subs.retain(|s| s.client_id != client_id);
+            !subs.is_empty()
+        });
+        drop(channels);
+        let mut patterns = self.patterns.lock().unwrap_or_else(|e| e.into_inner());
+        patterns.retain(|_, subs| {
+            subs.retain(|s| s.client_id != client_id);
+            !subs.is_empty()
+        });
+    }
 }
 
 #[cfg(test)]
@@ -326,5 +344,35 @@ mod tests {
         registry.psubscribe(Bytes::from_static(b"sports.*"), 2, tx2);
 
         assert_eq!(registry.num_pat(), 2);
+    }
+
+    #[test]
+    fn remove_all_drops_a_clients_channel_and_pattern_registrations() {
+        let registry = PubSubRegistry::default();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        registry.subscribe(Bytes::from_static(b"news"), 1, tx.clone());
+        registry.psubscribe(Bytes::from_static(b"sports.*"), 1, tx);
+
+        registry.remove_all(1);
+
+        assert_eq!(registry.publish(b"news", &Bytes::from_static(b"x")), 0);
+        assert_eq!(
+            registry.publish(b"sports.scores", &Bytes::from_static(b"x")),
+            0
+        );
+        assert_eq!(registry.num_pat(), 0);
+    }
+
+    #[test]
+    fn remove_all_leaves_other_clients_registrations_untouched() {
+        let registry = PubSubRegistry::default();
+        let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
+        let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel();
+        registry.subscribe(Bytes::from_static(b"news"), 1, tx1);
+        registry.subscribe(Bytes::from_static(b"news"), 2, tx2);
+
+        registry.remove_all(1);
+
+        assert_eq!(registry.publish(b"news", &Bytes::from_static(b"x")), 1);
     }
 }

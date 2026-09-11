@@ -179,12 +179,15 @@ pub async fn serve_tls(
 
 /// Decrements the live-connection count on drop, so every one of `handle_connection`'s early
 /// returns -- and the `serve_replica` path, which never returns normally -- is covered without
-/// each of them having to remember.
-pub(crate) struct ClientGuard(pub(crate) Arc<ReplicationHandle>);
+/// each of them having to remember. Also removes this connection's pub/sub registrations
+/// (`PubSubRegistry::remove_all`), so a disconnected subscriber's channel/pattern entries don't
+/// linger until the next failed `publish` send happens to prune them.
+pub(crate) struct ClientGuard(pub(crate) Arc<ReplicationHandle>, pub(crate) u64);
 
 impl Drop for ClientGuard {
     fn drop(&mut self) {
         self.0.connection_closed();
+        self.0.pubsub.remove_all(self.1);
     }
 }
 
@@ -246,7 +249,7 @@ async fn handle_connection<S>(
 {
     tracing::info!("connection accepted");
     replication.connection_opened();
-    let _client_guard = ClientGuard(Arc::clone(&replication));
+    let _client_guard = ClientGuard(Arc::clone(&replication), client_id);
     let mut conn_stats = ConnectionStats::new();
     let mut framed = Framed::new(socket, RespCodec::default());
     let session = dispatcher::Session::with_peer_addr(peer);
@@ -833,6 +836,40 @@ mod tests {
         assert_eq!(
             framed.next().await.unwrap().unwrap(),
             Frame::Simple("PONG".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_disconnected_subscribers_registrations_are_removed() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let engine = Arc::new(Engine::new());
+        let (_dir, aof) = test_aof();
+        let replication = Arc::new(crate::replication::ReplicationHandle::default());
+        tokio::spawn(serve(listener, engine, aof, Arc::clone(&replication)));
+
+        let mut subscriber = Framed::new(
+            TcpStream::connect(addr).await.unwrap(),
+            RespCodec::default(),
+        );
+        subscriber
+            .send(Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"SUBSCRIBE")),
+                Frame::Bulk(Bytes::from_static(b"news")),
+            ]))
+            .await
+            .unwrap();
+        subscriber.next().await.unwrap().unwrap(); // the subscribe confirmation
+
+        drop(subscriber);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert_eq!(
+            replication
+                .pubsub
+                .publish(b"news", &Bytes::from_static(b"hello")),
+            0,
+            "a disconnected subscriber must not still be counted as delivered-to"
         );
     }
 

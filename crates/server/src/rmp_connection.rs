@@ -150,7 +150,7 @@ async fn handle_connection<S>(
 {
     tracing::info!("connection accepted");
     replication.connection_opened();
-    let _client_guard = ClientGuard(Arc::clone(&replication));
+    let _client_guard = ClientGuard(Arc::clone(&replication), client_id);
     let mut conn_stats = ConnectionStats::new();
     let framed = Framed::new(socket, RmpCodec);
     let (mut sink, mut stream) = framed.split();
