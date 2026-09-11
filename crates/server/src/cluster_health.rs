@@ -792,7 +792,8 @@ shard-c 127.0.0.1:7003 10923 16383
         let sent = rx.await.unwrap();
         let expected = b"*2\r\n$4\r\nPING\r\n$25\r\n__rocket_mem_peer_probe__\r\n";
         assert_eq!(
-            sent, expected,
+            sent,
+            expected,
             "expected the exact PING <PROBE_MARKER> wire encoding, got: {}",
             String::from_utf8_lossy(&sent)
         );
