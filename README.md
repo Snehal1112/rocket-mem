@@ -253,6 +253,7 @@ allocation did.
 | Server/Cluster | `PING`, `ECHO`, `SELECT`, `COMMAND`, `HELLO`, `INFO [section]`, `SAVE`, `BGREWRITEAOF`, `REPLICAOF`, `PSYNC`, `DEBUG SLEEP`, `CLUSTER KEYSLOT`/`SHARDS`/`NODES`/`INFO`/`MYID`, `SLOWLOG GET`/`LEN`/`RESET` |
 | Auth/ACL | `AUTH` (single-arg and `<user> <pass>`), `ACL SETUSER`/`DELUSER`/`WHOAMI`/`LIST`/`GETUSER` |
 | Transactions | `MULTI`, `EXEC`, `DISCARD` (writers-only isolation — see [`docs/command-compatibility.md`](docs/command-compatibility.md) for what that means; no `WATCH`/`UNWATCH` yet) |
+| Pub/Sub | `SUBSCRIBE`, `UNSUBSCRIBE`, `PSUBSCRIBE`, `PUNSUBSCRIBE`, `PUBLISH`, `PUBSUB` (`CHANNELS`/`NUMSUB`/`NUMPAT`) — single-node delivery only, no cluster-wide fanout |
 
 Behavioural differences from real Redis — `KEYS` glob support is partial, `OBJECT ENCODING`
 reports engine type names rather than Redis's internal encodings, and others — are catalogued in
