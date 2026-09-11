@@ -618,6 +618,7 @@ impl ReplicationHandle {
                     mine: my_generation,
                 },
                 aof,
+                Arc::clone(&self.pubsub),
                 FollowerHandles {
                     last_apply,
                     link_up,
@@ -887,11 +888,13 @@ struct FollowerIdentity {
 /// grep-able from either end of a replication link. See
 /// ../../../docs/superpowers/specs/2026-09-09-verbose-logging-design.md's span table.
 #[tracing::instrument(name = "repl", skip_all, fields(host_port = %crate::logging::escape_ident(&host_port)))]
+#[allow(clippy::too_many_arguments)]
 async fn replication_client_loop(
     host_port: String,
     engine: Arc<Engine>,
     generation: Generation,
     aof: Option<Arc<AofWriter>>,
+    pubsub: Arc<crate::pubsub::PubSubRegistry>,
     handles: FollowerHandles,
     tls_client_config: Option<Arc<rustls::ClientConfig>>,
     identity: FollowerIdentity,
@@ -910,6 +913,7 @@ async fn replication_client_loop(
             &engine,
             &generation,
             aof.as_deref(),
+            &pubsub,
             status,
             tls_client_config.as_ref(),
             &identity,
@@ -943,11 +947,13 @@ async fn replication_client_loop(
 /// whichever stream type resulted. Two monomorphizations of the generic `sync_once` rather than
 /// a boxed trait object, matching this codebase's existing avoidance of dynamic dispatch on the
 /// hot connection-setup path.
+#[allow(clippy::too_many_arguments)]
 async fn connect_and_sync(
     host_port: &str,
     engine: &Engine,
     generation: &Generation,
     aof: Option<&AofWriter>,
+    pubsub: &crate::pubsub::PubSubRegistry,
     status: FollowerStatus<'_>,
     tls_client_config: Option<&Arc<rustls::ClientConfig>>,
     identity: &FollowerIdentity,
@@ -969,6 +975,7 @@ async fn connect_and_sync(
                 &generation.counter,
                 generation.mine,
                 aof,
+                pubsub,
                 status,
                 identity,
             )
@@ -981,6 +988,7 @@ async fn connect_and_sync(
                 &generation.counter,
                 generation.mine,
                 aof,
+                pubsub,
                 status,
                 identity,
             )
@@ -1028,12 +1036,14 @@ fn replconf_ack_frame(offset: u64) -> protocol::Frame {
 /// same body serves both plaintext and TLS-upgraded replication connections (`connect_and_sync`
 /// above), mirroring `connection::handle_connection`'s existing genericization for the
 /// server-accept side.
+#[allow(clippy::too_many_arguments)]
 async fn sync_once<S>(
     stream: S,
     engine: &Engine,
     generation: &AtomicU64,
     my_generation: u64,
     aof: Option<&AofWriter>,
+    _pubsub: &crate::pubsub::PubSubRegistry,
     status: FollowerStatus<'_>,
     identity: &FollowerIdentity,
 ) -> std::io::Result<()>
@@ -1616,12 +1626,14 @@ mod tests {
             let generation = Arc::clone(&generation);
             tokio::spawn(async move {
                 let stream = tokio::net::TcpStream::connect(&host_port).await.unwrap();
+                let pubsub = crate::pubsub::PubSubRegistry::default();
                 sync_once(
                     stream,
                     &engine,
                     &generation,
                     0,
                     None,
+                    &pubsub,
                     FollowerStatus {
                         last_apply: &AtomicI64::new(0),
                         link_up: &AtomicBool::new(false),
@@ -1688,12 +1700,14 @@ mod tests {
             let generation = Arc::clone(&generation);
             tokio::spawn(async move {
                 let stream = tokio::net::TcpStream::connect(&host_port).await.unwrap();
+                let pubsub = crate::pubsub::PubSubRegistry::default();
                 sync_once(
                     stream,
                     &engine,
                     &generation,
                     0,
                     None,
+                    &pubsub,
                     FollowerStatus {
                         last_apply: &AtomicI64::new(0),
                         link_up: &AtomicBool::new(false),
@@ -1766,12 +1780,14 @@ mod tests {
             let slave_offset = Arc::clone(&slave_offset);
             tokio::spawn(async move {
                 let stream = tokio::net::TcpStream::connect(&host_port).await.unwrap();
+                let pubsub = crate::pubsub::PubSubRegistry::default();
                 sync_once(
                     stream,
                     &engine,
                     &generation,
                     0,
                     None,
+                    &pubsub,
                     FollowerStatus {
                         last_apply: &AtomicI64::new(0),
                         link_up: &AtomicBool::new(false),
@@ -1863,12 +1879,14 @@ mod tests {
             let slave_offset = Arc::clone(&slave_offset);
             tokio::spawn(async move {
                 let stream = tokio::net::TcpStream::connect(&host_port).await.unwrap();
+                let pubsub = crate::pubsub::PubSubRegistry::default();
                 sync_once(
                     stream,
                     &engine,
                     &generation,
                     0,
                     None,
+                    &pubsub,
                     FollowerStatus {
                         last_apply: &AtomicI64::new(0),
                         link_up: &AtomicBool::new(false),
@@ -1947,12 +1965,14 @@ mod tests {
         let host_port = addr.to_string();
         let generation = Arc::new(AtomicU64::new(0));
         let stream = tokio::net::TcpStream::connect(&host_port).await.unwrap();
+        let pubsub = crate::pubsub::PubSubRegistry::default();
         sync_once(
             stream,
             &engine,
             &generation,
             0,
             None,
+            &pubsub,
             FollowerStatus {
                 last_apply: &AtomicI64::new(0),
                 link_up: &AtomicBool::new(false),
@@ -2015,12 +2035,14 @@ mod tests {
         let host_port = addr.to_string();
         let generation = Arc::new(AtomicU64::new(0));
         let stream = tokio::net::TcpStream::connect(&host_port).await.unwrap();
+        let pubsub = crate::pubsub::PubSubRegistry::default();
         sync_once(
             stream,
             &engine,
             &generation,
             0,
             None,
+            &pubsub,
             FollowerStatus {
                 last_apply: &AtomicI64::new(0),
                 link_up: &AtomicBool::new(false),
@@ -2086,12 +2108,14 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(&addr.to_string())
             .await
             .unwrap();
+        let pubsub = crate::pubsub::PubSubRegistry::default();
         sync_once(
             stream,
             &engine,
             &generation,
             0,
             None,
+            &pubsub,
             FollowerStatus {
                 last_apply: &AtomicI64::new(0),
                 link_up: &AtomicBool::new(false),
@@ -2159,12 +2183,14 @@ mod tests {
         // newer task has already loaded.
         let generation = Arc::new(AtomicU64::new(1));
         let stream = tokio::net::TcpStream::connect(&host_port).await.unwrap();
+        let pubsub = crate::pubsub::PubSubRegistry::default();
         sync_once(
             stream,
             &engine,
             &generation,
             0,
             None,
+            &pubsub,
             FollowerStatus {
                 last_apply: &AtomicI64::new(0),
                 link_up: &AtomicBool::new(false),
@@ -2206,12 +2232,14 @@ mod tests {
         let generation = Arc::new(AtomicU64::new(0));
         let stream = tokio::net::TcpStream::connect(&host_port).await.unwrap();
 
+        let pubsub = crate::pubsub::PubSubRegistry::default();
         let result = sync_once(
             stream,
             &engine,
             &generation,
             0,
             None,
+            &pubsub,
             FollowerStatus {
                 last_apply: &AtomicI64::new(0),
                 link_up: &AtomicBool::new(false),
@@ -2258,12 +2286,14 @@ mod tests {
         let generation = Arc::new(AtomicU64::new(0));
         let stream = tokio::net::TcpStream::connect(&host_port).await.unwrap();
 
+        let pubsub = crate::pubsub::PubSubRegistry::default();
         let _ = sync_once(
             stream,
             &engine,
             &generation,
             0,
             None,
+            &pubsub,
             FollowerStatus {
                 last_apply: &AtomicI64::new(0),
                 link_up: &AtomicBool::new(false),
@@ -2324,12 +2354,14 @@ mod tests {
         let generation = Arc::new(AtomicU64::new(0));
         let stream = tokio::net::TcpStream::connect(&host_port).await.unwrap();
 
+        let pubsub = crate::pubsub::PubSubRegistry::default();
         let _ = sync_once(
             stream,
             &engine,
             &generation,
             0,
             None,
+            &pubsub,
             FollowerStatus {
                 last_apply: &AtomicI64::new(0),
                 link_up: &AtomicBool::new(false),
@@ -2368,12 +2400,14 @@ mod tests {
         let generation = Arc::new(AtomicU64::new(0));
         let stream = tokio::net::TcpStream::connect(&host_port).await.unwrap();
 
+        let pubsub = crate::pubsub::PubSubRegistry::default();
         let result = sync_once(
             stream,
             &engine,
             &generation,
             0,
             None,
+            &pubsub,
             FollowerStatus {
                 last_apply: &AtomicI64::new(0),
                 link_up: &AtomicBool::new(false),
@@ -2477,6 +2511,7 @@ mod tests {
         let sync_task = {
             let engine = Arc::clone(&engine);
             let aof = Arc::clone(&aof);
+            let replication = Arc::clone(&replication);
             let host_port = addr.to_string();
             let generation = Arc::new(AtomicU64::new(0));
             tokio::spawn(async move {
@@ -2487,6 +2522,7 @@ mod tests {
                     &generation,
                     0,
                     Some(&aof),
+                    &replication.pubsub,
                     FollowerStatus {
                         last_apply: &AtomicI64::new(0),
                         link_up: &AtomicBool::new(false),
@@ -2770,6 +2806,7 @@ mod tests {
                 mine: 0,
             },
             None,
+            Arc::new(crate::pubsub::PubSubRegistry::default()),
             FollowerHandles {
                 last_apply: Arc::new(AtomicI64::new(0)),
                 link_up: Arc::new(AtomicBool::new(false)),
@@ -2829,12 +2866,14 @@ mod tests {
         let generation = Arc::new(AtomicU64::new(0));
         let stream = tokio::net::TcpStream::connect(&host_port).await.unwrap();
         let sync_task = tokio::spawn(async move {
+            let pubsub = crate::pubsub::PubSubRegistry::default();
             sync_once(
                 stream,
                 &engine,
                 &generation,
                 0,
                 None,
+                &pubsub,
                 FollowerStatus {
                     last_apply: &AtomicI64::new(0),
                     link_up: &AtomicBool::new(false),
