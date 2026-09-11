@@ -1,8 +1,8 @@
 # Example rocket-mem-replica.toml — a template for a node whose only job is to replicate from
 # some other rocket-mem node (the "leader"). Copy this to a real file (e.g. my-replica.toml),
-# fill in the fields below with values distinct from every other node on the machine, start it,
-# then point it at the leader with REPLICAOF (a live command, not a config-file field -- see
-# "Wiring it up" at the bottom).
+# fill in the fields below with values distinct from every other node on the machine, then
+# either set `replicaof` below to auto-connect on every startup, or start it standalone and
+# send a live REPLICAOF command by hand -- see "Wiring it up" at the bottom for both.
 #
 # Layering: built-in defaults < this file < ROCKET_MEM_* env vars < CLI flags. A field left
 # unset here simply falls through to the next layer down.
@@ -38,6 +38,64 @@
 # 0 disables the slow log entirely.
 # slowlog_threshold_micros = 0
 
+# --- Logging ------------------------------------------------------------------
+
+# Tracing filter directive, e.g. "info", "debug", "trace", "rocket_mem=debug,warn" --
+# same syntax as RUST_LOG. Overridden by the RUST_LOG environment variable when set.
+# log_level = "info"
+
+# Maximum bytes of a value or command argument rendered into a `trace`-level log line
+# before truncation. Only consulted when logging at `trace`.
+# log_value_max_bytes = 128
+
+# --- TLS ---------------------------------------------------------------------
+# Only needed if THIS replica should also serve TLS-wrapped clients, or if the leader
+# it replicates from is TLS-only (in which case tls_ca_path below, not these listener
+# fields, is what matters). A replica that only ever speaks plaintext to its own
+# clients and to a plaintext leader needs none of this section.
+
+# TLS-wrapped RESP/RMP listeners for this replica's own clients, alongside the
+# plaintext ones at addr/rmp_addr above. Setting either requires both tls_cert_path
+# and tls_key_path.
+# tls_resp_addr = "0.0.0.0:16479"
+# tls_rmp_addr = "0.0.0.0:17479"
+# tls_cert_path = "/etc/rocket-mem/tls/server.crt"
+# tls_key_path = "/etc/rocket-mem/tls/server.key"
+
+# The LEADER's certificate file, for this replica's own replication connection (as a
+# follower) to verify and pin to when the leader requires TLS. Unset means plaintext
+# replication, independent of whether this replica's own listeners above use TLS.
+# tls_ca_path = "/etc/rocket-mem/tls/leader-ca.crt"
+
+# --- Replication (config-driven) -----------------------------------------------
+# These four fields are the config-file alternative to sending REPLICAOF by hand --
+# see "Wiring it up" below for when you'd still want the live command instead.
+
+# host:port of the leader to auto-connect to as a follower on every startup. Setting
+# this closes the "restarted replica silently comes back as standalone" footgun: with
+# it unset, a restarted node forgets it was ever a replica until REPLICAOF is reissued
+# by hand. Not validated at startup beyond being present -- a bad host or unreachable
+# leader fails soft, with the same once-a-second background reconnect loop the live
+# REPLICAOF command already uses.
+# replicaof = "<leader-host>:<leader-port>"
+
+# Username/password sent in AUTH before PSYNC, when the leader has ACL users
+# configured (as in the ACL section below). Must be set together, or neither --
+# rocket-mem checks this at startup, before any listener binds. These authenticate
+# THIS replica's connection to the leader; they are the same credentials the LEADER's
+# own [[acl.users]] defines, not a separate account for this replica.
+# replicaof_auth_username = "app"
+# replicaof_auth_password = "changeme"
+
+# The host:port THIS replica advertises to its leader in PSYNC, and which the leader
+# reports back in INFO REPLICATION's slaveN:ip=...,port=... lines. Left unset, this
+# defaults to addr above. Set it when a peer must dial an address other than addr to
+# reach this replica -- e.g. announce this replica's own tls_resp_addr if the leader
+# (or future failover tooling) needs to reach it over TLS, or an externally reachable
+# host:port under NAT or container port mapping. Shape-checked at startup, never
+# checked for reachability.
+# replica_announce_addr = "10.0.0.7:16479"
+
 # --- ACL / authentication -----------------------------------------------------
 # Must match the LEADER's [[acl.users]] username/password exactly: REPLICAOF's AUTH clause
 # (see "Wiring it up" below) authenticates this replica's connection to the leader with these
@@ -54,8 +112,16 @@
 # rules = ["allcommands", "allkeys"]
 
 # --- Wiring it up --------------------------------------------------------------
-# REPLICAOF has no config-file equivalent -- it is always sent as a live command to an
-# already-running node. Once this replica is up:
+# Two ways to connect this replica to its leader:
+#
+# 1. Set `replicaof` (and its auth fields, if the leader has ACL users) above and
+#    start this node -- it connects automatically on every startup, including after
+#    a restart. This is the config-driven path and is what most deployments want.
+#
+# 2. Leave `replicaof` unset and send a live REPLICAOF command by hand instead. Use
+#    this for a one-off or temporary replication link, or to re-point an already-
+#    running replica at a different leader without restarting it -- a runtime
+#    REPLICAOF change is NOT persisted back into this file. Once this replica is up:
 #
 #   redis-cli -p <this replica's addr port> replicaof <leader-host> <leader-port>
 #
