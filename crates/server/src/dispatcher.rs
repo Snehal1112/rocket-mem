@@ -3223,6 +3223,17 @@ fn intercept_for_transaction(
                 // connection's serial command loop. Kept as a safe fallthrough, not a panic.
                 return None;
             };
+            if matches!(
+                name.as_str(),
+                "SUBSCRIBE" | "UNSUBSCRIBE" | "PSUBSCRIBE" | "PUNSUBSCRIBE"
+            ) {
+                *dirty = true;
+                tracing::debug!(command = %name.as_str(), "transaction marked dirty");
+                return Some(Frame::Error(format!(
+                    "ERR {} is not allowed in transactions",
+                    name.as_str()
+                )));
+            }
             if KNOWN_COMMANDS.binary_search(&name.as_str()).is_err() {
                 *dirty = true;
                 tracing::debug!(command = %name.as_str(), "transaction marked dirty");
@@ -3498,7 +3509,99 @@ fn intercept_for_pubsub(
             }
             Some(Frame::Array(replies))
         }
+        "PSUBSCRIBE" => {
+            let tx = ensure_push_channel(session);
+            let mut replies = Vec::new();
+            for item in &items[1..] {
+                let Frame::Bulk(pattern) = item else { continue };
+                session
+                    .psubscriptions
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(pattern.clone());
+                replication
+                    .pubsub
+                    .psubscribe(pattern.clone(), client_id, tx.clone());
+                let count = total_subscription_count(session);
+                session
+                    .subscription_count
+                    .store(count, std::sync::atomic::Ordering::Relaxed);
+                tracing::debug!(client_id, channel = %crate::logging::escape_ident(&String::from_utf8_lossy(pattern)), count, "subscription changed");
+                replies.push(Frame::Push(vec![
+                    Frame::Bulk(Bytes::from_static(b"psubscribe")),
+                    Frame::Bulk(pattern.clone()),
+                    Frame::Integer(count as i64),
+                ]));
+            }
+            Some(Frame::Array(replies))
+        }
+        "PUNSUBSCRIBE" => {
+            let explicit: Vec<Bytes> = items[1..]
+                .iter()
+                .filter_map(|f| match f {
+                    Frame::Bulk(b) => Some(b.clone()),
+                    _ => None,
+                })
+                .collect();
+            let targets = if explicit.is_empty() {
+                session
+                    .psubscriptions
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            } else {
+                explicit
+            };
+            let mut replies = Vec::new();
+            for pattern in targets {
+                session
+                    .psubscriptions
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&pattern);
+                replication.pubsub.punsubscribe(&pattern, client_id);
+                let count = total_subscription_count(session);
+                session
+                    .subscription_count
+                    .store(count, std::sync::atomic::Ordering::Relaxed);
+                tracing::debug!(client_id, channel = %crate::logging::escape_ident(&String::from_utf8_lossy(&pattern)), count, "subscription changed");
+                replies.push(Frame::Push(vec![
+                    Frame::Bulk(Bytes::from_static(b"punsubscribe")),
+                    Frame::Bulk(pattern),
+                    Frame::Integer(count as i64),
+                ]));
+            }
+            Some(Frame::Array(replies))
+        }
         _ => None,
+    }
+}
+
+/// Real Redis's RESP2 "subscribe mode" restriction: while a RESP2 connection has at least one
+/// active channel/pattern subscription, only these commands are legal -- everything else gets
+/// this exact error text, matching real Redis's own. RESP3 connections are exempt: push messages
+/// arrive out-of-band there (as `Frame::Push`, distinct from command replies), so an ordinary
+/// command sent on the same connection stays unambiguous. Checked before
+/// `intercept_for_transaction` so a subscribed RESP2 connection cannot open `MULTI` either --
+/// `MULTI` is not in real Redis's own allowed set for this mode.
+fn subscribe_mode_gate(frame: &Frame, session: &Session) -> Option<Frame> {
+    if session
+        .subscription_count
+        .load(std::sync::atomic::Ordering::Relaxed)
+        == 0
+        || session.protocol() != Protocol::Resp2
+    {
+        return None;
+    }
+    let name = command_name_upper(frame)?;
+    match name.as_str() {
+        "SUBSCRIBE" | "UNSUBSCRIBE" | "PSUBSCRIBE" | "PUNSUBSCRIBE" | "PING" | "QUIT" => None,
+        _ => Some(Frame::Error(
+            "ERR only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context"
+                .into(),
+        )),
     }
 }
 
@@ -3870,6 +3973,9 @@ fn dispatch_and_log_inner(
     // or unauthorized client must not learn cluster topology or reach any other gate. Matches
     // real Redis's own auth-before-everything ordering.
     if let Some(reply) = auth_gate(replication, session, &frame) {
+        return reply;
+    }
+    if let Some(reply) = subscribe_mode_gate(&frame, session) {
         return reply;
     }
     if let Some(reply) =
@@ -5191,6 +5297,88 @@ mod tests {
                 Frame::Bulk(Bytes::from_static(b"never-subscribed")),
                 Frame::Integer(0),
             ])]))
+        );
+    }
+
+    #[test]
+    fn psubscribe_delivers_pmessage_on_publish() {
+        let session = Session::new();
+        let replication = crate::replication::ReplicationHandle::default();
+        intercept_for_pubsub(&cmd(&[b"PSUBSCRIBE", b"news.*"]), &session, &replication, 1);
+
+        let delivered = replication
+            .pubsub
+            .publish(b"news.sports", &Bytes::from_static(b"hello"));
+        assert_eq!(delivered, 1);
+    }
+
+    #[test]
+    fn a_resp2_connection_with_an_active_subscription_rejects_an_ordinary_command() {
+        let session = Session::new();
+        let replication = crate::replication::ReplicationHandle::default();
+        intercept_for_pubsub(&cmd(&[b"SUBSCRIBE", b"news"]), &session, &replication, 1);
+
+        let reply = subscribe_mode_gate(&cmd(&[b"GET", b"k"]), &session);
+
+        assert_eq!(
+            reply,
+            Some(Frame::Error(
+                "ERR only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context"
+                    .into()
+            ))
+        );
+    }
+
+    #[test]
+    fn a_resp2_connection_with_an_active_subscription_still_allows_ping_and_more_subscribe() {
+        let session = Session::new();
+        let replication = crate::replication::ReplicationHandle::default();
+        intercept_for_pubsub(&cmd(&[b"SUBSCRIBE", b"news"]), &session, &replication, 1);
+
+        assert_eq!(subscribe_mode_gate(&cmd(&[b"PING"]), &session), None);
+        assert_eq!(
+            subscribe_mode_gate(&cmd(&[b"SUBSCRIBE", b"more"]), &session),
+            None
+        );
+        assert_eq!(subscribe_mode_gate(&cmd(&[b"UNSUBSCRIBE"]), &session), None);
+    }
+
+    #[test]
+    fn a_resp3_connection_with_an_active_subscription_allows_an_ordinary_command() {
+        let session = Session::new();
+        session.set_protocol(Protocol::Resp3);
+        let replication = crate::replication::ReplicationHandle::default();
+        intercept_for_pubsub(&cmd(&[b"SUBSCRIBE", b"news"]), &session, &replication, 1);
+
+        assert_eq!(subscribe_mode_gate(&cmd(&[b"GET", b"k"]), &session), None);
+    }
+
+    #[test]
+    fn subscribe_queued_inside_a_transaction_is_rejected_at_queue_time() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let replication = crate::replication::ReplicationHandle::default();
+        let session = Session::new();
+        dispatch_and_log(&engine, &aof, &replication, cmd(&[b"MULTI"]), &session, 1);
+
+        let reply = dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"SUBSCRIBE", b"news"]),
+            &session,
+            1,
+        );
+
+        assert_eq!(
+            reply,
+            Frame::Error("ERR SUBSCRIBE is not allowed in transactions".into())
+        );
+        let exec_reply =
+            dispatch_and_log(&engine, &aof, &replication, cmd(&[b"EXEC"]), &session, 1);
+        assert_eq!(
+            exec_reply,
+            Frame::Error("EXECABORT Transaction discarded because of previous errors".into())
         );
     }
 
