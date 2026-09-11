@@ -1176,6 +1176,7 @@ where
         ))
         .await?;
     let mut frames_applied: u64 = 0; // per-session counter, not persisted or shared -- see Global Constraints
+    let mut grouper = crate::transaction_grouping::TransactionGrouper::new();
 
     // `interval_at`, not `interval`: `interval`'s first tick completes immediately, which would
     // duplicate the ack just sent above. The first tick belongs one interval out.
@@ -1202,38 +1203,65 @@ where
                 }
                 let frame = result?;
                 frames_applied += 1;
-                let name = replicated_command_name(&frame);
-                // Re-encode to learn this frame's replication-stream length, before the frame is moved
-                // into `dispatch` below. This is byte-exact, not an approximation, and the exactness is
-                // load-bearing: it is what makes this follower's offset directly comparable to the
-                // leader's `master_repl_offset`, which counted the same bytes on the way out. It holds
-                // because only `aof::WRITE_COMMANDS` frames are ever replicated, and those are always a
-                // Frame::Array of Frame::Bulk -- a shape whose RESP encoding is identical under RESP2
-                // and RESP3. (Frame::Null and Frame::Map do encode differently per protocol version;
-                // neither can appear in a replicated write command.) Do not replace this with a
-                // decoder-side byte count or a frame count: widening what gets replicated is what would
-                // break the invariant, not this re-encode.
+                // Computed before the frame is fed to the grouper (which may consume it into its
+                // buffer): this is the byte-exact length the leader counted in its own
+                // master_repl_offset for *this* frame, marker or not -- append_transaction_marker
+                // advances the leader's offset for MULTI/EXEC markers too, so this follower's
+                // offset must advance for every decoded frame the same way, regardless of whether
+                // it is buffered, released, or itself a marker. This is byte-exact, not an
+                // approximation, and the exactness is load-bearing: it is what makes this
+                // follower's offset directly comparable to the leader's `master_repl_offset`,
+                // which counted the same bytes on the way out. It holds because only
+                // `aof::WRITE_COMMANDS` frames and the bare MULTI/EXEC markers are ever
+                // replicated, and those are always a `Frame::Array` of `Frame::Bulk` -- a shape
+                // whose RESP encoding is identical under RESP2 and RESP3. (`Frame::Null` and
+                // `Frame::Map` do encode differently per protocol version; neither can appear
+                // here.) Do not replace this with a decoder-side byte count or a frame count:
+                // widening what gets replicated is what would break the invariant, not this
+                // re-encode.
                 let frame_len = crate::aof::encode_frame(&frame)?.len() as u64;
-                let mut protocol = protocol::codec::Protocol::default();
-                // Mutual exclusion with a concurrent SAVE on this same node: SAVE's shard-by-shard
-                // snapshot walk (Store::snapshot_entries) must not observe a multi-key replicated
-                // command (MSET, RENAME, SINTERSTORE, ...) half-applied across shards. Holding the same
-                // lock_for_ordering() handle_save already takes closes that race. Deliberately wraps
-                // only the dispatch call — not the framed.next() await, not the generation check —
-                // matching handle_save's own pattern of holding the lock across the mutating work and
-                // nothing else. None when this node has no AofWriter configured (test-only handles),
-                // which matches the pre-fix behavior for those.
-                let _order_guard = aof.map(|a| a.lock_all_shards());
-                let reply = crate::dispatcher::dispatch(engine, frame, &mut protocol, 0);
-                // Escaped: `replicated_command_name` is a lossy decode of whatever bytes the leader put
-                // in the frame's first bulk, with no length or character restriction of its own.
-                tracing::debug!(cmd = %crate::logging::escape_ident(&name), "applied replicated command");
-                // A leader only ever fans out a command whose local execution already succeeded, so
-                // an error applying it here means the two sides have genuinely diverged (a bug, or
-                // version skew) — logged and skipped, not a reason to tear down and resync, which
-                // would just reproduce the same error against the same divergence.
-                if let protocol::Frame::Error(e) = reply {
-                    tracing::error!(error = %e, "failed to apply replicated command");
+                match grouper.feed(frame) {
+                    Ok(to_apply) => {
+                        for buffered in to_apply {
+                            let name = replicated_command_name(&buffered);
+                            let mut protocol = protocol::codec::Protocol::default();
+                            // Mutual exclusion with a concurrent SAVE on this same node: SAVE's
+                            // shard-by-shard snapshot walk (Store::snapshot_entries) must not
+                            // observe a multi-key replicated command (MSET, RENAME,
+                            // SINTERSTORE, ...) half-applied across shards. Holding the same
+                            // lock_for_ordering() handle_save already takes closes that race.
+                            // Scoped to one buffered command's own dispatch call, exactly as
+                            // before this change -- deliberately NOT widened to span a whole
+                            // transaction's worth of buffered commands, since that is a larger,
+                            // separate behavior change out of scope here. None when this node
+                            // has no AofWriter configured (test-only handles), which matches the
+                            // pre-fix behavior for those.
+                            let _order_guard = aof.map(|a| a.lock_all_shards());
+                            let reply =
+                                crate::dispatcher::dispatch(engine, buffered, &mut protocol, 0);
+                            // Escaped: `replicated_command_name` is a lossy decode of whatever
+                            // bytes the leader put in the frame's first bulk, with no length or
+                            // character restriction of its own.
+                            tracing::debug!(
+                                cmd = %crate::logging::escape_ident(&name),
+                                "applied replicated command"
+                            );
+                            // A leader only ever fans out a command whose local execution
+                            // already succeeded, so an error applying it here means the two
+                            // sides have genuinely diverged (a bug, or version skew) -- logged
+                            // and skipped, not a reason to tear down and resync, which would
+                            // just reproduce the same error against the same divergence.
+                            if let protocol::Frame::Error(e) = reply {
+                                tracing::error!(error = %e, "failed to apply replicated command");
+                            }
+                        }
+                    }
+                    Err(reason) => {
+                        tracing::warn!(
+                            reason,
+                            "replication: malformed transaction framing from leader"
+                        );
+                    }
                 }
                 status.last_apply.store(unix_now_secs(), Ordering::Relaxed);
                 // Advanced even when the apply above errored: those bytes were still consumed from the
@@ -1601,6 +1629,78 @@ mod tests {
         assert_eq!(
             engine.get(b"from-stream"),
             Some(engine::Value::String(bytes::Bytes::from_static(b"v")))
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_once_applies_a_streamed_transaction_as_one_unit() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let fake_leader = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut psync_bytes = [0u8; 15];
+            socket.read_exact(&mut psync_bytes).await.unwrap();
+
+            let snapshot_engine = engine::Engine::new();
+            let blob = snapshot_engine.snapshot(0);
+            socket
+                .write_all(&(blob.len() as u64).to_le_bytes())
+                .await
+                .unwrap();
+            socket.write_all(&blob).await.unwrap();
+
+            socket.write_all(b"*1\r\n$5\r\nMULTI\r\n").await.unwrap();
+            socket
+                .write_all(b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n")
+                .await
+                .unwrap();
+            socket
+                .write_all(b"*3\r\n$3\r\nSET\r\n$1\r\nb\r\n$1\r\n2\r\n")
+                .await
+                .unwrap();
+            socket.write_all(b"*1\r\n$4\r\nEXEC\r\n").await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        });
+
+        let engine = std::sync::Arc::new(engine::Engine::new());
+        let host_port = addr.to_string();
+        let generation = Arc::new(AtomicU64::new(0));
+        let sync_task = {
+            let engine = std::sync::Arc::clone(&engine);
+            let generation = Arc::clone(&generation);
+            tokio::spawn(async move {
+                let stream = tokio::net::TcpStream::connect(&host_port).await.unwrap();
+                sync_once(
+                    stream,
+                    &engine,
+                    &generation,
+                    0,
+                    None,
+                    FollowerStatus {
+                        last_apply: &AtomicI64::new(0),
+                        link_up: &AtomicBool::new(false),
+                        slave_offset: &AtomicU64::new(0),
+                    },
+                    &FollowerIdentity::default(),
+                )
+                .await
+            })
+        };
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        sync_task.abort();
+        fake_leader.await.unwrap();
+
+        assert_eq!(
+            engine.get(b"a"),
+            Some(engine::Value::String(bytes::Bytes::from_static(b"1")))
+        );
+        assert_eq!(
+            engine.get(b"b"),
+            Some(engine::Value::String(bytes::Bytes::from_static(b"2")))
         );
     }
 
