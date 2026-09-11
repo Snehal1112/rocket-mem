@@ -47,6 +47,15 @@ tls_cert_path = "/home/numericlabs/data/tls/server.crt"
 # Default: unset
 tls_key_path = "/home/numericlabs/data/tls/server.key"
 
+# The certificate file (CA) this node uses to verify and pin every outbound TLS
+# connection it makes to another node in the deployment: a follower's replication
+# connection to its leader, and (in cluster mode) the cluster peer-liveness prober's
+# connections to the other shards. Unset means both stay plaintext. Every node
+# sharing one cluster.conf must set this consistently -- a node that leaves it unset
+# while cluster.conf names its peers' TLS listeners will fail every probe.
+# Default: unset
+tls_ca_path = "/home/numericlabs/data/tls/root_ca-numericlabs.crt"
+
 # --- Persistence & Durability -------------------------------------------------
 
 # Path to the append-only file used for write-durability and crash recovery.
@@ -60,14 +69,14 @@ snapshot_path = "./dump-shard-b.snapshot"
 # Minimum command duration, in microseconds, that gets recorded to the slow log.
 # 0 disables the slow log entirely.
 # Default: 10000 (10ms)
-slowlog_threshold_micros = 0
+slowlog_threshold_micros = 1000
 
 # --- Logging -----------------------------------------------------------------
 
 # Tracing filter directive (e.g. "info", "debug", "trace", "rocket_mem=debug,warn").
 # Overridden by the RUST_LOG environment variable when set.
 # Default: "info"
-log_level = "debug"
+log_level = "info"
 
 # Maximum bytes of a value or command argument rendered into a `trace`-level log
 # line before truncation. Only consulted when logging at `trace` -- trace-level
@@ -111,7 +120,7 @@ cluster_node_id = "shard-b"
 # topology. Read only in cluster mode -- a standalone node has no peers and never
 # starts a prober. Must be at least 1: a zero value crashes tokio's timer outright.
 # Default: 1
-cluster_probe_interval_secs = 1
+cluster_probe_interval_secs = 20
 
 # How long, in seconds, a peer may go without answering a probe before this node
 # reports it failed in CLUSTER NODES/SHARDS/INFO. Reporting only -- nothing is
