@@ -175,6 +175,15 @@ async fn probe_once(
         .is_some()
 }
 
+/// The RESP argument every peer-liveness probe's `PING` carries, so the probed peer's
+/// `connection.rs` can recognize this connection as this node's own internal health check
+/// (never a real client) and log its accept/close pair at `debug` instead of `info`. The sender
+/// (`probe_ping`, below) and the recognizer (`connection::is_probe_ping`) must agree on this
+/// exact byte string — it is a log-verbosity signal only, never an authentication or security
+/// boundary: a client that happens to send this by coincidence just gets a quieter log line for
+/// that one connection, nothing more.
+pub(crate) const PROBE_MARKER: &[u8] = b"__rocket_mem_peer_probe__";
+
 /// Sends one `PING` on `socket` and reads the first bytes of a reply. `true` means something
 /// answered. Generic over the stream type so `probe_once` can share this between its plaintext
 /// and TLS branches without a boxed trait object -- see `replication::connect_and_sync`'s
@@ -183,11 +192,22 @@ async fn probe_ping<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
     mut socket: S,
 ) -> Option<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    socket.write_all(b"*1\r\n$4\r\nPING\r\n").await.ok()?;
-    let mut buf = [0u8; 32];
+    let mut request = Vec::with_capacity(16 + PROBE_MARKER.len());
+    request.extend_from_slice(b"*2\r\n$4\r\nPING\r\n$");
+    request.extend_from_slice(PROBE_MARKER.len().to_string().as_bytes());
+    request.extend_from_slice(b"\r\n");
+    request.extend_from_slice(PROBE_MARKER);
+    request.extend_from_slice(b"\r\n");
+    socket.write_all(&request).await.ok()?;
+    let mut buf = [0u8; 64];
     let read = socket.read(&mut buf).await.ok()?;
-    // A zero-length read is the peer closing the connection, not answering it.
-    let answered = read > 0 && (buf[0] == b'+' || buf[0] == b'-');
+    // `PING <msg>` replies with a Bulk string (`$...`), not the Simple-string `+PONG` a bare
+    // PING gets — probe_ping now always sends the two-argument form, so `$` is the expected
+    // success prefix. `+`/`-` stay accepted too, for robustness against a peer that doesn't
+    // recognize rocket-mem's own marker at all (a plain RESP server, or a future protocol
+    // change) and just answers with an ordinary PONG or an error — either still proves the peer
+    // is alive and speaking RESP, which is all this check is for.
+    let answered = read > 0 && matches!(buf[0], b'+' | b'-' | b'$');
     // Best-effort graceful close. Over TLS this sends a `close_notify` alert before the socket
     // closes; dropping the stream without it leaves the peer's rustls session reading a bare TCP
     // EOF, which it reports as an error ("peer closed connection without sending TLS
@@ -740,5 +760,49 @@ shard-c 127.0.0.1:7003 10923 16383
             .await;
             assert!(changed.is_empty(), "round {round} reported a healthy peer");
         }
+    }
+
+    /// Like `spawn_ping_responder`, but captures the raw bytes the prober actually sent instead
+    /// of blindly replying — this is what proves `probe_ping` sends the marker, not just that
+    /// probing still works. Replies with a `PING`-style Bulk echo of whatever second argument it
+    /// parsed out of the request, mirroring what a real rocket-mem peer's `PING <msg>` handling
+    /// does, so the round trip stays representative.
+    async fn spawn_capturing_responder() -> (String, tokio::sync::oneshot::Receiver<Vec<u8>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 128];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                let _ = tx.send(buf[..n].to_vec());
+                let _ = socket
+                    .write_all(b"$25\r\n__rocket_mem_peer_probe__\r\n")
+                    .await;
+            }
+        });
+        (addr, rx)
+    }
+
+    #[tokio::test]
+    async fn probe_ping_sends_the_ping_marker_as_a_two_element_array() {
+        let (addr, rx) = spawn_capturing_responder().await;
+        assert!(probe_once(&addr, Duration::from_secs(1), None).await);
+        let sent = rx.await.unwrap();
+        let expected = b"*2\r\n$4\r\nPING\r\n$25\r\n__rocket_mem_peer_probe__\r\n";
+        assert_eq!(
+            sent, expected,
+            "expected the exact PING <PROBE_MARKER> wire encoding, got: {}",
+            String::from_utf8_lossy(&sent)
+        );
+    }
+
+    #[test]
+    fn probe_marker_is_the_length_the_wire_encoding_assumes() {
+        // The test above hardcodes `$25\r\n` for the marker's RESP bulk-length prefix; this
+        // guards that assumption so a future edit to PROBE_MARKER's text fails loudly here
+        // instead of silently breaking the wire-format assertion above.
+        assert_eq!(PROBE_MARKER.len(), 25);
     }
 }
