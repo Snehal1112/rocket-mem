@@ -3601,6 +3601,51 @@ fn intercept_for_pubsub(
             );
             Some(Frame::Integer(delivered as i64))
         }
+        "PUBSUB" => {
+            let Some(Frame::Bulk(sub_bytes)) = items.get(1) else {
+                return Some(Frame::Error(
+                    "ERR wrong number of arguments for 'pubsub' command".into(),
+                ));
+            };
+            let sub = String::from_utf8_lossy(sub_bytes).to_ascii_uppercase();
+            Some(match sub.as_str() {
+                "CHANNELS" => {
+                    let pattern = items.get(2).and_then(|f| match f {
+                        Frame::Bulk(b) => Some(b.clone()),
+                        _ => None,
+                    });
+                    let mut channels: Vec<Bytes> = replication
+                        .pubsub
+                        .channels()
+                        .into_iter()
+                        .filter(|c| {
+                            pattern
+                                .as_ref()
+                                .is_none_or(|p| engine::glob::glob_match(p, c))
+                        })
+                        .collect();
+                    channels.sort();
+                    Frame::Array(channels.into_iter().map(Frame::Bulk).collect())
+                }
+                "NUMSUB" => {
+                    let requested: Vec<Bytes> = items[2..]
+                        .iter()
+                        .filter_map(|f| match f {
+                            Frame::Bulk(b) => Some(b.clone()),
+                            _ => None,
+                        })
+                        .collect();
+                    let mut reply = Vec::new();
+                    for (channel, count) in replication.pubsub.num_sub(&requested) {
+                        reply.push(Frame::Bulk(channel));
+                        reply.push(Frame::Integer(count as i64));
+                    }
+                    Frame::Array(reply)
+                }
+                "NUMPAT" => Frame::Integer(replication.pubsub.num_pat() as i64),
+                _ => Frame::Error(format!("ERR unknown PUBSUB subcommand '{sub}'")),
+            })
+        }
         _ => None,
     }
 }
@@ -5436,6 +5481,106 @@ mod tests {
             dispatch_and_log(&engine, &aof, &replication, cmd(&[b"EXEC"]), &session, 2);
 
         assert_eq!(exec_reply, Frame::Array(vec![Frame::Integer(1)]));
+    }
+
+    #[test]
+    fn pubsub_channels_lists_every_subscribed_channel() {
+        let replication = ReplicationHandle::default();
+        intercept_for_pubsub(
+            &cmd(&[b"SUBSCRIBE", b"news"]),
+            &Session::new(),
+            &replication,
+            1,
+        );
+
+        let reply = intercept_for_pubsub(
+            &cmd(&[b"PUBSUB", b"CHANNELS"]),
+            &Session::new(),
+            &replication,
+            2,
+        );
+
+        assert_eq!(
+            reply,
+            Some(Frame::Array(vec![Frame::Bulk(Bytes::from_static(b"news"))]))
+        );
+    }
+
+    #[test]
+    fn pubsub_channels_with_a_pattern_filters_the_result() {
+        let replication = ReplicationHandle::default();
+        intercept_for_pubsub(
+            &cmd(&[b"SUBSCRIBE", b"news"]),
+            &Session::new(),
+            &replication,
+            1,
+        );
+        intercept_for_pubsub(
+            &cmd(&[b"SUBSCRIBE", b"sports"]),
+            &Session::new(),
+            &replication,
+            2,
+        );
+
+        let reply = intercept_for_pubsub(
+            &cmd(&[b"PUBSUB", b"CHANNELS", b"news"]),
+            &Session::new(),
+            &replication,
+            3,
+        );
+
+        assert_eq!(
+            reply,
+            Some(Frame::Array(vec![Frame::Bulk(Bytes::from_static(b"news"))]))
+        );
+    }
+
+    #[test]
+    fn pubsub_numsub_reports_a_count_per_requested_channel() {
+        let replication = ReplicationHandle::default();
+        intercept_for_pubsub(
+            &cmd(&[b"SUBSCRIBE", b"news"]),
+            &Session::new(),
+            &replication,
+            1,
+        );
+
+        let reply = intercept_for_pubsub(
+            &cmd(&[b"PUBSUB", b"NUMSUB", b"news", b"empty"]),
+            &Session::new(),
+            &replication,
+            2,
+        );
+
+        assert_eq!(
+            reply,
+            Some(Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"news")),
+                Frame::Integer(1),
+                Frame::Bulk(Bytes::from_static(b"empty")),
+                Frame::Integer(0),
+            ]))
+        );
+    }
+
+    #[test]
+    fn pubsub_numpat_counts_registered_patterns() {
+        let replication = ReplicationHandle::default();
+        intercept_for_pubsub(
+            &cmd(&[b"PSUBSCRIBE", b"news.*"]),
+            &Session::new(),
+            &replication,
+            1,
+        );
+
+        let reply = intercept_for_pubsub(
+            &cmd(&[b"PUBSUB", b"NUMPAT"]),
+            &Session::new(),
+            &replication,
+            2,
+        );
+
+        assert_eq!(reply, Some(Frame::Integer(1)));
     }
 
     #[test]
