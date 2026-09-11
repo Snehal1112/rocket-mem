@@ -3269,6 +3269,10 @@ fn handle_exec(
         .in_transaction
         .store(false, std::sync::atomic::Ordering::Relaxed);
 
+    let has_write = queued
+        .iter()
+        .any(|f| extract_write_command_name(f).is_some());
+
     let started = std::time::Instant::now();
     let shard_set: std::collections::HashSet<usize> = queued
         .iter()
@@ -3282,6 +3286,9 @@ fn handle_exec(
         aof.lock_shards(&shards)
     };
 
+    if has_write {
+        append_transaction_marker(aof, replication, "MULTI");
+    }
     let mut replies = Vec::with_capacity(queued.len());
     for queued_frame in queued.iter() {
         replies.push(dispatch_and_log_gated(
@@ -3294,6 +3301,9 @@ fn handle_exec(
             false,
         ));
     }
+    if has_write {
+        append_transaction_marker(aof, replication, "EXEC");
+    }
     drop(_batch_guard);
 
     tracing::debug!(
@@ -3303,6 +3313,32 @@ fn handle_exec(
         "transaction executed"
     );
     Frame::Array(replies)
+}
+
+/// Writes a bare `MULTI`/`EXEC` marker frame (no arguments) to the AOF and broadcasts it to
+/// replicas, exactly like `dispatch_and_log_gated`'s own per-command append does for a real
+/// write, but without going through the command dispatcher -- these two frames are never
+/// dispatched as commands by anything but a replayer, which special-cases them
+/// (`transaction_grouping::TransactionGrouper`).
+fn append_transaction_marker(
+    aof: &crate::aof::AofWriter,
+    replication: &crate::replication::ReplicationHandle,
+    name: &'static str,
+) {
+    let marker = Frame::Array(vec![Frame::Bulk(Bytes::from_static(name.as_bytes()))]);
+    let encoded = match crate::aof::encode_frame(&marker) {
+        Ok(encoded) => encoded,
+        Err(e) => {
+            tracing::error!(error = %e, marker = name, "aof encode failed");
+            return;
+        }
+    };
+    if let Err(e) = aof.append_encoded(encoded.clone()) {
+        tracing::error!(error = %e, marker = name, "aof append failed");
+    }
+    let bytes = Bytes::from(encoded);
+    replication.advance_master_repl_offset(bytes.len() as u64);
+    replication.registry.broadcast(bytes);
 }
 
 /// The uppercased command name, or `None` for a frame that isn't a command array. Cheap enough to
@@ -4820,6 +4856,68 @@ mod tests {
         // The GET is unaffected: READONLY only gates writes, and one queued command's gate
         // rejection must not abort the rest of the batch (same rule as a runtime error).
         assert!(matches!(replies[1], Frame::Null | Frame::Bulk(_)));
+    }
+
+    #[test]
+    fn exec_wraps_its_writes_in_multi_and_exec_aof_markers() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let replication = ReplicationHandle::default();
+        let session = Session::new();
+        dispatch_and_log(&engine, &aof, &replication, cmd(&[b"MULTI"]), &session, 1);
+        dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"SET", b"k1", b"v1"]),
+            &session,
+            1,
+        );
+        dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"SET", b"k2", b"v2"]),
+            &session,
+            1,
+        );
+        dispatch_and_log(&engine, &aof, &replication, cmd(&[b"EXEC"]), &session, 1);
+        aof.fsync().unwrap();
+
+        let on_disk = std::fs::read(_dir.path().join("test.aof")).unwrap();
+        let expected = [
+            crate::aof::encode_frame(&cmd(&[b"MULTI"])).unwrap(),
+            crate::aof::encode_frame(&cmd(&[b"SET", b"k1", b"v1"])).unwrap(),
+            crate::aof::encode_frame(&cmd(&[b"SET", b"k2", b"v2"])).unwrap(),
+            crate::aof::encode_frame(&cmd(&[b"EXEC"])).unwrap(),
+        ]
+        .concat();
+        assert_eq!(on_disk, expected);
+    }
+
+    #[test]
+    fn a_read_only_transaction_writes_nothing_to_the_aof_at_all() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let replication = ReplicationHandle::default();
+        let session = Session::new();
+        dispatch_and_log(&engine, &aof, &replication, cmd(&[b"MULTI"]), &session, 1);
+        dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"GET", b"nope"]),
+            &session,
+            1,
+        );
+        dispatch_and_log(&engine, &aof, &replication, cmd(&[b"EXEC"]), &session, 1);
+        aof.fsync().unwrap();
+
+        let on_disk = std::fs::read(_dir.path().join("test.aof")).unwrap();
+        assert!(
+            on_disk.is_empty(),
+            "a transaction with no writes must not touch the AOF at all"
+        );
     }
 
     #[test]
