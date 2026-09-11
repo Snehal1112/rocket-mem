@@ -61,7 +61,11 @@ fn string_commands_reject_non_string_keys() {
 #[test]
 fn hash_commands_reject_non_hash_keys() {
     assert_wrongtype!(hash::hget(&engine_with_string_key(), b"k", b"f"));
-    assert_wrongtype!(hash::hdel(&engine_with_list_key(), b"k", b"f"));
+    assert_wrongtype!(hash::hdel(
+        &engine_with_list_key(),
+        b"k",
+        &[Bytes::from_static(b"f")]
+    ));
     assert_wrongtype!(hash::hgetall(&engine_with_set_key(), b"k"));
     let e = engine_with_string_key();
     assert_wrongtype!(hash::hset(
@@ -114,7 +118,11 @@ fn set_commands_reject_non_set_keys() {
 #[test]
 fn sorted_set_commands_reject_non_sorted_set_keys() {
     assert_wrongtype!(sorted_set::zscore(&engine_with_string_key(), b"k", b"m"));
-    assert_wrongtype!(sorted_set::zrem(&engine_with_hash_key(), b"k", b"m"));
+    assert_wrongtype!(sorted_set::zrem(
+        &engine_with_hash_key(),
+        b"k",
+        &[Bytes::from_static(b"m")]
+    ));
     assert_wrongtype!(sorted_set::zcard(&engine_with_list_key(), b"k"));
     let e = engine_with_string_key();
     assert_wrongtype!(sorted_set::zadd(

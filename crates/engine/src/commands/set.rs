@@ -123,15 +123,27 @@ pub fn sdiff(engine: &Engine, keys: &[Bytes]) -> Result<HashSet<Bytes>, common::
     Ok(result)
 }
 
+/// Stores `result` at `dest`, or -- when `result` is empty -- deletes `dest` instead of
+/// creating a phantom empty Set. This matches real Redis's *STORE semantics: an empty computed
+/// result deletes any pre-existing `dest` rather than leaving its old value in place. See
+/// `sadd`'s doc comment above for this file's established "no phantom empty collection" idiom.
+fn store_or_delete(engine: &Engine, dest: Bytes, result: HashSet<Bytes>) -> usize {
+    let len = result.len();
+    if result.is_empty() {
+        engine.del(&dest);
+    } else {
+        engine.set(dest, Value::Set(result));
+    }
+    len
+}
+
 pub fn sinterstore(
     engine: &Engine,
     dest: Bytes,
     keys: &[Bytes],
 ) -> Result<usize, common::EngineError> {
     let result = sinter(engine, keys)?;
-    let len = result.len();
-    engine.set(dest, Value::Set(result));
-    Ok(len)
+    Ok(store_or_delete(engine, dest, result))
 }
 
 pub fn sunionstore(
@@ -140,9 +152,7 @@ pub fn sunionstore(
     keys: &[Bytes],
 ) -> Result<usize, common::EngineError> {
     let result = sunion(engine, keys)?;
-    let len = result.len();
-    engine.set(dest, Value::Set(result));
-    Ok(len)
+    Ok(store_or_delete(engine, dest, result))
 }
 
 pub fn sdiffstore(
@@ -151,9 +161,7 @@ pub fn sdiffstore(
     keys: &[Bytes],
 ) -> Result<usize, common::EngineError> {
     let result = sdiff(engine, keys)?;
-    let len = result.len();
-    engine.set(dest, Value::Set(result));
-    Ok(len)
+    Ok(store_or_delete(engine, dest, result))
 }
 
 pub fn spop(engine: &Engine, key: &[u8]) -> Result<Option<Bytes>, common::EngineError> {
@@ -447,6 +455,150 @@ mod tests {
             smembers(&engine, b"dest").unwrap(),
             HashSet::from([Bytes::from_static(b"x")])
         );
+    }
+
+    #[test]
+    fn sinterstore_with_disjoint_sets_does_not_create_a_phantom_dest() {
+        let engine = Engine::new();
+        sadd(
+            &engine,
+            Bytes::from_static(b"a"),
+            vec![Bytes::from_static(b"x")],
+        )
+        .unwrap();
+        sadd(
+            &engine,
+            Bytes::from_static(b"b"),
+            vec![Bytes::from_static(b"y")],
+        )
+        .unwrap();
+        let len = sinterstore(
+            &engine,
+            Bytes::from_static(b"dest"),
+            &[Bytes::from_static(b"a"), Bytes::from_static(b"b")],
+        )
+        .unwrap();
+        assert_eq!(len, 0);
+        assert!(!engine.exists(b"dest"));
+    }
+
+    #[test]
+    fn sinterstore_with_empty_result_deletes_a_preexisting_dest() {
+        let engine = Engine::new();
+        sadd(
+            &engine,
+            Bytes::from_static(b"a"),
+            vec![Bytes::from_static(b"x")],
+        )
+        .unwrap();
+        sadd(
+            &engine,
+            Bytes::from_static(b"b"),
+            vec![Bytes::from_static(b"y")],
+        )
+        .unwrap();
+        sadd(
+            &engine,
+            Bytes::from_static(b"dest"),
+            vec![Bytes::from_static(b"old")],
+        )
+        .unwrap();
+        let len = sinterstore(
+            &engine,
+            Bytes::from_static(b"dest"),
+            &[Bytes::from_static(b"a"), Bytes::from_static(b"b")],
+        )
+        .unwrap();
+        assert_eq!(len, 0);
+        assert!(!engine.exists(b"dest"));
+    }
+
+    #[test]
+    fn sunionstore_of_two_missing_keys_does_not_create_a_phantom_dest() {
+        let engine = Engine::new();
+        let len = sunionstore(
+            &engine,
+            Bytes::from_static(b"dest"),
+            &[Bytes::from_static(b"a"), Bytes::from_static(b"b")],
+        )
+        .unwrap();
+        assert_eq!(len, 0);
+        assert!(!engine.exists(b"dest"));
+    }
+
+    #[test]
+    fn sunionstore_with_empty_result_deletes_a_preexisting_dest() {
+        let engine = Engine::new();
+        sadd(
+            &engine,
+            Bytes::from_static(b"dest"),
+            vec![Bytes::from_static(b"old")],
+        )
+        .unwrap();
+        let len = sunionstore(
+            &engine,
+            Bytes::from_static(b"dest"),
+            &[Bytes::from_static(b"a"), Bytes::from_static(b"b")],
+        )
+        .unwrap();
+        assert_eq!(len, 0);
+        assert!(!engine.exists(b"dest"));
+    }
+
+    #[test]
+    fn sdiffstore_when_first_set_is_a_subset_of_the_second_does_not_create_a_phantom_dest() {
+        let engine = Engine::new();
+        sadd(
+            &engine,
+            Bytes::from_static(b"a"),
+            vec![Bytes::from_static(b"x")],
+        )
+        .unwrap();
+        sadd(
+            &engine,
+            Bytes::from_static(b"b"),
+            vec![Bytes::from_static(b"x"), Bytes::from_static(b"y")],
+        )
+        .unwrap();
+        let len = sdiffstore(
+            &engine,
+            Bytes::from_static(b"dest"),
+            &[Bytes::from_static(b"a"), Bytes::from_static(b"b")],
+        )
+        .unwrap();
+        assert_eq!(len, 0);
+        assert!(!engine.exists(b"dest"));
+    }
+
+    #[test]
+    fn sdiffstore_with_empty_result_deletes_a_preexisting_dest() {
+        let engine = Engine::new();
+        sadd(
+            &engine,
+            Bytes::from_static(b"a"),
+            vec![Bytes::from_static(b"x")],
+        )
+        .unwrap();
+        sadd(
+            &engine,
+            Bytes::from_static(b"b"),
+            vec![Bytes::from_static(b"x"), Bytes::from_static(b"y")],
+        )
+        .unwrap();
+        sadd(
+            &engine,
+            Bytes::from_static(b"dest"),
+            vec![Bytes::from_static(b"old")],
+        )
+        .unwrap();
+        let len = sdiffstore(
+            &engine,
+            Bytes::from_static(b"dest"),
+            &[Bytes::from_static(b"a"), Bytes::from_static(b"b")],
+        )
+        .unwrap();
+        assert_eq!(len, 0);
+        assert!(!engine.exists(b"dest"));
     }
 
     #[test]

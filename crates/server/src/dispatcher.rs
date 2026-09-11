@@ -486,9 +486,8 @@ pub fn dispatch(engine: &Engine, frame: Frame, _protocol: &mut Protocol, _client
         }
         "HDEL" => {
             require_args!(rest, 2, "hdel");
-            match commands::hash::hdel(engine, &rest[0], &rest[1]) {
-                Ok(true) => Frame::Integer(1),
-                Ok(false) => Frame::Integer(0),
+            match commands::hash::hdel(engine, &rest[0], &rest[1..]) {
+                Ok(n) => Frame::Integer(n),
                 Err(e) => engine_error_to_frame(e),
             }
         }
@@ -679,8 +678,7 @@ pub fn dispatch(engine: &Engine, frame: Frame, _protocol: &mut Protocol, _client
                 None => return Frame::Error("ERR value is not an integer or out of range".into()),
             };
             match commands::list::lset(engine, rest[0].clone(), index, rest[2].clone()) {
-                Ok(true) => Frame::Simple("OK".into()),
-                Ok(false) => Frame::Error("ERR index out of range".into()),
+                Ok(()) => Frame::Simple("OK".into()),
                 Err(e) => engine_error_to_frame(e),
             }
         }
@@ -949,9 +947,8 @@ pub fn dispatch(engine: &Engine, frame: Frame, _protocol: &mut Protocol, _client
         }
         "ZREM" => {
             require_args!(rest, 2, "zrem");
-            match commands::sorted_set::zrem(engine, &rest[0], &rest[1]) {
-                Ok(true) => Frame::Integer(1),
-                Ok(false) => Frame::Integer(0),
+            match commands::sorted_set::zrem(engine, &rest[0], &rest[1..]) {
+                Ok(n) => Frame::Integer(n),
                 Err(e) => engine_error_to_frame(e),
             }
         }
@@ -8479,6 +8476,31 @@ mod tests {
     }
 
     #[test]
+    fn hdel_with_multiple_fields_returns_the_count_actually_removed() {
+        let engine = Engine::new();
+        dispatch(
+            &engine,
+            cmd(&[b"HSET", b"h", b"a", b"1", b"b", b"2"]),
+            &mut Protocol::default(),
+            1,
+        );
+        // "c" was never a field, so only "a" and "b" count as removed.
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"HDEL", b"h", b"a", b"b", b"c"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Integer(2)
+        );
+        assert_eq!(
+            dispatch(&engine, cmd(&[b"HLEN", b"h"]), &mut Protocol::default(), 1),
+            Frame::Integer(0)
+        );
+    }
+
+    #[test]
     fn hset_with_an_odd_number_of_field_value_args_is_a_resp_error() {
         let engine = Engine::new();
         assert_eq!(
@@ -9614,6 +9636,37 @@ mod tests {
     }
 
     #[test]
+    fn zrem_with_multiple_members_returns_the_count_actually_removed() {
+        let engine = Engine::new();
+        dispatch(
+            &engine,
+            cmd(&[b"ZADD", b"z", b"5", b"alice"]),
+            &mut Protocol::default(),
+            1,
+        );
+        dispatch(
+            &engine,
+            cmd(&[b"ZADD", b"z", b"2", b"bob"]),
+            &mut Protocol::default(),
+            1,
+        );
+        // "carol" was never a member, so only "alice" and "bob" count as removed.
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"ZREM", b"z", b"alice", b"bob", b"carol"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Integer(2)
+        );
+        assert_eq!(
+            dispatch(&engine, cmd(&[b"ZCARD", b"z"]), &mut Protocol::default(), 1),
+            Frame::Integer(0)
+        );
+    }
+
+    #[test]
     fn zincrby_returns_the_new_score_as_a_bulk_string() {
         let engine = Engine::new();
         dispatch(
@@ -9796,7 +9849,21 @@ mod tests {
                 &mut Protocol::default(),
                 1
             ),
-            Frame::Error("ERR index out of range".into())
+            Frame::Error("index out of range".into())
+        );
+    }
+
+    #[test]
+    fn lset_on_missing_key_is_a_no_such_key_resp_error_not_index_out_of_range() {
+        let engine = Engine::new();
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"LSET", b"missing", b"0", b"z"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Error("no such key".into())
         );
     }
 

@@ -41,6 +41,10 @@ pub enum EngineError {
     NotAnInteger,
     #[error("no such key")]
     NoSuchKey,
+    #[error("increment or decrement would overflow")]
+    IncrementOverflow,
+    #[error("index out of range")]
+    IndexOutOfRange,
 }
 
 #[cfg(test)]

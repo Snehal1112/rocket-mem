@@ -1,13 +1,22 @@
-use crate::Engine;
+use crate::{Engine, TtlStatus};
 use bytes::Bytes;
+use std::time::Instant;
 
 pub fn rename(engine: &Engine, src: &[u8], dst: Bytes) -> Result<(), common::EngineError> {
     let val = engine.get(src).ok_or(common::EngineError::NoSuchKey)?;
     if src == dst.as_ref() {
         return Ok(());
     }
-    engine.set(dst, val);
+    // Read the source's TTL before `del` removes the entry -- and thus its TTL -- entirely.
+    let ttl = engine.ttl(src);
+    engine.set(dst.clone(), val);
     engine.del(src);
+    // `engine.set` already cleared any TTL the destination previously had, matching Redis:
+    // RENAME's destination always ends up exactly matching the source's TTL state. Only a
+    // source that carried a remaining TTL needs it re-applied to the destination.
+    if let TtlStatus::Remaining(remaining) = ttl {
+        engine.expire_at(&dst, Instant::now() + remaining);
+    }
     Ok(())
 }
 
@@ -16,8 +25,13 @@ pub fn renamenx(engine: &Engine, src: &[u8], dst: Bytes) -> Result<bool, common:
     if engine.exists(&dst) {
         return Ok(false);
     }
-    engine.set(dst, val);
+    // Read the source's TTL before `del` removes the entry -- and thus its TTL -- entirely.
+    let ttl = engine.ttl(src);
+    engine.set(dst.clone(), val);
     engine.del(src);
+    if let TtlStatus::Remaining(remaining) = ttl {
+        engine.expire_at(&dst, Instant::now() + remaining);
+    }
     Ok(true)
 }
 
@@ -41,8 +55,9 @@ pub fn randomkey(engine: &Engine) -> Option<Bytes> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Engine, Value};
+    use crate::{Engine, TtlStatus, Value};
     use bytes::Bytes;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn rename_moves_the_value_and_removes_the_source() {
@@ -139,6 +154,67 @@ mod tests {
         let engine = Engine::new();
         let err = renamenx(&engine, b"missing", Bytes::from_static(b"dst")).unwrap_err();
         assert_eq!(err, common::EngineError::NoSuchKey);
+    }
+
+    #[test]
+    fn rename_moves_the_sources_ttl_to_the_destination() {
+        let engine = Engine::new();
+        engine.set(
+            Bytes::from_static(b"src"),
+            Value::String(Bytes::from_static(b"v")),
+        );
+        engine.expire_at(b"src", Instant::now() + Duration::from_secs(100));
+        rename(&engine, b"src", Bytes::from_static(b"dst")).unwrap();
+        match engine.ttl(b"dst") {
+            TtlStatus::Remaining(d) => {
+                assert!(d > Duration::from_secs(55) && d <= Duration::from_secs(100))
+            }
+            other => panic!("expected Remaining, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rename_of_a_source_with_no_ttl_leaves_the_destination_with_no_ttl() {
+        let engine = Engine::new();
+        engine.set(
+            Bytes::from_static(b"src"),
+            Value::String(Bytes::from_static(b"v")),
+        );
+        engine.set(
+            Bytes::from_static(b"dst"),
+            Value::String(Bytes::from_static(b"old")),
+        );
+        engine.expire_at(b"dst", Instant::now() + Duration::from_secs(100));
+        rename(&engine, b"src", Bytes::from_static(b"dst")).unwrap();
+        assert_eq!(engine.ttl(b"dst"), TtlStatus::NoExpiry);
+    }
+
+    #[test]
+    fn renamenx_moves_the_sources_ttl_to_the_destination() {
+        let engine = Engine::new();
+        engine.set(
+            Bytes::from_static(b"src"),
+            Value::String(Bytes::from_static(b"v")),
+        );
+        engine.expire_at(b"src", Instant::now() + Duration::from_secs(100));
+        renamenx(&engine, b"src", Bytes::from_static(b"dst")).unwrap();
+        match engine.ttl(b"dst") {
+            TtlStatus::Remaining(d) => {
+                assert!(d > Duration::from_secs(55) && d <= Duration::from_secs(100))
+            }
+            other => panic!("expected Remaining, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn renamenx_of_a_source_with_no_ttl_leaves_the_destination_with_no_ttl() {
+        let engine = Engine::new();
+        engine.set(
+            Bytes::from_static(b"src"),
+            Value::String(Bytes::from_static(b"v")),
+        );
+        renamenx(&engine, b"src", Bytes::from_static(b"dst")).unwrap();
+        assert_eq!(engine.ttl(b"dst"), TtlStatus::NoExpiry);
     }
 
     #[test]

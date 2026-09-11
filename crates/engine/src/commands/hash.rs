@@ -54,16 +54,19 @@ pub fn hget(
     })
 }
 
-pub fn hdel(engine: &Engine, key: &[u8], field: &[u8]) -> Result<bool, common::EngineError> {
+pub fn hdel(engine: &Engine, key: &[u8], fields: &[Bytes]) -> Result<i64, common::EngineError> {
     engine.with_mut_delta(key, |existing| match existing {
-        None => (Ok(false), 0),
+        None => (Ok(0), 0),
         Some(Value::Hash(map)) => {
-            let removed = map.remove(field);
-            let size_delta = match &removed {
-                Some(old_val) => -(field.len() as isize + old_val.len() as isize + 16),
-                None => 0,
-            };
-            (Ok(removed.is_some()), size_delta)
+            let mut removed = 0i64;
+            let mut size_delta = 0isize;
+            for field in fields {
+                if let Some(old_val) = map.remove(field.as_ref()) {
+                    removed += 1;
+                    size_delta -= field.len() as isize + old_val.len() as isize + 16;
+                }
+            }
+            (Ok(removed), size_delta)
         }
         Some(_) => (Err(common::EngineError::WrongType), 0),
     })
@@ -113,7 +116,10 @@ pub fn hincrby(
                         None => 0,
                     };
                     let old_len = old.map(|b| b.len());
-                    let next = current + delta;
+                    let next = match current.checked_add(delta) {
+                        Some(n) => n,
+                        None => return (Err(common::EngineError::IncrementOverflow), 0),
+                    };
                     let next_bytes = Bytes::from(next.to_string());
                     let size_delta = match old_len {
                         None => field.len() as isize + next_bytes.len() as isize + 16,
@@ -255,8 +261,57 @@ mod tests {
             Bytes::from_static(b"v"),
         )
         .unwrap();
-        assert!(hdel(&engine, b"h", b"f").unwrap());
-        assert!(!hdel(&engine, b"h", b"f").unwrap());
+        assert_eq!(hdel(&engine, b"h", &[Bytes::from_static(b"f")]).unwrap(), 1);
+        assert_eq!(hdel(&engine, b"h", &[Bytes::from_static(b"f")]).unwrap(), 0);
+    }
+
+    #[test]
+    fn hdel_with_multiple_fields_removes_all_in_one_call_and_returns_count_removed() {
+        let engine = Engine::new();
+        hset(
+            &engine,
+            Bytes::from_static(b"h"),
+            Bytes::from_static(b"f1"),
+            Bytes::from_static(b"v1"),
+        )
+        .unwrap();
+        hset(
+            &engine,
+            Bytes::from_static(b"h"),
+            Bytes::from_static(b"f2"),
+            Bytes::from_static(b"v2"),
+        )
+        .unwrap();
+        let removed = hdel(
+            &engine,
+            b"h",
+            &[Bytes::from_static(b"f1"), Bytes::from_static(b"f2")],
+        )
+        .unwrap();
+        assert_eq!(removed, 2);
+        assert!(hgetall(&engine, b"h").unwrap().is_empty());
+    }
+
+    #[test]
+    fn hdel_with_mix_of_present_and_absent_fields_counts_only_the_present_ones() {
+        let engine = Engine::new();
+        hset(
+            &engine,
+            Bytes::from_static(b"h"),
+            Bytes::from_static(b"f1"),
+            Bytes::from_static(b"v1"),
+        )
+        .unwrap();
+        let removed = hdel(
+            &engine,
+            b"h",
+            &[
+                Bytes::from_static(b"f1"),
+                Bytes::from_static(b"missing"), // never a field
+            ],
+        )
+        .unwrap();
+        assert_eq!(removed, 1);
     }
 
     #[test]
@@ -320,6 +375,30 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, common::EngineError::NotAnInteger);
+    }
+
+    #[test]
+    fn hincrby_on_i64_max_returns_increment_overflow_and_leaves_the_field_unchanged() {
+        let engine = Engine::new();
+        hset(
+            &engine,
+            Bytes::from_static(b"h"),
+            Bytes::from_static(b"f"),
+            Bytes::from(i64::MAX.to_string()),
+        )
+        .unwrap();
+        let err = hincrby(
+            &engine,
+            Bytes::from_static(b"h"),
+            Bytes::from_static(b"f"),
+            1,
+        )
+        .unwrap_err();
+        assert_eq!(err, common::EngineError::IncrementOverflow);
+        assert_eq!(
+            hget(&engine, b"h", b"f").unwrap(),
+            Some(Bytes::from(i64::MAX.to_string()))
+        );
     }
 
     #[test]
@@ -471,11 +550,11 @@ mod tests {
         assert_memory_used_matches_recomputed_size(&engine, &key);
 
         // hdel: removes a field
-        hdel(&engine, &key, b"f2").unwrap();
+        hdel(&engine, &key, &[Bytes::from_static(b"f2")]).unwrap();
         assert_memory_used_matches_recomputed_size(&engine, &key);
 
         // hdel: field already absent, no-op
-        hdel(&engine, &key, b"f2").unwrap();
+        hdel(&engine, &key, &[Bytes::from_static(b"f2")]).unwrap();
         assert_memory_used_matches_recomputed_size(&engine, &key);
     }
 }

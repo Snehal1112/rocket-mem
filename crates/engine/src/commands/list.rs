@@ -142,6 +142,27 @@ pub fn llen(engine: &Engine, key: &[u8]) -> Result<usize, common::EngineError> {
     })
 }
 
+/// Normalizes a `[start, stop]` Redis-style index range (negative indices count from the end,
+/// `stop` is inclusive) against a list of length `len` into a `[s, e)` half-open, in-bounds
+/// range ready for slicing. Shared by `lrange` and `ltrim` so the index math can't diverge
+/// between the two -- `ltrim`'s "keep this range" and `lrange`'s "return this range" must agree
+/// on exactly which elements the range covers.
+fn normalize_range(len: i64, start: i64, stop: i64) -> (usize, usize) {
+    let norm = |i: i64| -> i64 {
+        if i < 0 {
+            (len + i).max(0)
+        } else {
+            i.min(len)
+        }
+    };
+    let (s, e) = (norm(start), norm(stop) + 1);
+    if s >= e {
+        (0, 0)
+    } else {
+        (s as usize, e as usize)
+    }
+}
+
 /// start/stop follow Redis semantics: negative indices count from the end, -1 is the last element.
 pub fn lrange(
     engine: &Engine,
@@ -155,26 +176,10 @@ pub fn lrange(
             Some(Value::List(list)) => list,
             Some(_) => return Err(common::EngineError::WrongType),
         };
-        let len = list.len() as i64;
-        let norm = |i: i64| -> i64 {
-            if i < 0 {
-                (len + i).max(0)
-            } else {
-                i.min(len)
-            }
-        };
-        let (s, e) = (norm(start), norm(stop) + 1);
-        if s >= e {
-            return Ok(Vec::new());
-        }
+        let (s, e) = normalize_range(list.len() as i64, start, stop);
         // Only the requested slice gets cloned, not the whole list -- e.g. `LRANGE key 0 9`
         // on a million-element list clones 10 Bytes handles, not a million.
-        Ok(list
-            .iter()
-            .skip(s as usize)
-            .take((e - s) as usize)
-            .cloned()
-            .collect())
+        Ok(list.iter().skip(s).take(e - s).cloned().collect())
     })
 }
 
@@ -203,22 +208,22 @@ pub fn lset(
     key: Bytes,
     index: i64,
     val: Bytes,
-) -> Result<bool, common::EngineError> {
+) -> Result<(), common::EngineError> {
     engine.with_mut_delta(&key, |existing| {
         let list = match existing {
-            None => return (Ok(false), 0),
+            None => return (Err(common::EngineError::NoSuchKey), 0),
             Some(Value::List(list)) => list,
             Some(_) => return (Err(common::EngineError::WrongType), 0),
         };
         let len = list.len() as i64;
         let idx = if index < 0 { len + index } else { index };
         if idx < 0 || idx >= len {
-            return (Ok(false), 0);
+            return (Err(common::EngineError::IndexOutOfRange), 0);
         }
         // Only the replaced element's length changes -- the rest of the list is untouched.
         let delta = val.len() as isize - list[idx as usize].len() as isize;
         list[idx as usize] = val;
-        (Ok(true), delta)
+        (Ok(()), delta)
     })
 }
 
@@ -228,9 +233,31 @@ pub fn ltrim(
     start: i64,
     stop: i64,
 ) -> Result<(), common::EngineError> {
-    let trimmed = lrange(engine, &key, start, stop)?;
-    engine.set(key, Value::List(trimmed.into_iter().collect()));
-    Ok(())
+    engine.with_mut_delta(&key, |existing| {
+        let list = match existing {
+            // Missing key is a no-op -- it must not fabricate a phantom empty list (see
+            // missing_key_semantics_tests.rs's convention, and unlike the old lrange+set
+            // implementation this replaced).
+            None => return (Ok(()), 0),
+            Some(Value::List(list)) => list,
+            Some(_) => return (Err(common::EngineError::WrongType), 0),
+        };
+        let (s, e) = normalize_range(list.len() as i64, start, stop);
+        // Drop the tail first, then the head -- either order removes the same elements,
+        // but truncating first keeps the head-drain's indices untouched by the tail removal.
+        let mut delta = 0isize;
+        for b in list.iter().skip(e) {
+            delta -= b.len() as isize + 8; // matches Value::approx_size's per-element cost
+        }
+        list.truncate(e);
+        for b in list.iter().take(s) {
+            delta -= b.len() as isize + 8;
+        }
+        list.drain(0..s);
+        // If this emptied the list, `Shard::with_mut_delta` deletes the key itself -- no
+        // special-casing needed here.
+        (Ok(()), delta)
+    })
 }
 
 /// Removes occurrences of `val`: `count > 0` removes up to `count` from the head,
@@ -563,7 +590,7 @@ mod tests {
     }
 
     #[test]
-    fn lset_replaces_the_element_at_index_and_reports_success() {
+    fn lset_on_existing_list_with_bad_index_returns_index_out_of_range() {
         let engine = Engine::new();
         rpush(
             &engine,
@@ -571,21 +598,35 @@ mod tests {
             vec![Bytes::from_static(b"a")],
         )
         .unwrap();
-        assert!(lset(
-            &engine,
-            Bytes::from_static(b"l"),
-            0,
-            Bytes::from_static(b"z")
-        )
-        .unwrap());
         assert_eq!(
-            lindex(&engine, b"l", 0).unwrap(),
-            Some(Bytes::from_static(b"z"))
+            lset(
+                &engine,
+                Bytes::from_static(b"l"),
+                5,
+                Bytes::from_static(b"z")
+            )
+            .unwrap_err(),
+            common::EngineError::IndexOutOfRange
         );
     }
 
     #[test]
-    fn lset_out_of_range_returns_false_not_an_error() {
+    fn lset_on_missing_key_returns_no_such_key_not_index_out_of_range() {
+        let engine = Engine::new();
+        assert_eq!(
+            lset(
+                &engine,
+                Bytes::from_static(b"missing"),
+                0,
+                Bytes::from_static(b"z")
+            )
+            .unwrap_err(),
+            common::EngineError::NoSuchKey
+        );
+    }
+
+    #[test]
+    fn lset_on_valid_index_still_works_and_returns_ok() {
         let engine = Engine::new();
         rpush(
             &engine,
@@ -593,13 +634,17 @@ mod tests {
             vec![Bytes::from_static(b"a")],
         )
         .unwrap();
-        assert!(!lset(
+        lset(
             &engine,
             Bytes::from_static(b"l"),
-            5,
-            Bytes::from_static(b"z")
+            0,
+            Bytes::from_static(b"z"),
         )
-        .unwrap());
+        .unwrap();
+        assert_eq!(
+            lindex(&engine, b"l", 0).unwrap(),
+            Some(Bytes::from_static(b"z"))
+        );
     }
 
     #[test]
@@ -618,6 +663,65 @@ mod tests {
             lrange(&engine, b"l", 0, -1).unwrap(),
             vec![Bytes::from_static(b"b"), Bytes::from_static(b"c")]
         );
+    }
+
+    #[test]
+    fn ltrim_on_a_missing_key_does_not_create_a_phantom_key() {
+        let engine = Engine::new();
+        ltrim(&engine, Bytes::from_static(b"missing"), 0, -1).unwrap();
+        assert!(!engine.exists(b"missing"));
+    }
+
+    #[test]
+    fn ltrim_on_a_string_key_returns_wrongtype() {
+        let engine = Engine::new();
+        engine.set(
+            Bytes::from_static(b"k"),
+            Value::String(Bytes::from_static(b"v")),
+        );
+        assert_eq!(
+            ltrim(&engine, Bytes::from_static(b"k"), 0, -1).unwrap_err(),
+            common::EngineError::WrongType
+        );
+    }
+
+    #[test]
+    fn ltrim_preserves_ttl_on_a_normal_trim() {
+        let engine = Engine::new();
+        for v in [b"a", b"b", b"c"] {
+            rpush(
+                &engine,
+                Bytes::from_static(b"l"),
+                vec![Bytes::from_static(v)],
+            )
+            .unwrap();
+        }
+        engine.expire_at(
+            b"l",
+            std::time::Instant::now() + std::time::Duration::from_secs(100),
+        );
+        ltrim(&engine, Bytes::from_static(b"l"), 0, 1).unwrap();
+        assert_eq!(
+            lrange(&engine, b"l", 0, -1).unwrap(),
+            vec![Bytes::from_static(b"a"), Bytes::from_static(b"b")]
+        );
+        assert!(matches!(
+            engine.ttl(b"l"),
+            crate::TtlStatus::Remaining(d) if d.as_secs() > 0
+        ));
+    }
+
+    #[test]
+    fn ltrim_to_empty_range_deletes_the_key() {
+        let engine = Engine::new();
+        rpush(
+            &engine,
+            Bytes::from_static(b"l"),
+            vec![Bytes::from_static(b"a")],
+        )
+        .unwrap();
+        ltrim(&engine, Bytes::from_static(b"l"), 5, 3).unwrap();
+        assert!(!engine.exists(b"l"));
     }
 
     #[test]

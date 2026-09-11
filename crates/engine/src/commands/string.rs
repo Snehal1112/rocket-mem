@@ -26,15 +26,33 @@ pub fn get(engine: &Engine, key: &[u8]) -> Result<Option<Bytes>, common::EngineE
 }
 
 pub fn append(engine: &Engine, key: Bytes, suffix: &[u8]) -> Result<usize, common::EngineError> {
-    let mut buf = match engine.get(&key) {
-        None => Vec::new(),
-        Some(Value::String(b)) => b.to_vec(),
-        Some(_) => return Err(common::EngineError::WrongType),
-    };
-    buf.extend_from_slice(suffix);
-    let len = buf.len();
-    engine.set(key, Value::String(Bytes::from(buf)));
-    Ok(len)
+    // Mutate in place via `with_mut_delta` when the key already holds a string, so its TTL
+    // (which `Engine::set` would unconditionally clear) survives -- matching real Redis. Only
+    // fall back to `engine.set` to create a genuinely new key, which has no TTL to preserve.
+    let existed = engine.with_mut_delta(
+        &key,
+        |existing| -> (Result<Option<usize>, common::EngineError>, isize) {
+            match existing {
+                Some(Value::String(b)) => {
+                    let mut buf = b.to_vec();
+                    buf.extend_from_slice(suffix);
+                    let len = buf.len();
+                    *b = Bytes::from(buf);
+                    (Ok(Some(len)), suffix.len() as isize)
+                }
+                Some(_) => (Err(common::EngineError::WrongType), 0),
+                None => (Ok(None), 0),
+            }
+        },
+    )?;
+    match existed {
+        Some(len) => Ok(len),
+        None => {
+            let len = suffix.len();
+            engine.set(key, Value::String(Bytes::copy_from_slice(suffix)));
+            Ok(len)
+        }
+    }
 }
 
 pub fn strlen(engine: &Engine, key: &[u8]) -> Result<usize, common::EngineError> {
@@ -46,17 +64,43 @@ pub fn strlen(engine: &Engine, key: &[u8]) -> Result<usize, common::EngineError>
 }
 
 pub fn incr_by(engine: &Engine, key: Bytes, delta: i64) -> Result<i64, common::EngineError> {
-    let current: i64 = match engine.get(&key) {
-        None => 0,
-        Some(Value::String(b)) => std::str::from_utf8(&b)
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .ok_or(common::EngineError::NotAnInteger)?,
-        Some(_) => return Err(common::EngineError::WrongType),
-    };
-    let next = current + delta;
-    engine.set(key, Value::String(Bytes::from(next.to_string())));
-    Ok(next)
+    // Mutate in place via `with_mut_delta` when the key already holds a string, so its TTL
+    // (which `Engine::set` would unconditionally clear) survives -- matching real Redis. Only
+    // fall back to `engine.set` to create a genuinely new key, which has no TTL to preserve.
+    let existed = engine.with_mut_delta(
+        &key,
+        |existing| -> (Result<Option<i64>, common::EngineError>, isize) {
+            match existing {
+                Some(Value::String(b)) => {
+                    let current: i64 =
+                        match std::str::from_utf8(b).ok().and_then(|s| s.parse().ok()) {
+                            Some(v) => v,
+                            None => return (Err(common::EngineError::NotAnInteger), 0),
+                        };
+                    let next = match current.checked_add(delta) {
+                        Some(v) => v,
+                        None => return (Err(common::EngineError::IncrementOverflow), 0),
+                    };
+                    let new_bytes = Bytes::from(next.to_string());
+                    let size_delta = new_bytes.len() as isize - b.len() as isize;
+                    *b = new_bytes;
+                    (Ok(Some(next)), size_delta)
+                }
+                Some(_) => (Err(common::EngineError::WrongType), 0),
+                None => (Ok(None), 0),
+            }
+        },
+    )?;
+    match existed {
+        Some(next) => Ok(next),
+        None => {
+            // A missing key initializes as if the current value were 0; 0 + delta can never
+            // overflow an i64, so no overflow check is needed on this path.
+            let next = delta;
+            engine.set(key, Value::String(Bytes::from(next.to_string())));
+            Ok(next)
+        }
+    }
 }
 
 pub fn getset(
@@ -107,22 +151,51 @@ pub fn setrange(
     offset: usize,
     value: &[u8],
 ) -> Result<usize, common::EngineError> {
-    let mut buf = match engine.get(&key) {
-        None => Vec::new(),
-        Some(Value::String(b)) => b.to_vec(),
-        Some(_) => return Err(common::EngineError::WrongType),
-    };
+    // An empty `value` is a pure no-op (even against an existing key) -- it must not create a
+    // missing key, and it must not touch an existing one, so this never reaches `with_mut_delta`.
     if value.is_empty() {
-        return Ok(buf.len());
+        return match engine.get(&key) {
+            None => Ok(0),
+            Some(Value::String(b)) => Ok(b.len()),
+            Some(_) => Err(common::EngineError::WrongType),
+        };
     }
-    let end = offset + value.len();
-    if buf.len() < end {
-        buf.resize(end, 0);
+    // Mutate in place via `with_mut_delta` when the key already holds a string, so its TTL
+    // (which `Engine::set` would unconditionally clear) survives -- matching real Redis. Only
+    // fall back to `engine.set` to create a genuinely new key, which has no TTL to preserve.
+    let existed = engine.with_mut_delta(
+        &key,
+        |existing| -> (Result<Option<usize>, common::EngineError>, isize) {
+            match existing {
+                Some(Value::String(b)) => {
+                    let mut buf = b.to_vec();
+                    let old_len = buf.len();
+                    let end = offset + value.len();
+                    if buf.len() < end {
+                        buf.resize(end, 0);
+                    }
+                    buf[offset..end].copy_from_slice(value);
+                    let len = buf.len();
+                    let size_delta = len as isize - old_len as isize;
+                    *b = Bytes::from(buf);
+                    (Ok(Some(len)), size_delta)
+                }
+                Some(_) => (Err(common::EngineError::WrongType), 0),
+                None => (Ok(None), 0),
+            }
+        },
+    )?;
+    match existed {
+        Some(len) => Ok(len),
+        None => {
+            let end = offset + value.len();
+            let mut buf = vec![0u8; end];
+            buf[offset..end].copy_from_slice(value);
+            let len = buf.len();
+            engine.set(key, Value::String(Bytes::from(buf)));
+            Ok(len)
+        }
     }
-    buf[offset..end].copy_from_slice(value);
-    let len = buf.len();
-    engine.set(key, Value::String(Bytes::from(buf)));
-    Ok(len)
 }
 
 pub fn mset(engine: &Engine, pairs: Vec<(Bytes, Bytes)>) {
@@ -402,6 +475,97 @@ mod tests {
         assert_eq!(
             setrange(&engine, Bytes::from_static(b"h"), 0, b"x").unwrap_err(),
             common::EngineError::WrongType
+        );
+    }
+
+    #[test]
+    fn append_preserves_an_existing_ttl() {
+        let engine = Engine::new();
+        engine.set(
+            Bytes::from_static(b"k"),
+            Value::String(Bytes::from_static(b"hello")),
+        );
+        engine.expire_at(
+            b"k",
+            std::time::Instant::now() + std::time::Duration::from_secs(100),
+        );
+        append(&engine, Bytes::from_static(b"k"), b" world").unwrap();
+        match engine.ttl(b"k") {
+            crate::engine::TtlStatus::Remaining(d) => {
+                assert!(d > std::time::Duration::from_secs(90))
+            }
+            other => panic!("expected Remaining, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn incr_by_preserves_an_existing_ttl() {
+        let engine = Engine::new();
+        engine.set(
+            Bytes::from_static(b"counter"),
+            Value::String(Bytes::from_static(b"10")),
+        );
+        engine.expire_at(
+            b"counter",
+            std::time::Instant::now() + std::time::Duration::from_secs(100),
+        );
+        incr_by(&engine, Bytes::from_static(b"counter"), 5).unwrap();
+        match engine.ttl(b"counter") {
+            crate::engine::TtlStatus::Remaining(d) => {
+                assert!(d > std::time::Duration::from_secs(90))
+            }
+            other => panic!("expected Remaining, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn setrange_preserves_an_existing_ttl() {
+        let engine = Engine::new();
+        engine.set(
+            Bytes::from_static(b"k"),
+            Value::String(Bytes::from_static(b"Hello World")),
+        );
+        engine.expire_at(
+            b"k",
+            std::time::Instant::now() + std::time::Duration::from_secs(100),
+        );
+        setrange(&engine, Bytes::from_static(b"k"), 6, b"Redis!").unwrap();
+        match engine.ttl(b"k") {
+            crate::engine::TtlStatus::Remaining(d) => {
+                assert!(d > std::time::Duration::from_secs(90))
+            }
+            other => panic!("expected Remaining, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn incr_by_on_i64_max_returns_increment_overflow_and_leaves_the_value_unchanged() {
+        let engine = Engine::new();
+        engine.set(
+            Bytes::from_static(b"counter"),
+            Value::String(Bytes::from(i64::MAX.to_string())),
+        );
+        let err = incr_by(&engine, Bytes::from_static(b"counter"), 1).unwrap_err();
+        assert_eq!(err, common::EngineError::IncrementOverflow);
+        assert_eq!(
+            get(&engine, b"counter").unwrap(),
+            Some(Bytes::from(i64::MAX.to_string()))
+        );
+    }
+
+    #[test]
+    fn incr_by_on_i64_min_with_a_negative_delta_returns_increment_overflow_and_leaves_the_value_unchanged(
+    ) {
+        let engine = Engine::new();
+        engine.set(
+            Bytes::from_static(b"counter"),
+            Value::String(Bytes::from(i64::MIN.to_string())),
+        );
+        let err = incr_by(&engine, Bytes::from_static(b"counter"), -1).unwrap_err();
+        assert_eq!(err, common::EngineError::IncrementOverflow);
+        assert_eq!(
+            get(&engine, b"counter").unwrap(),
+            Some(Bytes::from(i64::MIN.to_string()))
         );
     }
 

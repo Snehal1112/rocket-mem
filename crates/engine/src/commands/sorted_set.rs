@@ -53,16 +53,18 @@ pub fn zscore(
     })
 }
 
-pub fn zrem(engine: &Engine, key: &[u8], member: &[u8]) -> Result<bool, common::EngineError> {
+pub fn zrem(engine: &Engine, key: &[u8], members: &[Bytes]) -> Result<i64, common::EngineError> {
     engine.with_mut_delta(key, |existing| match existing {
-        None => (Ok(false), 0),
+        None => (Ok(0), 0),
         Some(Value::SortedSet(zset)) => {
-            let removed = zset.remove(member);
-            let size_delta = if removed {
-                -(member.len() as isize + 24)
-            } else {
-                0
-            };
+            let mut removed = 0i64;
+            let mut size_delta = 0isize;
+            for member in members {
+                if zset.remove(member.as_ref()) {
+                    removed += 1;
+                    size_delta -= member.len() as isize + 24;
+                }
+            }
             (Ok(removed), size_delta)
         }
         Some(_) => (Err(common::EngineError::WrongType), 0),
@@ -230,8 +232,74 @@ mod tests {
             Bytes::from_static(b"alice"),
         )
         .unwrap();
-        assert!(zrem(&engine, b"z", b"alice").unwrap());
-        assert!(!zrem(&engine, b"z", b"alice").unwrap());
+        assert_eq!(
+            zrem(&engine, b"z", &[Bytes::from_static(b"alice")]).unwrap(),
+            1
+        );
+        assert_eq!(
+            zrem(&engine, b"z", &[Bytes::from_static(b"alice")]).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn zrem_with_multiple_members_removes_all_in_one_call_and_returns_count_removed() {
+        let engine = Engine::new();
+        zadd(
+            &engine,
+            Bytes::from_static(b"z"),
+            1.0,
+            Bytes::from_static(b"a"),
+        )
+        .unwrap();
+        zadd(
+            &engine,
+            Bytes::from_static(b"z"),
+            2.0,
+            Bytes::from_static(b"b"),
+        )
+        .unwrap();
+        zadd(
+            &engine,
+            Bytes::from_static(b"z"),
+            3.0,
+            Bytes::from_static(b"c"),
+        )
+        .unwrap();
+        let removed = zrem(
+            &engine,
+            b"z",
+            &[
+                Bytes::from_static(b"a"),
+                Bytes::from_static(b"b"),
+                Bytes::from_static(b"c"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(removed, 3);
+        assert_eq!(zcard(&engine, b"z").unwrap(), 0);
+    }
+
+    #[test]
+    fn zrem_with_mix_of_present_and_absent_members_counts_only_the_present_ones() {
+        let engine = Engine::new();
+        zadd(
+            &engine,
+            Bytes::from_static(b"z"),
+            1.0,
+            Bytes::from_static(b"a"),
+        )
+        .unwrap();
+        let removed = zrem(
+            &engine,
+            b"z",
+            &[
+                Bytes::from_static(b"a"),
+                Bytes::from_static(b"missing"), // never a member
+            ],
+        )
+        .unwrap();
+        assert_eq!(removed, 1);
     }
 
     #[test]
@@ -472,11 +540,11 @@ mod tests {
         assert_memory_used_matches_recomputed_size(&engine, &key);
 
         // zrem: removes an existing member
-        zrem(&engine, &key, b"alice").unwrap();
+        zrem(&engine, &key, &[Bytes::from_static(b"alice")]).unwrap();
         assert_memory_used_matches_recomputed_size(&engine, &key);
 
         // zrem: member already absent, no-op
-        zrem(&engine, &key, b"alice").unwrap();
+        zrem(&engine, &key, &[Bytes::from_static(b"alice")]).unwrap();
         assert_memory_used_matches_recomputed_size(&engine, &key);
     }
 }
