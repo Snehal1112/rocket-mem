@@ -7,6 +7,7 @@ pub mod connection;
 pub mod dispatcher;
 pub mod logging;
 pub mod metrics;
+pub mod pubsub;
 pub mod replication;
 pub mod rmp_connection;
 pub mod slowlog;
