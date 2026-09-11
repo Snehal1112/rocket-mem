@@ -3575,6 +3575,32 @@ fn intercept_for_pubsub(
             }
             Some(Frame::Array(replies))
         }
+        "PUBLISH" => {
+            let (Some(Frame::Bulk(channel)), Some(Frame::Bulk(message))) =
+                (items.get(1), items.get(2))
+            else {
+                return Some(Frame::Error(
+                    "ERR wrong number of arguments for 'publish' command".into(),
+                ));
+            };
+            let started = std::time::Instant::now();
+            let delivered = replication.pubsub.publish(channel, message);
+            // Never AOF-appended -- not a keyspace mutation, nothing for AOF replay to redo.
+            // Forwarded to replicas so a follower's own locally-subscribed clients still
+            // receive it; see the spec's "Why not dispatch()" section for why the follower side
+            // (Plan 06) intercepts this in its apply loop rather than routing it through
+            // dispatch()'s engine-mutation path.
+            if let Ok(encoded) = crate::aof::encode_frame(frame) {
+                replication.registry.broadcast(Bytes::from(encoded));
+            }
+            tracing::debug!(
+                channel = %crate::logging::escape_ident(&String::from_utf8_lossy(channel)),
+                delivered_count = delivered,
+                elapsed_us = started.elapsed().as_micros(),
+                "message published"
+            );
+            Some(Frame::Integer(delivered as i64))
+        }
         _ => None,
     }
 }
@@ -5310,6 +5336,106 @@ mod tests {
             .pubsub
             .publish(b"news.sports", &Bytes::from_static(b"hello"));
         assert_eq!(delivered, 1);
+    }
+
+    #[test]
+    fn publish_delivers_locally_and_returns_the_delivered_count() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let replication = ReplicationHandle::default();
+        let subscriber_session = Session::new();
+        intercept_for_pubsub(
+            &cmd(&[b"SUBSCRIBE", b"news"]),
+            &subscriber_session,
+            &replication,
+            1,
+        );
+
+        let reply = dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"PUBLISH", b"news", b"hello"]),
+            &Session::new(),
+            2,
+        );
+
+        assert_eq!(reply, Frame::Integer(1));
+    }
+
+    #[test]
+    fn publish_is_never_written_to_the_aof() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let replication = ReplicationHandle::default();
+        dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"PUBLISH", b"news", b"hello"]),
+            &Session::new(),
+            1,
+        );
+        aof.fsync().unwrap();
+
+        assert_eq!(read_aof(&_dir), "");
+    }
+
+    #[test]
+    fn publish_is_forwarded_to_replicas() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let replication = ReplicationHandle::default();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        replication.registry.register(None, tx);
+
+        dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"PUBLISH", b"news", b"hello"]),
+            &Session::new(),
+            1,
+        );
+
+        let forwarded = rx.try_recv().unwrap();
+        assert_eq!(
+            forwarded,
+            bytes::Bytes::from(
+                crate::aof::encode_frame(&cmd(&[b"PUBLISH", b"news", b"hello"])).unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn publish_is_queueable_and_replays_at_exec_time() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let replication = ReplicationHandle::default();
+        let subscriber_session = Session::new();
+        intercept_for_pubsub(
+            &cmd(&[b"SUBSCRIBE", b"news"]),
+            &subscriber_session,
+            &replication,
+            1,
+        );
+
+        let session = Session::new();
+        dispatch_and_log(&engine, &aof, &replication, cmd(&[b"MULTI"]), &session, 2);
+        let queued_reply = dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"PUBLISH", b"news", b"hello"]),
+            &session,
+            2,
+        );
+        assert_eq!(queued_reply, Frame::Simple("QUEUED".into()));
+
+        let exec_reply =
+            dispatch_and_log(&engine, &aof, &replication, cmd(&[b"EXEC"]), &session, 2);
+
+        assert_eq!(exec_reply, Frame::Array(vec![Frame::Integer(1)]));
     }
 
     #[test]
