@@ -18,7 +18,7 @@ struct Subscriber {
 /// across an `.await` -- matching `ReplicaRegistry`'s own justification for the same choice.
 #[derive(Default)]
 #[allow(dead_code)]
-pub(crate) struct PubSubRegistry {
+pub struct PubSubRegistry {
     channels: Mutex<HashMap<Bytes, Vec<Subscriber>>>,
     patterns: Mutex<HashMap<Bytes, Vec<Subscriber>>>,
 }

@@ -211,6 +211,12 @@ pub struct ReplicationHandle {
     /// (`04-replica-registry-and-leader-fanout.md`, Task 4) calls `ReplicaRegistry::register`
     /// during `PSYNC` handling.
     pub registry: ReplicaRegistry,
+    /// Cross-connection pub/sub state: which connections are subscribed to which
+    /// channels/patterns. A per-process singleton, like `registry` just above -- single-node
+    /// delivery only (see the pub/sub spec's "Cluster scope" section). `Arc`-wrapped, like
+    /// `engine`/`aof` below, because Plan 06 threads it into the `'static` spawned follower
+    /// task, which needs its own owned handle rather than a borrow of this struct's field.
+    pub pubsub: Arc<crate::pubsub::PubSubRegistry>,
     /// Follower side: gates client-originated writes once this node is replicating from a
     /// leader. Read by `dispatch_and_log`'s `-READONLY` check, added in
     /// `05-replicaof-and-follower-apply-loop.md`. A plain field, not `Arc<AtomicBool>`: the
@@ -380,6 +386,7 @@ impl ReplicationHandle {
     pub fn new(engine: Arc<Engine>, snapshot_path: PathBuf) -> Self {
         Self {
             registry: ReplicaRegistry::default(),
+            pubsub: Arc::new(crate::pubsub::PubSubRegistry::default()),
             is_replica: AtomicBool::new(false),
             follower_task: Mutex::new(None),
             engine,
@@ -1344,6 +1351,14 @@ mod tests {
     fn default_is_idle_with_no_replicas_and_is_not_a_replica() {
         let h = ReplicationHandle::default();
         assert!(!h.is_replica.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn replication_handle_exposes_a_pubsub_registry() {
+        let replication = ReplicationHandle::default();
+        // Not previously reachable at all -- this only needs to compile and not panic to prove
+        // the field exists and is usable from outside replication.rs's own module.
+        assert_eq!(replication.pubsub.channels(), Vec::<bytes::Bytes>::new());
     }
 
     #[test]
