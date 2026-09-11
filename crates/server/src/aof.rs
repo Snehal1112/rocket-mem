@@ -531,8 +531,10 @@ pub fn replay_with_stats(
     let start = (start_at as usize).min(raw.len());
     let mut buf = bytes::BytesMut::from(&raw[start..]);
     let mut codec = protocol::codec::RespCodec::default();
+    let mut consumed_total = start;
     let mut valid_len = start;
     let mut commands: u64 = 0;
+    let mut grouper = crate::transaction_grouping::TransactionGrouper::new();
     // Which of the two tolerated tail conditions ended the loop, for the warning below. Both are
     // handled identically -- this only names the cause. The decode error itself is deliberately
     // not carried: `RespCodec::decode` already logs it (see `codec.rs`'s `protocol error decoding
@@ -542,10 +544,27 @@ pub fn replay_with_stats(
         let before = buf.len();
         match codec.decode(&mut buf) {
             Ok(Some(frame)) => {
-                valid_len += before - buf.len();
-                commands += 1;
-                let mut protocol = protocol::codec::Protocol::default();
-                crate::dispatcher::dispatch(engine, frame, &mut protocol, 0);
+                consumed_total += before - buf.len();
+                match grouper.feed(frame) {
+                    Ok(to_apply) => {
+                        if !grouper.is_mid_transaction() {
+                            // Either an ordinary command (`to_apply` has one frame) or a
+                            // transaction that just closed on this EXEC (`to_apply` has every
+                            // buffered command) -- both are a safe truncation point.
+                            valid_len = consumed_total;
+                        }
+                        for f in to_apply {
+                            commands += 1;
+                            let mut protocol = protocol::codec::Protocol::default();
+                            crate::dispatcher::dispatch(engine, f, &mut protocol, 0);
+                        }
+                    }
+                    Err(reason) => {
+                        tracing::warn!(reason, "aof replay: malformed transaction framing");
+                        tail_reason = "corrupt";
+                        break;
+                    }
+                }
             }
             // Incomplete or corrupt tail — stop here, keep what decoded.
             Ok(None) => break,
@@ -1092,6 +1111,62 @@ mod tests {
         let mut expected = first.to_vec();
         expected.extend_from_slice(second);
         assert_eq!(on_disk, expected); // corrupt tail removed; the skipped-over prefix stays intact
+    }
+
+    #[test]
+    fn replay_applies_a_complete_transaction_as_one_unit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.aof");
+        write_raw(&path, &encode_frame(&frame(&[b"MULTI"])).unwrap());
+        write_raw(&path, &encode_frame(&frame(&[b"SET", b"a", b"1"])).unwrap());
+        write_raw(&path, &encode_frame(&frame(&[b"SET", b"b", b"2"])).unwrap());
+        write_raw(&path, &encode_frame(&frame(&[b"EXEC"])).unwrap());
+
+        let engine = Engine::new();
+        replay(&path, &engine, 0).unwrap();
+
+        assert_eq!(
+            engine.get(b"a"),
+            Some(Value::String(Bytes::from_static(b"1")))
+        );
+        assert_eq!(
+            engine.get(b"b"),
+            Some(Value::String(Bytes::from_static(b"2")))
+        );
+    }
+
+    #[test]
+    fn replay_discards_a_transaction_truncated_before_its_exec_and_truncates_the_file_before_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.aof");
+        let complete_prefix = encode_frame(&frame(&[b"SET", b"before", b"1"])).unwrap();
+        write_raw(&path, &complete_prefix);
+        write_raw(&path, &encode_frame(&frame(&[b"MULTI"])).unwrap());
+        write_raw(
+            &path,
+            &encode_frame(&frame(&[b"SET", b"mid-tx", b"1"])).unwrap(),
+        );
+        // No EXEC -- simulates a kill -9 mid-transaction. No corrupt bytes either: this is a
+        // structurally valid RESP stream that simply never closes its transaction.
+
+        let engine = Engine::new();
+        replay(&path, &engine, 0).unwrap();
+
+        assert_eq!(
+            engine.get(b"before"),
+            Some(Value::String(Bytes::from_static(b"1")))
+        );
+        assert_eq!(
+            engine.get(b"mid-tx"),
+            None,
+            "a command inside an unterminated transaction must never apply"
+        );
+        let on_disk = std::fs::read(&path).unwrap();
+        assert_eq!(
+            on_disk, complete_prefix,
+            "the file must be truncated back to before the unterminated MULTI, not just before \
+             the last decodable frame"
+        );
     }
 
     #[test]

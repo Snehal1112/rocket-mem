@@ -11,4 +11,5 @@ pub mod replication;
 pub mod rmp_connection;
 pub mod slowlog;
 pub mod tls;
+pub mod transaction_grouping;
 pub use connection::{serve, serve_tls};
