@@ -13,12 +13,13 @@ pub async fn serve(
     engine: Arc<Engine>,
     aof: Arc<AofWriter>,
     replication: Arc<ReplicationHandle>,
+    node_id: Arc<str>,
 ) {
     tokio::spawn(active_expire_loop(
         Arc::clone(&engine),
         Arc::clone(&replication),
     ));
-    tokio::spawn(periodic_fsync_loop(Arc::clone(&aof)));
+    tokio::spawn(periodic_fsync_loop(Arc::clone(&aof), Arc::clone(&node_id)));
 
     let mut next_client_id: u64 = 1;
     loop {
@@ -40,6 +41,7 @@ pub async fn serve(
             aof,
             replication,
             client_id,
+            Arc::clone(&node_id),
         ));
     }
 }
@@ -66,7 +68,7 @@ async fn active_expire_loop(engine: Arc<Engine>, replication: Arc<ReplicationHan
 /// it's meant to defer entirely to the OS, so this loop must skip calling `fsync` for it —
 /// otherwise `Never` degrades into `EverySecond` in practice, which is what `AofWriter::policy`
 /// exists to let this loop check.
-async fn periodic_fsync_loop(aof: Arc<AofWriter>) {
+async fn periodic_fsync_loop(aof: Arc<AofWriter>, node_id: Arc<str>) {
     if aof.policy() == crate::aof::FsyncPolicy::Never {
         return;
     }
@@ -74,9 +76,9 @@ async fn periodic_fsync_loop(aof: Arc<AofWriter>) {
     loop {
         interval.tick().await;
         if let Err(e) = aof.fsync() {
-            tracing::error!(error = %e, "aof fsync failed");
+            tracing::error!(%node_id, error = %e, "aof fsync failed");
         }
-        check_aof_intact(&aof);
+        check_aof_intact(&aof, &node_id);
     }
 }
 
@@ -86,7 +88,7 @@ async fn periodic_fsync_loop(aof: Arc<AofWriter>) {
 /// which otherwise stays completely silent (writes keep succeeding) until the next restart
 /// discards everything written since. A 1-second detection window turns that into a logged
 /// error and a Prometheus gauge flip instead.
-fn check_aof_intact(aof: &AofWriter) {
+fn check_aof_intact(aof: &AofWriter, node_id: &str) {
     match aof.is_file_intact() {
         Ok(true) => ::metrics::gauge!("rocket_mem_aof_file_intact").set(1.0),
         Ok(false) => {
@@ -95,13 +97,14 @@ fn check_aof_intact(aof: &AofWriter) {
             // `aof_path`, and the same file the `aof_path` config key configures. A lone `path`
             // here made `grep aof_path` miss the one event that says the file is gone.
             tracing::error!(
+                %node_id,
                 aof_path = %aof.path().display(),
                 "AOF file has no directory entry at its configured path -- it was deleted or \
                  replaced while this process is still writing to it; every byte written since \
                  will be lost on the next restart unless this is fixed now"
             );
         }
-        Err(e) => tracing::error!(error = %e, "aof integrity check failed"),
+        Err(e) => tracing::error!(%node_id, error = %e, "aof integrity check failed"),
     }
 }
 
@@ -134,6 +137,7 @@ pub async fn serve_tls(
     engine: Arc<Engine>,
     aof: Arc<AofWriter>,
     replication: Arc<ReplicationHandle>,
+    node_id: Arc<str>,
 ) {
     let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
     let mut next_client_id: u64 = 1;
@@ -151,6 +155,7 @@ pub async fn serve_tls(
         let engine = Arc::clone(&engine);
         let aof = Arc::clone(&aof);
         let replication = Arc::clone(&replication);
+        let node_id = Arc::clone(&node_id);
         tokio::spawn(async move {
             // Bounded so a client that completes the TCP handshake and then sends nothing --
             // or an incomplete ClientHello -- can't hold this task alive forever. 10 seconds is
@@ -172,7 +177,17 @@ pub async fn serve_tls(
                     return;
                 }
             };
-            handle_connection(tls_socket, peer, true, engine, aof, replication, client_id).await;
+            handle_connection(
+                tls_socket,
+                peer,
+                true,
+                engine,
+                aof,
+                replication,
+                client_id,
+                node_id,
+            )
+            .await;
         });
     }
 }
@@ -232,7 +247,18 @@ impl Drop for ConnectionStats {
 // line on a connection renders as `handle_connection{...}` and the spec's three-span vocabulary
 // (`conn`/`cmd`/`repl`) matches only two of its three names. `serve_replica` below already names
 // its span `repl` for the same reason.
-#[tracing::instrument(name = "conn", skip_all, fields(conn_id = client_id, %peer, protocol = %"RESP", %tls))]
+// 8 arguments, one over clippy's default threshold, since `node_id` (2026-09-11) joined the
+// existing seven: `socket`/`peer`/`tls` describe this one connection, `engine`/`aof`/`replication`
+// are the three handles every command needs, and `client_id`/`node_id` are two independent
+// correlation ids (per-connection, per-process). Bundling the latter into a context struct would
+// need a name for every call site to construct and would still have to be destructured right back
+// out for the `#[instrument]` fields below -- not a real reduction, just moved indirection.
+#[allow(clippy::too_many_arguments)]
+#[tracing::instrument(
+    name = "conn",
+    skip_all,
+    fields(conn_id = client_id, %peer, protocol = %"RESP", %tls, %node_id)
+)]
 async fn handle_connection<S>(
     socket: S,
     peer: std::net::SocketAddr,
@@ -241,6 +267,7 @@ async fn handle_connection<S>(
     aof: Arc<AofWriter>,
     replication: Arc<ReplicationHandle>,
     client_id: u64,
+    node_id: Arc<str>,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -627,6 +654,7 @@ mod tests {
             Arc::clone(&engine),
             Arc::clone(&aof),
             Arc::clone(&replication),
+            Arc::from("test-node"),
         ));
 
         let mut framed = Framed::new(
@@ -666,6 +694,7 @@ mod tests {
             Arc::clone(&engine),
             Arc::clone(&aof),
             Arc::clone(&replication),
+            Arc::from("test-node"),
         ));
 
         // one shard per 100ms tick, 16 shards -- 2s covers a full rotation with headroom, the
@@ -690,6 +719,7 @@ mod tests {
             engine,
             aof,
             Arc::new(crate::replication::ReplicationHandle::default()),
+            Arc::from("test-node"),
         ));
 
         let mut framed = Framed::new(
@@ -726,6 +756,7 @@ mod tests {
             engine,
             aof,
             Arc::new(crate::replication::ReplicationHandle::default()),
+            Arc::from("test-node"),
         ));
 
         let stream = TcpStream::connect(addr).await.unwrap();
@@ -768,6 +799,7 @@ mod tests {
             engine,
             aof,
             Arc::new(crate::replication::ReplicationHandle::default()),
+            Arc::from("test-node"),
         ));
 
         let mut a = Framed::new(
@@ -812,6 +844,7 @@ mod tests {
             engine,
             aof,
             Arc::new(crate::replication::ReplicationHandle::default()),
+            Arc::from("test-node"),
         ));
 
         let stream = TcpStream::connect(addr).await.unwrap();
@@ -855,6 +888,7 @@ mod tests {
             engine.clone(),
             aof,
             Arc::new(crate::replication::ReplicationHandle::default()),
+            Arc::from("test-node"),
         ));
 
         // Wait for a *full* rotation, not just a few ticks: the loop sweeps one shard per
@@ -904,6 +938,7 @@ mod tests {
             Arc::clone(&engine),
             Arc::clone(&aof),
             Arc::clone(&replication),
+            Arc::from("test-node"),
         ));
 
         let stream = TcpStream::connect(addr).await.unwrap();
@@ -969,6 +1004,7 @@ mod tests {
             Arc::clone(&engine),
             Arc::clone(&aof),
             Arc::clone(&replication),
+            Arc::from("test-node"),
         ));
 
         let stream = TcpStream::connect(addr).await.unwrap();
@@ -1003,6 +1039,7 @@ mod tests {
             Arc::clone(&engine),
             Arc::clone(&aof),
             Arc::clone(&replication),
+            Arc::from("test-node"),
         ));
 
         let stream = TcpStream::connect(addr).await.unwrap();
@@ -1071,6 +1108,7 @@ mod tests {
             Arc::clone(&engine),
             Arc::clone(&aof),
             Arc::clone(&replication),
+            Arc::from("test-node"),
         ));
 
         let stream = TcpStream::connect(addr).await.unwrap();
@@ -1128,6 +1166,7 @@ mod tests {
             Arc::clone(&engine),
             Arc::clone(&aof),
             Arc::clone(&replication),
+            Arc::from("test-node"),
         ));
 
         let stream = TcpStream::connect(addr).await.unwrap();
@@ -1255,6 +1294,7 @@ mod tests {
             Arc::clone(&engine),
             Arc::clone(&aof),
             Arc::clone(&replication),
+            Arc::from("test-node"),
         ));
 
         let stream = TcpStream::connect(addr).await.unwrap();
@@ -1324,6 +1364,7 @@ mod tests {
             Arc::clone(&engine),
             Arc::clone(&aof),
             Arc::clone(&replication),
+            Arc::from("test-node"),
         ));
 
         use tokio::io::AsyncWriteExt;
@@ -1370,6 +1411,7 @@ mod tests {
             Arc::clone(&engine),
             Arc::clone(&aof),
             Arc::clone(&replication),
+            Arc::from("test-node"),
         ));
 
         let stream = TcpStream::connect(addr).await.unwrap();
@@ -1479,6 +1521,7 @@ mod tests {
             Arc::clone(&engine),
             Arc::clone(&aof),
             Arc::clone(&replication),
+            Arc::from("test-node"),
         ));
 
         // Take a write first, so the leader's offset is non-zero before any follower attaches.
@@ -1547,6 +1590,7 @@ mod tests {
             Arc::clone(&engine),
             Arc::clone(&aof),
             Arc::clone(&replication),
+            Arc::from("test-node"),
         ));
 
         let captured = CapturedLogs::default();

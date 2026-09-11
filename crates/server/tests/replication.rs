@@ -131,6 +131,7 @@ async fn spawn_node() -> (
         Arc::clone(&engine),
         Arc::clone(&aof),
         Arc::clone(&replication),
+        Arc::from("test-node"),
     ));
     (dir, engine, aof, replication, addr.to_string())
 }
@@ -192,6 +193,7 @@ async fn spawn_node_with_min_replicas(
         Arc::clone(&engine),
         Arc::clone(&aof),
         Arc::clone(&replication),
+        Arc::from("test-node"),
     ));
     (dir, engine, aof, replication, addr.to_string())
 }
@@ -740,6 +742,7 @@ async fn a_follower_resyncs_over_tls_when_pinned_to_the_leaders_certificate() {
         Arc::clone(&leader_engine),
         Arc::clone(&leader_aof),
         Arc::clone(&leader_replication),
+        Arc::from("test-node"),
     ));
 
     let follower_dir = tempfile::tempdir().unwrap();
@@ -792,6 +795,7 @@ async fn a_follower_never_resyncs_when_pinned_to_the_wrong_certificate() {
         Arc::clone(&leader_engine),
         Arc::clone(&leader_aof),
         Arc::clone(&leader_replication),
+        Arc::from("test-node"),
     ));
 
     let follower_dir = tempfile::tempdir().unwrap();
@@ -852,6 +856,7 @@ async fn a_tls_follower_keeps_receiving_streamed_writes_after_its_resync() {
         Arc::clone(&leader_engine),
         Arc::clone(&leader_aof),
         Arc::clone(&leader_replication),
+        Arc::from("test-node"),
     ));
 
     let plain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -861,6 +866,7 @@ async fn a_tls_follower_keeps_receiving_streamed_writes_after_its_resync() {
         Arc::clone(&leader_engine),
         Arc::clone(&leader_aof),
         Arc::clone(&leader_replication),
+        Arc::from("test-node"),
     ));
 
     let follower_dir = tempfile::tempdir().unwrap();

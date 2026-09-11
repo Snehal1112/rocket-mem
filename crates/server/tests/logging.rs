@@ -843,6 +843,7 @@ async fn a_replica_registering_and_being_pruned_are_both_logged_at_info() {
         Arc::clone(&engine),
         Arc::clone(&aof),
         Arc::clone(&replication),
+        Arc::from("test-node"),
     ));
 
     let buffer = Arc::new(Mutex::new(Vec::new()));
@@ -1483,6 +1484,7 @@ async fn the_connection_and_replication_spans_render_under_the_names_conn_and_re
         Arc::clone(&engine),
         Arc::clone(&aof),
         Arc::clone(&replication),
+        Arc::from("test-node"),
     ));
 
     let buffer = Arc::new(Mutex::new(Vec::new()));
@@ -1556,6 +1558,7 @@ async fn an_rmp_command_dispatched_in_its_own_task_still_logs_under_the_conn_spa
         Arc::clone(&engine),
         Arc::clone(&aof),
         Arc::clone(&replication),
+        Arc::from("test-node"),
     ));
 
     let buffer = Arc::new(Mutex::new(Vec::new()));

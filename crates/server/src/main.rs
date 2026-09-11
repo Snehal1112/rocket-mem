@@ -96,6 +96,23 @@ async fn main() -> std::io::Result<()> {
     let log_color = std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none();
     let color = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
 
+    // The identity every log line on this process carries from here on -- see the verbose
+    // logging spec's `node_id` addendum. A cluster node already has an operator-assigned
+    // identity (`cluster_node_id`, matched against `cluster.conf`); a standalone node or a
+    // replica (which deliberately leaves `cluster_config`/`cluster_node_id` unset -- see
+    // `rocket-mem-replica.toml.example`) has no such id, so `config.addr` stands in: it is the
+    // one value that is always set and always unique per node in a real deployment. Without
+    // this, two shards' logs merged into one stream (a shared systemd journal, a log
+    // aggregator) are indistinguishable line-by-line -- an operator has to already know which
+    // file or journal unit a line came from, which is exactly the correlation problem a log
+    // line should carry the answer to itself.
+    let node_id: Arc<str> = Arc::from(
+        config
+            .cluster_node_id
+            .clone()
+            .unwrap_or_else(|| config.addr.clone()),
+    );
+
     // Hoisted out of the `EnvFilter::new(...)` call so the config summary below can log the
     // directive that is actually in force. `config.log_level` is only the fallback -- `RUST_LOG`
     // wins (see `resolve_log_filter_directive`) -- so logging the config field would have the
@@ -107,7 +124,11 @@ async fn main() -> std::io::Result<()> {
         .with_writer(std::io::stderr)
         .with_env_filter(filter)
         .init();
-    tracing::info!(version = env!("CARGO_PKG_VERSION"), "rocket-mem starting");
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        %node_id,
+        "rocket-mem starting"
+    );
 
     // The machine-readable counterpart to the boxed startup banner printed further down this
     // function, not a replacement for it -- see the verbose logging spec's "Decision: the
@@ -141,6 +162,7 @@ async fn main() -> std::io::Result<()> {
     // honest signal. TLS *replication* is a separate switch (`tls_ca_path`) that turns on no
     // listener, so it gets its own field instead of being folded into this one.
     tracing::info!(
+        %node_id,
         addr = %config.addr,
         rmp_addr = %config.rmp_addr,
         metrics_addr = %config.metrics_addr,
@@ -409,6 +431,7 @@ async fn main() -> std::io::Result<()> {
         Arc::clone(&engine),
         Arc::clone(&aof),
         Arc::clone(&replication),
+        Arc::clone(&node_id),
     ));
 
     if let (Some(tls_addr), Some(cert), Some(key)) = (
@@ -430,6 +453,7 @@ async fn main() -> std::io::Result<()> {
             Arc::clone(&engine),
             Arc::clone(&aof),
             Arc::clone(&replication),
+            Arc::clone(&node_id),
         ));
     }
 
@@ -452,6 +476,7 @@ async fn main() -> std::io::Result<()> {
             Arc::clone(&engine),
             Arc::clone(&aof),
             Arc::clone(&replication),
+            Arc::clone(&node_id),
         ));
     }
 
@@ -532,6 +557,6 @@ async fn main() -> std::io::Result<()> {
     // here, would run. Logging a shutdown event requires adding real signal handling first,
     // which is a graceful-shutdown feature in its own right, not a logging change --
     // deferred, and marked as such in the spec's event catalogue.
-    rocket_mem::serve(listener, engine, aof, replication).await;
+    rocket_mem::serve(listener, engine, aof, replication, node_id).await;
     Ok(())
 }

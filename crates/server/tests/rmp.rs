@@ -29,12 +29,14 @@ async fn spawn_dual_protocol_server() -> (tempfile::TempDir, String, std::net::S
         Arc::clone(&engine),
         Arc::clone(&aof),
         Arc::clone(&replication),
+        Arc::from("test-node"),
     ));
     tokio::spawn(rocket_mem::rmp_connection::serve(
         rmp_listener,
         engine,
         aof,
         replication,
+        Arc::from("test-node"),
     ));
 
     (dir, format!("redis://{resp_addr}"), rmp_addr)

@@ -19,6 +19,7 @@ async fn spawn_test_server() -> (tempfile::TempDir, String) {
         engine,
         aof,
         Arc::new(rocket_mem::replication::ReplicationHandle::default()),
+        Arc::from("test-node"),
     ));
     (dir, format!("redis://{addr}"))
 }
@@ -225,6 +226,7 @@ async fn a_resp_connection_is_denied_before_auth_and_permitted_after_on_the_same
         engine,
         aof,
         std::sync::Arc::clone(&replication),
+        Arc::from("test-node"),
     ));
 
     use futures_util::{SinkExt, StreamExt};
@@ -307,6 +309,7 @@ async fn psync_is_denied_before_auth_on_an_unauthenticated_connection() {
         engine,
         aof,
         std::sync::Arc::clone(&replication),
+        Arc::from("test-node"),
     ));
 
     use futures_util::{SinkExt, StreamExt};
@@ -384,6 +387,7 @@ async fn psync_is_denied_after_deluser_empties_a_once_configured_store() {
         engine,
         aof,
         std::sync::Arc::clone(&replication),
+        Arc::from("test-node"),
     ));
 
     use futures_util::{SinkExt, StreamExt};
@@ -445,6 +449,7 @@ async fn psync_is_denied_to_an_authenticated_user_without_a_psync_grant() {
         engine,
         aof,
         std::sync::Arc::clone(&replication),
+        Arc::from("test-node"),
     ));
 
     use futures_util::{SinkExt, StreamExt};

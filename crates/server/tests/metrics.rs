@@ -43,6 +43,7 @@ async fn command_counts_and_latencies_appear_in_the_prometheus_output() {
         Arc::clone(&engine),
         Arc::clone(&aof),
         Arc::clone(&replication),
+        Arc::from("test-node"),
     ));
 
     let metrics_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

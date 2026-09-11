@@ -76,7 +76,13 @@ async fn spawn_3_shard_cluster() -> Cluster {
             )
             .with_cluster(Arc::new(config)),
         );
-        tokio::spawn(rocket_mem::serve(listener, engine, aof, replication));
+        tokio::spawn(rocket_mem::serve(
+            listener,
+            engine,
+            aof,
+            replication,
+            Arc::from("test-node"),
+        ));
         dirs.push(dir);
     }
 
@@ -383,7 +389,13 @@ async fn spawn_cluster_with_one_dead_node() -> (Vec<tempfile::TempDir>, Vec<Stri
             .with_cluster(Arc::clone(&cluster))
             .with_peer_health(health),
         );
-        tokio::spawn(rocket_mem::serve(listener, engine, aof, replication));
+        tokio::spawn(rocket_mem::serve(
+            listener,
+            engine,
+            aof,
+            replication,
+            Arc::from("test-node"),
+        ));
         dirs.push(dir);
     }
     (dirs, addrs, dead_addr)

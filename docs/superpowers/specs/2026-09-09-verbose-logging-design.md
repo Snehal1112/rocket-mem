@@ -80,7 +80,7 @@ Instead, exactly three spans carry the correlation, and everything nested inheri
 
 | Span | Site | Fields |
 |---|---|---|
-| `conn` | `#[instrument(skip_all, ...)]` on `connection.rs`'s `handle_connection` and `rmp_connection.rs`'s `handle_connection` | `conn_id`, `peer`, `protocol`, `tls` |
+| `conn` | `#[instrument(skip_all, ...)]` on `connection.rs`'s `handle_connection` and `rmp_connection.rs`'s `handle_connection` | `conn_id`, `peer`, `protocol`, `tls`, `node_id` (added 2026-09-11, see "Decisions established during execution" below) |
 | `cmd` | opened inside `dispatcher.rs`'s `dispatch_and_log` | `cmd`, `key`, `argc` |
 | `repl` | replication client loop, and `connection.rs`'s `serve_replica` | `host_port` |
 
@@ -296,6 +296,64 @@ It was **not** done here for two reasons, and neither is a defence of the curren
 2. rocket-mem's slowlog stores key + arity rather than Redis's full argument list, so "what should a keyless command's slowlog entry show" is a design question with more than one defensible answer — not a cleanup.
 
 The natural home is **Sprint 8's ACL work**, which is already reasoning about what a permitted client may see.
+
+### `node_id`, added 2026-09-11: a connection log line named no node
+
+An operator running a real multi-node deployment (three `rocket-mem` processes, one per shard,
+each under its own `systemd --user` unit per `cluster.conf`) reported that `conn`-span log
+lines carried no field naming which node emitted them: `conn{conn_id=41 peer=... protocol=RESP
+tls=true}: connection accepted` reads identically on shard-a, shard-b, and shard-c. Each node's
+journal is a separate unit today, so the correlation problem is latent rather than active — but
+the moment those streams are merged (a shared `journalctl`, a log aggregator, a support bundle
+someone concatenates by hand), every line becomes ambiguous, and the fix belongs in the line
+itself rather than in operator discipline about which file they're reading.
+
+`node_id` was already in this spec's field vocabulary (the Cluster row: `cluster.rs`'s
+topology-loaded event), but only for cluster-mode startup, once, not threaded onto any
+per-connection or per-cycle event. The gap: `cluster_node_id` only exists for a node that is a
+cluster *member* — a standalone node, and a replica (which deliberately leaves
+`cluster_config`/`cluster_node_id` unset, see `rocket-mem-replica.toml.example`), has no such
+id at all.
+
+**Decision: `main.rs` computes one `node_id: Arc<str>` per process, falling back to `config.addr`
+when `cluster_node_id` is unset**, and threads it as a plain function parameter — not an ambient
+span propagated by nesting — into every long-lived accept loop: `connection::serve`,
+`connection::serve_tls`, `rmp_connection::serve`, `rmp_connection::serve_tls`, and from there
+into `handle_connection`'s `conn` span fields (both protocols) and `periodic_fsync_loop`'s two
+`error!` sites. `config.addr` is always set and always unique per node in a real deployment,
+unlike `cluster_node_id`, which is `None` for exactly the two node kinds (standalone, replica)
+that most need a way to self-identify since they have no cluster-assigned name.
+
+**Why a plain parameter, not a wrapping "node" span entered once at startup.** The
+tracing-idiomatic-looking shortcut — open one `info_span!("node", node_id = ..)` in `main` and
+rely on span-parent inheritance to stamp every descendant — was considered and rejected. It
+works for `connection::serve`'s plaintext loop, where `handle_connection(...)` is called
+directly and its `#[instrument]` span captures its parent synchronously at the call site inside
+an already-entered ambient span. It silently does **not** work for either TLS accept loop
+(`connection::serve_tls`, `rmp_connection::serve_tls`): each wraps the handshake in a bare
+`async move { ... }` block spawned via `tokio::spawn`, and a bare async block creates no span at
+construction — `handle_connection`'s span is only created later, when the *spawned* task is
+first polled, by which point the ambient "current span" thread-local is whatever unrelated task
+the executor happened to be running, not `main`'s node span. The bug is invisible in a
+plaintext-only test and only shows up under TLS, which is exactly the deployment shape (shard
+nodes talking to each other, replicas dialing a leader) this feature was added for. This is the
+identical reason `rmp_connection.rs`'s `handle_connection` already captures `conn_span =
+tracing::Span::current()` and explicitly `.instrument(conn_span.clone())`s each per-request task
+it spawns — RMP's own comment there says it plainly: "a bare `tokio::spawn` starts with an empty
+context, so without this every event the spawned task emits ... would have no `conn` parent."
+Explicit parameter-threading is the same fix applied one level higher, and avoids relying on
+call-site-dependent span-nesting behavior a future accept loop could easily get wrong again.
+
+`serve_replica`'s `repl` span needed no change: it is called synchronously from inside
+`handle_connection`'s own already-entered `conn` span (no `tokio::spawn` between them), so it
+already inherits `node_id` the same way it inherits `conn_id`/`peer`/`protocol`/`tls` — see that
+span's own doc comment, unchanged by this addendum.
+
+Out of scope, deliberately: `metrics::serve_metrics` (the Prometheus scrape endpoint) and
+`active_expire_loop` were not given a `node_id` parameter. Neither currently logs anything that
+would benefit from it — `active_expire_loop` calls straight into the protocol-agnostic `engine`
+crate, which correctly has no node concept at all, and the scrape-served event at `trace` is not
+part of the correlation problem this addendum addresses.
 
 ## Out of scope
 

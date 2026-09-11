@@ -26,6 +26,7 @@ pub async fn serve(
     engine: Arc<Engine>,
     aof: Arc<AofWriter>,
     replication: Arc<ReplicationHandle>,
+    node_id: Arc<str>,
 ) {
     let mut next_client_id: u64 = 1;
     loop {
@@ -44,6 +45,7 @@ pub async fn serve(
             Arc::clone(&aof),
             Arc::clone(&replication),
             client_id,
+            Arc::clone(&node_id),
         ));
     }
 }
@@ -55,6 +57,7 @@ pub async fn serve_tls(
     engine: Arc<Engine>,
     aof: Arc<AofWriter>,
     replication: Arc<ReplicationHandle>,
+    node_id: Arc<str>,
 ) {
     let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
     let mut next_client_id: u64 = 1;
@@ -71,6 +74,7 @@ pub async fn serve_tls(
         let engine = Arc::clone(&engine);
         let aof = Arc::clone(&aof);
         let replication = Arc::clone(&replication);
+        let node_id = Arc::clone(&node_id);
         tokio::spawn(async move {
             // Bounded so a client that completes the TCP handshake and then sends nothing --
             // or an incomplete ClientHello -- can't hold this task alive forever. 10 seconds is
@@ -92,7 +96,17 @@ pub async fn serve_tls(
                     return;
                 }
             };
-            handle_connection(tls_socket, peer, true, engine, aof, replication, client_id).await;
+            handle_connection(
+                tls_socket,
+                peer,
+                true,
+                engine,
+                aof,
+                replication,
+                client_id,
+                node_id,
+            )
+            .await;
         });
     }
 }
@@ -136,7 +150,14 @@ impl Drop for ConnectionStats {
 
 // `protocol = %"RMP"`, not `protocol = "rmp"` -- see `connection.rs`'s matching comment for why
 // the sigil and the case are deliberate.
-#[tracing::instrument(name = "conn", skip_all, fields(conn_id = client_id, %peer, protocol = %"RMP", %tls))]
+// 8 arguments -- see `connection.rs`'s matching `#[allow(clippy::too_many_arguments)]` comment on
+// its own `handle_connection`; the same reasoning applies here unchanged.
+#[allow(clippy::too_many_arguments)]
+#[tracing::instrument(
+    name = "conn",
+    skip_all,
+    fields(conn_id = client_id, %peer, protocol = %"RMP", %tls, %node_id)
+)]
 async fn handle_connection<S>(
     socket: S,
     peer: std::net::SocketAddr,
@@ -145,6 +166,7 @@ async fn handle_connection<S>(
     aof: Arc<AofWriter>,
     replication: Arc<ReplicationHandle>,
     client_id: u64,
+    node_id: Arc<str>,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -267,7 +289,13 @@ mod tests {
         let engine = Arc::new(Engine::new());
         let (dir, aof) = test_aof();
         let replication = Arc::new(ReplicationHandle::default());
-        tokio::spawn(serve(listener, Arc::clone(&engine), aof, replication));
+        tokio::spawn(serve(
+            listener,
+            Arc::clone(&engine),
+            aof,
+            replication,
+            Arc::from("test-node"),
+        ));
         (dir, addr, engine)
     }
 
@@ -313,7 +341,7 @@ mod tests {
                 let writer = AofWriter::open(&aof_path, crate::aof::FsyncPolicy::Never).unwrap();
                 let aof = Arc::new(writer);
                 let replication = Arc::new(ReplicationHandle::default());
-                serve(listener, engine, aof, replication).await;
+                serve(listener, engine, aof, replication, Arc::from("test-node")).await;
             });
         });
         (addr, dir)
@@ -442,7 +470,13 @@ mod tests {
         let engine = Arc::new(Engine::new());
         let (_dir, aof) = test_aof();
         let replication = Arc::new(ReplicationHandle::default());
-        tokio::spawn(serve(listener, engine, aof, Arc::clone(&replication)));
+        tokio::spawn(serve(
+            listener,
+            engine,
+            aof,
+            Arc::clone(&replication),
+            Arc::from("test-node"),
+        ));
 
         let mut con = connect(addr).await;
         con.send(RmpMessage {
@@ -602,7 +636,13 @@ mod tests {
                 ],
             )
             .unwrap();
-        tokio::spawn(serve(listener, engine, aof, Arc::clone(&replication)));
+        tokio::spawn(serve(
+            listener,
+            engine,
+            aof,
+            Arc::clone(&replication),
+            Arc::from("test-node"),
+        ));
 
         let mut con = connect(addr).await;
 
@@ -671,7 +711,13 @@ mod tests {
                 ],
             )
             .unwrap();
-        tokio::spawn(serve(listener, engine, aof, Arc::clone(&replication)));
+        tokio::spawn(serve(
+            listener,
+            engine,
+            aof,
+            Arc::clone(&replication),
+            Arc::from("test-node"),
+        ));
 
         let mut a = connect(addr).await;
         a.send(RmpMessage {

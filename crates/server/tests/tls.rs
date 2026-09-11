@@ -81,6 +81,7 @@ async fn a_real_tls_client_completes_a_set_get_round_trip() {
         engine,
         aof,
         replication,
+        Arc::from("test-node"),
     ));
 
     let connector = tokio_rustls::TlsConnector::from(test_client_config());
@@ -139,6 +140,7 @@ async fn a_plaintext_client_connects_at_tcp_but_never_gets_a_valid_reply() {
         engine,
         aof,
         replication,
+        Arc::from("test-node"),
     ));
 
     // The TCP layer connects fine -- the port is open and accepting.
