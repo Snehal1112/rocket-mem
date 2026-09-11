@@ -1608,3 +1608,99 @@ async fn an_rmp_command_dispatched_in_its_own_task_still_logs_under_the_conn_spa
         );
     }
 }
+
+#[test]
+fn multi_and_discard_log_at_debug_with_counts_only_never_command_arguments() {
+    let (_, output) = capture_during("debug", || {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = engine::Engine::new();
+        let aof = rocket_mem::aof::AofWriter::open(
+            &dir.path().join("tx-logging.aof"),
+            rocket_mem::aof::FsyncPolicy::Never,
+        )
+        .expect("open aof");
+        let replication = rocket_mem::replication::ReplicationHandle::default();
+        let session = rocket_mem::dispatcher::Session::new();
+
+        rocket_mem::dispatcher::dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            Frame::Array(vec![Frame::Bulk(Bytes::from_static(b"MULTI"))]),
+            &session,
+            1,
+        );
+        rocket_mem::dispatcher::dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"SET")),
+                Frame::Bulk(Bytes::from_static(b"queued-key")),
+                Frame::Bulk(Bytes::from_static(b"super-secret-value")),
+            ]),
+            &session,
+            1,
+        );
+        rocket_mem::dispatcher::dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            Frame::Array(vec![Frame::Bulk(Bytes::from_static(b"DISCARD"))]),
+            &session,
+            1,
+        );
+    });
+
+    assert!(output.contains("transaction started"), "got: {output}");
+    assert!(
+        output.contains("transaction discarded") && output.contains("queued_count=1"),
+        "got: {output}"
+    );
+    // The queued SET's *key* legitimately reaches the log: `dispatch_and_log`'s pre-existing
+    // `cmd` span logs every command's key name at `debug` regardless of whether a transaction
+    // is queuing it, per this file's `debug_logs_the_key_but_not_the_value` test and CLAUDE.md's
+    // redaction policy (key names and byte lengths, never value contents). Only the *value* is
+    // the thing this test must prove never leaks.
+    assert!(
+        !output.contains("super-secret-value"),
+        "a queued command's value must never reach the log at debug, got: {output}"
+    );
+}
+
+#[test]
+fn exec_logs_queued_count_shard_count_and_elapsed_at_debug() {
+    let (_, output) = capture_during("debug", || {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = engine::Engine::new();
+        let aof = rocket_mem::aof::AofWriter::open(
+            &dir.path().join("tx-exec-logging.aof"),
+            rocket_mem::aof::FsyncPolicy::Never,
+        )
+        .expect("open aof");
+        let replication = rocket_mem::replication::ReplicationHandle::default();
+        let session = rocket_mem::dispatcher::Session::new();
+
+        for frame in [vec!["MULTI"], vec!["SET", "k", "v"], vec!["EXEC"]] {
+            let frame = Frame::Array(
+                frame
+                    .into_iter()
+                    .map(|s| Frame::Bulk(Bytes::from(s.to_string())))
+                    .collect(),
+            );
+            rocket_mem::dispatcher::dispatch_and_log(
+                &engine,
+                &aof,
+                &replication,
+                frame,
+                &session,
+                1,
+            );
+        }
+    });
+
+    assert!(output.contains("transaction executed"), "got: {output}");
+    assert!(output.contains("queued_count=1"), "got: {output}");
+    assert!(output.contains("shard_count=1"), "got: {output}");
+    assert!(output.contains("elapsed_us="), "got: {output}");
+}
