@@ -52,11 +52,17 @@ pub struct Session {
     /// Channels this connection currently has an open `SUBSCRIBE` on. A separate lock from
     /// `tx`/`protocol`/etc: nothing about subscription state needs to block an unrelated read of
     /// this connection's transaction or auth state.
+    ///
+    /// `BTreeSet`, not `HashSet`: an unqualified `UNSUBSCRIBE` (Task 2) replies once per
+    /// currently-subscribed channel, in the order it iterates this set, and a real client
+    /// expects that order to be stable across calls -- `HashSet`'s iteration order is randomized
+    /// per-process (`RandomState`), which made that reply order flaky from one test run to the
+    /// next. `BTreeSet` costs nothing here: sets stay tiny (one connection's own subscriptions).
+    subscriptions: std::sync::Mutex<std::collections::BTreeSet<Bytes>>,
+    /// Patterns this connection currently has an open `PSUBSCRIBE` on. Same `BTreeSet` rationale
+    /// as `subscriptions` above.
     #[allow(dead_code)]
-    subscriptions: std::sync::Mutex<std::collections::HashSet<Bytes>>,
-    /// Patterns this connection currently has an open `PSUBSCRIBE` on.
-    #[allow(dead_code)]
-    psubscriptions: std::sync::Mutex<std::collections::HashSet<Bytes>>,
+    psubscriptions: std::sync::Mutex<std::collections::BTreeSet<Bytes>>,
     /// Fast path for the overwhelmingly common case (no subscription ever opened): checked with
     /// a relaxed load before `subscriptions`/`psubscriptions` are ever touched. See the spec's
     /// "Performance" section.
@@ -83,8 +89,8 @@ impl Session {
             peer_addr: None,
             in_transaction: std::sync::atomic::AtomicBool::new(false),
             tx: std::sync::Mutex::new(TransactionState::Idle),
-            subscriptions: std::sync::Mutex::new(std::collections::HashSet::new()),
-            psubscriptions: std::sync::Mutex::new(std::collections::HashSet::new()),
+            subscriptions: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+            psubscriptions: std::sync::Mutex::new(std::collections::BTreeSet::new()),
             subscription_count: std::sync::atomic::AtomicUsize::new(0),
             push_tx: std::sync::Mutex::new(None),
             push_rx: std::sync::Mutex::new(None),
@@ -3375,6 +3381,127 @@ fn append_transaction_marker(
     replication.registry.broadcast(bytes);
 }
 
+/// Returns this connection's `push_tx`, creating it (and the matching `push_rx`) on first use.
+/// `connection.rs`'s read loop (Plan 05) takes `push_rx` out to drain it once it is `Some`.
+fn ensure_push_channel(session: &Session) -> tokio::sync::mpsc::UnboundedSender<Frame> {
+    let mut tx_guard = session.push_tx.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(tx) = tx_guard.as_ref() {
+        return tx.clone();
+    }
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    *tx_guard = Some(tx.clone());
+    drop(tx_guard);
+    *session.push_rx.lock().unwrap_or_else(|e| e.into_inner()) = Some(rx);
+    tx
+}
+
+/// The combined channel + pattern subscription count this connection currently holds -- what
+/// every `subscribe`/`unsubscribe`/`psubscribe`/`punsubscribe` reply reports, and what
+/// `subscribe_mode_gate` (Task 3) checks via `subscription_count`'s fast-path atomic.
+fn total_subscription_count(session: &Session) -> usize {
+    session
+        .subscriptions
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .len()
+        + session
+            .psubscriptions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
+}
+
+/// Handles `SUBSCRIBE`/`UNSUBSCRIBE`/`PSUBSCRIBE`/`PUNSUBSCRIBE`/`PUBLISH`/`PUBSUB`. Called from
+/// `dispatch_and_log_gated`, alongside `handle_client` -- see the spec's "Interception point"
+/// section for why this placement (not `dispatch_and_log_inner`, alongside
+/// `intercept_for_transaction`) is what makes a queued `PUBLISH` replay correctly at `EXEC` time.
+/// This task implements `SUBSCRIBE`/`UNSUBSCRIBE` only; `PSUBSCRIBE`/`PUNSUBSCRIBE` are Task 3,
+/// `PUBLISH`/`PUBSUB` are Plan 04.
+fn intercept_for_pubsub(
+    frame: &Frame,
+    session: &Session,
+    replication: &crate::replication::ReplicationHandle,
+    client_id: u64,
+) -> Option<Frame> {
+    let Frame::Array(items) = frame else {
+        return None;
+    };
+    let Some(Frame::Bulk(name_bytes)) = items.first() else {
+        return None;
+    };
+    let name = upper_name(name_bytes)?;
+    match name.as_str() {
+        "SUBSCRIBE" => {
+            let tx = ensure_push_channel(session);
+            let mut replies = Vec::new();
+            for item in &items[1..] {
+                let Frame::Bulk(channel) = item else { continue };
+                let mut subs = session
+                    .subscriptions
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                subs.insert(channel.clone());
+                drop(subs);
+                replication
+                    .pubsub
+                    .subscribe(channel.clone(), client_id, tx.clone());
+                let count = total_subscription_count(session);
+                session
+                    .subscription_count
+                    .store(count, std::sync::atomic::Ordering::Relaxed);
+                tracing::debug!(client_id, channel = %crate::logging::escape_ident(&String::from_utf8_lossy(channel)), count, "subscription changed");
+                replies.push(Frame::Push(vec![
+                    Frame::Bulk(Bytes::from_static(b"subscribe")),
+                    Frame::Bulk(channel.clone()),
+                    Frame::Integer(count as i64),
+                ]));
+            }
+            Some(Frame::Array(replies))
+        }
+        "UNSUBSCRIBE" => {
+            let explicit: Vec<Bytes> = items[1..]
+                .iter()
+                .filter_map(|f| match f {
+                    Frame::Bulk(b) => Some(b.clone()),
+                    _ => None,
+                })
+                .collect();
+            let targets = if explicit.is_empty() {
+                session
+                    .subscriptions
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            } else {
+                explicit
+            };
+            let mut replies = Vec::new();
+            for channel in targets {
+                session
+                    .subscriptions
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&channel);
+                replication.pubsub.unsubscribe(&channel, client_id);
+                let count = total_subscription_count(session);
+                session
+                    .subscription_count
+                    .store(count, std::sync::atomic::Ordering::Relaxed);
+                tracing::debug!(client_id, channel = %crate::logging::escape_ident(&String::from_utf8_lossy(&channel)), count, "subscription changed");
+                replies.push(Frame::Push(vec![
+                    Frame::Bulk(Bytes::from_static(b"unsubscribe")),
+                    Frame::Bulk(channel),
+                    Frame::Integer(count as i64),
+                ]));
+            }
+            Some(Frame::Array(replies))
+        }
+        _ => None,
+    }
+}
+
 /// The uppercased command name, or `None` for a frame that isn't a command array. Cheap enough to
 /// call once per command -- uppercases into a stack buffer rather than allocating.
 fn command_name_upper(frame: &Frame) -> Option<CommandName> {
@@ -3859,6 +3986,9 @@ fn dispatch_and_log_gated(
         return reply;
     }
     if let Some(reply) = handle_client(&frame, session, client_id) {
+        return reply;
+    }
+    if let Some(reply) = intercept_for_pubsub(&frame, session, replication, client_id) {
         return reply;
     }
 
@@ -4957,6 +5087,110 @@ mod tests {
         assert!(
             on_disk.is_empty(),
             "a transaction with no writes must not touch the AOF at all"
+        );
+    }
+
+    #[test]
+    fn subscribe_replies_with_one_push_frame_per_channel_naming_the_running_count() {
+        let session = Session::new();
+        let replication = crate::replication::ReplicationHandle::default();
+        let reply = intercept_for_pubsub(
+            &cmd(&[b"SUBSCRIBE", b"news", b"sports"]),
+            &session,
+            &replication,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            reply,
+            Frame::Array(vec![
+                Frame::Push(vec![
+                    Frame::Bulk(Bytes::from_static(b"subscribe")),
+                    Frame::Bulk(Bytes::from_static(b"news")),
+                    Frame::Integer(1),
+                ]),
+                Frame::Push(vec![
+                    Frame::Bulk(Bytes::from_static(b"subscribe")),
+                    Frame::Bulk(Bytes::from_static(b"sports")),
+                    Frame::Integer(2),
+                ]),
+            ])
+        );
+    }
+
+    #[test]
+    fn subscribe_actually_registers_with_the_pubsub_registry() {
+        let session = Session::new();
+        let replication = crate::replication::ReplicationHandle::default();
+        intercept_for_pubsub(&cmd(&[b"SUBSCRIBE", b"news"]), &session, &replication, 1);
+
+        let delivered = replication
+            .pubsub
+            .publish(b"news", &Bytes::from_static(b"hello"));
+        assert_eq!(delivered, 1);
+    }
+
+    #[test]
+    fn unsubscribe_with_no_arguments_leaves_every_subscribed_channel() {
+        let session = Session::new();
+        let replication = crate::replication::ReplicationHandle::default();
+        intercept_for_pubsub(
+            &cmd(&[b"SUBSCRIBE", b"news", b"sports"]),
+            &session,
+            &replication,
+            1,
+        );
+
+        let reply = intercept_for_pubsub(&cmd(&[b"UNSUBSCRIBE"]), &session, &replication, 1);
+
+        assert_eq!(
+            replication
+                .pubsub
+                .publish(b"news", &Bytes::from_static(b"x")),
+            0
+        );
+        assert_eq!(
+            replication
+                .pubsub
+                .publish(b"sports", &Bytes::from_static(b"x")),
+            0
+        );
+        // Both channels' own reply frames are present, in subscription order, each counting
+        // down: 1 remaining after leaving "news" (still on "sports"), 0 after leaving "sports".
+        assert_eq!(
+            reply,
+            Some(Frame::Array(vec![
+                Frame::Push(vec![
+                    Frame::Bulk(Bytes::from_static(b"unsubscribe")),
+                    Frame::Bulk(Bytes::from_static(b"news")),
+                    Frame::Integer(1),
+                ]),
+                Frame::Push(vec![
+                    Frame::Bulk(Bytes::from_static(b"unsubscribe")),
+                    Frame::Bulk(Bytes::from_static(b"sports")),
+                    Frame::Integer(0),
+                ]),
+            ]))
+        );
+    }
+
+    #[test]
+    fn unsubscribe_of_a_channel_never_subscribed_to_still_replies_once() {
+        let session = Session::new();
+        let replication = crate::replication::ReplicationHandle::default();
+        let reply = intercept_for_pubsub(
+            &cmd(&[b"UNSUBSCRIBE", b"never-subscribed"]),
+            &session,
+            &replication,
+            1,
+        );
+        assert_eq!(
+            reply,
+            Some(Frame::Array(vec![Frame::Push(vec![
+                Frame::Bulk(Bytes::from_static(b"unsubscribe")),
+                Frame::Bulk(Bytes::from_static(b"never-subscribed")),
+                Frame::Integer(0),
+            ])]))
         );
     }
 
