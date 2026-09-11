@@ -1,37 +1,118 @@
+/// One parsed pattern element. `pattern` is tokenized once up front so the matcher below can
+/// walk it with plain indices instead of re-parsing variable-width syntax (`\X`, `[...]`) on
+/// every backtrack.
+enum Token {
+    /// A single literal byte, from either a bare character or a `\`-escape.
+    Literal(u8),
+    /// `?` — matches exactly one byte.
+    Any,
+    /// `*` — matches any run of bytes, including empty.
+    Star,
+    /// `[...]`/`[^...]`/`[!...]` — `body` is the class content with any leading negation
+    /// marker already stripped, exactly as `class_matches` expects.
+    Class { body: Vec<u8>, negate: bool },
+}
+
+/// Tokenizes a glob `pattern` into `Token`s, using the same escape and bracket-class parsing
+/// rules `glob_match` has always used (see its doc comment).
+fn tokenize(pattern: &[u8]) -> Vec<Token> {
+    let mut tokens = Vec::new();
+    let mut i = 0;
+    while i < pattern.len() {
+        match pattern[i] {
+            b'\\' if i + 1 < pattern.len() => {
+                tokens.push(Token::Literal(pattern[i + 1]));
+                i += 2;
+            }
+            b'*' => {
+                tokens.push(Token::Star);
+                i += 1;
+            }
+            b'?' => {
+                tokens.push(Token::Any);
+                i += 1;
+            }
+            b'[' => match pattern[i..].iter().position(|&b| b == b']') {
+                Some(close) => {
+                    let mut body = &pattern[i + 1..i + close];
+                    let negate = matches!(body.first(), Some(b'^') | Some(b'!'));
+                    if negate {
+                        body = &body[1..];
+                    }
+                    tokens.push(Token::Class {
+                        body: body.to_vec(),
+                        negate,
+                    });
+                    i += close + 1;
+                }
+                // Unterminated class: treat the '[' as a literal character.
+                None => {
+                    tokens.push(Token::Literal(b'['));
+                    i += 1;
+                }
+            },
+            c => {
+                tokens.push(Token::Literal(c));
+                i += 1;
+            }
+        }
+    }
+    tokens
+}
+
+/// Does `token` match the single byte `c`? `Star` never matches a byte directly — it is
+/// handled by the caller's backtracking loop instead.
+fn token_matches(token: &Token, c: u8) -> bool {
+    match token {
+        Token::Literal(l) => *l == c,
+        Token::Any => true,
+        Token::Class { body, negate } => class_matches(body, c) != *negate,
+        Token::Star => false,
+    }
+}
+
 /// Matches `text` against a Redis-style glob `pattern`. Supports `*` (any run, including
 /// empty), `?` (exactly one character), `[abc]` (one character from the listed set),
 /// `[a-z]` (one character from a range), `[^abc]`/`[!abc]` (negated set), and a top-level
 /// `\` to match the next character literally. Escaping is not supported inside `[...]`
 /// classes — see `docs/superpowers/specs/2026-08-30-tech-debt-cleanup-spec.md`.
+///
+/// Uses the standard linear-time two-pointer wildcard-matching algorithm (tokenizing `pattern`
+/// once, then walking token and text indices together, remembering the most recent `*` as a
+/// backtrack point) rather than naive recursive backtracking — the latter re-explores both
+/// branches of every `*`, which is exponential in the number of `*`s in the pattern when the
+/// match ultimately fails.
 pub fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
-    match pattern.first() {
-        None => text.is_empty(),
-        Some(b'\\') if pattern.len() > 1 => {
-            let literal = pattern[1];
-            !text.is_empty() && text[0] == literal && glob_match(&pattern[2..], &text[1..])
+    let tokens = tokenize(pattern);
+
+    let (mut ti, mut si) = (0usize, 0usize);
+    let mut star_ti: Option<usize> = None;
+    let mut star_si = 0usize;
+
+    while si < text.len() {
+        if ti < tokens.len() && token_matches(&tokens[ti], text[si]) {
+            ti += 1;
+            si += 1;
+        } else if ti < tokens.len() && matches!(tokens[ti], Token::Star) {
+            // Record the backtrack point: try matching zero characters with this '*' for now.
+            star_ti = Some(ti);
+            star_si = si;
+            ti += 1;
+        } else if let Some(st) = star_ti {
+            // The last '*' needs to absorb one more character; retry from just after it.
+            star_si += 1;
+            ti = st + 1;
+            si = star_si;
+        } else {
+            return false;
         }
-        Some(b'*') => {
-            glob_match(&pattern[1..], text) || (!text.is_empty() && glob_match(pattern, &text[1..]))
-        }
-        Some(b'?') => !text.is_empty() && glob_match(&pattern[1..], &text[1..]),
-        Some(b'[') => match pattern.iter().position(|&b| b == b']') {
-            Some(close) => {
-                if text.is_empty() {
-                    return false;
-                }
-                let mut class = &pattern[1..close];
-                let negate = matches!(class.first(), Some(b'^') | Some(b'!'));
-                if negate {
-                    class = &class[1..];
-                }
-                let matched = class_matches(class, text[0]);
-                (matched != negate) && glob_match(&pattern[close + 1..], &text[1..])
-            }
-            // Unterminated class: treat the '[' as a literal character.
-            None => !text.is_empty() && text[0] == b'[' && glob_match(&pattern[1..], &text[1..]),
-        },
-        Some(&c) => !text.is_empty() && text[0] == c && glob_match(&pattern[1..], &text[1..]),
     }
+
+    // Any tokens left must all be '*' -- they match the empty remainder.
+    while ti < tokens.len() && matches!(tokens[ti], Token::Star) {
+        ti += 1;
+    }
+    ti == tokens.len()
 }
 
 /// Matches `c` against a bracket-class body (with any leading `^`/`!` negation marker already
@@ -176,5 +257,27 @@ mod tests {
         // No second byte to escape -- falls through to matching '\' itself literally.
         assert!(glob_match(b"a\\", b"a\\"));
         assert!(!glob_match(b"a\\", b"a"));
+    }
+
+    #[test]
+    fn many_stars_against_a_non_matching_text_completes_quickly() {
+        // Regression test for a DoS: the old naive recursive `*` handling
+        // (`glob_match(&pattern[1..], text) || glob_match(pattern, &text[1..])`)
+        // branches twice per '*', giving exponential worst-case time when the
+        // match ultimately fails. A pattern with many '*'s against a
+        // non-matching text used to hang for a very long time; it must now
+        // finish comfortably within a tight wall-clock bound.
+        let pattern = b"*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*b";
+        let text = b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; // 35 'a's, no trailing 'b'.
+
+        let start = std::time::Instant::now();
+        let matched = glob_match(pattern, text);
+        let elapsed = start.elapsed();
+
+        assert!(!matched);
+        assert!(
+            elapsed < std::time::Duration::from_millis(100),
+            "glob_match took {elapsed:?}, expected well under 100ms"
+        );
     }
 }
