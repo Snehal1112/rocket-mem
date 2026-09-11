@@ -22,6 +22,7 @@ environment variables and config-file options, see
 | Sorted Set | `ZADD`, `ZSCORE`, `ZREM`, `ZCARD`, `ZINCRBY`, `ZRANGE`, `ZRANK` |
 | Server/Cluster | `PING`, `ECHO`, `DEBUG SLEEP`[^debug-sleep-cap], `SELECT`, `COMMAND`, `HELLO`, `INFO [section]`, `SAVE`, `BGREWRITEAOF`, `REPLICAOF`, `PSYNC`, `CLUSTER KEYSLOT`/`SHARDS`/`NODES`/`INFO`/`MYID`, `SLOWLOG GET`/`LEN`/`RESET` |
 | Auth/ACL | `AUTH` (both single-arg and `<user> <pass>` forms), `ACL SETUSER`/`DELUSER`/`WHOAMI`/`LIST`/`GETUSER` |
+| Transactions | `MULTI`, `EXEC`, `DISCARD` |
 
 [^debug-sleep-cap]: `DEBUG SLEEP` is capped at a 10-second maximum duration; a longer request is rejected with an error rather than accepted and blocking a server thread indefinitely.
 
@@ -96,6 +97,15 @@ implement.
   form is not accepted as an input token by `ACL SETUSER`; only `>password` (a plaintext
   password to hash) and `nopass` are accepted there. `ACL LIST`'s user ordering is also
   unspecified: users are stored in a hash map, so the order returned can vary between calls.
+- **`MULTI`/`EXEC` gives writers-only isolation, not full read isolation.** A transaction's
+  queued commands block any other *write* to a shard they touch for the whole batch, but a
+  concurrent *read* can observe intermediate state partway through the batch — impossible in
+  real Redis, which is single-threaded. See
+  [the transactions spec](superpowers/specs/2026-09-10-multi-exec-transactions-spec.md)'s
+  "Rejected: full read+write isolation now" section for why, and what closing this gap would
+  require.
+- **No `WATCH`/`UNWATCH`.** Optimistic locking needs a per-key change-tracking primitive this
+  engine does not have yet — a deferred follow-up, not an oversight.
 
 ## Commands not implemented
 

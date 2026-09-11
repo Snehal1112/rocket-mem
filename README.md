@@ -252,6 +252,7 @@ allocation did.
 | Sorted Set | `ZADD` (single pair only, no `NX`/`XX`/`GT`/`LT`/`CH`/`INCR`), `ZSCORE`, `ZREM`, `ZCARD`, `ZINCRBY`, `ZRANGE`, `ZRANK` |
 | Server/Cluster | `PING`, `ECHO`, `SELECT`, `COMMAND`, `HELLO`, `INFO [section]`, `SAVE`, `BGREWRITEAOF`, `REPLICAOF`, `PSYNC`, `DEBUG SLEEP`, `CLUSTER KEYSLOT`/`SHARDS`/`NODES`/`INFO`/`MYID`, `SLOWLOG GET`/`LEN`/`RESET` |
 | Auth/ACL | `AUTH` (single-arg and `<user> <pass>`), `ACL SETUSER`/`DELUSER`/`WHOAMI`/`LIST`/`GETUSER` |
+| Transactions | `MULTI`, `EXEC`, `DISCARD` (writers-only isolation — see [`docs/command-compatibility.md`](docs/command-compatibility.md) for what that means; no `WATCH`/`UNWATCH` yet) |
 
 Behavioural differences from real Redis — `KEYS` glob support is partial, `OBJECT ENCODING`
 reports engine type names rather than Redis's internal encodings, and others — are catalogued in
