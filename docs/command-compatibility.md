@@ -23,6 +23,7 @@ environment variables and config-file options, see
 | Server/Cluster | `PING`, `ECHO`, `DEBUG SLEEP`[^debug-sleep-cap], `SELECT`, `COMMAND`, `HELLO`, `INFO [section]`, `SAVE`, `BGREWRITEAOF`, `REPLICAOF`, `PSYNC`, `CLUSTER KEYSLOT`/`SHARDS`/`NODES`/`INFO`/`MYID`, `SLOWLOG GET`/`LEN`/`RESET` |
 | Auth/ACL | `AUTH` (both single-arg and `<user> <pass>` forms), `ACL SETUSER`/`DELUSER`/`WHOAMI`/`LIST`/`GETUSER` |
 | Transactions | `MULTI`, `EXEC`, `DISCARD` |
+| Pub/Sub | `SUBSCRIBE`, `UNSUBSCRIBE`, `PSUBSCRIBE`, `PUNSUBSCRIBE`, `PUBLISH`, `PUBSUB CHANNELS`/`NUMSUB`/`NUMPAT` |
 
 [^debug-sleep-cap]: `DEBUG SLEEP` is capped at a 10-second maximum duration; a longer request is rejected with an error rather than accepted and blocking a server thread indefinitely.
 
@@ -106,6 +107,12 @@ implement.
   require.
 - **No `WATCH`/`UNWATCH`.** Optimistic locking needs a per-key change-tracking primitive this
   engine does not have yet — a deferred follow-up, not an oversight.
+- **Pub/sub delivery is single-node only, not cluster-wide.** `PUBLISH` only reaches subscribers
+  connected to the same node it was called on — no cross-shard forwarding, no gossip. Real
+  Redis's cluster-wide pub/sub relies on its gossip protocol, which this project doesn't
+  implement. See [the pub/sub spec](superpowers/specs/2026-09-11-pubsub-spec.md)'s "Cluster
+  scope" section.
+- **No sharded pub/sub (`SPUBLISH`/`SSUBSCRIBE`).** Not applicable without cluster-wide fanout.
 
 ## Commands not implemented
 
@@ -119,8 +126,9 @@ follow-on backlog covering exactly these four areas, plus live cluster reshardin
   (`BLPOP`, `BRPOP`, `BLMPOP`, `BZMPOP`, `BZPOPMIN`/`BZPOPMAX`, etc.).
 - **Key/object extras:** `COPY`, `OBJECT FREQ`, `OBJECT IDLETIME`, `WAIT`, `LOLWUT`.
 - **Lua scripting:** `EVAL`, `EVALSHA`, `SCRIPT LOAD`/`EXISTS`/`FLUSH`.
-- **Pub/sub:** `SUBSCRIBE`, `UNSUBSCRIBE`, `PUBLISH`, `PSUBSCRIBE`, and related commands.
-- **Transactions:** `MULTI`, `EXEC`, `DISCARD`, `WATCH`/`UNWATCH`.
+- **Sharded pub/sub:** `SPUBLISH`, `SSUBSCRIBE`, `SUNSUBSCRIBE` (Redis 7's cluster-aware pub/sub
+  variant) — not applicable without cluster-wide fanout (see "Known divergences" above).
+- **Transactions:** `WATCH`/`UNWATCH`.
 - **Streams:** `XADD` and the rest of the stream command family.
 - **Cluster live operations:** `CLUSTER SETSLOT`, `MIGRATE`, `ASK`/`ASKING` — slot ownership is
   fixed at process start via a static config file, so there is no live resharding or failover.

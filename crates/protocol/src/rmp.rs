@@ -117,6 +117,10 @@ pub(crate) fn encode_frame(frame: &Frame, dst: &mut BytesMut) -> io::Result<()> 
                 encode_frame(v, dst)?;
             }
         }
+        // Pub/sub is RESP-only for v1 (see the pub/sub spec's "Out of scope" section) -- RMP has
+        // no tag for it. This arm exists only so adding Frame::Push doesn't leave this match
+        // silently wrong; nothing in this codebase constructs a Push frame on an RMP connection.
+        Frame::Push(_) => return Err(invalid_data("RMP does not support pub/sub Push frames")),
     }
     Ok(())
 }

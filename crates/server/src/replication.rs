@@ -211,6 +211,12 @@ pub struct ReplicationHandle {
     /// (`04-replica-registry-and-leader-fanout.md`, Task 4) calls `ReplicaRegistry::register`
     /// during `PSYNC` handling.
     pub registry: ReplicaRegistry,
+    /// Cross-connection pub/sub state: which connections are subscribed to which
+    /// channels/patterns. A per-process singleton, like `registry` just above -- single-node
+    /// delivery only (see the pub/sub spec's "Cluster scope" section). `Arc`-wrapped, like
+    /// `engine`/`aof` below, because Plan 06 threads it into the `'static` spawned follower
+    /// task, which needs its own owned handle rather than a borrow of this struct's field.
+    pub pubsub: Arc<crate::pubsub::PubSubRegistry>,
     /// Follower side: gates client-originated writes once this node is replicating from a
     /// leader. Read by `dispatch_and_log`'s `-READONLY` check, added in
     /// `05-replicaof-and-follower-apply-loop.md`. A plain field, not `Arc<AtomicBool>`: the
@@ -380,6 +386,7 @@ impl ReplicationHandle {
     pub fn new(engine: Arc<Engine>, snapshot_path: PathBuf) -> Self {
         Self {
             registry: ReplicaRegistry::default(),
+            pubsub: Arc::new(crate::pubsub::PubSubRegistry::default()),
             is_replica: AtomicBool::new(false),
             follower_task: Mutex::new(None),
             engine,
@@ -611,6 +618,7 @@ impl ReplicationHandle {
                     mine: my_generation,
                 },
                 aof,
+                Arc::clone(&self.pubsub),
                 FollowerHandles {
                     last_apply,
                     link_up,
@@ -880,11 +888,13 @@ struct FollowerIdentity {
 /// grep-able from either end of a replication link. See
 /// ../../../docs/superpowers/specs/2026-09-09-verbose-logging-design.md's span table.
 #[tracing::instrument(name = "repl", skip_all, fields(host_port = %crate::logging::escape_ident(&host_port)))]
+#[allow(clippy::too_many_arguments)]
 async fn replication_client_loop(
     host_port: String,
     engine: Arc<Engine>,
     generation: Generation,
     aof: Option<Arc<AofWriter>>,
+    pubsub: Arc<crate::pubsub::PubSubRegistry>,
     handles: FollowerHandles,
     tls_client_config: Option<Arc<rustls::ClientConfig>>,
     identity: FollowerIdentity,
@@ -903,6 +913,7 @@ async fn replication_client_loop(
             &engine,
             &generation,
             aof.as_deref(),
+            &pubsub,
             status,
             tls_client_config.as_ref(),
             &identity,
@@ -936,11 +947,13 @@ async fn replication_client_loop(
 /// whichever stream type resulted. Two monomorphizations of the generic `sync_once` rather than
 /// a boxed trait object, matching this codebase's existing avoidance of dynamic dispatch on the
 /// hot connection-setup path.
+#[allow(clippy::too_many_arguments)]
 async fn connect_and_sync(
     host_port: &str,
     engine: &Engine,
     generation: &Generation,
     aof: Option<&AofWriter>,
+    pubsub: &crate::pubsub::PubSubRegistry,
     status: FollowerStatus<'_>,
     tls_client_config: Option<&Arc<rustls::ClientConfig>>,
     identity: &FollowerIdentity,
@@ -962,6 +975,7 @@ async fn connect_and_sync(
                 &generation.counter,
                 generation.mine,
                 aof,
+                pubsub,
                 status,
                 identity,
             )
@@ -974,6 +988,7 @@ async fn connect_and_sync(
                 &generation.counter,
                 generation.mine,
                 aof,
+                pubsub,
                 status,
                 identity,
             )
@@ -1021,12 +1036,14 @@ fn replconf_ack_frame(offset: u64) -> protocol::Frame {
 /// same body serves both plaintext and TLS-upgraded replication connections (`connect_and_sync`
 /// above), mirroring `connection::handle_connection`'s existing genericization for the
 /// server-accept side.
+#[allow(clippy::too_many_arguments)]
 async fn sync_once<S>(
     stream: S,
     engine: &Engine,
     generation: &AtomicU64,
     my_generation: u64,
     aof: Option<&AofWriter>,
+    pubsub: &crate::pubsub::PubSubRegistry,
     status: FollowerStatus<'_>,
     identity: &FollowerIdentity,
 ) -> std::io::Result<()>
@@ -1224,6 +1241,23 @@ where
                     Ok(to_apply) => {
                         for buffered in to_apply {
                             let name = replicated_command_name(&buffered);
+                            // PUBLISH has no keyspace effect and never reaches dispatch() here --
+                            // dispatch() has no way to reach a PubSubRegistry (see the pub/sub
+                            // spec's "Why not dispatch()" section), so it is delivered directly
+                            // to this follower's own locally-subscribed clients instead.
+                            if name == "PUBLISH" {
+                                if let protocol::Frame::Array(items) = &buffered {
+                                    if let (
+                                        Some(protocol::Frame::Bulk(channel)),
+                                        Some(protocol::Frame::Bulk(message)),
+                                    ) = (items.get(1), items.get(2))
+                                    {
+                                        pubsub.publish(channel, message);
+                                    }
+                                }
+                                tracing::debug!(cmd = "PUBLISH", "applied replicated command");
+                                continue;
+                            }
                             let mut protocol = protocol::codec::Protocol::default();
                             // Mutual exclusion with a concurrent SAVE on this same node: SAVE's
                             // shard-by-shard snapshot walk (Store::snapshot_entries) must not
@@ -1344,6 +1378,14 @@ mod tests {
     fn default_is_idle_with_no_replicas_and_is_not_a_replica() {
         let h = ReplicationHandle::default();
         assert!(!h.is_replica.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn replication_handle_exposes_a_pubsub_registry() {
+        let replication = ReplicationHandle::default();
+        // Not previously reachable at all -- this only needs to compile and not panic to prove
+        // the field exists and is usable from outside replication.rs's own module.
+        assert_eq!(replication.pubsub.channels(), Vec::<bytes::Bytes>::new());
     }
 
     #[test]
@@ -1601,12 +1643,14 @@ mod tests {
             let generation = Arc::clone(&generation);
             tokio::spawn(async move {
                 let stream = tokio::net::TcpStream::connect(&host_port).await.unwrap();
+                let pubsub = crate::pubsub::PubSubRegistry::default();
                 sync_once(
                     stream,
                     &engine,
                     &generation,
                     0,
                     None,
+                    &pubsub,
                     FollowerStatus {
                         last_apply: &AtomicI64::new(0),
                         link_up: &AtomicBool::new(false),
@@ -1673,12 +1717,14 @@ mod tests {
             let generation = Arc::clone(&generation);
             tokio::spawn(async move {
                 let stream = tokio::net::TcpStream::connect(&host_port).await.unwrap();
+                let pubsub = crate::pubsub::PubSubRegistry::default();
                 sync_once(
                     stream,
                     &engine,
                     &generation,
                     0,
                     None,
+                    &pubsub,
                     FollowerStatus {
                         last_apply: &AtomicI64::new(0),
                         link_up: &AtomicBool::new(false),
@@ -1702,6 +1748,85 @@ mod tests {
             engine.get(b"b"),
             Some(engine::Value::String(bytes::Bytes::from_static(b"2")))
         );
+    }
+
+    /// A replicated `PUBLISH` must never reach `dispatch()`'s engine-mutation path -- it has no
+    /// keyspace effect on the leader either, and `dispatch()` has no way to reach a
+    /// `PubSubRegistry` anyway. Instead `sync_once` delivers it straight to the follower's own
+    /// `pubsub`, so a client subscribed locally on the follower still receives messages published
+    /// on the leader.
+    #[tokio::test]
+    async fn sync_once_delivers_a_replicated_publish_to_a_locally_subscribed_client() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let fake_leader = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut psync_bytes = [0u8; 15];
+            socket.read_exact(&mut psync_bytes).await.unwrap();
+
+            let snapshot_engine = engine::Engine::new();
+            let blob = snapshot_engine.snapshot(0);
+            socket
+                .write_all(&(blob.len() as u64).to_le_bytes())
+                .await
+                .unwrap();
+            socket.write_all(&blob).await.unwrap();
+
+            socket
+                .write_all(b"*3\r\n$7\r\nPUBLISH\r\n$4\r\nnews\r\n$5\r\nhello\r\n")
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        });
+
+        let engine = std::sync::Arc::new(engine::Engine::new());
+        let pubsub = std::sync::Arc::new(crate::pubsub::PubSubRegistry::default());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        pubsub.subscribe(bytes::Bytes::from_static(b"news"), 1, tx);
+
+        let host_port = addr.to_string();
+        let generation = Arc::new(AtomicU64::new(0));
+        let sync_task = {
+            let engine = std::sync::Arc::clone(&engine);
+            let pubsub = std::sync::Arc::clone(&pubsub);
+            let generation = Arc::clone(&generation);
+            tokio::spawn(async move {
+                let stream = tokio::net::TcpStream::connect(&host_port).await.unwrap();
+                sync_once(
+                    stream,
+                    &engine,
+                    &generation,
+                    0,
+                    None,
+                    &pubsub,
+                    FollowerStatus {
+                        last_apply: &AtomicI64::new(0),
+                        link_up: &AtomicBool::new(false),
+                        slave_offset: &AtomicU64::new(0),
+                    },
+                    &FollowerIdentity::default(),
+                )
+                .await
+            })
+        };
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        sync_task.abort();
+        fake_leader.await.unwrap();
+
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            protocol::Frame::Push(vec![
+                protocol::Frame::Bulk(bytes::Bytes::from_static(b"message")),
+                protocol::Frame::Bulk(bytes::Bytes::from_static(b"news")),
+                protocol::Frame::Bulk(bytes::Bytes::from_static(b"hello")),
+            ])
+        );
+        // The engine must be untouched -- PUBLISH never reaches dispatch()'s engine-mutation path.
+        assert_eq!(engine.keys().len(), 0);
     }
 
     /// A follower that has just loaded a snapshot already knows exactly where it sits in the
@@ -1751,12 +1876,14 @@ mod tests {
             let slave_offset = Arc::clone(&slave_offset);
             tokio::spawn(async move {
                 let stream = tokio::net::TcpStream::connect(&host_port).await.unwrap();
+                let pubsub = crate::pubsub::PubSubRegistry::default();
                 sync_once(
                     stream,
                     &engine,
                     &generation,
                     0,
                     None,
+                    &pubsub,
                     FollowerStatus {
                         last_apply: &AtomicI64::new(0),
                         link_up: &AtomicBool::new(false),
@@ -1848,12 +1975,14 @@ mod tests {
             let slave_offset = Arc::clone(&slave_offset);
             tokio::spawn(async move {
                 let stream = tokio::net::TcpStream::connect(&host_port).await.unwrap();
+                let pubsub = crate::pubsub::PubSubRegistry::default();
                 sync_once(
                     stream,
                     &engine,
                     &generation,
                     0,
                     None,
+                    &pubsub,
                     FollowerStatus {
                         last_apply: &AtomicI64::new(0),
                         link_up: &AtomicBool::new(false),
@@ -1932,12 +2061,14 @@ mod tests {
         let host_port = addr.to_string();
         let generation = Arc::new(AtomicU64::new(0));
         let stream = tokio::net::TcpStream::connect(&host_port).await.unwrap();
+        let pubsub = crate::pubsub::PubSubRegistry::default();
         sync_once(
             stream,
             &engine,
             &generation,
             0,
             None,
+            &pubsub,
             FollowerStatus {
                 last_apply: &AtomicI64::new(0),
                 link_up: &AtomicBool::new(false),
@@ -2000,12 +2131,14 @@ mod tests {
         let host_port = addr.to_string();
         let generation = Arc::new(AtomicU64::new(0));
         let stream = tokio::net::TcpStream::connect(&host_port).await.unwrap();
+        let pubsub = crate::pubsub::PubSubRegistry::default();
         sync_once(
             stream,
             &engine,
             &generation,
             0,
             None,
+            &pubsub,
             FollowerStatus {
                 last_apply: &AtomicI64::new(0),
                 link_up: &AtomicBool::new(false),
@@ -2071,12 +2204,14 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(&addr.to_string())
             .await
             .unwrap();
+        let pubsub = crate::pubsub::PubSubRegistry::default();
         sync_once(
             stream,
             &engine,
             &generation,
             0,
             None,
+            &pubsub,
             FollowerStatus {
                 last_apply: &AtomicI64::new(0),
                 link_up: &AtomicBool::new(false),
@@ -2144,12 +2279,14 @@ mod tests {
         // newer task has already loaded.
         let generation = Arc::new(AtomicU64::new(1));
         let stream = tokio::net::TcpStream::connect(&host_port).await.unwrap();
+        let pubsub = crate::pubsub::PubSubRegistry::default();
         sync_once(
             stream,
             &engine,
             &generation,
             0,
             None,
+            &pubsub,
             FollowerStatus {
                 last_apply: &AtomicI64::new(0),
                 link_up: &AtomicBool::new(false),
@@ -2191,12 +2328,14 @@ mod tests {
         let generation = Arc::new(AtomicU64::new(0));
         let stream = tokio::net::TcpStream::connect(&host_port).await.unwrap();
 
+        let pubsub = crate::pubsub::PubSubRegistry::default();
         let result = sync_once(
             stream,
             &engine,
             &generation,
             0,
             None,
+            &pubsub,
             FollowerStatus {
                 last_apply: &AtomicI64::new(0),
                 link_up: &AtomicBool::new(false),
@@ -2243,12 +2382,14 @@ mod tests {
         let generation = Arc::new(AtomicU64::new(0));
         let stream = tokio::net::TcpStream::connect(&host_port).await.unwrap();
 
+        let pubsub = crate::pubsub::PubSubRegistry::default();
         let _ = sync_once(
             stream,
             &engine,
             &generation,
             0,
             None,
+            &pubsub,
             FollowerStatus {
                 last_apply: &AtomicI64::new(0),
                 link_up: &AtomicBool::new(false),
@@ -2309,12 +2450,14 @@ mod tests {
         let generation = Arc::new(AtomicU64::new(0));
         let stream = tokio::net::TcpStream::connect(&host_port).await.unwrap();
 
+        let pubsub = crate::pubsub::PubSubRegistry::default();
         let _ = sync_once(
             stream,
             &engine,
             &generation,
             0,
             None,
+            &pubsub,
             FollowerStatus {
                 last_apply: &AtomicI64::new(0),
                 link_up: &AtomicBool::new(false),
@@ -2353,12 +2496,14 @@ mod tests {
         let generation = Arc::new(AtomicU64::new(0));
         let stream = tokio::net::TcpStream::connect(&host_port).await.unwrap();
 
+        let pubsub = crate::pubsub::PubSubRegistry::default();
         let result = sync_once(
             stream,
             &engine,
             &generation,
             0,
             None,
+            &pubsub,
             FollowerStatus {
                 last_apply: &AtomicI64::new(0),
                 link_up: &AtomicBool::new(false),
@@ -2462,6 +2607,7 @@ mod tests {
         let sync_task = {
             let engine = Arc::clone(&engine);
             let aof = Arc::clone(&aof);
+            let replication = Arc::clone(&replication);
             let host_port = addr.to_string();
             let generation = Arc::new(AtomicU64::new(0));
             tokio::spawn(async move {
@@ -2472,6 +2618,7 @@ mod tests {
                     &generation,
                     0,
                     Some(&aof),
+                    &replication.pubsub,
                     FollowerStatus {
                         last_apply: &AtomicI64::new(0),
                         link_up: &AtomicBool::new(false),
@@ -2755,6 +2902,7 @@ mod tests {
                 mine: 0,
             },
             None,
+            Arc::new(crate::pubsub::PubSubRegistry::default()),
             FollowerHandles {
                 last_apply: Arc::new(AtomicI64::new(0)),
                 link_up: Arc::new(AtomicBool::new(false)),
@@ -2814,12 +2962,14 @@ mod tests {
         let generation = Arc::new(AtomicU64::new(0));
         let stream = tokio::net::TcpStream::connect(&host_port).await.unwrap();
         let sync_task = tokio::spawn(async move {
+            let pubsub = crate::pubsub::PubSubRegistry::default();
             sync_once(
                 stream,
                 &engine,
                 &generation,
                 0,
                 None,
+                &pubsub,
                 FollowerStatus {
                     last_apply: &AtomicI64::new(0),
                     link_up: &AtomicBool::new(false),

@@ -194,12 +194,15 @@ pub async fn serve_tls(
 
 /// Decrements the live-connection count on drop, so every one of `handle_connection`'s early
 /// returns -- and the `serve_replica` path, which never returns normally -- is covered without
-/// each of them having to remember.
-pub(crate) struct ClientGuard(pub(crate) Arc<ReplicationHandle>);
+/// each of them having to remember. Also removes this connection's pub/sub registrations
+/// (`PubSubRegistry::remove_all`), so a disconnected subscriber's channel/pattern entries don't
+/// linger until the next failed `publish` send happens to prune them.
+pub(crate) struct ClientGuard(pub(crate) Arc<ReplicationHandle>, pub(crate) u64);
 
 impl Drop for ClientGuard {
     fn drop(&mut self) {
         self.0.connection_closed();
+        self.0.pubsub.remove_all(self.1);
     }
 }
 
@@ -273,7 +276,7 @@ async fn handle_connection<S>(
 {
     tracing::info!("connection accepted");
     replication.connection_opened();
-    let _client_guard = ClientGuard(Arc::clone(&replication));
+    let _client_guard = ClientGuard(Arc::clone(&replication), client_id);
     let mut conn_stats = ConnectionStats::new();
     let mut framed = Framed::new(socket, RespCodec::default());
     let session = dispatcher::Session::with_peer_addr(peer);
@@ -282,7 +285,44 @@ async fn handle_connection<S>(
     loop {
         let next = match pending.take() {
             Some(n) => n,
-            None => framed.next().await,
+            None => {
+                // Take the receiver out of its `Mutex` rather than holding the `MutexGuard`
+                // itself across the `select!`'s `.await`: `std::sync::MutexGuard` is
+                // unconditionally `!Send` (regardless of the guarded type), so a guard held
+                // across this await would make `handle_connection`'s whole future `!Send`,
+                // which every `tokio::spawn` call site spawning it (`serve`, `serve_tls`)
+                // requires. Owning the receiver locally for the `select!`'s duration, then
+                // putting it straight back, keeps the future `Send` at the cost of one extra
+                // short, uncontended lock per loop tick -- and only once a connection has
+                // subscribed; an ordinary connection pays a single `Mutex::lock` +
+                // `Option::take()` (on an already-`None` option) and nothing else.
+                let mut rx_opt = session
+                    .push_rx
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take();
+                let outcome = match rx_opt.as_mut() {
+                    Some(rx) => {
+                        tokio::select! {
+                            frame = framed.next() => Ok(frame),
+                            Some(push) = rx.recv() => Err(push),
+                        }
+                    }
+                    None => Ok(framed.next().await),
+                };
+                if let Some(rx) = rx_opt {
+                    *session.push_rx.lock().unwrap_or_else(|e| e.into_inner()) = Some(rx);
+                }
+                match outcome {
+                    Ok(frame) => frame,
+                    Err(push) => {
+                        if framed.send(push).await.is_err() {
+                            return; // client went away
+                        }
+                        continue;
+                    }
+                }
+            }
         };
         let frame = match next {
             Some(Ok(frame)) => frame,
@@ -866,6 +906,40 @@ mod tests {
         assert_eq!(
             framed.next().await.unwrap().unwrap(),
             Frame::Simple("PONG".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_disconnected_subscribers_registrations_are_removed() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let engine = Arc::new(Engine::new());
+        let (_dir, aof) = test_aof();
+        let replication = Arc::new(crate::replication::ReplicationHandle::default());
+        tokio::spawn(serve(listener, engine, aof, Arc::clone(&replication)));
+
+        let mut subscriber = Framed::new(
+            TcpStream::connect(addr).await.unwrap(),
+            RespCodec::default(),
+        );
+        subscriber
+            .send(Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"SUBSCRIBE")),
+                Frame::Bulk(Bytes::from_static(b"news")),
+            ]))
+            .await
+            .unwrap();
+        subscriber.next().await.unwrap().unwrap(); // the subscribe confirmation
+
+        drop(subscriber);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert_eq!(
+            replication
+                .pubsub
+                .publish(b"news", &Bytes::from_static(b"hello")),
+            0,
+            "a disconnected subscriber must not still be counted as delivered-to"
         );
     }
 
@@ -1639,4 +1713,122 @@ mod tests {
     // `crates/server/tests/logging.rs`, a separate integration-test binary with far fewer
     // tests/callsites where capture assertions have never flaked, driving the same scenario
     // through the public `rocket_mem::serve`. Do not re-add a capture assertion here.
+
+    #[tokio::test]
+    async fn a_subscribed_connection_receives_a_published_message_between_its_own_commands() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let engine = Arc::new(Engine::new());
+        let (_dir, aof) = test_aof();
+        let replication = Arc::new(crate::replication::ReplicationHandle::default());
+        tokio::spawn(serve(listener, engine, aof, Arc::clone(&replication)));
+
+        let mut subscriber = Framed::new(
+            TcpStream::connect(addr).await.unwrap(),
+            RespCodec::default(),
+        );
+        subscriber
+            .send(Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"SUBSCRIBE")),
+                Frame::Bulk(Bytes::from_static(b"news")),
+            ]))
+            .await
+            .unwrap();
+        // This test never negotiates RESP3 (no `HELLO 3`), so the connection stays on the default
+        // `Protocol::Resp2`: `RespCodec` encodes `Frame::Push` as a plain `*`-array under RESP2
+        // (only RESP3 uses the `>` push marker), and its decoder has no case for `>` at all -- so
+        // nothing this test decodes off the wire can ever come back as `Frame::Push`; every push
+        // arrives here as the structurally-identical `Frame::Array`. A single-channel SUBSCRIBE's
+        // confirmation is that one bare array -- never batched inside an outer array (that would
+        // break every real RESP client's per-channel handshake, and is invalid RESP3 to boot).
+        assert_eq!(
+            subscriber.next().await.unwrap().unwrap(),
+            Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"subscribe")),
+                Frame::Bulk(Bytes::from_static(b"news")),
+                Frame::Integer(1),
+            ])
+        );
+
+        let mut publisher = Framed::new(
+            TcpStream::connect(addr).await.unwrap(),
+            RespCodec::default(),
+        );
+        publisher
+            .send(Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"PUBLISH")),
+                Frame::Bulk(Bytes::from_static(b"news")),
+                Frame::Bulk(Bytes::from_static(b"hello")),
+            ]))
+            .await
+            .unwrap();
+        assert_eq!(publisher.next().await.unwrap().unwrap(), Frame::Integer(1));
+
+        assert_eq!(
+            subscriber.next().await.unwrap().unwrap(),
+            // Same RESP2-decodes-as-Array reasoning as the SUBSCRIBE ack above -- the pushed
+            // message itself is a bare (unwrapped) push, not batched in an outer Array like the
+            // SUBSCRIBE ack is.
+            Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"message")),
+                Frame::Bulk(Bytes::from_static(b"news")),
+                Frame::Bulk(Bytes::from_static(b"hello")),
+            ])
+        );
+
+        // The connection can still send its own commands afterward -- receiving the push
+        // didn't consume its ability to read a next request. PING is in the RESP2
+        // subscribe-mode allowed set (see subscribe_mode_gate), so a plain PONG is expected,
+        // not another push.
+        subscriber
+            .send(Frame::Array(vec![Frame::Bulk(Bytes::from_static(b"PING"))]))
+            .await
+            .unwrap();
+        assert_eq!(
+            subscriber.next().await.unwrap().unwrap(),
+            Frame::Simple("PONG".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribing_to_two_channels_in_one_call_yields_two_separate_top_level_replies() {
+        // A real client issuing `SUBSCRIBE news sports` in one call must read back two
+        // independent, well-formed replies -- never one call yielding a single batched frame.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let engine = Arc::new(Engine::new());
+        let (_dir, aof) = test_aof();
+        let replication = Arc::new(crate::replication::ReplicationHandle::default());
+        tokio::spawn(serve(listener, engine, aof, Arc::clone(&replication)));
+
+        let mut subscriber = Framed::new(
+            TcpStream::connect(addr).await.unwrap(),
+            RespCodec::default(),
+        );
+        subscriber
+            .send(Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"SUBSCRIBE")),
+                Frame::Bulk(Bytes::from_static(b"news")),
+                Frame::Bulk(Bytes::from_static(b"sports")),
+            ]))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            subscriber.next().await.unwrap().unwrap(),
+            Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"subscribe")),
+                Frame::Bulk(Bytes::from_static(b"news")),
+                Frame::Integer(1),
+            ])
+        );
+        assert_eq!(
+            subscriber.next().await.unwrap().unwrap(),
+            Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"subscribe")),
+                Frame::Bulk(Bytes::from_static(b"sports")),
+                Frame::Integer(2),
+            ])
+        );
+    }
 }

@@ -341,6 +341,74 @@ async fn one_leader_two_followers_propagates_writes_within_a_bounded_time_window
     wait_for(&f2_engine, b"k", b"v").await;
 }
 
+#[tokio::test]
+async fn a_followers_subscriber_receives_a_message_published_on_the_leader() {
+    use futures_util::{SinkExt, StreamExt};
+    use protocol::codec::RespCodec;
+    use protocol::Frame;
+    use tokio_util::codec::Framed;
+
+    let (_leader_dir, _leader_engine, _leader_aof, _leader_replication, leader_addr) =
+        spawn_node().await;
+    let (_f_dir, _f_engine, _f_aof, f_replication, f_addr) = spawn_node().await;
+
+    f_replication.start_replicating(leader_addr.clone());
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Subscribe directly on the follower.
+    let mut subscriber = Framed::new(
+        tokio::net::TcpStream::connect(&f_addr).await.unwrap(),
+        RespCodec::default(),
+    );
+    subscriber
+        .send(Frame::Array(vec![
+            Frame::Bulk(bytes::Bytes::from_static(b"SUBSCRIBE")),
+            Frame::Bulk(bytes::Bytes::from_static(b"news")),
+        ]))
+        .await
+        .unwrap();
+    subscriber.next().await.unwrap().unwrap(); // the subscribe confirmation
+
+    // Publish on the leader.
+    let mut publisher = Framed::new(
+        tokio::net::TcpStream::connect(&leader_addr).await.unwrap(),
+        RespCodec::default(),
+    );
+    publisher
+        .send(Frame::Array(vec![
+            Frame::Bulk(bytes::Bytes::from_static(b"PUBLISH")),
+            Frame::Bulk(bytes::Bytes::from_static(b"news")),
+            Frame::Bulk(bytes::Bytes::from_static(b"hello")),
+        ]))
+        .await
+        .unwrap();
+    assert_eq!(
+        publisher.next().await.unwrap().unwrap(),
+        Frame::Integer(0), // the leader itself has no local subscriber on "news"
+    );
+
+    let delivered = tokio::time::timeout(std::time::Duration::from_secs(5), subscriber.next())
+        .await
+        .expect("timed out waiting for the replicated message")
+        .unwrap()
+        .unwrap();
+    // This connection never negotiates RESP3 (no `HELLO 3`), so it stays on the default
+    // `Protocol::Resp2` -- and `RespCodec` encodes `Frame::Push` as a plain `*`-array under
+    // RESP2 (only RESP3 uses the `>` push marker), with no decoder case for `>` at all. So the
+    // pushed message arrives here as the structurally-identical `Frame::Array`, not
+    // `Frame::Push`, exactly as `connection.rs`'s
+    // `a_subscribed_connection_receives_a_published_message_between_its_own_commands` documents
+    // for a non-replicated publish on the same connection.
+    assert_eq!(
+        delivered,
+        Frame::Array(vec![
+            Frame::Bulk(bytes::Bytes::from_static(b"message")),
+            Frame::Bulk(bytes::Bytes::from_static(b"news")),
+            Frame::Bulk(bytes::Bytes::from_static(b"hello")),
+        ])
+    );
+}
+
 /// The payoff of the offset chain: a leader and a caught-up follower report the *same* number.
 /// Both halves are exercised -- a write taken before the follower attached (carried across in
 /// the snapshot header) and one taken after (counted in the apply loop) -- because either half

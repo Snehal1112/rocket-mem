@@ -172,7 +172,7 @@ async fn handle_connection<S>(
 {
     tracing::info!("connection accepted");
     replication.connection_opened();
-    let _client_guard = ClientGuard(Arc::clone(&replication));
+    let _client_guard = ClientGuard(Arc::clone(&replication), client_id);
     let mut conn_stats = ConnectionStats::new();
     let framed = Framed::new(socket, RmpCodec);
     let (mut sink, mut stream) = framed.split();
@@ -180,7 +180,7 @@ async fn handle_connection<S>(
     // this is what lets AUTH on one request be observed by a later, independently-spawned
     // request on the same connection. See
     // ../../docs/superpowers/plans/2026-08-31-sprint-8-plans/07-rmp-session-sharing.md.
-    let session = Arc::new(dispatcher::Session::new());
+    let session = Arc::new(dispatcher::Session::new_for_rmp());
 
     // Every spawned request-handling task below gets its own clone of `tx`; this loop's own
     // clone is dropped when the read loop ends. The writer task's `rx.recv()` only returns

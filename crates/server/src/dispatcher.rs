@@ -49,6 +49,41 @@ pub struct Session {
     /// nothing about a transaction's queue needs to be visible to, or block, an unrelated read
     /// of the connection's name or auth state.
     tx: std::sync::Mutex<TransactionState>,
+    /// Channels this connection currently has an open `SUBSCRIBE` on. A separate lock from
+    /// `tx`/`protocol`/etc: nothing about subscription state needs to block an unrelated read of
+    /// this connection's transaction or auth state.
+    ///
+    /// `BTreeSet`, not `HashSet`: an unqualified `UNSUBSCRIBE` (Task 2) replies once per
+    /// currently-subscribed channel, in the order it iterates this set, and a real client
+    /// expects that order to be stable across calls -- `HashSet`'s iteration order is randomized
+    /// per-process (`RandomState`), which made that reply order flaky from one test run to the
+    /// next. `BTreeSet` costs nothing here: sets stay tiny (one connection's own subscriptions).
+    subscriptions: std::sync::Mutex<std::collections::BTreeSet<Bytes>>,
+    /// Patterns this connection currently has an open `PSUBSCRIBE` on. Same `BTreeSet` rationale
+    /// as `subscriptions` above.
+    #[allow(dead_code)]
+    psubscriptions: std::sync::Mutex<std::collections::BTreeSet<Bytes>>,
+    /// Fast path for the overwhelmingly common case (no subscription ever opened): checked with
+    /// a relaxed load before `subscriptions`/`psubscriptions` are ever touched. See the spec's
+    /// "Performance" section.
+    #[allow(dead_code)]
+    subscription_count: std::sync::atomic::AtomicUsize,
+    /// This connection's own outbound channel for pushed pub/sub messages, created lazily on the
+    /// first `SUBSCRIBE`/`PSUBSCRIBE`. Kept alongside `push_rx` so a later `SUBSCRIBE` on the
+    /// same connection can clone it again to register another channel, rather than the sender
+    /// half being handed once to the registry and then unreachable.
+    #[allow(dead_code)]
+    push_tx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<Frame>>>,
+    /// The receiving half of `push_tx`'s channel. `connection.rs`'s read loop drains this once
+    /// it is `Some` (Plan 05) -- `None` for a connection that has never subscribed. `pub(crate)`
+    /// (not private): `connection.rs`'s `handle_connection` locks it directly each loop
+    /// iteration to decide whether to race it against `framed.next()` in a `tokio::select!`.
+    pub(crate) push_rx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<Frame>>>,
+    /// `true` for a session backed by an RMP connection. Pub/sub is RESP-only for v1 (see the
+    /// pub/sub spec's "Out of scope" section) -- checked at the top of `intercept_for_pubsub` so
+    /// an RMP client gets a clear error instead of a registration nothing ever drains, and a reply
+    /// frame RMP's own encoder cannot represent.
+    is_rmp: bool,
 }
 
 impl Session {
@@ -60,6 +95,12 @@ impl Session {
             peer_addr: None,
             in_transaction: std::sync::atomic::AtomicBool::new(false),
             tx: std::sync::Mutex::new(TransactionState::Idle),
+            subscriptions: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+            psubscriptions: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+            subscription_count: std::sync::atomic::AtomicUsize::new(0),
+            push_tx: std::sync::Mutex::new(None),
+            push_rx: std::sync::Mutex::new(None),
+            is_rmp: false,
         }
     }
 
@@ -67,6 +108,15 @@ impl Session {
     pub fn with_peer_addr(peer_addr: std::net::SocketAddr) -> Self {
         Self {
             peer_addr: Some(peer_addr),
+            ..Self::new()
+        }
+    }
+
+    /// An RMP connection's `Session` -- see the `is_rmp` field's doc comment for why this needs to
+    /// be distinguishable from a RESP session at all.
+    pub fn new_for_rmp() -> Self {
+        Self {
+            is_rmp: true,
             ..Self::new()
         }
     }
@@ -1413,8 +1463,12 @@ pub(crate) const KNOWN_COMMANDS: &[&str] = &[
     "PEXPIRE",
     "PEXPIREAT",
     "PING",
+    "PSUBSCRIBE",
     "PSYNC",
     "PTTL",
+    "PUBLISH",
+    "PUBSUB",
+    "PUNSUBSCRIBE",
     "RANDOMKEY",
     "RENAME",
     "RENAMENX",
@@ -1439,10 +1493,12 @@ pub(crate) const KNOWN_COMMANDS: &[&str] = &[
     "SRANDMEMBER",
     "SREM",
     "STRLEN",
+    "SUBSCRIBE",
     "SUNION",
     "SUNIONSTORE",
     "TTL",
     "TYPE",
+    "UNSUBSCRIBE",
     "ZADD",
     "ZCARD",
     "ZINCRBY",
@@ -1503,13 +1559,13 @@ fn key_spec(name: &str) -> KeySpec {
     match name {
         "PING" | "ECHO" | "SELECT" | "COMMAND" | "INFO" | "HELLO" | "KEYS" | "SCAN"
         | "RANDOMKEY" | "CLUSTER" | "SAVE" | "BGREWRITEAOF" | "REPLICAOF" | "PSYNC" | "SLOWLOG"
-        | "DEBUG" | "AUTH" | "ACL" | "DBSIZE" | "CONFIG" | "CLIENT" => {
+        | "DEBUG" | "AUTH" | "ACL" | "DBSIZE" | "CONFIG" | "CLIENT" | "SUBSCRIBE"
+        | "UNSUBSCRIBE" | "PSUBSCRIBE" | "PUNSUBSCRIBE" | "PUBLISH" | "PUBSUB" => {
             // AUTH has no keys -- its arguments are a username/password, never a routable key.
             // ACL likewise -- its arguments are a subcommand/username/rule tokens, never a
-            // routable key. Without this exception either would fall through to the
-            // `KNOWN_COMMANDS` catch-all below and get `KeySpec::First`, which in cluster mode
-            // would hash a plaintext password (AUTH) or a rule token (ACL SETUSER) to a slot and
-            // potentially -MOVED it before it's ever authenticated/applied.
+            // routable key. Channel/pattern names are not routable keyspace keys -- without this,
+            // the `KNOWN_COMMANDS` catch-all below would default them to `KeySpec::First`, which
+            // in cluster mode would hash a channel name to a slot and potentially -MOVED it.
             KeySpec::None
         }
         "MEMORY" | "OBJECT" => KeySpec::Second,
@@ -3183,6 +3239,17 @@ fn intercept_for_transaction(
                 // connection's serial command loop. Kept as a safe fallthrough, not a panic.
                 return None;
             };
+            if matches!(
+                name.as_str(),
+                "SUBSCRIBE" | "UNSUBSCRIBE" | "PSUBSCRIBE" | "PUNSUBSCRIBE"
+            ) {
+                *dirty = true;
+                tracing::debug!(command = %name.as_str(), "transaction marked dirty");
+                return Some(Frame::Error(format!(
+                    "ERR {} is not allowed in transactions",
+                    name.as_str()
+                )));
+            }
             if KNOWN_COMMANDS.binary_search(&name.as_str()).is_err() {
                 *dirty = true;
                 tracing::debug!(command = %name.as_str(), "transaction marked dirty");
@@ -3339,6 +3406,351 @@ fn append_transaction_marker(
     let bytes = Bytes::from(encoded);
     replication.advance_master_repl_offset(bytes.len() as u64);
     replication.registry.broadcast(bytes);
+}
+
+/// Returns this connection's `push_tx`, creating it (and the matching `push_rx`) on first use.
+/// `connection.rs`'s read loop (Plan 05) takes `push_rx` out to drain it once it is `Some`.
+fn ensure_push_channel(session: &Session) -> tokio::sync::mpsc::UnboundedSender<Frame> {
+    let mut tx_guard = session.push_tx.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(tx) = tx_guard.as_ref() {
+        return tx.clone();
+    }
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    *tx_guard = Some(tx.clone());
+    drop(tx_guard);
+    *session.push_rx.lock().unwrap_or_else(|e| e.into_inner()) = Some(rx);
+    tx
+}
+
+/// The combined channel + pattern subscription count this connection currently holds -- what
+/// every `subscribe`/`unsubscribe`/`psubscribe`/`punsubscribe` reply reports, and what
+/// `subscribe_mode_gate` (Task 3) checks via `subscription_count`'s fast-path atomic.
+fn total_subscription_count(session: &Session) -> usize {
+    session
+        .subscriptions
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .len()
+        + session
+            .psubscriptions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
+}
+
+/// Handles `SUBSCRIBE`/`UNSUBSCRIBE`/`PSUBSCRIBE`/`PUNSUBSCRIBE`/`PUBLISH`/`PUBSUB`. Called from
+/// `dispatch_and_log_gated`, alongside `handle_client` -- see the spec's "Interception point"
+/// section for why this placement (not `dispatch_and_log_inner`, alongside
+/// `intercept_for_transaction`) is what makes a queued `PUBLISH` replay correctly at `EXEC` time.
+/// This task implements `SUBSCRIBE`/`UNSUBSCRIBE` only; `PSUBSCRIBE`/`PUNSUBSCRIBE` are Task 3,
+/// `PUBLISH`/`PUBSUB` are Plan 04.
+fn intercept_for_pubsub(
+    frame: &Frame,
+    session: &Session,
+    replication: &crate::replication::ReplicationHandle,
+    client_id: u64,
+) -> Option<Frame> {
+    let Frame::Array(items) = frame else {
+        return None;
+    };
+    let Some(Frame::Bulk(name_bytes)) = items.first() else {
+        return None;
+    };
+    let name = upper_name(name_bytes)?;
+    if session.is_rmp
+        && matches!(
+            name.as_str(),
+            "SUBSCRIBE" | "UNSUBSCRIBE" | "PSUBSCRIBE" | "PUNSUBSCRIBE" | "PUBLISH" | "PUBSUB"
+        )
+    {
+        return Some(Frame::Error("ERR pub/sub is not supported over RMP".into()));
+    }
+    match name.as_str() {
+        "SUBSCRIBE" => {
+            if items.len() < 2 {
+                return Some(Frame::Error(
+                    "ERR wrong number of arguments for 'subscribe' command".into(),
+                ));
+            }
+            let tx = ensure_push_channel(session);
+            let mut replies = Vec::new();
+            for item in &items[1..] {
+                let Frame::Bulk(channel) = item else { continue };
+                let mut subs = session
+                    .subscriptions
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                subs.insert(channel.clone());
+                drop(subs);
+                replication
+                    .pubsub
+                    .subscribe(channel.clone(), client_id, tx.clone());
+                let count = total_subscription_count(session);
+                session
+                    .subscription_count
+                    .store(count, std::sync::atomic::Ordering::Relaxed);
+                tracing::debug!(client_id, channel = %crate::logging::escape_ident(&String::from_utf8_lossy(channel)), count, "subscription changed");
+                replies.push(Frame::Push(vec![
+                    Frame::Bulk(Bytes::from_static(b"subscribe")),
+                    Frame::Bulk(channel.clone()),
+                    Frame::Integer(count as i64),
+                ]));
+            }
+            let mut iter = replies.into_iter();
+            let first = iter.next();
+            for extra in iter {
+                let _ = tx.send(extra);
+            }
+            first
+        }
+        "UNSUBSCRIBE" => {
+            let tx = ensure_push_channel(session);
+            let explicit: Vec<Bytes> = items[1..]
+                .iter()
+                .filter_map(|f| match f {
+                    Frame::Bulk(b) => Some(b.clone()),
+                    _ => None,
+                })
+                .collect();
+            let targets = if explicit.is_empty() {
+                session
+                    .subscriptions
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            } else {
+                explicit
+            };
+            let mut replies = Vec::new();
+            for channel in targets {
+                session
+                    .subscriptions
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&channel);
+                replication.pubsub.unsubscribe(&channel, client_id);
+                let count = total_subscription_count(session);
+                session
+                    .subscription_count
+                    .store(count, std::sync::atomic::Ordering::Relaxed);
+                tracing::debug!(client_id, channel = %crate::logging::escape_ident(&String::from_utf8_lossy(&channel)), count, "subscription changed");
+                replies.push(Frame::Push(vec![
+                    Frame::Bulk(Bytes::from_static(b"unsubscribe")),
+                    Frame::Bulk(channel),
+                    Frame::Integer(count as i64),
+                ]));
+            }
+            if replies.is_empty() {
+                replies.push(Frame::Push(vec![
+                    Frame::Bulk(Bytes::from_static(b"unsubscribe")),
+                    Frame::Null,
+                    Frame::Integer(0),
+                ]));
+            }
+            let mut iter = replies.into_iter();
+            let first = iter.next();
+            for extra in iter {
+                let _ = tx.send(extra);
+            }
+            first
+        }
+        "PSUBSCRIBE" => {
+            if items.len() < 2 {
+                return Some(Frame::Error(
+                    "ERR wrong number of arguments for 'psubscribe' command".into(),
+                ));
+            }
+            let tx = ensure_push_channel(session);
+            let mut replies = Vec::new();
+            for item in &items[1..] {
+                let Frame::Bulk(pattern) = item else { continue };
+                session
+                    .psubscriptions
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(pattern.clone());
+                replication
+                    .pubsub
+                    .psubscribe(pattern.clone(), client_id, tx.clone());
+                let count = total_subscription_count(session);
+                session
+                    .subscription_count
+                    .store(count, std::sync::atomic::Ordering::Relaxed);
+                tracing::debug!(client_id, channel = %crate::logging::escape_ident(&String::from_utf8_lossy(pattern)), count, "subscription changed");
+                replies.push(Frame::Push(vec![
+                    Frame::Bulk(Bytes::from_static(b"psubscribe")),
+                    Frame::Bulk(pattern.clone()),
+                    Frame::Integer(count as i64),
+                ]));
+            }
+            let mut iter = replies.into_iter();
+            let first = iter.next();
+            for extra in iter {
+                let _ = tx.send(extra);
+            }
+            first
+        }
+        "PUNSUBSCRIBE" => {
+            let tx = ensure_push_channel(session);
+            let explicit: Vec<Bytes> = items[1..]
+                .iter()
+                .filter_map(|f| match f {
+                    Frame::Bulk(b) => Some(b.clone()),
+                    _ => None,
+                })
+                .collect();
+            let targets = if explicit.is_empty() {
+                session
+                    .psubscriptions
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            } else {
+                explicit
+            };
+            let mut replies = Vec::new();
+            for pattern in targets {
+                session
+                    .psubscriptions
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&pattern);
+                replication.pubsub.punsubscribe(&pattern, client_id);
+                let count = total_subscription_count(session);
+                session
+                    .subscription_count
+                    .store(count, std::sync::atomic::Ordering::Relaxed);
+                tracing::debug!(client_id, channel = %crate::logging::escape_ident(&String::from_utf8_lossy(&pattern)), count, "subscription changed");
+                replies.push(Frame::Push(vec![
+                    Frame::Bulk(Bytes::from_static(b"punsubscribe")),
+                    Frame::Bulk(pattern),
+                    Frame::Integer(count as i64),
+                ]));
+            }
+            if replies.is_empty() {
+                replies.push(Frame::Push(vec![
+                    Frame::Bulk(Bytes::from_static(b"punsubscribe")),
+                    Frame::Null,
+                    Frame::Integer(0),
+                ]));
+            }
+            let mut iter = replies.into_iter();
+            let first = iter.next();
+            for extra in iter {
+                let _ = tx.send(extra);
+            }
+            first
+        }
+        "PUBLISH" => {
+            let (Some(Frame::Bulk(channel)), Some(Frame::Bulk(message))) =
+                (items.get(1), items.get(2))
+            else {
+                return Some(Frame::Error(
+                    "ERR wrong number of arguments for 'publish' command".into(),
+                ));
+            };
+            let started = std::time::Instant::now();
+            let delivered = replication.pubsub.publish(channel, message);
+            // Never AOF-appended -- not a keyspace mutation, nothing for AOF replay to redo.
+            // Forwarded to replicas so a follower's own locally-subscribed clients still
+            // receive it; see the spec's "Why not dispatch()" section for why the follower side
+            // (Plan 06) intercepts this in its apply loop rather than routing it through
+            // dispatch()'s engine-mutation path.
+            match crate::aof::encode_frame(frame) {
+                Ok(encoded) => {
+                    let bytes = Bytes::from(encoded);
+                    replication.advance_master_repl_offset(bytes.len() as u64);
+                    replication.registry.broadcast(bytes);
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "aof encode failed for PUBLISH broadcast");
+                }
+            }
+            tracing::debug!(
+                channel = %crate::logging::escape_ident(&String::from_utf8_lossy(channel)),
+                delivered_count = delivered,
+                elapsed_us = started.elapsed().as_micros(),
+                "message published"
+            );
+            Some(Frame::Integer(delivered as i64))
+        }
+        "PUBSUB" => {
+            let Some(Frame::Bulk(sub_bytes)) = items.get(1) else {
+                return Some(Frame::Error(
+                    "ERR wrong number of arguments for 'pubsub' command".into(),
+                ));
+            };
+            let sub = String::from_utf8_lossy(sub_bytes).to_ascii_uppercase();
+            Some(match sub.as_str() {
+                "CHANNELS" => {
+                    let pattern = items.get(2).and_then(|f| match f {
+                        Frame::Bulk(b) => Some(b.clone()),
+                        _ => None,
+                    });
+                    let mut channels: Vec<Bytes> = replication
+                        .pubsub
+                        .channels()
+                        .into_iter()
+                        .filter(|c| {
+                            pattern
+                                .as_ref()
+                                .is_none_or(|p| engine::glob::glob_match(p, c))
+                        })
+                        .collect();
+                    channels.sort();
+                    Frame::Array(channels.into_iter().map(Frame::Bulk).collect())
+                }
+                "NUMSUB" => {
+                    let requested: Vec<Bytes> = items[2..]
+                        .iter()
+                        .filter_map(|f| match f {
+                            Frame::Bulk(b) => Some(b.clone()),
+                            _ => None,
+                        })
+                        .collect();
+                    let mut reply = Vec::new();
+                    for (channel, count) in replication.pubsub.num_sub(&requested) {
+                        reply.push(Frame::Bulk(channel));
+                        reply.push(Frame::Integer(count as i64));
+                    }
+                    Frame::Array(reply)
+                }
+                "NUMPAT" => Frame::Integer(replication.pubsub.num_pat() as i64),
+                _ => Frame::Error(format!("ERR unknown PUBSUB subcommand '{sub}'")),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Real Redis's RESP2 "subscribe mode" restriction: while a RESP2 connection has at least one
+/// active channel/pattern subscription, only these commands are legal -- everything else gets
+/// this exact error text, matching real Redis's own. RESP3 connections are exempt: push messages
+/// arrive out-of-band there (as `Frame::Push`, distinct from command replies), so an ordinary
+/// command sent on the same connection stays unambiguous. Checked before
+/// `intercept_for_transaction` so a subscribed RESP2 connection cannot open `MULTI` either --
+/// `MULTI` is not in real Redis's own allowed set for this mode.
+fn subscribe_mode_gate(frame: &Frame, session: &Session) -> Option<Frame> {
+    if session
+        .subscription_count
+        .load(std::sync::atomic::Ordering::Relaxed)
+        == 0
+        || session.protocol() != Protocol::Resp2
+    {
+        return None;
+    }
+    let name = command_name_upper(frame)?;
+    match name.as_str() {
+        "SUBSCRIBE" | "UNSUBSCRIBE" | "PSUBSCRIBE" | "PUNSUBSCRIBE" | "PING" | "QUIT" => None,
+        _ => Some(Frame::Error(
+            "ERR only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context"
+                .into(),
+        )),
+    }
 }
 
 /// The uppercased command name, or `None` for a frame that isn't a command array. Cheap enough to
@@ -3536,8 +3948,12 @@ pub(crate) const KNOWN_COMMANDS_LOWER: &[&str] = &[
     "pexpire",
     "pexpireat",
     "ping",
+    "psubscribe",
     "psync",
     "pttl",
+    "publish",
+    "pubsub",
+    "punsubscribe",
     "randomkey",
     "rename",
     "renamenx",
@@ -3562,10 +3978,12 @@ pub(crate) const KNOWN_COMMANDS_LOWER: &[&str] = &[
     "srandmember",
     "srem",
     "strlen",
+    "subscribe",
     "sunion",
     "sunionstore",
     "ttl",
     "type",
+    "unsubscribe",
     "zadd",
     "zcard",
     "zincrby",
@@ -3705,6 +4123,9 @@ fn dispatch_and_log_inner(
     if let Some(reply) = auth_gate(replication, session, &frame) {
         return reply;
     }
+    if let Some(reply) = subscribe_mode_gate(&frame, session) {
+        return reply;
+    }
     if let Some(reply) =
         intercept_for_transaction(&frame, session, engine, aof, replication, client_id)
     {
@@ -3819,6 +4240,9 @@ fn dispatch_and_log_gated(
         return reply;
     }
     if let Some(reply) = handle_client(&frame, session, client_id) {
+        return reply;
+    }
+    if let Some(reply) = intercept_for_pubsub(&frame, session, replication, client_id) {
         return reply;
     }
 
@@ -4917,6 +5341,558 @@ mod tests {
         assert!(
             on_disk.is_empty(),
             "a transaction with no writes must not touch the AOF at all"
+        );
+    }
+
+    /// Drains every frame currently queued on `session.push_rx`, in order, WITHOUT taking the
+    /// receiver out of the session (a real connection may still need to receive more pushes
+    /// afterward, and dropping the receiver would make every subsequent `tx.send` silently fail).
+    /// Used by dispatcher-level unit tests to observe the extra confirmations `intercept_for_pubsub`
+    /// queues on the push channel beyond the first, which it now returns directly as the reply.
+    fn drain_push_rx(session: &Session) -> Vec<Frame> {
+        let mut guard = session.push_rx.lock().unwrap_or_else(|e| e.into_inner());
+        let rx = guard
+            .as_mut()
+            .expect("push channel should have been created by a SUBSCRIBE/PSUBSCRIBE/UNSUBSCRIBE/PUNSUBSCRIBE call");
+        let mut frames = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            frames.push(frame);
+        }
+        frames
+    }
+
+    #[test]
+    fn subscribe_replies_with_one_push_frame_per_channel_naming_the_running_count() {
+        let session = Session::new();
+        let replication = crate::replication::ReplicationHandle::default();
+        let reply = intercept_for_pubsub(
+            &cmd(&[b"SUBSCRIBE", b"news", b"sports"]),
+            &session,
+            &replication,
+            1,
+        )
+        .unwrap();
+        // Only the FIRST channel's confirmation comes back as the direct reply -- never a
+        // batched array (that would break every real RESP client's per-channel handshake, and
+        // is invalid RESP3 to boot: a `>`-type push nested inside a `*`-type array).
+        assert_eq!(
+            reply,
+            Frame::Push(vec![
+                Frame::Bulk(Bytes::from_static(b"subscribe")),
+                Frame::Bulk(Bytes::from_static(b"news")),
+                Frame::Integer(1),
+            ])
+        );
+        // The second channel's confirmation arrives as an independent frame on the push channel.
+        assert_eq!(
+            drain_push_rx(&session),
+            vec![Frame::Push(vec![
+                Frame::Bulk(Bytes::from_static(b"subscribe")),
+                Frame::Bulk(Bytes::from_static(b"sports")),
+                Frame::Integer(2),
+            ])]
+        );
+    }
+
+    #[test]
+    fn subscribe_to_a_single_channel_yields_a_bare_push_frame_as_its_only_reply() {
+        // The core wire-compatibility fix: a real RESP2 client subscribing to one channel reads
+        // exactly one reply, and that reply's first element is literally the bulk string
+        // "subscribe" -- not an outer array wrapping it.
+        let session = Session::new();
+        let replication = crate::replication::ReplicationHandle::default();
+        let reply = intercept_for_pubsub(&cmd(&[b"SUBSCRIBE", b"news"]), &session, &replication, 1)
+            .unwrap();
+        assert_eq!(
+            reply,
+            Frame::Push(vec![
+                Frame::Bulk(Bytes::from_static(b"subscribe")),
+                Frame::Bulk(Bytes::from_static(b"news")),
+                Frame::Integer(1),
+            ])
+        );
+        assert!(
+            drain_push_rx(&session).is_empty(),
+            "a single-channel SUBSCRIBE must not queue any extra confirmations"
+        );
+    }
+
+    #[test]
+    fn subscribe_to_two_channels_yields_two_separate_well_formed_top_level_replies() {
+        let session = Session::new();
+        let replication = crate::replication::ReplicationHandle::default();
+        let first = intercept_for_pubsub(
+            &cmd(&[b"SUBSCRIBE", b"news", b"sports"]),
+            &session,
+            &replication,
+            1,
+        )
+        .unwrap();
+        let rest = drain_push_rx(&session);
+
+        // Both are independently well-formed Push frames -- neither nested inside the other.
+        assert!(matches!(first, Frame::Push(_)));
+        assert_eq!(rest.len(), 1);
+        assert!(matches!(rest[0], Frame::Push(_)));
+        assert_eq!(
+            first,
+            Frame::Push(vec![
+                Frame::Bulk(Bytes::from_static(b"subscribe")),
+                Frame::Bulk(Bytes::from_static(b"news")),
+                Frame::Integer(1),
+            ])
+        );
+        assert_eq!(
+            rest[0],
+            Frame::Push(vec![
+                Frame::Bulk(Bytes::from_static(b"subscribe")),
+                Frame::Bulk(Bytes::from_static(b"sports")),
+                Frame::Integer(2),
+            ])
+        );
+    }
+
+    #[test]
+    fn subscribe_actually_registers_with_the_pubsub_registry() {
+        let session = Session::new();
+        let replication = crate::replication::ReplicationHandle::default();
+        intercept_for_pubsub(&cmd(&[b"SUBSCRIBE", b"news"]), &session, &replication, 1);
+
+        let delivered = replication
+            .pubsub
+            .publish(b"news", &Bytes::from_static(b"hello"));
+        assert_eq!(delivered, 1);
+    }
+
+    #[test]
+    fn unsubscribe_with_no_arguments_leaves_every_subscribed_channel() {
+        let session = Session::new();
+        let replication = crate::replication::ReplicationHandle::default();
+        intercept_for_pubsub(
+            &cmd(&[b"SUBSCRIBE", b"news", b"sports"]),
+            &session,
+            &replication,
+            1,
+        );
+        // Drain the "sports" subscribe confirmation queued alongside the direct "news" reply,
+        // so it doesn't get mistaken for one of UNSUBSCRIBE's own queued replies below.
+        drain_push_rx(&session);
+
+        let reply = intercept_for_pubsub(&cmd(&[b"UNSUBSCRIBE"]), &session, &replication, 1);
+
+        assert_eq!(
+            replication
+                .pubsub
+                .publish(b"news", &Bytes::from_static(b"x")),
+            0
+        );
+        assert_eq!(
+            replication
+                .pubsub
+                .publish(b"sports", &Bytes::from_static(b"x")),
+            0
+        );
+        // Both channels' own reply frames are present, in subscription order, each counting
+        // down: 1 remaining after leaving "news" (still on "sports"), 0 after leaving "sports".
+        // Only the first comes back as the direct reply; the second is queued on the push channel.
+        assert_eq!(
+            reply,
+            Some(Frame::Push(vec![
+                Frame::Bulk(Bytes::from_static(b"unsubscribe")),
+                Frame::Bulk(Bytes::from_static(b"news")),
+                Frame::Integer(1),
+            ]))
+        );
+        assert_eq!(
+            drain_push_rx(&session),
+            vec![Frame::Push(vec![
+                Frame::Bulk(Bytes::from_static(b"unsubscribe")),
+                Frame::Bulk(Bytes::from_static(b"sports")),
+                Frame::Integer(0),
+            ])]
+        );
+    }
+
+    #[test]
+    fn unsubscribe_of_a_channel_never_subscribed_to_still_replies_once() {
+        let session = Session::new();
+        let replication = crate::replication::ReplicationHandle::default();
+        let reply = intercept_for_pubsub(
+            &cmd(&[b"UNSUBSCRIBE", b"never-subscribed"]),
+            &session,
+            &replication,
+            1,
+        );
+        assert_eq!(
+            reply,
+            Some(Frame::Push(vec![
+                Frame::Bulk(Bytes::from_static(b"unsubscribe")),
+                Frame::Bulk(Bytes::from_static(b"never-subscribed")),
+                Frame::Integer(0),
+            ]))
+        );
+        assert!(drain_push_rx(&session).is_empty());
+    }
+
+    #[test]
+    fn subscribe_over_rmp_is_rejected_and_never_registers_anything() {
+        // Pub/sub is RESP-only for v1 (see the pub/sub spec's "Out of scope" section). An RMP
+        // session must get a clear error instead of a registration nothing ever drains, and a
+        // reply frame RMP's own encoder cannot represent.
+        let session = Session::new_for_rmp();
+        let replication = crate::replication::ReplicationHandle::default();
+
+        let reply = intercept_for_pubsub(&cmd(&[b"SUBSCRIBE", b"news"]), &session, &replication, 1);
+
+        assert_eq!(
+            reply,
+            Some(Frame::Error("ERR pub/sub is not supported over RMP".into()))
+        );
+        assert!(
+            session
+                .push_tx
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_none(),
+            "no push channel should have been created for a rejected RMP subscribe"
+        );
+        assert!(session
+            .push_rx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_none());
+        assert!(replication.pubsub.channels().is_empty());
+    }
+
+    #[test]
+    fn unsubscribe_with_no_arguments_and_no_active_subscriptions_replies_once_with_nil_channel() {
+        // Real Redis still sends exactly ONE reply here -- a nil channel, count 0 -- never
+        // nothing at all.
+        let session = Session::new();
+        let replication = crate::replication::ReplicationHandle::default();
+        let reply = intercept_for_pubsub(&cmd(&[b"UNSUBSCRIBE"]), &session, &replication, 1);
+        assert_eq!(
+            reply,
+            Some(Frame::Push(vec![
+                Frame::Bulk(Bytes::from_static(b"unsubscribe")),
+                Frame::Null,
+                Frame::Integer(0),
+            ]))
+        );
+        assert!(drain_push_rx(&session).is_empty());
+    }
+
+    #[test]
+    fn psubscribe_delivers_pmessage_on_publish() {
+        let session = Session::new();
+        let replication = crate::replication::ReplicationHandle::default();
+        intercept_for_pubsub(&cmd(&[b"PSUBSCRIBE", b"news.*"]), &session, &replication, 1);
+
+        let delivered = replication
+            .pubsub
+            .publish(b"news.sports", &Bytes::from_static(b"hello"));
+        assert_eq!(delivered, 1);
+    }
+
+    #[test]
+    fn publish_delivers_locally_and_returns_the_delivered_count() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let replication = ReplicationHandle::default();
+        let subscriber_session = Session::new();
+        intercept_for_pubsub(
+            &cmd(&[b"SUBSCRIBE", b"news"]),
+            &subscriber_session,
+            &replication,
+            1,
+        );
+
+        let reply = dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"PUBLISH", b"news", b"hello"]),
+            &Session::new(),
+            2,
+        );
+
+        assert_eq!(reply, Frame::Integer(1));
+    }
+
+    #[test]
+    fn publish_is_never_written_to_the_aof() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let replication = ReplicationHandle::default();
+        dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"PUBLISH", b"news", b"hello"]),
+            &Session::new(),
+            1,
+        );
+        aof.fsync().unwrap();
+
+        assert_eq!(read_aof(&_dir), "");
+    }
+
+    #[test]
+    fn publish_is_forwarded_to_replicas() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let replication = ReplicationHandle::default();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        replication.registry.register(None, tx);
+
+        dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"PUBLISH", b"news", b"hello"]),
+            &Session::new(),
+            1,
+        );
+
+        let forwarded = rx.try_recv().unwrap();
+        assert_eq!(
+            forwarded,
+            bytes::Bytes::from(
+                crate::aof::encode_frame(&cmd(&[b"PUBLISH", b"news", b"hello"])).unwrap()
+            )
+        );
+    }
+
+    /// A follower's `sync_once` apply loop advances its own offset by `frame_len` for every
+    /// decoded frame, `PUBLISH` included -- so the leader must advance its own
+    /// `master_repl_offset` by the exact same encoded length when it broadcasts a `PUBLISH`, or
+    /// a follower's offset silently drifts ahead of its leader's. Mirrors
+    /// `writes_advance_the_master_replication_offset_with_no_replicas_attached`.
+    #[test]
+    fn publish_advances_the_master_replication_offset_by_the_encoded_frame_length() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let replication = ReplicationHandle::default();
+        assert_eq!(replication.master_repl_offset(), 0);
+
+        dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"PUBLISH", b"news", b"hello"]),
+            &Session::new(),
+            1,
+        );
+
+        let encoded_len = crate::aof::encode_frame(&cmd(&[b"PUBLISH", b"news", b"hello"]))
+            .unwrap()
+            .len() as u64;
+        assert_eq!(
+            replication.master_repl_offset(),
+            encoded_len,
+            "PUBLISH must advance the offset by exactly the bytes it broadcast, just like an \
+             ordinary write, to keep a follower's offset from drifting ahead of the leader's"
+        );
+    }
+
+    #[test]
+    fn publish_is_queueable_and_replays_at_exec_time() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let replication = ReplicationHandle::default();
+        let subscriber_session = Session::new();
+        intercept_for_pubsub(
+            &cmd(&[b"SUBSCRIBE", b"news"]),
+            &subscriber_session,
+            &replication,
+            1,
+        );
+
+        let session = Session::new();
+        dispatch_and_log(&engine, &aof, &replication, cmd(&[b"MULTI"]), &session, 2);
+        let queued_reply = dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"PUBLISH", b"news", b"hello"]),
+            &session,
+            2,
+        );
+        assert_eq!(queued_reply, Frame::Simple("QUEUED".into()));
+
+        let exec_reply =
+            dispatch_and_log(&engine, &aof, &replication, cmd(&[b"EXEC"]), &session, 2);
+
+        assert_eq!(exec_reply, Frame::Array(vec![Frame::Integer(1)]));
+    }
+
+    #[test]
+    fn pubsub_channels_lists_every_subscribed_channel() {
+        let replication = ReplicationHandle::default();
+        intercept_for_pubsub(
+            &cmd(&[b"SUBSCRIBE", b"news"]),
+            &Session::new(),
+            &replication,
+            1,
+        );
+
+        let reply = intercept_for_pubsub(
+            &cmd(&[b"PUBSUB", b"CHANNELS"]),
+            &Session::new(),
+            &replication,
+            2,
+        );
+
+        assert_eq!(
+            reply,
+            Some(Frame::Array(vec![Frame::Bulk(Bytes::from_static(b"news"))]))
+        );
+    }
+
+    #[test]
+    fn pubsub_channels_with_a_pattern_filters_the_result() {
+        let replication = ReplicationHandle::default();
+        intercept_for_pubsub(
+            &cmd(&[b"SUBSCRIBE", b"news"]),
+            &Session::new(),
+            &replication,
+            1,
+        );
+        intercept_for_pubsub(
+            &cmd(&[b"SUBSCRIBE", b"sports"]),
+            &Session::new(),
+            &replication,
+            2,
+        );
+
+        let reply = intercept_for_pubsub(
+            &cmd(&[b"PUBSUB", b"CHANNELS", b"news"]),
+            &Session::new(),
+            &replication,
+            3,
+        );
+
+        assert_eq!(
+            reply,
+            Some(Frame::Array(vec![Frame::Bulk(Bytes::from_static(b"news"))]))
+        );
+    }
+
+    #[test]
+    fn pubsub_numsub_reports_a_count_per_requested_channel() {
+        let replication = ReplicationHandle::default();
+        intercept_for_pubsub(
+            &cmd(&[b"SUBSCRIBE", b"news"]),
+            &Session::new(),
+            &replication,
+            1,
+        );
+
+        let reply = intercept_for_pubsub(
+            &cmd(&[b"PUBSUB", b"NUMSUB", b"news", b"empty"]),
+            &Session::new(),
+            &replication,
+            2,
+        );
+
+        assert_eq!(
+            reply,
+            Some(Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"news")),
+                Frame::Integer(1),
+                Frame::Bulk(Bytes::from_static(b"empty")),
+                Frame::Integer(0),
+            ]))
+        );
+    }
+
+    #[test]
+    fn pubsub_numpat_counts_registered_patterns() {
+        let replication = ReplicationHandle::default();
+        intercept_for_pubsub(
+            &cmd(&[b"PSUBSCRIBE", b"news.*"]),
+            &Session::new(),
+            &replication,
+            1,
+        );
+
+        let reply = intercept_for_pubsub(
+            &cmd(&[b"PUBSUB", b"NUMPAT"]),
+            &Session::new(),
+            &replication,
+            2,
+        );
+
+        assert_eq!(reply, Some(Frame::Integer(1)));
+    }
+
+    #[test]
+    fn a_resp2_connection_with_an_active_subscription_rejects_an_ordinary_command() {
+        let session = Session::new();
+        let replication = crate::replication::ReplicationHandle::default();
+        intercept_for_pubsub(&cmd(&[b"SUBSCRIBE", b"news"]), &session, &replication, 1);
+
+        let reply = subscribe_mode_gate(&cmd(&[b"GET", b"k"]), &session);
+
+        assert_eq!(
+            reply,
+            Some(Frame::Error(
+                "ERR only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context"
+                    .into()
+            ))
+        );
+    }
+
+    #[test]
+    fn a_resp2_connection_with_an_active_subscription_still_allows_ping_and_more_subscribe() {
+        let session = Session::new();
+        let replication = crate::replication::ReplicationHandle::default();
+        intercept_for_pubsub(&cmd(&[b"SUBSCRIBE", b"news"]), &session, &replication, 1);
+
+        assert_eq!(subscribe_mode_gate(&cmd(&[b"PING"]), &session), None);
+        assert_eq!(
+            subscribe_mode_gate(&cmd(&[b"SUBSCRIBE", b"more"]), &session),
+            None
+        );
+        assert_eq!(subscribe_mode_gate(&cmd(&[b"UNSUBSCRIBE"]), &session), None);
+    }
+
+    #[test]
+    fn a_resp3_connection_with_an_active_subscription_allows_an_ordinary_command() {
+        let session = Session::new();
+        session.set_protocol(Protocol::Resp3);
+        let replication = crate::replication::ReplicationHandle::default();
+        intercept_for_pubsub(&cmd(&[b"SUBSCRIBE", b"news"]), &session, &replication, 1);
+
+        assert_eq!(subscribe_mode_gate(&cmd(&[b"GET", b"k"]), &session), None);
+    }
+
+    #[test]
+    fn subscribe_queued_inside_a_transaction_is_rejected_at_queue_time() {
+        let engine = Engine::new();
+        let (_dir, aof) = test_aof();
+        let replication = crate::replication::ReplicationHandle::default();
+        let session = Session::new();
+        dispatch_and_log(&engine, &aof, &replication, cmd(&[b"MULTI"]), &session, 1);
+
+        let reply = dispatch_and_log(
+            &engine,
+            &aof,
+            &replication,
+            cmd(&[b"SUBSCRIBE", b"news"]),
+            &session,
+            1,
+        );
+
+        assert_eq!(
+            reply,
+            Frame::Error("ERR SUBSCRIBE is not allowed in transactions".into())
+        );
+        let exec_reply =
+            dispatch_and_log(&engine, &aof, &replication, cmd(&[b"EXEC"]), &session, 1);
+        assert_eq!(
+            exec_reply,
+            Frame::Error("EXECABORT Transaction discarded because of previous errors".into())
         );
     }
 
@@ -6628,6 +7604,34 @@ mod tests {
             panic!("COMMAND INFO must reply with an array");
         };
         assert_eq!(entries.len(), KNOWN_COMMANDS.len());
+    }
+
+    #[test]
+    fn command_info_recognizes_every_new_pubsub_command() {
+        let engine = Engine::new();
+        for name in [
+            "SUBSCRIBE",
+            "UNSUBSCRIBE",
+            "PSUBSCRIBE",
+            "PUNSUBSCRIBE",
+            "PUBLISH",
+            "PUBSUB",
+        ] {
+            let reply = dispatch(
+                &engine,
+                cmd(&[b"COMMAND", b"INFO", name.as_bytes()]),
+                &mut Protocol::default(),
+                1,
+            );
+            let Frame::Array(entries) = reply else {
+                panic!("expected COMMAND INFO to reply with an array");
+            };
+            assert_ne!(
+                entries[0],
+                Frame::Null,
+                "{name} should be a known command by now"
+            );
+        }
     }
 
     #[test]

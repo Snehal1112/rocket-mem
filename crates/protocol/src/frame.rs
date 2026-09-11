@@ -9,6 +9,7 @@ pub enum Frame {
     Null,
     Array(Vec<Frame>),
     Map(Vec<(Frame, Frame)>),
+    Push(Vec<Frame>),
 }
 
 impl Frame {
@@ -24,6 +25,7 @@ impl Frame {
             Frame::Null => "null",
             Frame::Array(_) => "array",
             Frame::Map(_) => "map",
+            Frame::Push(_) => "push",
         }
     }
 
@@ -39,6 +41,7 @@ impl Frame {
             Frame::Null => 0,
             Frame::Array(items) => items.len(),
             Frame::Map(pairs) => pairs.len(),
+            Frame::Push(items) => items.len(),
         }
     }
 }
@@ -133,5 +136,40 @@ mod tests {
     fn log_len_is_zero_for_frames_with_no_natural_length() {
         assert_eq!(Frame::Integer(42).log_len(), 0);
         assert_eq!(Frame::Null.log_len(), 0);
+    }
+
+    #[test]
+    fn push_frame_holds_nested_frames() {
+        let f = Frame::Push(vec![
+            Frame::Bulk(Bytes::from_static(b"message")),
+            Frame::Bulk(Bytes::from_static(b"chan")),
+        ]);
+        assert_eq!(
+            f,
+            Frame::Push(vec![
+                Frame::Bulk(Bytes::from_static(b"message")),
+                Frame::Bulk(Bytes::from_static(b"chan")),
+            ])
+        );
+    }
+
+    #[test]
+    fn push_frames_are_not_equal_to_array_frames_with_the_same_flattened_content() {
+        let push = Frame::Push(vec![Frame::Integer(1), Frame::Integer(2)]);
+        let array = Frame::Array(vec![Frame::Integer(1), Frame::Integer(2)]);
+        assert_ne!(push, array);
+    }
+
+    #[test]
+    fn kind_names_push_without_touching_its_contents() {
+        assert_eq!(Frame::Push(vec![]).kind(), "push");
+    }
+
+    #[test]
+    fn log_len_reports_element_count_for_push_frames() {
+        assert_eq!(
+            Frame::Push(vec![Frame::Integer(1), Frame::Integer(2)]).log_len(),
+            2
+        );
     }
 }
