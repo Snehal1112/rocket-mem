@@ -75,9 +75,10 @@ pub struct Session {
     #[allow(dead_code)]
     push_tx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<Frame>>>,
     /// The receiving half of `push_tx`'s channel. `connection.rs`'s read loop drains this once
-    /// it is `Some` (Plan 05) -- `None` for a connection that has never subscribed.
-    #[allow(dead_code)]
-    push_rx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<Frame>>>,
+    /// it is `Some` (Plan 05) -- `None` for a connection that has never subscribed. `pub(crate)`
+    /// (not private): `connection.rs`'s `handle_connection` locks it directly each loop
+    /// iteration to decide whether to race it against `framed.next()` in a `tokio::select!`.
+    pub(crate) push_rx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<Frame>>>,
 }
 
 impl Session {
