@@ -49,6 +49,29 @@ pub struct Session {
     /// nothing about a transaction's queue needs to be visible to, or block, an unrelated read
     /// of the connection's name or auth state.
     tx: std::sync::Mutex<TransactionState>,
+    /// Channels this connection currently has an open `SUBSCRIBE` on. A separate lock from
+    /// `tx`/`protocol`/etc: nothing about subscription state needs to block an unrelated read of
+    /// this connection's transaction or auth state.
+    #[allow(dead_code)]
+    subscriptions: std::sync::Mutex<std::collections::HashSet<Bytes>>,
+    /// Patterns this connection currently has an open `PSUBSCRIBE` on.
+    #[allow(dead_code)]
+    psubscriptions: std::sync::Mutex<std::collections::HashSet<Bytes>>,
+    /// Fast path for the overwhelmingly common case (no subscription ever opened): checked with
+    /// a relaxed load before `subscriptions`/`psubscriptions` are ever touched. See the spec's
+    /// "Performance" section.
+    #[allow(dead_code)]
+    subscription_count: std::sync::atomic::AtomicUsize,
+    /// This connection's own outbound channel for pushed pub/sub messages, created lazily on the
+    /// first `SUBSCRIBE`/`PSUBSCRIBE`. Kept alongside `push_rx` so a later `SUBSCRIBE` on the
+    /// same connection can clone it again to register another channel, rather than the sender
+    /// half being handed once to the registry and then unreachable.
+    #[allow(dead_code)]
+    push_tx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<Frame>>>,
+    /// The receiving half of `push_tx`'s channel. `connection.rs`'s read loop drains this once
+    /// it is `Some` (Plan 05) -- `None` for a connection that has never subscribed.
+    #[allow(dead_code)]
+    push_rx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<Frame>>>,
 }
 
 impl Session {
@@ -60,6 +83,11 @@ impl Session {
             peer_addr: None,
             in_transaction: std::sync::atomic::AtomicBool::new(false),
             tx: std::sync::Mutex::new(TransactionState::Idle),
+            subscriptions: std::sync::Mutex::new(std::collections::HashSet::new()),
+            psubscriptions: std::sync::Mutex::new(std::collections::HashSet::new()),
+            subscription_count: std::sync::atomic::AtomicUsize::new(0),
+            push_tx: std::sync::Mutex::new(None),
+            push_rx: std::sync::Mutex::new(None),
         }
     }
 
@@ -1413,8 +1441,12 @@ pub(crate) const KNOWN_COMMANDS: &[&str] = &[
     "PEXPIRE",
     "PEXPIREAT",
     "PING",
+    "PSUBSCRIBE",
     "PSYNC",
     "PTTL",
+    "PUBLISH",
+    "PUBSUB",
+    "PUNSUBSCRIBE",
     "RANDOMKEY",
     "RENAME",
     "RENAMENX",
@@ -1439,10 +1471,12 @@ pub(crate) const KNOWN_COMMANDS: &[&str] = &[
     "SRANDMEMBER",
     "SREM",
     "STRLEN",
+    "SUBSCRIBE",
     "SUNION",
     "SUNIONSTORE",
     "TTL",
     "TYPE",
+    "UNSUBSCRIBE",
     "ZADD",
     "ZCARD",
     "ZINCRBY",
@@ -1503,13 +1537,13 @@ fn key_spec(name: &str) -> KeySpec {
     match name {
         "PING" | "ECHO" | "SELECT" | "COMMAND" | "INFO" | "HELLO" | "KEYS" | "SCAN"
         | "RANDOMKEY" | "CLUSTER" | "SAVE" | "BGREWRITEAOF" | "REPLICAOF" | "PSYNC" | "SLOWLOG"
-        | "DEBUG" | "AUTH" | "ACL" | "DBSIZE" | "CONFIG" | "CLIENT" => {
+        | "DEBUG" | "AUTH" | "ACL" | "DBSIZE" | "CONFIG" | "CLIENT" | "SUBSCRIBE"
+        | "UNSUBSCRIBE" | "PSUBSCRIBE" | "PUNSUBSCRIBE" | "PUBLISH" | "PUBSUB" => {
             // AUTH has no keys -- its arguments are a username/password, never a routable key.
             // ACL likewise -- its arguments are a subcommand/username/rule tokens, never a
-            // routable key. Without this exception either would fall through to the
-            // `KNOWN_COMMANDS` catch-all below and get `KeySpec::First`, which in cluster mode
-            // would hash a plaintext password (AUTH) or a rule token (ACL SETUSER) to a slot and
-            // potentially -MOVED it before it's ever authenticated/applied.
+            // routable key. Channel/pattern names are not routable keyspace keys -- without this,
+            // the `KNOWN_COMMANDS` catch-all below would default them to `KeySpec::First`, which
+            // in cluster mode would hash a channel name to a slot and potentially -MOVED it.
             KeySpec::None
         }
         "MEMORY" | "OBJECT" => KeySpec::Second,
@@ -3536,8 +3570,12 @@ pub(crate) const KNOWN_COMMANDS_LOWER: &[&str] = &[
     "pexpire",
     "pexpireat",
     "ping",
+    "psubscribe",
     "psync",
     "pttl",
+    "publish",
+    "pubsub",
+    "punsubscribe",
     "randomkey",
     "rename",
     "renamenx",
@@ -3562,10 +3600,12 @@ pub(crate) const KNOWN_COMMANDS_LOWER: &[&str] = &[
     "srandmember",
     "srem",
     "strlen",
+    "subscribe",
     "sunion",
     "sunionstore",
     "ttl",
     "type",
+    "unsubscribe",
     "zadd",
     "zcard",
     "zincrby",
@@ -6628,6 +6668,34 @@ mod tests {
             panic!("COMMAND INFO must reply with an array");
         };
         assert_eq!(entries.len(), KNOWN_COMMANDS.len());
+    }
+
+    #[test]
+    fn command_info_recognizes_every_new_pubsub_command() {
+        let engine = Engine::new();
+        for name in [
+            "SUBSCRIBE",
+            "UNSUBSCRIBE",
+            "PSUBSCRIBE",
+            "PUNSUBSCRIBE",
+            "PUBLISH",
+            "PUBSUB",
+        ] {
+            let reply = dispatch(
+                &engine,
+                cmd(&[b"COMMAND", b"INFO", name.as_bytes()]),
+                &mut Protocol::default(),
+                1,
+            );
+            let Frame::Array(entries) = reply else {
+                panic!("expected COMMAND INFO to reply with an array");
+            };
+            assert_ne!(
+                entries[0],
+                Frame::Null,
+                "{name} should be a known command by now"
+            );
+        }
     }
 
     #[test]
