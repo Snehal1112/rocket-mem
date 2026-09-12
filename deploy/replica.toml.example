@@ -1,0 +1,104 @@
+# deploy/replica.toml.example — the production single-primary+replica bundle's REPLICA config.
+#
+# This is NOT the general-purpose reference (that's rocket-mem-replica.toml.example at the repo
+# root, where every field is commented out and off by default). This file is the opinionated,
+# close-to-as-is config for the specific topology described in deploy/README.md: one primary +
+# one replica, same box, different ports, replicating over the primary's TLS port. Fields that
+# matter for that topology are active (uncommented) below; install.sh copies this file to
+# /etc/rocket-mem/replica.toml and substitutes the two password placeholders (with the SAME
+# values written into primary.toml.example, since this replica authenticates using the primary's
+# own ACL credentials). See docs/config-reference.md for the full field reference every value
+# below is drawn from, and deploy/README.md for the install/cutover workflow this file is part
+# of.
+#
+# Layering reminder: built-in defaults < this file < ROCKET_MEM_* env vars < CLI flags.
+
+# --- Listeners -----------------------------------------------------------------
+# Same box as the primary for now (single physical server) -- every address below must be
+# distinct from the primary's, which is why this replica uses a whole different port range
+# rather than reusing 6379/6380/9121/16379/17379.
+
+# This replica's own plaintext RESP listener, for its own client connections. Loopback-only,
+# same reasoning as the primary's addr.
+addr = "127.0.0.1:6389"
+
+# This replica's own plaintext RMP listener. Loopback-only.
+rmp_addr = "127.0.0.1:6390"
+
+# This replica's own Prometheus /metrics endpoint. Loopback-only -- unauthenticated regardless
+# of ACL, same as the primary's.
+metrics_addr = "127.0.0.1:9122"
+
+# --- Storage -------------------------------------------------------------------
+# This replica's own AOF/snapshot files -- never shared with the primary's. Each node's recovery
+# reads only its own files.
+
+aof_path = "/var/lib/rocket-mem/replica/appendonly.aof"
+snapshot_path = "/var/lib/rocket-mem/replica/dump.snapshot"
+
+# --- Logging ---------------------------------------------------------------------
+
+# Tracing filter directive. Default: "info" -- kept explicit for the same self-documentation
+# reason as primary.toml.example.
+log_level = "info"
+
+# --- TLS -------------------------------------------------------------------------
+# This replica serves its own TLS-wrapped clients on tls_resp_addr below (loopback-only -- this
+# deployment is not internet-facing for the replica, only the primary is), and separately uses
+# tls_ca_path to verify the PRIMARY's certificate for its own outgoing replication connection.
+# Those are two independent uses of TLS -- see docs/config-reference.md's TLS note.
+
+# TLS-wrapped RESP listener for this replica's own clients, alongside the plaintext one at addr
+# above. Loopback-only, unlike the primary's tls_resp_addr -- nothing external talks to the
+# replica directly in this topology.
+tls_resp_addr = "127.0.0.1:16389"
+
+# Shared cert/key material with the primary (same files, same CA) -- both nodes on this box are
+# part of the same TLS identity for now. install.sh does not generate these; see
+# deploy/README.md's "What's NOT handled" section.
+tls_cert_path = "/etc/rocket-mem/tls/server.crt"
+tls_key_path = "/etc/rocket-mem/tls/server.key"
+
+# The PRIMARY's CA certificate, so THIS replica's outgoing replication connection (via
+# replicaof below) can verify and pin to it. This is what makes replication itself run over TLS
+# -- see "Wiring it up" at the bottom of rocket-mem-replica.toml.example at the repo root for the
+# general mechanism, and the note on replicaof below for why this deployment points at the
+# primary's TLS port specifically.
+tls_ca_path = "/etc/rocket-mem/tls/root_ca.crt"
+
+# --- Replication (config-driven) -----------------------------------------------
+# Points at the PRIMARY'S TLS port (16379), not its plaintext port (6379), so the replication
+# link itself runs over TLS end to end -- confirmed against .claude/manual-testing.md's
+# "replica_announce_addr: what a TLS follower tells its leader" section, which documents exactly
+# this pattern for a TLS follower.
+
+replicaof = "127.0.0.1:16379"
+
+# Dedicated replication credential -- NOT the "app" user. Must match the SAME password
+# install.sh generates and substitutes into the primary's [[acl.users]] "replica" entry; the two
+# __REPLICA_PASSWORD__ placeholders are filled from one generated value, never two.
+# Generate with: openssl rand -base64 32
+replicaof_auth_username = "replica"
+replicaof_auth_password = "__REPLICA_PASSWORD__"
+
+# What this replica advertises to the primary in PSYNC, and what the primary reports back in
+# INFO REPLICATION's slaveN:... line. Set to this replica's own TLS address (rather than left to
+# default to addr, its plaintext one) for consistent logging, since the replication link itself
+# runs over TLS.
+replica_announce_addr = "127.0.0.1:16389"
+
+# --- ACL / authentication -----------------------------------------------------------
+# Only the "app" user is needed here -- for this replica's OWN client connections. The
+# replication link's credentials live in replicaof_auth_username/password above instead, and
+# authenticate against the PRIMARY's [[acl.users]] "replica" entry, not anything defined in this
+# file. Defining this entry also turns authentication ON for this replica's own client
+# connections, same as any other rocket-mem.toml.
+
+# Generate with: openssl rand -base64 32
+# Must match primary.toml.example's "app" user password exactly -- install.sh substitutes the
+# same generated value into both files' __APP_PASSWORD__ placeholder.
+[[acl.users]]
+username = "app"
+password = "__APP_PASSWORD__"
+enabled = true
+rules = ["allcommands", "allkeys"]

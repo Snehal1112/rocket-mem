@@ -1,0 +1,26 @@
+[Unit]
+Description=rocket-mem primary
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rocket-mem
+Group=rocket-mem
+ExecStart=/usr/local/bin/rocket-mem --config /etc/rocket-mem/primary.toml
+Restart=on-failure
+RestartSec=2
+# rocket-mem has no built-in maxmemory enforcement reachable from any config layer: the
+# Engine::with_maxmemory() constructor exists but crates/server/src/main.rs never wires a
+# config field, CLI flag, or env var to it, and CONFIG SET maxmemory is rejected outright. This
+# cgroup memory limit is therefore the only backstop against unbounded growth -- watch
+# rocket_mem_memory_used_bytes in the metrics output and adjust this if the box's total RAM
+# differs from what it was sized against.
+MemoryMax=4G
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/rocket-mem/primary
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

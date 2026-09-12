@@ -1,0 +1,110 @@
+# deploy/primary.toml.example — the production single-primary+replica bundle's PRIMARY config.
+#
+# This is NOT the general-purpose reference (that's rocket-mem.toml.example at the repo root,
+# where every field is commented out and off by default). This file is the opinionated,
+# close-to-as-is config for the specific topology described in deploy/README.md: one primary +
+# one replica, same box, primary's TLS RESP port the only externally-facing listener. Fields that
+# matter for that topology are active (uncommented) below; install.sh copies this file to
+# /etc/rocket-mem/primary.toml and substitutes the two password placeholders. See
+# docs/config-reference.md for the full field reference every value below is drawn from, and
+# deploy/README.md for the install/cutover workflow this file is part of.
+#
+# Layering reminder (same as the root .example files): built-in defaults < this file <
+# ROCKET_MEM_* env vars < CLI flags.
+
+# --- Listeners -----------------------------------------------------------------
+# The plaintext RESP/RMP listeners are mandatory -- rocket-mem always binds them, they cannot be
+# turned off (see crates/server/src/main.rs) -- so they're bound to loopback only and never
+# firewalled open. tls_resp_addr below is the only listener meant to be reachable from outside
+# this box.
+
+# Plaintext RESP listener. Loopback-only: real clients use tls_resp_addr instead.
+addr = "127.0.0.1:6379"
+
+# Plaintext RMP listener. Loopback-only, same reasoning as addr above.
+rmp_addr = "127.0.0.1:6380"
+
+# Prometheus /metrics HTTP endpoint. Unauthenticated regardless of ACL, so loopback-only --
+# tunnel over SSH or point a local Prometheus at it, never expose this directly.
+metrics_addr = "127.0.0.1:9121"
+
+# --- Storage -------------------------------------------------------------------
+
+# AOF write-durability log. Default would be ./appendonly.aof (relative to cwd) -- pinned to an
+# absolute path under this node's own data directory so it doesn't depend on the systemd unit's
+# working directory.
+aof_path = "/var/lib/rocket-mem/primary/appendonly.aof"
+
+# Point-in-time snapshot written by SAVE / loaded on startup. Same absolute-path reasoning as
+# aof_path above.
+snapshot_path = "/var/lib/rocket-mem/primary/dump.snapshot"
+
+# Minimum command duration, in microseconds, recorded to the slow log. Default: 10000 (10ms) --
+# kept at the default here; see docs/config-reference.md if you need to tune it for this
+# workload.
+slowlog_threshold_micros = 10000
+
+# --- Logging ---------------------------------------------------------------------
+
+# Tracing filter directive. Default: "info" -- kept explicit here rather than left to fall
+# through, so the installed file is self-documenting about what level production runs at.
+log_level = "info"
+
+# --- TLS -------------------------------------------------------------------------
+# TLS listeners run *alongside* the plaintext ones above -- they never replace addr/rmp_addr.
+# Server-auth only, no mutual TLS. See docs/config-reference.md's TLS note and
+# docs/getting-started.md's "Enabling TLS" section for the underlying mechanics.
+
+# The ONLY externally-facing listener in this deployment. install.sh's firewall step opens
+# exactly this port (16379) and nothing else.
+tls_resp_addr = "0.0.0.0:16379"
+
+# TLS-wrapped RMP listener. Kept loopback-only, unlike tls_resp_addr above -- only RESP clients
+# are assumed to need public reach in this deployment. Revisit (and open the firewall for it) if
+# an RMP client ever needs to connect from outside this box.
+tls_rmp_addr = "127.0.0.1:17379"
+
+# PEM certificate chain, shared by both TLS listeners above. install.sh does not generate this --
+# see deploy/README.md's "What's NOT handled" section for how to provision it.
+tls_cert_path = "/etc/rocket-mem/tls/server.crt"
+
+# PEM private key, shared by both TLS listeners above. Same provisioning note as tls_cert_path.
+tls_key_path = "/etc/rocket-mem/tls/server.key"
+
+# --- Replication & Failover Safety ------------------------------------------------
+# This node is the leader in this topology, so replicaof/replicaof_auth_* stay unset here --
+# those belong on replica.toml.example instead.
+
+# Left at the default (0, write fencing disabled): the primary never refuses a write because the
+# replica is slow or down. See docs/config-reference.md's "Replica fencing" note before raising
+# this -- deploy/README.md's "What's NOT handled" section flags enabling it as a follow-up, not
+# done here.
+min_replicas_to_write = 0
+
+# Only consulted while min_replicas_to_write above 0; kept at the doc default (10) so it's ready
+# to go the moment min_replicas_to_write is raised.
+min_replicas_max_lag_secs = 10
+
+# --- ACL / authentication -----------------------------------------------------------
+# Two users, matching the design's split between real client traffic and the replication link:
+# a leaked replication credential grants only +psync/+replconf, never full command access.
+# Defining any [[acl.users]] entry turns authentication ON for this whole server -- see
+# docs/config-reference.md's ACL section for the bootstrap-vs-runtime-ACL-SETUSER distinction
+# before adding users here later.
+
+# Generate with: openssl rand -base64 32
+[[acl.users]]
+username = "app"
+password = "__APP_PASSWORD__"
+enabled = true
+rules = ["allcommands", "allkeys"]
+
+# Generate with: openssl rand -base64 32
+# Must match replica.toml.example's replicaof_auth_password exactly -- the replica authenticates
+# to THIS primary using this same account. install.sh substitutes the same generated value into
+# both files' __REPLICA_PASSWORD__ placeholder for exactly this reason.
+[[acl.users]]
+username = "replica"
+password = "__REPLICA_PASSWORD__"
+enabled = true
+rules = ["+psync", "+replconf", "allkeys"]

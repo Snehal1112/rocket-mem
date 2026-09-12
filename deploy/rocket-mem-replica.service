@@ -1,0 +1,22 @@
+[Unit]
+Description=rocket-mem replica
+After=network-online.target rocket-mem-primary.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rocket-mem
+Group=rocket-mem
+ExecStart=/usr/local/bin/rocket-mem --config /etc/rocket-mem/replica.toml
+Restart=on-failure
+RestartSec=2
+# Same no-maxmemory-enforcement caveat as rocket-mem-primary.service -- see the comment there.
+# This cgroup limit is the only backstop against this replica's own unbounded memory growth.
+MemoryMax=4G
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/rocket-mem/replica
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
