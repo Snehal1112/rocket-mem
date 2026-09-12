@@ -4,7 +4,7 @@ A test playbook for `rocket-mem`, a from-scratch Redis-wire-compatible (RESP2/RE
 data store. It assumes no knowledge of the codebase: every case gives the exact commands to run
 and the exact output to expect.
 
-**Covers version:** `v0.1.3` (commit `61f40ae`). If you are testing a later build, re-check the
+**Covers version:** `v0.1.4` (commit `9b8e0a1`). If you are testing a later build, re-check the
 cases marked with a Note — expected output can legitimately change between versions.
 
 ## How to use this playbook
@@ -39,18 +39,20 @@ cut first when time is short.
 |---|---|---|---|
 | Environment setup (`ENV`) | — | 15 min | Once per machine, or when the build method changes. |
 | Smoke suite (`SMOKE`) | — | 10 min | **Critical.** Every build. Stop and report if any case fails. |
-| Core data types (`CORE`) | 46 | 45 min | High. Every release candidate. |
+| Core data types (`CORE`) | 54 | 50 min | High. Every release candidate. |
+| Transactions (`TXN`) | 10 | 20 min | High. `MULTI`/`EXEC`/`DISCARD` atomicity and isolation. |
 | Persistence (`PERSIST`) | 5 | 20 min | High. Data-loss surface. |
-| Replication (`REPL`) | 6 | 25 min | Medium. Needs two nodes. |
-| Cluster (`CLUSTER`) | 6 | 30 min | Medium. Needs three nodes. |
+| Replication (`REPL`) | 12 | 45 min | Medium. Needs two nodes. |
+| Pub/sub (`PUBSUB`) | 12 | 40 min | Medium. Needs two nodes for the cross-node case. |
+| Cluster (`CLUSTER`) | 10 | 45 min | Medium. Needs three nodes. |
 | Configuration (`CFG`) | 9 | 20 min | Medium. |
 | RMP protocol (`RMP`) | 5 | 20 min | Medium. Needs a Rust toolchain. |
-| Observability (`OBS`) | 7 | 15 min | Low, unless metrics are part of the release. |
-| ACL and authentication (`ACL`) | 18 | 40 min | **Critical.** Security. |
-| TLS (`TLS`) | 10 | 25 min | **Critical.** Security. |
+| Observability (`OBS`) | 14 | 30 min | Low, unless metrics are part of the release. |
+| ACL and authentication (`ACL`) | 19 | 40 min | **Critical.** Security. |
+| TLS (`TLS`) | 11 | 25 min | **Critical.** Security. |
 
 If you only have time for one section, run the smoke suite. For two, add ACL. The full pass is
-roughly four to five hours including setup.
+roughly six to seven hours including setup.
 
 ### Two variables every case assumes
 
@@ -626,8 +628,8 @@ redis-cli -p 6540 INFO server
 **Expected:**
 ```
 # Server
-redis_version:rocket-mem-0.1.3
-rocket_mem_version:0.1.3
+redis_version:rocket-mem-0.1.4
+rocket_mem_version:0.1.4
 redis_mode:standalone
 os:linux
 arch_bits:64
@@ -1187,8 +1189,12 @@ OK
 Y2
 b
 c
-ERR index out of range
+index out of range
 ```
+
+**Notes:** The error text has no `ERR` prefix, matching the pattern noted in CORE-06/CORE-32. A
+bad index against an *existing* list returns this `index out of range` error. A missing key
+returns a **different** error — `no such key` — instead of this one; see CORE-46.
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -2069,6 +2075,776 @@ ERR unknown command 'NOTACOMMAND'
 
 ---
 
+### CORE-46 — LSET on a missing key returns "no such key", distinct from a bad index
+
+**Precondition:** `core:lsmissing` does not exist.
+
+**Steps:**
+```bash
+redis-cli -p 6550 del core:lsmissing
+redis-cli -p 6550 lset core:lsmissing 0 z
+```
+
+**Expected:**
+```
+0
+no such key
+```
+
+**Notes:** Before this was fixed, a missing key and a bad index on an existing list both
+returned the same generic `ERR index out of range` (see CORE-15's history). Now they're
+distinguishable: a missing key returns `no such key` (no `ERR` prefix, same pattern as CORE-32's
+missing-source `RENAME` error), while a bad index on an existing list returns `index out of
+range` (CORE-15).
+
+**Result:** ☐ Pass ☐ Fail
+
+---
+
+### CORE-47 — APPEND, INCR/INCRBY/DECR/DECRBY, and SETRANGE preserve an existing key's TTL
+
+**Precondition:** None.
+
+**Steps:**
+```bash
+redis-cli -p 6550 del core:ttlapp
+redis-cli -p 6550 set core:ttlapp hello EX 100
+redis-cli -p 6550 ttl core:ttlapp
+redis-cli -p 6550 append core:ttlapp world
+redis-cli -p 6550 ttl core:ttlapp
+redis-cli -p 6550 del core:ttlincr
+redis-cli -p 6550 set core:ttlincr 10 EX 100
+redis-cli -p 6550 ttl core:ttlincr
+redis-cli -p 6550 incrby core:ttlincr 5
+redis-cli -p 6550 ttl core:ttlincr
+redis-cli -p 6550 del core:ttlsr
+redis-cli -p 6550 set core:ttlsr "Hello World" EX 100
+redis-cli -p 6550 ttl core:ttlsr
+redis-cli -p 6550 setrange core:ttlsr 6 Redis!
+redis-cli -p 6550 ttl core:ttlsr
+```
+
+**Expected:**
+```
+0
+OK
+99
+10
+99
+0
+OK
+99
+15
+99
+0
+OK
+99
+12
+99
+```
+
+**Notes:** Before this was fixed, `APPEND`/`INCR`/`INCRBY`/`DECR`/`DECRBY`/`SETRANGE` all wrote
+through `Engine::set`, which unconditionally clears any existing TTL — a `TTL` immediately after
+any of these calls used to return `-1` (no expiry) instead of the still-counting-down value shown
+here. `DECR`/`DECRBY` share the exact same code path as `INCRBY` and are not re-tested
+separately. As in CORE-02, exact TTL values will be a few units below what was set, since the
+clock keeps ticking between calls — that is expected, not a bug.
+
+**Result:** ☐ Pass ☐ Fail
+
+---
+
+### CORE-48 — RENAME and RENAMENX move the source's TTL to the destination
+
+**Precondition:** None.
+
+**Steps:**
+```bash
+redis-cli -p 6550 del core:ttlrnsrc core:ttlrndst
+redis-cli -p 6550 set core:ttlrnsrc v1 EX 100
+redis-cli -p 6550 ttl core:ttlrnsrc
+redis-cli -p 6550 rename core:ttlrnsrc core:ttlrndst
+redis-cli -p 6550 ttl core:ttlrndst
+redis-cli -p 6550 get core:ttlrndst
+```
+
+**Expected:**
+```
+0
+OK
+99
+OK
+99
+v1
+```
+
+**Notes:** Before this was fixed, `RENAME`/`RENAMENX` wrote the destination via `Engine::set`,
+which unconditionally clears TTL — the destination used to come out with no expiry (`TTL` = `-1`)
+regardless of what the source carried. `RENAMENX` moves TTL the same way when the destination
+doesn't already exist. A source with no TTL still leaves the destination with no TTL either way.
+
+**Result:** ☐ Pass ☐ Fail
+
+---
+
+### CORE-49 — LTRIM preserves TTL, and does not fabricate a key when trimming one that never existed
+
+**Precondition:** None.
+
+**Steps:**
+```bash
+redis-cli -p 6550 del core:ttlltrim
+redis-cli -p 6550 rpush core:ttlltrim a b c d e
+redis-cli -p 6550 expire core:ttlltrim 100
+redis-cli -p 6550 ttl core:ttlltrim
+redis-cli -p 6550 ltrim core:ttlltrim 1 3
+redis-cli -p 6550 ttl core:ttlltrim
+redis-cli -p 6550 lrange core:ttlltrim 0 -1
+redis-cli -p 6550 del core:ltrimmissing
+redis-cli -p 6550 ltrim core:ltrimmissing 0 -1
+redis-cli -p 6550 exists core:ltrimmissing
+```
+
+**Expected:**
+```
+0
+5
+1
+99
+OK
+99
+b
+c
+d
+0
+OK
+0
+```
+
+**Notes:** Before this was fixed, `LTRIM` was implemented as `LRANGE` followed by `Engine::set`,
+which unconditionally cleared TTL — a trimmed list used to lose its expiry even though nothing
+about `LTRIM` should touch it. `LTRIM` on a key that was never set is a no-op and must not create
+a phantom empty list (same "no-phantom-collection" convention as CORE-42) — `EXISTS` confirms the
+key stays absent afterward.
+
+**Result:** ☐ Pass ☐ Fail
+
+---
+
+### CORE-50 — HDEL and ZREM remove multiple fields/members in one variadic call
+
+**Precondition:** None.
+
+**Steps:**
+```bash
+redis-cli -p 6550 del core:hdelmulti
+redis-cli -p 6550 hset core:hdelmulti f1 v1 f2 v2 f3 v3
+redis-cli -p 6550 hdel core:hdelmulti f1 f2 fnosuch
+redis-cli -p 6550 hgetall core:hdelmulti
+redis-cli -p 6550 del core:zremmulti
+redis-cli -p 6550 zadd core:zremmulti 1 a
+redis-cli -p 6550 zadd core:zremmulti 2 b
+redis-cli -p 6550 zadd core:zremmulti 3 c
+redis-cli -p 6550 zrem core:zremmulti a b nosuch
+redis-cli -p 6550 zrange core:zremmulti 0 -1
+```
+
+**Expected:**
+```
+0
+3
+2
+f3
+v3
+0
+1
+1
+1
+2
+c
+```
+
+**Notes:** Before this was fixed, `HDEL`/`ZREM` only ever acted on the *first* field/member of a
+variadic call, silently ignoring the rest — `hdel core:hdelmulti f1 f2 fnosuch` used to remove
+only `f1` and return `1`, leaving `f2` behind in the hash. Both commands now remove every
+field/member given in one call and return the count actually removed: `2` for the `hdel` above
+(`f1` and `f2` existed, `fnosuch` never did), and `2` for the `zrem` above (`a` and `b` existed,
+`nosuch` never did) — `zrange` afterward shows only `c` remains. Recall `ZADD` itself is still not
+variadic (CORE-28) — that bug is unrelated and unfixed, which is why this case adds `a`/`b`/`c`
+via three separate `ZADD` calls.
+
+**Result:** ☐ Pass ☐ Fail
+
+---
+
+### CORE-51 — INCR/INCRBY/HINCRBY overflow
+
+**Precondition:** None.
+
+**Steps:**
+```bash
+redis-cli -p 6550 del core:ovf
+redis-cli -p 6550 set core:ovf 9223372036854775807
+redis-cli -p 6550 incr core:ovf
+redis-cli -p 6550 get core:ovf
+redis-cli -p 6550 del core:ovfneg
+redis-cli -p 6550 set core:ovfneg -9223372036854775808
+redis-cli -p 6550 incrby core:ovfneg -1
+redis-cli -p 6550 get core:ovfneg
+redis-cli -p 6550 del core:hovf
+redis-cli -p 6550 hset core:hovf f 9223372036854775807
+redis-cli -p 6550 hincrby core:hovf f 1
+redis-cli -p 6550 hget core:hovf f
+```
+
+**Expected:**
+```
+0
+OK
+increment or decrement would overflow
+9223372036854775807
+0
+OK
+increment or decrement would overflow
+-9223372036854775808
+0
+1
+increment or decrement would overflow
+9223372036854775807
+```
+
+**Notes:** Before this was fixed, `INCR`/`INCRBY`/`HINCRBY` added the delta with unchecked `i64`
+arithmetic and wrapped silently on overflow (`i64::MAX + 1` wrapping around to `i64::MIN`)
+instead of erroring. The error text has no `ERR` prefix, matching the pattern noted in
+CORE-06/CORE-32/CORE-15 — this project's convention is that engine-originated errors carry no
+prefix on the wire, only `WRONGTYPE` does (CORE-40). In every case here the value is left
+completely unchanged by the failed increment, confirmed by the follow-up `GET`/`HGET` still
+showing the pre-overflow value. `9223372036854775807` is `i64::MAX`; `-9223372036854775808` is
+`i64::MIN`.
+
+**Result:** ☐ Pass ☐ Fail
+
+---
+
+### CORE-52 — SINTERSTORE/SUNIONSTORE/SDIFFSTORE delete an empty-result destination
+
+**Precondition:** None.
+
+**Steps:**
+```bash
+redis-cli -p 6550 del core:sis_a core:sis_b core:sis_dest
+redis-cli -p 6550 sadd core:sis_a x
+redis-cli -p 6550 sadd core:sis_b y
+redis-cli -p 6550 sadd core:sis_dest old
+redis-cli -p 6550 sinterstore core:sis_dest core:sis_a core:sis_b
+redis-cli -p 6550 exists core:sis_dest
+redis-cli -p 6550 del core:sus_dest
+redis-cli -p 6550 sadd core:sus_dest old
+redis-cli -p 6550 sunionstore core:sus_dest core:missing1 core:missing2
+redis-cli -p 6550 exists core:sus_dest
+redis-cli -p 6550 del core:sds_a core:sds_b core:sds_dest
+redis-cli -p 6550 sadd core:sds_a x
+redis-cli -p 6550 sadd core:sds_b x y
+redis-cli -p 6550 sadd core:sds_dest old
+redis-cli -p 6550 sdiffstore core:sds_dest core:sds_a core:sds_b
+redis-cli -p 6550 exists core:sds_dest
+```
+
+**Expected:**
+```
+0
+1
+1
+1
+0
+0
+0
+1
+1
+0
+0
+0
+1
+2
+1
+0
+0
+```
+
+**Notes:** Before this was fixed, `SINTERSTORE`/`SUNIONSTORE`/`SDIFFSTORE` always wrote the
+(possibly empty) result to the destination with `Engine::set`, fabricating a live empty `Set` —
+`EXISTS` on the destination used to wrongly return `1`, even though `SMEMBERS`/`SCARD` on it
+would correctly show zero members. Now an empty result **deletes** the destination instead,
+matching real Redis's `*STORE` semantics, whether the destination previously held data (as with
+`core:sis_dest`/`core:sus_dest`/`core:sds_dest` above, each pre-loaded with a member called
+`old`) or never existed at all. The return value (`0` for each `*STORE` call) was already correct
+before the fix and is unchanged — only the phantom-key side effect is new.
+
+**Result:** ☐ Pass ☐ Fail
+
+---
+
+### CORE-53 — SREM/LPOP/RPOP/HDEL/ZREM delete the key once the last element is removed
+
+**Precondition:** None.
+
+**Steps:**
+```bash
+redis-cli -p 6550 del core:sremlast
+redis-cli -p 6550 sadd core:sremlast onlymember
+redis-cli -p 6550 srem core:sremlast onlymember
+redis-cli -p 6550 exists core:sremlast
+redis-cli -p 6550 type core:sremlast
+redis-cli -p 6550 del core:lpoplast
+redis-cli -p 6550 rpush core:lpoplast onlyelem
+redis-cli -p 6550 lpop core:lpoplast
+redis-cli -p 6550 exists core:lpoplast
+redis-cli -p 6550 type core:lpoplast
+redis-cli -p 6550 del core:rpoplast
+redis-cli -p 6550 rpush core:rpoplast onlyelem
+redis-cli -p 6550 rpop core:rpoplast
+redis-cli -p 6550 exists core:rpoplast
+redis-cli -p 6550 type core:rpoplast
+redis-cli -p 6550 del core:hdellast
+redis-cli -p 6550 hset core:hdellast f v
+redis-cli -p 6550 hdel core:hdellast f
+redis-cli -p 6550 exists core:hdellast
+redis-cli -p 6550 type core:hdellast
+redis-cli -p 6550 del core:zremlast
+redis-cli -p 6550 zadd core:zremlast 1 onlymember
+redis-cli -p 6550 zrem core:zremlast onlymember
+redis-cli -p 6550 exists core:zremlast
+redis-cli -p 6550 type core:zremlast
+```
+
+**Expected:**
+```
+0
+1
+1
+0
+none
+0
+1
+onlyelem
+0
+none
+0
+1
+onlyelem
+0
+none
+0
+1
+1
+0
+none
+0
+1
+1
+0
+none
+```
+
+**Notes:** Before this was fixed, `SREM`/`SPOP`/`HDEL`/`LPOP`/`RPOP`/`ZREM` left a live, empty
+List/Hash/Set/SortedSet behind once the last element was removed, instead of deleting the key the
+way real Redis does — `EXISTS` used to wrongly return `1` and `TYPE` would still wrongly report
+the original type (`set`/`list`/`hash`/`zset`) instead of `none`, even though the collection
+itself was empty. This is a different scenario from CORE-42 ("a mutation that finds nothing does
+not leave a phantom collection"): CORE-42 covers a mutation against a key that was *never set* to
+begin with; this case covers a mutation that empties a collection that *did* exist.
+
+**Result:** ☐ Pass ☐ Fail
+
+---
+
+## Transactions
+
+`MULTI`/`EXEC`/`DISCARD` shipped per the 2026-09-10 spec. `WATCH`/`UNWATCH` (optimistic locking)
+remain unimplemented — see "Known limits" at the end of this playbook.
+
+Start a standalone instance from a directory with **no** `rocket-mem.toml` present (this repo's
+own root `rocket-mem.toml` turns on ACL/TLS/cluster, none of which these cases need):
+
+```bash
+ROCKET_MEM_ADDR=127.0.0.1:6620 ROCKET_MEM_RMP_ADDR=127.0.0.1:6621 \
+ROCKET_MEM_METRICS_ADDR=127.0.0.1:9320 \
+ROCKET_MEM_AOF_PATH=$DATA/txn.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/txn.snap \
+  "$ROCKET_MEM_BIN" &
+echo $! > /tmp/txn.pid
+```
+
+Every case below sends its `MULTI`/`EXEC` block as a **single pipelined session in one
+`redis-cli` connection** — a fresh `redis-cli` invocation per command opens a new connection, and
+`MULTI`/`EXEC` state is per-connection:
+```bash
+redis-cli -p 6620 <<'EOF'
+MULTI
+...
+EXEC
+EOF
+```
+
+### TXN-01 — MULTI/queue/EXEC happy path
+
+**Precondition:** Key `txn:a` does not exist.
+
+**Steps:**
+```bash
+redis-cli -p 6620 <<'EOF'
+MULTI
+SET txn:a 1
+INCR txn:a
+GET txn:a
+EXEC
+EOF
+```
+
+**Expected:**
+```
+OK
+QUEUED
+QUEUED
+QUEUED
+OK
+2
+2
+```
+
+**Notes:** The first four lines are the replies to `MULTI`/each queued command (`+OK` then three
+`+QUEUED`); the last three lines are `EXEC`'s own reply — a RESP array of `[OK, 2, "2"]`
+(`redis-cli` prints array elements one per line in raw mode). Each queued command's reply is
+exactly what it would have been outside a transaction.
+
+**Result:** ☐ Pass ☐ Fail
+
+---
+
+### TXN-02 — DISCARD drops the queue
+
+**Precondition:** Key `txn:b` does not exist.
+
+**Steps:**
+```bash
+redis-cli -p 6620 <<'EOF'
+MULTI
+SET txn:b 1
+DISCARD
+GET txn:b
+EOF
+```
+
+**Expected:**
+```
+OK
+QUEUED
+OK
+(nil)
+```
+
+**Notes:** `DISCARD` replies `+OK` and the queued `SET` never ran — `txn:b` stays unset.
+
+**Result:** ☐ Pass ☐ Fail
+
+---
+
+### TXN-03 — Nested MULTI is rejected without disturbing the existing queue
+
+**Precondition:** Key `txn:g` does not exist.
+
+**Steps:**
+```bash
+redis-cli -p 6620 --no-raw <<'EOF'
+MULTI
+MULTI
+SET txn:g 1
+EXEC
+GET txn:g
+EOF
+```
+
+**Expected:**
+```
+OK
+(error) ERR MULTI calls can not be nested
+QUEUED
+1) OK
+"1"
+```
+
+**Notes:** The nested `MULTI` itself is not queued — it errors immediately and the transaction it
+was nested inside stays open exactly as before. The following `SET` still queues normally and
+still runs at `EXEC`.
+
+**Result:** ☐ Pass ☐ Fail
+
+---
+
+### TXN-04 — A queue-time unknown command aborts the whole batch (EXECABORT)
+
+**Precondition:** Key `txn:f` does not exist.
+
+**Steps:**
+```bash
+redis-cli -p 6620 --no-raw <<'EOF'
+MULTI
+SET txn:f 1
+NOTACOMMAND foo
+EXEC
+GET txn:f
+EOF
+```
+
+**Expected:**
+```
+OK
+QUEUED
+(error) ERR unknown command 'NOTACOMMAND'
+(error) EXECABORT Transaction discarded because of previous errors
+(nil)
+```
+
+**Notes:** The unknown command is rejected immediately (not queued) and marks the transaction
+dirty. `EXEC` then runs nothing at all, including the earlier, otherwise-valid `SET` — `txn:f` is
+confirmed unset afterward.
+
+**Result:** ☐ Pass ☐ Fail
+
+---
+
+### TXN-05 — A queue-time arity error does NOT abort the batch (contrast with TXN-04)
+
+**Precondition:** Key `txn:e` does not exist.
+
+**Steps:**
+```bash
+redis-cli -p 6620 --no-raw <<'EOF'
+MULTI
+SET txn:e 1
+SET
+EXEC
+GET txn:e
+EOF
+```
+
+**Expected:**
+```
+OK
+QUEUED
+QUEUED
+1) OK
+2) (error) ERR wrong number of arguments for 'set' command
+"1"
+```
+
+**Notes:** `SET` with no arguments is a *known* command name, so queue-time interception queues
+it (`+QUEUED`) instead of rejecting it up front — the arity check only happens when `EXEC`
+actually dispatches it. The result is a two-element reply array: the successful `SET txn:e 1` and
+the failed bare `SET`'s own error, side by side, with no `EXECABORT`. `txn:e` is confirmed set to
+`1` afterward. If you need a queue-time-rejected case, use an unknown command name (TXN-04), not
+a bad-arity call to a real command.
+
+**Result:** ☐ Pass ☐ Fail
+
+---
+
+### TXN-06 — An execution-time WRONGTYPE inside EXEC is reported per-command, not fatal
+
+**Precondition:** Key `txn:list` is a list (`LPUSH txn:list a b c`); key `txn:d` does not exist.
+
+**Steps:**
+```bash
+redis-cli -p 6620 <<'EOF'
+LPUSH txn:list a b c
+MULTI
+SET txn:d ok
+INCR txn:list
+GET txn:d
+EXEC
+GET txn:d
+EOF
+```
+
+**Expected:**
+```
+3
+OK
+QUEUED
+QUEUED
+QUEUED
+OK
+WRONGTYPE Operation against a key holding the wrong kind of value
+
+ok
+ok
+```
+
+**Notes:** `EXEC`'s reply array has three entries: `OK` (the `SET` succeeded), the `WRONGTYPE`
+error (the `INCR` against a list), and the string `ok` (`GET txn:d`, printed as the array's third
+line — use `--no-raw` to see this unambiguously as `3) "ok"`). The command *after* the failing
+one (`GET txn:d`) still ran and returned the value the `SET` wrote — a per-command runtime error
+doesn't abort the batch.
+
+**Result:** ☐ Pass ☐ Fail
+
+---
+
+### TXN-07 — SUBSCRIBE queued inside an open transaction is rejected and aborts it
+
+**Precondition:** Key `txn:h` does not exist. This connection is not currently subscribed to
+anything (a connection that *is* subscribed can't open `MULTI` in the first place — a separate,
+earlier RESP2-only gate; see the Pub/sub section).
+
+**Steps:**
+```bash
+redis-cli -p 6620 --no-raw <<'EOF'
+MULTI
+SUBSCRIBE foo
+SET txn:h 1
+EXEC
+GET txn:h
+EOF
+```
+
+**Expected:**
+```
+OK
+(error) ERR SUBSCRIBE is not allowed in transactions
+QUEUED
+(error) EXECABORT Transaction discarded because of previous errors
+(nil)
+```
+
+**Notes:** `SUBSCRIBE`/`UNSUBSCRIBE`/`PSUBSCRIBE`/`PUNSUBSCRIBE` are treated exactly like an
+unknown command at queue time — immediate `-ERR`, dirty flag set, later `EXEC` aborts regardless
+of what else was queued.
+
+**Result:** ☐ Pass ☐ Fail
+
+---
+
+### TXN-08 — EXEC / DISCARD without a MULTI in effect
+
+**Precondition:** No transaction open on this connection.
+
+**Steps:**
+```bash
+redis-cli -p 6620 --no-raw <<'EOF'
+EXEC
+DISCARD
+EOF
+```
+
+**Expected:**
+```
+(error) ERR EXEC without MULTI
+(error) ERR DISCARD without MULTI
+```
+
+**Notes:** Matches real Redis's own error text/shape for both commands.
+
+**Result:** ☐ Pass ☐ Fail
+
+---
+
+### TXN-09 — AOF wraps only writes in MULTI/EXEC markers; a read-only batch writes nothing
+
+**Precondition:** `ROCKET_MEM_AOF_PATH` points at a file you can inspect directly. TXN-01 has
+already run (so there's a prior write transaction in the AOF to inspect).
+
+**Steps:**
+```bash
+wc -l "$DATA/txn.aof"          # note the line count
+redis-cli -p 6620 <<'EOF'
+MULTI
+GET txn:a
+GET txn:c
+EXEC
+EOF
+wc -l "$DATA/txn.aof"          # compare -- should be unchanged
+cat -A "$DATA/txn.aof" | head -20
+```
+
+**Expected:** The two `wc -l` counts are identical — a read-only transaction appends nothing to
+the AOF. The `cat -A` of TXN-01's transaction shows a bare `*1\r\n$5\r\nMULTI\r\n` marker frame (a
+RESP array of exactly one bulk string, no arguments), then each queued write's own normal
+RESP-encoded command, then a bare `*1\r\n$4\r\nEXEC\r\n` marker:
+```
+*1^M$
+$5^M$
+MULTI^M$
+*3^M$
+$3^M$
+SET^M$
+$5^M$
+txn:a^M$
+$1^M$
+1^M$
+*2^M$
+$4^M$
+INCR^M$
+$5^M$
+txn:a^M$
+*1^M$
+$4^M$
+EXEC^M$
+```
+
+**Notes:** This confirms the AOF-atomicity *shape* (the markers exist and wrap exactly the
+writes, one contiguous append), not crash atomicity. Proving that a `kill -9` mid-`EXEC` never
+replays a half-written transaction is not practically verifiable through `redis-cli` alone — the
+project's own test suite covers this directly (`crates/server/src/dispatcher.rs`, tests
+`exec_wraps_its_writes_in_multi_and_exec_aof_markers` and
+`a_read_only_transaction_writes_nothing_to_the_aof_at_all`).
+
+**Result:** ☐ Pass ☐ Fail
+
+---
+
+### TXN-10 — Writers-only isolation: concurrent writes to a touched shard block; concurrent reads do not
+
+**Precondition:** Two separate connections (A and B) to the same instance.
+
+**Steps:** Not practically driven through plain `redis-cli` timing — recorded here as a
+know-the-guarantee case rather than a copy-paste reproduction:
+1. On connection A: `MULTI`, queue several commands touching key `k`, `EXEC`.
+2. While A's `EXEC` is still running, attempt `SET k v2` on connection B.
+3. While A's `EXEC` is still running, attempt `GET k` on connection B.
+
+**Expected:** B's `SET` blocks until A's `EXEC` fully completes (the same shard-lock guard
+ordinary writers already share, just held for the whole batch). B's `GET` is **not** blocked and
+may observe the transaction's intermediate state partway through the batch — this is the
+documented gap, not a bug.
+
+**Notes — the writers-only isolation gap, quoted from
+`docs/superpowers/specs/2026-09-10-multi-exec-transactions-spec.md`:**
+
+> "This blocks any other **write** touching an overlapping shard until the transaction finishes —
+> the same guarantee ordinary writes already give each other, just held longer. **Reads stay
+> fully concurrent**, exactly as they are today (`dispatch_and_log_inner`'s guard is
+> `write_name`-gated only) — a concurrent `GET` could observe the transaction's intermediate state
+> partway through the batch. Real Redis cannot expose this (single-threaded), but closing that gap
+> means holding each touched shard's actual data `RwLock` for the whole batch, which needs
+> `engine.rs`'s `with_mut`/`with_ref` reworked to run against an already-held guard instead of
+> re-locking (`parking_lot::RwLock` isn't reentrant). Explicitly deferred — see 'Out of scope.'"
+
+Not black-box verifiable through ad-hoc `redis-cli` timing. The project's own test suite proves it
+directly: `crates/server/src/dispatcher.rs`, test
+`a_write_to_the_same_key_blocks_until_exec_releases_its_batch_guard_but_a_read_does_not`. Record
+this case as verified via source/spec + existing test, not independently reproduced live.
+
+**Result:** ☐ Pass ☐ Fail
+
+---
+
+Teardown:
+```bash
+kill $(cat /tmp/txn.pid) 2>/dev/null
+rm -f /tmp/txn.pid
+```
+
+---
+
 
 Binary under test: `"$ROCKET_MEM_BIN"`
 (built release binary — do not rebuild unless asked).
@@ -2102,19 +2878,26 @@ shell session. Every server is started with `&` and killed by the PID captured a
 **never** with `pkill -f rocket-mem`; that also kills other agents' servers and any running
 chaos test.
 
-Startup banner, byte for byte, on every node regardless of whether the AOF/snapshot files
-already existed:
+Startup log lines, on every node regardless of whether the AOF/snapshot files already existed
+(exact timestamps/values vary; the fields present don't):
 
 ```
-Recovered state from <snapshot-path> and <aof-path>
-Metrics on http://<metrics-addr>/metrics
-RMP listening on <rmp-addr>
-Listening on <resp-addr>
+<ts>  INFO rocket_mem: rocket-mem starting version="<version>" node_id=<node-id>
+<ts>  INFO rocket_mem: resolved config summary node_id=<node-id> addr=<resp-addr> rmp_addr=<rmp-addr> metrics_addr=<metrics-addr> aof_path=<aof-path> snapshot_path=<snapshot-path> log_filter=info log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=<bool> acl_enabled=<bool> acl_user_count=<n> tls_enabled=<bool> tls_replication_enabled=<bool>
+<ts>  INFO rocket_mem::aof: aof recovery replay complete commands=<n> bytes=<n> elapsed_us=<n>
+<ts>  INFO rocket_mem: listener bound protocol=metrics addr=http://<metrics-addr>/metrics
+<ts>  INFO rocket_mem: listener bound protocol=RMP addr=<rmp-addr>
+<ts>  INFO rocket_mem: listener bound protocol=RESP addr=<resp-addr>
 ```
+followed by a colorized boxed summary table (stripped of ANSI color when piped to a file/non-tty)
+repeating the same facts under `storage`/`acl`/`cluster`/`replicas`/`listeners` labels.
 
-The "Recovered state from..." line is printed unconditionally — it does not distinguish between
-"loaded real data" and "found nothing, started empty." Don't read its presence as proof of a
-non-empty recovery; check the actual keys.
+The `aof recovery replay complete commands=0 bytes=0 ...` event fires on every startup, including
+a totally fresh one with nothing to recover — don't read its presence as proof of a non-empty
+recovery; check the actual keys. (Older builds of this playbook, and of the server itself, showed
+a plain `Recovered state from <snapshot-path> and <aof-path>` / `Metrics on http://...` /
+`RMP listening on ...` / `Listening on ...` banner instead — that plain-text form no longer
+exists; the fields above are its structured-logging replacement.)
 
 ---
 
@@ -2593,16 +3376,811 @@ rocket_mem_connected_replicas 0
 
 **Notes:** This is expected behavior, not a bug: Sprint 5's design has no partial-resync/offset-
 resume support, so a dropped or freshly-attached follower always gets a fresh full snapshot,
-which silently discards anything the follower had written locally before rejecting further
-client writes wasn't yet in effect. There is no replication-offset lag metric either —
-`rocket_mem_replication_last_apply_timestamp_seconds` (a timestamp of last applied write, not an
-offset) is the documented substitute, confirmed present above; `rocket_mem_connected_replicas`
-is the follower-count gauge. Separately (not re-verified in this run, see `README.md`'s Sprint 5
-entry and Sprint 8 entry): `PSYNC` has no dedicated auth mechanism of its own — it goes through
-the same `AUTH`/ACL gate every other command does, and only actually blocks anything once ACL
-users are configured; a server with none configured authenticates nobody, replica included.
+which silently discards anything the follower had written locally. `rocket_mem_connected_replicas`
+is the follower-count gauge; `rocket_mem_replication_last_apply_timestamp_seconds` is a coarser
+wall-clock signal that exists *alongside* the real offset/lag fields — see REPL-04, which already
+covers `master_repl_offset`/`slave_repl_offset` and each `slaveN:` line's `offset=/lag=` fields.
+`PSYNC` goes through the same `AUTH`/ACL gate every other command does; REPL-11/REPL-12 below
+verify that an ACL-protected leader cleanly rejects an unauthenticated follower's `PSYNC` (never a
+crash) and accepts one configured with `replicaof_auth_username`/`replicaof_auth_password`.
 
 **Result:** ☐ Pass ☐ Fail
+
+---
+
+### REPL-07 — Leader refuses writes with `NOREPLICAS` when fencing is enabled and no replica has acked
+
+**Precondition:** No servers on 6630-6631/9330 or 6640-6641/9340. Fencing is opt-in
+(`min_replicas_to_write=0` is the default and disables this entirely — see the `CFG` section for
+the config-layering cases; this section turns it on via env var as shown).
+
+**Steps:**
+```bash
+rm -f $DATA/prc-fence-leader.aof $DATA/prc-fence-leader.snap
+
+ROCKET_MEM_ADDR=127.0.0.1:6630 ROCKET_MEM_RMP_ADDR=127.0.0.1:6631 \
+ROCKET_MEM_AOF_PATH=$DATA/prc-fence-leader.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-fence-leader.snap \
+ROCKET_MEM_METRICS_ADDR=127.0.0.1:9330 \
+ROCKET_MEM_MIN_REPLICAS_TO_WRITE=1 ROCKET_MEM_MIN_REPLICAS_MAX_LAG_SECS=3 \
+  $BIN &
+echo $! > /tmp/prc-fence-leader.pid
+sleep 0.6
+
+redis-cli -p 6630 set k v
+curl -s http://127.0.0.1:9330/metrics | grep rocket_mem_writes_rejected_no_replicas_total
+```
+
+**Expected:**
+```
+NOREPLICAS Not enough good replicas to write.
+
+# TYPE rocket_mem_writes_rejected_no_replicas_total counter
+rocket_mem_writes_rejected_no_replicas_total 1
+```
+
+**Notes:** Error text matches Redis's `NOREPLICAS` exactly. This gate fires *before* the AOF
+ordering lock is taken, so a rejected write leaves no AOF/snapshot trace. A read command (`GET`)
+is never fenced — only commands the dispatcher recognizes as writes.
+
+**Result:** ☐ Pass ☐ Fail
+
+---
+
+### REPL-08 — Fencing clears once a replica attaches and acks within the lag window
+
+**Precondition:** REPL-07's leader still running and still fenced.
+
+**Steps:**
+```bash
+rm -f $DATA/prc-fence-follower.aof $DATA/prc-fence-follower.snap
+
+ROCKET_MEM_ADDR=127.0.0.1:6640 ROCKET_MEM_RMP_ADDR=127.0.0.1:6641 \
+ROCKET_MEM_AOF_PATH=$DATA/prc-fence-follower.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-fence-follower.snap \
+ROCKET_MEM_METRICS_ADDR=127.0.0.1:9340 \
+  $BIN &
+echo $! > /tmp/prc-fence-follower.pid
+sleep 0.6
+
+redis-cli -p 6640 replicaof 127.0.0.1 6630
+sleep 2.5                                 # let it attach and send its first REPLCONF ACK
+
+redis-cli -p 6630 set k v
+sleep 0.3
+redis-cli -p 6640 get k
+curl -s http://127.0.0.1:9330/metrics | grep -E 'rocket_mem_good_replicas|rocket_mem_replica_min_ack_offset'
+
+kill $(cat /tmp/prc-fence-leader.pid) $(cat /tmp/prc-fence-follower.pid)
+sleep 0.3
+```
+
+**Expected:**
+```
+OK
+OK
+v
+# TYPE rocket_mem_good_replicas gauge
+rocket_mem_good_replicas 1
+# TYPE rocket_mem_replica_min_ack_offset gauge
+rocket_mem_replica_min_ack_offset 27
+```
+
+**Notes:** `rocket_mem_replica_min_ack_offset`'s exact number will vary run to run (it's the
+furthest-behind connected replica's acked byte offset); only `rocket_mem_good_replicas: 1` is a
+fixed expectation. The leader's stderr also logs exactly one `WARN ... entering fenced state`
+line at startup and one `INFO ... leaving fenced state` line the moment the first ack arrives.
+
+**Result:** ☐ Pass ☐ Fail
+
+---
+
+### REPL-09 — `min_replicas_to_write` with a zero lag window is rejected at startup, not at write time
+
+**Precondition:** No server on 6630/6631/9330.
+
+**Steps:**
+```bash
+ROCKET_MEM_ADDR=127.0.0.1:6630 ROCKET_MEM_RMP_ADDR=127.0.0.1:6631 \
+ROCKET_MEM_METRICS_ADDR=127.0.0.1:9330 \
+ROCKET_MEM_MIN_REPLICAS_TO_WRITE=1 ROCKET_MEM_MIN_REPLICAS_MAX_LAG_SECS=0 \
+  $BIN
+```
+
+**Expected:** process exits immediately, before any listener binds:
+```
+config error: min_replicas_to_write is set but min_replicas_max_lag_secs is 0 -- no replica
+could ever qualify, so every write would be refused forever
+```
+
+**Notes:** `validate_min_replicas` (`crates/server/src/config.rs`) treats this combination as a
+config typo that would otherwise spell a permanent, silent write outage — a 0-second lag window
+means no replica's ack could ever be "recent enough."
+
+**Result:** ☐ Pass ☐ Fail
+
+---
+
+### REPL-10 — `replica_announce_addr` makes the leader report the announced address, not the raw socket peer
+
+**Precondition:** No servers on 6630-6631/9330 or 6640-6641/9340.
+
+**Steps:**
+```bash
+rm -f $DATA/prc-announce-leader.aof $DATA/prc-announce-leader.snap
+rm -f $DATA/prc-announce-follower.aof $DATA/prc-announce-follower.snap
+
+ROCKET_MEM_ADDR=127.0.0.1:6630 ROCKET_MEM_RMP_ADDR=127.0.0.1:6631 \
+ROCKET_MEM_AOF_PATH=$DATA/prc-announce-leader.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-announce-leader.snap \
+ROCKET_MEM_METRICS_ADDR=127.0.0.1:9330 \
+  $BIN &
+echo $! > /tmp/prc-announce-leader.pid
+
+ROCKET_MEM_ADDR=127.0.0.1:6640 ROCKET_MEM_RMP_ADDR=127.0.0.1:6641 \
+ROCKET_MEM_AOF_PATH=$DATA/prc-announce-follower.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-announce-follower.snap \
+ROCKET_MEM_METRICS_ADDR=127.0.0.1:9340 \
+ROCKET_MEM_REPLICA_ANNOUNCE_ADDR=announced.example.com:16640 \
+  $BIN &
+echo $! > /tmp/prc-announce-follower.pid
+sleep 0.6
+
+redis-cli -p 6640 replicaof 127.0.0.1 6630
+sleep 1
+redis-cli -p 6630 info replication
+
+kill $(cat /tmp/prc-announce-leader.pid) $(cat /tmp/prc-announce-follower.pid)
+sleep 0.3
+```
+
+**Expected:**
+```
+OK
+# Replication
+role:master
+connected_slaves:1
+slave0:ip=announced.example.com,port=16640,state=online,offset=<n>,lag=<n>
+master_repl_offset:<n>
+```
+
+**Notes:** Without `replica_announce_addr` set, the same line instead shows the follower's real
+*socket* peer (`127.0.0.1` and an ephemeral outbound port, not `6640`) — the connection's source
+port is not the follower's listening port. `replica_announce_addr` defaults to unset, which
+reproduces that old (label-only) behavior byte for byte.
+
+**Result:** ☐ Pass ☐ Fail
+
+---
+
+### REPL-11 — PSYNC against an ACL-protected leader is rejected cleanly with `NOAUTH`, and the follower keeps retrying rather than crashing
+
+**Precondition:** No servers on 6630-6631/9330 or 6640-6641/9340. Requires a config file (ACL
+bootstrap users are TOML-only — `ROCKET_MEM_*` env vars can't express `[[acl.users]]`).
+
+**Steps:**
+```bash
+cat > $DATA/prc-acl-leader.toml <<EOF
+addr = "127.0.0.1:6630"
+rmp_addr = "127.0.0.1:6631"
+aof_path = "$DATA/prc-acl-leader.aof"
+snapshot_path = "$DATA/prc-acl-leader.snap"
+metrics_addr = "127.0.0.1:9330"
+
+[[acl.users]]
+username = "repl"
+password = "replpw"
+enabled = true
+rules = ["allcommands", "allkeys"]
+EOF
+
+$BIN --config $DATA/prc-acl-leader.toml &
+echo $! > /tmp/prc-acl-leader.pid
+sleep 0.6
+
+# follower with NO credentials configured
+ROCKET_MEM_ADDR=127.0.0.1:6640 ROCKET_MEM_RMP_ADDR=127.0.0.1:6641 \
+ROCKET_MEM_AOF_PATH=$DATA/prc-acl-follower.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-acl-follower.snap \
+ROCKET_MEM_METRICS_ADDR=127.0.0.1:9340 \
+RUST_LOG=rocket_mem=info \
+  $BIN 2>$DATA/prc-acl-follower.stderr &
+echo $! > /tmp/prc-acl-follower.pid
+sleep 0.6
+
+redis-cli -p 6640 replicaof 127.0.0.1 6630
+sleep 1.5
+redis-cli -p 6640 info replication
+grep "leader rejected PSYNC" $DATA/prc-acl-follower.stderr
+
+kill $(cat /tmp/prc-acl-leader.pid) $(cat /tmp/prc-acl-follower.pid)
+sleep 0.3
+```
+
+**Expected:**
+```
+OK
+# Replication
+role:slave
+master_host:127.0.0.1
+master_port:6630
+master_link_status:down
+slave_repl_offset:0
+master_repl_offset:0
+... error=leader rejected PSYNC: NOAUTH Authentication required.
+```
+
+**Notes:** `master_link_status` stays `down` — the follower process does not crash or exit; it
+retries on a fixed backoff, logging one `WARN ... replication connection lost, reconnecting ...
+error=leader rejected PSYNC: NOAUTH Authentication required.` line per attempt. An ACL-protected
+leader's `PSYNC` rejection is a plain RESP error line (`-NOAUTH ...`), distinct from the raw
+length-prefixed snapshot blob a successful `PSYNC` sends — the follower must distinguish the two
+before reading. REPL-12 proves the credentialed path succeeds against the same leader.
+
+**Result:** ☐ Pass ☐ Fail
+
+---
+
+### REPL-12 — PSYNC with correct `replicaof_auth_username`/`replicaof_auth_password` succeeds against the same ACL-protected leader
+
+**Precondition:** REPL-11's leader still running (or restart it identically). No follower on
+6640-6641/9340.
+
+**Steps:**
+```bash
+cat > $DATA/prc-acl-follower.toml <<EOF
+addr = "127.0.0.1:6640"
+rmp_addr = "127.0.0.1:6641"
+aof_path = "$DATA/prc-acl-follower2.aof"
+snapshot_path = "$DATA/prc-acl-follower2.snap"
+metrics_addr = "127.0.0.1:9340"
+replicaof = "127.0.0.1:6630"
+replicaof_auth_username = "repl"
+replicaof_auth_password = "replpw"
+EOF
+
+$BIN --config $DATA/prc-acl-follower.toml &
+echo $! > /tmp/prc-acl-follower2.pid
+sleep 1.5
+
+redis-cli -p 6640 info replication
+redis-cli -p 6630 -a replpw --user repl --no-auth-warning set k v
+sleep 0.3
+redis-cli -p 6640 get k
+
+kill $(cat /tmp/prc-acl-leader.pid) $(cat /tmp/prc-acl-follower2.pid)
+sleep 0.3
+```
+
+**Expected:**
+```
+# Replication
+role:slave
+master_host:127.0.0.1
+master_port:6630
+master_link_status:up
+slave_repl_offset:<n>
+master_repl_offset:<n>
+OK
+v
+```
+
+**Notes:** `AUTH <username> <password>` is sent once, before `PSYNC`, and its reply round-trips
+through the normal RESP codec (unlike `PSYNC`'s own reply, the raw length-prefixed blob) — a
+rejected `AUTH` (wrong password) fails the same way as a rejected `PSYNC`: cleanly, with a retry,
+never a crash.
+
+**Result:** ☐ Pass ☐ Fail
+
+---
+
+## Pub/sub
+
+`SUBSCRIBE`/`UNSUBSCRIBE`/`PSUBSCRIBE`/`PUNSUBSCRIBE`/`PUBLISH`/`PUBSUB` shipped per the
+2026-09-11 spec. Most cases use one standalone instance; the cross-node case needs a second node,
+same as `REPL-*`, which is why this section sits between Replication and Cluster.
+
+```bash
+ROCKET_MEM_ADDR=127.0.0.1:6600 ROCKET_MEM_RMP_ADDR=127.0.0.1:6601 \
+ROCKET_MEM_METRICS_ADDR=127.0.0.1:9600 \
+ROCKET_MEM_AOF_PATH=$DATA/pubsub-leader.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/pubsub-leader.snap \
+  $BIN &
+echo $! > /tmp/pubsub-leader.pid
+```
+
+**A pub/sub-specific `redis-cli` wrinkle:** because `SUBSCRIBE`/`PSUBSCRIBE` push messages
+asynchronously, capturing delivery needs a connection that stays open after its `subscribe`
+confirmation — a background job (`redis-cli -p 6600 subscribe chan > file &`, killed later), not
+a one-shot `redis-cli` call. A `redis-cli` invocation fed commands over a stdin *pipe* is fine for
+testing the command *replies themselves* (subscribe/unsubscribe confirmations, restricted-mode
+errors), because those come back synchronously, but such a process exits on stdin EOF and will
+miss any message published after its last piped line — use the backgrounded form whenever the
+case is about a *pushed* `message`/`pmessage` frame arriving after the fact. Also carried over
+from the general raw-output note given before `## Core data types`: every error reply in this
+mode is followed by one blank line, including the restricted-mode error below.
+
+### PUBSUB-01 — Basic SUBSCRIBE + PUBLISH delivery
+
+**Precondition:** Server running per the startup block above. No existing subscribers on `news`.
+
+**Steps:**
+```bash
+redis-cli -p 6600 subscribe news > /tmp/pubsub01.out 2>&1 &
+SUBPID=$!
+sleep 0.4
+redis-cli -p 6600 publish news hello
+sleep 0.3
+kill $SUBPID; wait $SUBPID 2>/dev/null
+cat /tmp/pubsub01.out
+```
+
+**Expected:**
+```
+1
+subscribe
+news
+1
+message
+news
+hello
+```
+
+**Notes:** The `1` on its own at the top is `PUBLISH`'s reply — the count of subscribers the
+message was actually delivered to. The subscriber's file shows the `subscribe` confirmation
+immediately followed by the pushed `message` frame — both use the same wire shape on a RESP2
+connection like this one (see PUBSUB-07 for the RESP3 `Push` type distinction).
+
+**Result:** ☐ Pass ☐ Fail
+
+---
+
+### PUBSUB-02 — Multiple subscribers on the same channel all receive
+
+**Precondition:** No existing subscribers on `multi1`.
+
+**Steps:**
+```bash
+redis-cli -p 6600 subscribe multi1 > /tmp/pubsub02a.out 2>&1 &
+SUBA=$!
+redis-cli -p 6600 subscribe multi1 > /tmp/pubsub02b.out 2>&1 &
+SUBB=$!
+sleep 0.4
+redis-cli -p 6600 publish multi1 hi-everyone
+sleep 0.3
+kill $SUBA $SUBB; wait $SUBA $SUBB 2>/dev/null
+cat /tmp/pubsub02a.out
+cat /tmp/pubsub02b.out
+```
+
+**Expected:**
+```
+2
+subscribe
+multi1
+1
+message
+multi1
+hi-everyone
+subscribe
+multi1
+1
+message
+multi1
+hi-everyone
+```
+
+**Notes:** `PUBLISH` replies `2` (both connections counted), and each subscriber's own
+`subscribe` confirmation reports count `1` — the count in a `subscribe`/`unsubscribe` reply is
+always *that connection's own* number of active subscriptions, not the channel's global
+subscriber count (`PUBSUB NUMSUB`, PUBSUB-06 below, reports the channel-level count).
+
+**Result:** ☐ Pass ☐ Fail
+
+---
+
+### PUBSUB-03 — PSUBSCRIBE delivers a matching channel as `pmessage`
+
+**Precondition:** No existing subscriptions on pattern `news.*`.
+
+**Steps:**
+```bash
+redis-cli -p 6600 psubscribe 'news.*' > /tmp/pubsub03.out 2>&1 &
+PSUBPID=$!
+sleep 0.4
+redis-cli -p 6600 publish news.sports golden-goal
+sleep 0.3
+kill $PSUBPID; wait $PSUBPID 2>/dev/null
+cat /tmp/pubsub03.out
+```
+
+**Expected:**
+```
+1
+psubscribe
+news.*
+1
+pmessage
+news.*
+news.sports
+golden-goal
+```
+
+**Notes:** A `pmessage` frame carries one extra field versus `message` — the matched pattern,
+then the concrete channel, then the payload.
+
+**Result:** ☐ Pass ☐ Fail
+
+---
+
+### PUBSUB-04 — UNSUBSCRIBE: explicit channel, a channel never subscribed to, and no-argument unsubscribe-all
+
+**Precondition:** No existing subscriptions for this connection.
+
+**Steps:**
+```bash
+printf 'subscribe ps:uns1 ps:uns2\nunsubscribe ps:uns1\nunsubscribe ps:nope\nunsubscribe\n' \
+  | timeout 2 redis-cli -p 6600
+```
+
+**Expected:**
+```
+subscribe
+ps:uns1
+1
+subscribe
+ps:uns2
+2
+unsubscribe
+ps:uns1
+1
+unsubscribe
+ps:nope
+1
+unsubscribe
+ps:uns2
+0
+```
+
+**Notes:** `unsubscribe ps:nope` — a channel this connection was never subscribed to — still
+replies once (count `1`, this connection's true remaining-subscription count at that point), it
+does not error and does not affect the connection's real subscription set. The final
+no-argument `unsubscribe` leaves every channel still held, replying once per channel it removes,
+ending at count `0`.
+
+**Result:** ☐ Pass ☐ Fail
+
+---
+
+### PUBSUB-05 — PUNSUBSCRIBE: the same shape, against patterns
+
+**Precondition:** No existing pattern subscriptions for this connection.
+
+**Steps:**
+```bash
+printf 'psubscribe ps:pat1.* ps:pat2.*\npunsubscribe ps:pat1.*\npunsubscribe\n' \
+  | timeout 2 redis-cli -p 6600
+```
+
+**Expected:**
+```
+psubscribe
+ps:pat1.*
+1
+psubscribe
+ps:pat2.*
+2
+punsubscribe
+ps:pat1.*
+1
+punsubscribe
+ps:pat2.*
+0
+```
+
+**Notes:** No-argument `PUNSUBSCRIBE` only ever removes patterns — a connection with both plain
+channel and pattern subscriptions open needs both a plain `UNSUBSCRIBE` and a plain
+`PUNSUBSCRIBE` to clear everything; neither command touches the other's set.
+
+**Result:** ☐ Pass ☐ Fail
+
+---
+
+### PUBSUB-06 — PUBSUB CHANNELS / NUMSUB / NUMPAT introspection
+
+**Precondition:** No existing subscriptions on `pubsubintro` or matching pattern
+`pubsubintro.*`.
+
+**Steps:**
+```bash
+redis-cli -p 6600 subscribe pubsubintro > /tmp/pubsub06a.out 2>&1 &
+S1=$!
+redis-cli -p 6600 subscribe pubsubintro > /tmp/pubsub06b.out 2>&1 &
+S2=$!
+redis-cli -p 6600 psubscribe 'pubsubintro.*' > /tmp/pubsub06c.out 2>&1 &
+S3=$!
+sleep 0.4
+redis-cli -p 6600 pubsub channels
+redis-cli -p 6600 pubsub channels 'pubsub*'
+redis-cli -p 6600 pubsub numsub pubsubintro nosuchchan
+redis-cli -p 6600 pubsub numpat
+kill $S1 $S2 $S3; wait $S1 $S2 $S3 2>/dev/null
+```
+
+**Expected:**
+```
+pubsubintro
+pubsubintro
+pubsubintro
+2
+nosuchchan
+0
+1
+```
+
+**Notes:** `PUBSUB CHANNELS` (no argument) lists `pubsubintro` once — a channel with 2
+subscribers is one entry, not two. `PUBSUB NUMSUB` replies as a flat `channel1 count1 channel2
+count2 ...` array, not a map — `nosuchchan` (never subscribed) legitimately reports `0` rather
+than erroring or being omitted. `PUBSUB NUMPAT` counts distinct registered *patterns*, not
+pattern subscribers.
+
+**Result:** ☐ Pass ☐ Fail
+
+---
+
+### PUBSUB-07 — RESP2 subscribe-mode command restrictions; RESP3 is unrestricted
+
+**Precondition:** No existing subscriptions for either connection below.
+
+**Steps:**
+```bash
+# RESP2 (redis-cli's default)
+printf 'subscribe ps:restrict\nget somekey\nping\nmulti\nunsubscribe\n' \
+  | timeout 2 redis-cli -p 6600
+
+# RESP3
+printf 'subscribe ps:resp3\nget somekey\nping\nunsubscribe\n' \
+  | timeout 2 redis-cli -3 -p 6600
+```
+
+**Expected (RESP2):**
+```
+subscribe
+ps:restrict
+1
+ERR only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context
+
+PONG
+ERR only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context
+
+unsubscribe
+ps:restrict
+0
+```
+
+**Expected (RESP3):**
+```
+subscribe
+ps:resp3
+1
+
+PONG
+unsubscribe
+ps:resp3
+0
+```
+
+**Notes:** On the RESP2 connection, both `GET` and `MULTI` are rejected with real Redis's own
+subscribe-mode message while at least one subscription is open; `PING` is exempted. On the RESP3
+connection the identical `GET` succeeds and returns nil — RESP3 connections skip this
+restriction entirely, because RESP3 clients get pub/sub messages out-of-band via the `Push`
+(`>`) frame type. `PUBLISH` itself is also restricted on a RESP2 connection while subscribed,
+matching real Redis.
+
+**Result:** ☐ Pass ☐ Fail
+
+---
+
+### PUBSUB-08 — MULTI/EXEC interaction: SUBSCRIBE rejected at queue time, PUBLISH queued and delivered at EXEC
+
+**Precondition:** No existing subscriptions on `ps:txchan`/`ps:txpub`.
+
+**Steps:**
+```bash
+# SUBSCRIBE inside MULTI
+printf 'multi\nsubscribe ps:txchan\nset ps:txkey v\nexec\n' | timeout 2 redis-cli -p 6600
+
+# PUBLISH inside MULTI, with a live subscriber
+redis-cli -p 6600 subscribe ps:txpub > /tmp/pubsub08.out 2>&1 &
+TP=$!
+sleep 0.4
+printf 'multi\npublish ps:txpub inside-tx\nexec\n' | timeout 2 redis-cli -p 6600
+sleep 0.3
+kill $TP; wait $TP 2>/dev/null
+cat /tmp/pubsub08.out
+```
+
+**Expected (SUBSCRIBE inside MULTI):**
+```
+OK
+ERR SUBSCRIBE is not allowed in transactions
+
+QUEUED
+EXECABORT Transaction discarded because of previous errors
+```
+
+**Expected (PUBLISH inside MULTI):**
+```
+OK
+QUEUED
+1
+subscribe
+ps:txpub
+1
+message
+ps:txpub
+inside-tx
+```
+
+**Notes:** `SUBSCRIBE` is rejected immediately at queue time and marks the transaction dirty —
+`EXEC` refuses the whole batch with `EXECABORT` (see `TXN-07` for the mirror case, queuing a
+`SUBSCRIBE`-family command inside an already-open transaction). `PUBLISH`, by contrast, queues
+normally and only actually publishes — and delivers to the live subscriber — when `EXEC` runs.
+
+**Result:** ☐ Pass ☐ Fail
+
+---
+
+### PUBSUB-09 — Cross-node delivery: a leader's PUBLISH reaches a follower's local subscriber
+
+**Precondition:** The leader from the section intro is running. Start a follower and attach it:
+```bash
+ROCKET_MEM_ADDR=127.0.0.1:6610 ROCKET_MEM_RMP_ADDR=127.0.0.1:6611 \
+ROCKET_MEM_METRICS_ADDR=127.0.0.1:9610 \
+ROCKET_MEM_AOF_PATH=$DATA/pubsub-follower.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/pubsub-follower.snap \
+  $BIN &
+echo $! > /tmp/pubsub-follower.pid
+sleep 0.5
+redis-cli -p 6610 replicaof 127.0.0.1 6600
+sleep 0.5
+redis-cli -p 6610 info replication | head -5   # master_link_status:up
+```
+
+**Steps:**
+```bash
+redis-cli -p 6610 subscribe crossnode > /tmp/pubsub09.out 2>&1 &
+FSUB=$!
+sleep 0.4
+redis-cli -p 6600 publish crossnode from-leader
+sleep 0.5
+kill $FSUB; wait $FSUB 2>/dev/null
+cat /tmp/pubsub09.out
+```
+
+**Expected:**
+```
+0
+subscribe
+crossnode
+1
+message
+crossnode
+from-leader
+```
+
+**Notes:** `PUBLISH` on the leader replies `0` — its *own* local subscriber count, genuinely zero
+here — yet the follower's subscriber still receives the message a moment later. A publishing
+node only ever reports its own local delivery count: the leader forwards the raw `PUBLISH` to the
+follower over the existing replication stream, and the follower's own registry delivers it to its
+local subscribers independently.
+
+**Result:** ☐ Pass ☐ Fail
+
+---
+
+### PUBSUB-10 — PUBLISH works directly against a read-only follower; SET still doesn't
+
+**Precondition:** PUBSUB-09's leader/follower pair still attached.
+
+**Steps:**
+```bash
+redis-cli -p 6610 subscribe followerpub > /tmp/pubsub10.out 2>&1 &
+FP=$!
+sleep 0.4
+redis-cli -p 6610 publish followerpub direct-on-follower
+redis-cli -p 6610 set shouldfail x
+sleep 0.4
+kill $FP; wait $FP 2>/dev/null
+cat /tmp/pubsub10.out
+```
+
+**Expected:**
+```
+1
+READONLY You can't write against a read only replica.
+
+subscribe
+followerpub
+1
+message
+followerpub
+direct-on-follower
+```
+
+**Notes:** `PUBLISH` issued straight at the follower succeeds and delivers locally (reply `1`) —
+it is not a keyspace mutation and carries no key, so the `READONLY` gate that correctly rejects
+`SET` on this follower never applies to it. A `PUBLISH` issued directly on a follower is not
+itself re-forwarded anywhere (no follower-to-leader or follower-to-follower fan-out) — it only
+reaches subscribers local to whichever node received the command.
+
+**Result:** ☐ Pass ☐ Fail
+
+---
+
+### PUBSUB-11 — Disconnect cleanup: PUBSUB CHANNELS/NUMSUB reflect a subscriber going away
+
+**Precondition:** No existing subscriptions on `cleantest`.
+
+**Steps:**
+```bash
+redis-cli -p 6600 subscribe cleantest > /tmp/pubsub11.out 2>&1 &
+CPID=$!
+sleep 0.4
+redis-cli -p 6600 pubsub channels
+redis-cli -p 6600 pubsub numsub cleantest
+kill $CPID; wait $CPID 2>/dev/null
+sleep 0.5
+redis-cli -p 6600 pubsub channels
+redis-cli -p 6600 pubsub numsub cleantest
+```
+
+**Expected:**
+```
+cleantest
+cleantest
+1
+cleantest
+0
+```
+
+**Notes:** Reading top to bottom: `PUBSUB CHANNELS` lists `cleantest` while the subscriber is
+connected. After it disconnects, `PUBSUB CHANNELS` prints nothing at all (an empty array renders
+as zero lines in `redis-cli`'s raw mode) and `PUBSUB NUMSUB cleantest` reports `0` — cleanup on
+disconnect is prompt, even though there's no explicit unsubscribe in this scenario at all, only
+the connection closing.
+
+**Result:** ☐ Pass ☐ Fail
+
+---
+
+### PUBSUB-12 — Arity errors for SUBSCRIBE / PUBLISH / PSUBSCRIBE
+
+**Precondition:** None.
+
+**Steps:**
+```bash
+redis-cli -p 6600 subscribe
+redis-cli -p 6600 publish onlyone
+redis-cli -p 6600 psubscribe
+```
+
+**Expected:**
+```
+ERR wrong number of arguments for 'subscribe' command
+
+ERR wrong number of arguments for 'publish' command
+
+ERR wrong number of arguments for 'psubscribe' command
+
+```
+
+**Notes:** Unlike `INCR`'s bare `increment or decrement would overflow` (no `ERR` prefix,
+CORE-51), these three all carry the correct `ERR` prefix.
+
+**Result:** ☐ Pass ☐ Fail
+
+---
+
+Teardown:
+```bash
+kill $(cat /tmp/pubsub-leader.pid) $(cat /tmp/pubsub-follower.pid) 2>/dev/null
+rm -f /tmp/pubsub-leader.pid /tmp/pubsub-follower.pid
+rm -f /tmp/pubsub0*.out /tmp/pubsub1*.out
+```
 
 ---
 
@@ -2842,6 +4420,245 @@ different owner is a topology decision nothing here can agree on; no live reshar
 forwarding — a `MOVED` reply is final, the client must reconnect itself, this server never proxies
 a request to another shard on the client's behalf; `CLUSTER SLOTS` is not implemented (deprecated
 upstream since Redis 7.0 in favor of `CLUSTER SHARDS`, which is implemented — see CLUSTER-03).
+
+**Result:** ☐ Pass ☐ Fail
+
+---
+
+### CLUSTER-07 — A killed peer is detected and reported within `cluster_node_timeout_secs`, and routing stays unchanged
+
+**Precondition:** `$DATA/prc-cluster.conf` exists (CLUSTER-01). No servers on
+7101-7103/9360-9362/6561-6563 — if CLUSTER-02 through CLUSTER-06 already ran in this session,
+CLUSTER-06's last step already killed them.
+
+**Steps:**
+```bash
+rm -f $DATA/prc-a.aof $DATA/prc-a.snap $DATA/prc-b.aof $DATA/prc-b.snap $DATA/prc-c.aof $DATA/prc-c.snap
+
+# Same as CLUSTER-02, plus a short probe interval/timeout so this case takes seconds, not
+# cluster_node_timeout_secs's 15s default.
+ROCKET_MEM_ADDR=127.0.0.1:7101 ROCKET_MEM_AOF_PATH=$DATA/prc-a.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-a.snap \
+ROCKET_MEM_CLUSTER_CONFIG=$DATA/prc-cluster.conf ROCKET_MEM_CLUSTER_NODE_ID=shard-a \
+ROCKET_MEM_METRICS_ADDR=127.0.0.1:9360 ROCKET_MEM_RMP_ADDR=127.0.0.1:6561 \
+ROCKET_MEM_CLUSTER_PROBE_INTERVAL_SECS=1 ROCKET_MEM_CLUSTER_NODE_TIMEOUT_SECS=3 \
+  $BIN &
+echo $! > /tmp/prc-cluster-a.pid
+
+ROCKET_MEM_ADDR=127.0.0.1:7102 ROCKET_MEM_AOF_PATH=$DATA/prc-b.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-b.snap \
+ROCKET_MEM_CLUSTER_CONFIG=$DATA/prc-cluster.conf ROCKET_MEM_CLUSTER_NODE_ID=shard-b \
+ROCKET_MEM_METRICS_ADDR=127.0.0.1:9361 ROCKET_MEM_RMP_ADDR=127.0.0.1:6562 \
+ROCKET_MEM_CLUSTER_PROBE_INTERVAL_SECS=1 ROCKET_MEM_CLUSTER_NODE_TIMEOUT_SECS=3 \
+  $BIN &
+echo $! > /tmp/prc-cluster-b.pid
+
+ROCKET_MEM_ADDR=127.0.0.1:7103 ROCKET_MEM_AOF_PATH=$DATA/prc-c.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-c.snap \
+ROCKET_MEM_CLUSTER_CONFIG=$DATA/prc-cluster.conf ROCKET_MEM_CLUSTER_NODE_ID=shard-c \
+ROCKET_MEM_METRICS_ADDR=127.0.0.1:9362 ROCKET_MEM_RMP_ADDR=127.0.0.1:6563 \
+ROCKET_MEM_CLUSTER_PROBE_INTERVAL_SECS=1 ROCKET_MEM_CLUSTER_NODE_TIMEOUT_SECS=3 \
+  $BIN &
+echo $! > /tmp/prc-cluster-c.pid
+sleep 1
+
+redis-cli -p 7102 cluster info | grep cluster_state   # baseline: healthy
+
+# Crash shard-a outright -- no graceful shutdown, the way a real crash looks.
+kill -9 $(cat /tmp/prc-cluster-a.pid)
+sleep 4   # one node_timeout (3s) plus one probe_interval (1s) of slack
+
+redis-cli -p 7102 cluster nodes
+redis-cli -p 7102 cluster info | grep -E 'cluster_state|cluster_slots_'
+redis-cli -p 7102 cluster shards | grep -A1 health
+curl -s localhost:9361/metrics | grep cluster_peers
+
+# Routing is unchanged even though shard-a is known dead:
+redis-cli -p 7102 get hello   # slot 866, owned by shard-a
+```
+
+**Expected:**
+```
+cluster_state:ok
+shard-a 127.0.0.1:7101@17101 master,fail? - 0 0 0 disconnected 0-5460
+shard-b 127.0.0.1:7102@17102 myself,master - 0 0 0 connected 5461-10922
+shard-c 127.0.0.1:7103@17103 master - 0 0 0 connected 10923-16383
+cluster_state:fail
+cluster_slots_assigned:16384
+cluster_slots_ok:10923
+cluster_slots_pfail:5461
+cluster_slots_fail:0
+health
+failed
+rocket_mem_cluster_peers_reachable 1
+rocket_mem_cluster_peers_unreachable 1
+MOVED 866 127.0.0.1:7101
+```
+
+**Notes:** `cluster_slots_pfail:5461` is exactly shard-a's span (slots 0-5460, 5461 slots) —
+`cluster_slots_fail` stays `0` by design: there is no cluster bus for a suspicion to be promoted
+over (see CLUSTER-06's notes on *pfail* vs *fail*). shard-b's own terminal output carries exactly
+one line for this transition, not one per probe round — a `WARN` naming `peer=shard-a
+node_timeout_secs=3`. `GET hello` still redirects to `127.0.0.1:7101` — shard-a's *configured*
+address — because picking a different owner for slots 0-5460 is a topology decision nothing here
+has a mechanism to agree on. This is the report-only behavior CLUSTER-06 already describes in
+prose; this case makes it a reproducible, exact-output test.
+
+**Result:** ☐ Pass ☐ Fail
+
+---
+
+### CLUSTER-08 — A peer that starts answering again is un-failed within one probe interval
+
+**Precondition:** CLUSTER-07 just ran; shard-a is still dead, shard-b/shard-c still up.
+
+**Steps:**
+```bash
+# Restart shard-a with the exact same env CLUSTER-07 used.
+ROCKET_MEM_ADDR=127.0.0.1:7101 ROCKET_MEM_AOF_PATH=$DATA/prc-a.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-a.snap \
+ROCKET_MEM_CLUSTER_CONFIG=$DATA/prc-cluster.conf ROCKET_MEM_CLUSTER_NODE_ID=shard-a \
+ROCKET_MEM_METRICS_ADDR=127.0.0.1:9360 ROCKET_MEM_RMP_ADDR=127.0.0.1:6561 \
+ROCKET_MEM_CLUSTER_PROBE_INTERVAL_SECS=1 ROCKET_MEM_CLUSTER_NODE_TIMEOUT_SECS=3 \
+  $BIN &
+echo $! > /tmp/prc-cluster-a.pid
+sleep 2
+
+redis-cli -p 7102 cluster nodes | head -1
+redis-cli -p 7102 cluster info | grep cluster_state
+```
+
+**Expected:**
+```
+shard-a 127.0.0.1:7101@17101 master - 0 0 0 connected 0-5460
+cluster_state:ok
+```
+
+**Notes:** Recovery needs no restart of the survivors and no operator action beyond bringing the
+node back — one successful probe is enough to mark it reachable again. This is symmetric with
+CLUSTER-07: the liveness map has no memory of a dead peer once a probe succeeds.
+
+**Result:** ☐ Pass ☐ Fail
+
+---
+
+### CLUSTER-09 — Peer-probe connections log at `debug`, not `info`
+
+**Precondition:** Same cluster as CLUSTER-07/08 (shard-a/b/c all up, `cluster_probe_interval_secs=1`).
+
+**Steps:**
+```bash
+kill $(cat /tmp/prc-cluster-a.pid) $(cat /tmp/prc-cluster-b.pid) $(cat /tmp/prc-cluster-c.pid)
+sleep 0.3
+
+# Round 1: default log level (info). Capture shard-b's output this time.
+ROCKET_MEM_ADDR=127.0.0.1:7102 ROCKET_MEM_AOF_PATH=$DATA/prc-b.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-b.snap \
+ROCKET_MEM_CLUSTER_CONFIG=$DATA/prc-cluster.conf ROCKET_MEM_CLUSTER_NODE_ID=shard-b \
+ROCKET_MEM_METRICS_ADDR=127.0.0.1:9361 ROCKET_MEM_RMP_ADDR=127.0.0.1:6562 \
+ROCKET_MEM_CLUSTER_PROBE_INTERVAL_SECS=1 ROCKET_MEM_CLUSTER_NODE_TIMEOUT_SECS=3 \
+  $BIN > $DATA/prc-b-info.log 2>&1 &
+echo $! > /tmp/prc-cluster-b.pid
+# shard-a and shard-c, unchanged from CLUSTER-07/08's commands, so shard-b has a live peer to be probed by.
+
+sleep 5
+grep -c "connection accepted" $DATA/prc-b-info.log   # count X
+
+kill $(cat /tmp/prc-cluster-b.pid)
+sleep 0.3
+
+# Round 2: same node, RUST_LOG=rocket_mem=debug this time.
+RUST_LOG=rocket_mem=debug \
+ROCKET_MEM_ADDR=127.0.0.1:7102 ROCKET_MEM_AOF_PATH=$DATA/prc-b.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-b.snap \
+ROCKET_MEM_CLUSTER_CONFIG=$DATA/prc-cluster.conf ROCKET_MEM_CLUSTER_NODE_ID=shard-b \
+ROCKET_MEM_METRICS_ADDR=127.0.0.1:9361 ROCKET_MEM_RMP_ADDR=127.0.0.1:6562 \
+ROCKET_MEM_CLUSTER_PROBE_INTERVAL_SECS=1 ROCKET_MEM_CLUSTER_NODE_TIMEOUT_SECS=3 \
+  $BIN > $DATA/prc-b-debug.log 2>&1 &
+echo $! > /tmp/prc-cluster-b.pid
+
+sleep 5
+grep -c "connection accepted" $DATA/prc-b-debug.log   # count Y
+```
+
+**Expected:** Round 1 (`info`, `$DATA/prc-b-info.log`): the `connection accepted` count over 5
+real seconds of probing (5 probe rounds from each of 2 peers) is **0** — no line at all from
+probe traffic. Round 2 (`debug`, `$DATA/prc-b-debug.log`): the count is **on the order of 10**
+(roughly one `DEBUG` pair per peer per second, two peers, five seconds).
+
+**Notes:** This is the observable, black-box effect of the fixed marker this node's own probe
+`PING`s carry (`crates/server/src/cluster_health.rs`) — the receiving side recognizes its own
+probe traffic and logs that one connection's accept/close pair at `debug` instead of `info`,
+specifically so a healthy, unchanging cluster stays quiet at the `info` default. There is no
+black-box way to inspect the marker's exact bytes without a packet capture, which is out of scope
+for this playbook — its effect on log volume, tested here, is what an operator actually needs to
+verify.
+
+**Result:** ☐ Pass ☐ Fail
+
+---
+
+### CLUSTER-10 — The peer prober is TLS-aware: it dials a TLS-only peer over TLS
+
+**Precondition:** `openssl` installed (ENV-02). No servers on 7104-7109/9363-9365/6564-6566.
+
+**Steps:**
+```bash
+mkdir -p $DATA/prc-tls
+cd $DATA/prc-tls
+# NOTE: TLS-01's plain "-subj /CN=localhost" recipe is NOT enough here -- it produces no
+# Subject Alternative Name, and rocket-mem's own TLS client (used both for probing peers and for
+# replication) requires one. Add -addext explicitly:
+openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 3650 -nodes \
+  -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+
+cat > $DATA/prc-cluster-tls.conf <<'EOF'
+shard-a localhost:7107 0     5460
+shard-b localhost:7108 5461  10922
+shard-c localhost:7109 10923 16383
+EOF
+
+for n in a:0:7104:7107:9363:6564 b:1:7105:7108:9364:6565 c:2:7106:7109:9365:6566; do
+  IFS=: read id idx addr tlsaddr metrics rmp <<< "$n"
+  ROCKET_MEM_ADDR=127.0.0.1:$addr ROCKET_MEM_TLS_RESP_ADDR=127.0.0.1:$tlsaddr \
+  ROCKET_MEM_TLS_CERT_PATH=$DATA/prc-tls/cert.pem ROCKET_MEM_TLS_KEY_PATH=$DATA/prc-tls/key.pem \
+  ROCKET_MEM_TLS_CA_PATH=$DATA/prc-tls/cert.pem \
+  ROCKET_MEM_AOF_PATH=$DATA/prc-tls-$id.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-tls-$id.snap \
+  ROCKET_MEM_CLUSTER_CONFIG=$DATA/prc-cluster-tls.conf ROCKET_MEM_CLUSTER_NODE_ID=shard-$id \
+  ROCKET_MEM_METRICS_ADDR=127.0.0.1:$metrics ROCKET_MEM_RMP_ADDR=127.0.0.1:$rmp \
+  ROCKET_MEM_CLUSTER_PROBE_INTERVAL_SECS=1 ROCKET_MEM_CLUSTER_NODE_TIMEOUT_SECS=3 \
+    $BIN &
+  echo $! > /tmp/prc-cluster-tls-$id.pid
+done
+sleep 2
+
+redis-cli --tls --cacert $DATA/prc-tls/cert.pem -p 7108 cluster nodes
+redis-cli --tls --cacert $DATA/prc-tls/cert.pem -p 7108 cluster info | grep cluster_state
+
+kill -9 $(cat /tmp/prc-cluster-tls-a.pid)
+sleep 4
+
+redis-cli --tls --cacert $DATA/prc-tls/cert.pem -p 7108 cluster nodes
+redis-cli --tls --cacert $DATA/prc-tls/cert.pem -p 7108 cluster info | grep -E 'cluster_state|cluster_slots_pfail'
+
+kill $(cat /tmp/prc-cluster-tls-b.pid) $(cat /tmp/prc-cluster-tls-c.pid)
+```
+
+**Expected:**
+```
+shard-a localhost:7107@17107 master - 0 0 0 connected 0-5460
+shard-b localhost:7108@17108 myself,master - 0 0 0 connected 5461-10922
+shard-c localhost:7109@17109 master - 0 0 0 connected 10923-16383
+cluster_state:ok
+shard-a localhost:7107@17107 master,fail? - 0 0 0 disconnected 0-5460
+shard-b localhost:7108@17108 myself,master - 0 0 0 connected 5461-10922
+shard-c localhost:7109@17109 master - 0 0 0 connected 10923-16383
+cluster_state:fail
+cluster_slots_pfail:5461
+```
+
+**Notes:** The topology file's addresses (`localhost:7107`-`7109`) are shard-a/b/c's **TLS**
+listener addresses, not their plaintext ones — this is what makes the prober dial each peer over
+TLS. Without the `-addext` Subject Alternative Name above, every probe's TLS handshake fails
+(`rustls` rejects the cert outright) and **every** peer reports `disconnected`/`cluster_state:fail`
+immediately, even though all three processes are alive and each answers a direct `redis-cli --tls
+... ping` individually — a real, reproducible gotcha: TLS-01's own cert-generation recipe
+elsewhere in this playbook is sufficient for a `redis-cli --tls` client, but not for rocket-mem's
+own peer-to-peer probing.
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -3355,12 +5172,12 @@ rm crates/rmp-client/examples/qa_scratch3.rs
 
 **Expected:**
 ```
-INFO server -> Bulk(b"# Server\r\nredis_version:rocket-mem-0.1.3\r\nrocket_mem_version:0.1.3\r\n...")
+INFO server -> Bulk(b"# Server\r\nredis_version:rocket-mem-0.1.4\r\nrocket_mem_version:0.1.4\r\n...")
 SAVE -> Simple("OK")
 SLOWLOG LEN -> Integer(0)
 ```
 (actual captured run: `SAVE -> Simple("OK")`, `SLOWLOG LEN -> Integer(0)`, `INFO server` first
-three lines were `# Server | redis_version:rocket-mem-0.1.3 | rocket_mem_version:0.1.3`)
+three lines were `# Server | redis_version:rocket-mem-0.1.4 | rocket_mem_version:0.1.4`)
 
 **Notes:** `client.call(vec![...])` builds the same `Array`-of-`Bulk` shape RESP sends and reaches
 the identical `dispatch_and_log` — `INFO`, `SAVE`, `SLOWLOG`, `CLUSTER`, `REPLICAOF` all work over
@@ -3440,8 +5257,8 @@ redis-cli -p 6570 info server | grep uptime_in_seconds
 **Expected:**
 ```
 # Server
-redis_version:rocket-mem-0.1.3
-rocket_mem_version:0.1.3
+redis_version:rocket-mem-0.1.4
+rocket_mem_version:0.1.4
 redis_mode:standalone
 os:linux
 arch_bits:64
@@ -3692,6 +5509,247 @@ documented known limit, not a bug to file.
 
 ---
 
+The cases above predate this project's structured-logging/tracing layer
+(`docs/superpowers/specs/2026-09-07-structured-logging-design.md`,
+`docs/superpowers/specs/2026-09-09-verbose-logging-design.md`). OBS-08 through OBS-14 below cover
+it — per-command debug logging, credential redaction, the startup config summary, connection
+spans, and the replica/cluster-peer Prometheus gauges.
+
+### OBS-08 — Per-command debug log line: `elapsed_us` and reply kind
+
+**Precondition:** A server started with `RUST_LOG=debug` and no ACL configured.
+
+**Steps:**
+```bash
+RUST_LOG=debug "$ROCKET_MEM_BIN" --addr 127.0.0.1:6680 --rmp-addr 127.0.0.1:6681 \
+  --metrics-addr 127.0.0.1:9380 --aof-path /tmp/rm-qa-obs8.aof --snapshot-path /tmp/rm-qa-obs8.snap &
+PID=$!
+sleep 0.5
+redis-cli -p 6680 set k1 v1
+redis-cli -p 6680 get k1
+redis-cli -p 6680 nosuchcommand
+kill $PID
+```
+
+**Expected:** one `DEBUG`-level `command dispatched` line per command, inside the `cmd{cmd=...
+key=... argc=...}` span, carrying `elapsed_us` and a quoted `reply` kind:
+```
+DEBUG ...cmd{cmd=SET key=k1 argc=2}: rocket_mem::dispatcher: command dispatched elapsed_us=58 reply="ok"
+DEBUG ...cmd{cmd=GET key=k1 argc=1}: rocket_mem::dispatcher: command dispatched elapsed_us=7 reply="ok"
+DEBUG ...cmd{cmd=NOSUCHCOMMAND key= argc=0}: rocket_mem::dispatcher: unknown command cmd=NOSUCHCOMMAND
+DEBUG ...cmd{cmd=NOSUCHCOMMAND key= argc=0}: rocket_mem::dispatcher: command dispatched elapsed_us=13 reply="error"
+```
+
+**Notes:** `reply` is `"ok"` or `"error"`, not the reply body — that stays out of the log at
+`debug`. `elapsed_us` is present on every `command dispatched` line regardless of outcome. This
+event is invisible at the production default of `info`, unlike OBS-04's Prometheus counters,
+which increment regardless of log level.
+
+**Result:** ☐ Pass ☐ Fail
+
+---
+
+### OBS-09 — Credential redaction: AUTH/HELLO/REPLICAOF passwords never appear in the log, even at `trace`
+
+**Precondition:** A server started with an ACL user configured (auth becomes mandatory the
+moment any `[[acl.users]]` entry exists — see "ACL and authentication"), and `RUST_LOG=trace`:
+```bash
+cat > /tmp/rm-qa-obs9.toml <<'EOF'
+addr = "127.0.0.1:6680"
+rmp_addr = "127.0.0.1:6681"
+metrics_addr = "127.0.0.1:9380"
+
+[[acl.users]]
+username = "tester"
+password = "secretpw123"
+enabled = true
+rules = ["allcommands", "allkeys"]
+EOF
+RUST_LOG=trace "$ROCKET_MEM_BIN" --config /tmp/rm-qa-obs9.toml \
+  --aof-path /tmp/rm-qa-obs9.aof --snapshot-path /tmp/rm-qa-obs9.snap > /tmp/rm-qa-obs9.log 2>&1 &
+PID=$!
+sleep 0.5
+```
+
+**Steps:**
+```bash
+redis-cli -p 6680 auth tester wrongpassword123
+printf 'auth tester secretpw123\nping\n' | redis-cli -p 6680
+grep -c "secretpw123\|wrongpassword123" /tmp/rm-qa-obs9.log
+kill $PID
+```
+
+**Expected:**
+```
+WRONGPASS invalid username-password pair or user is disabled.
+
+OK
+PONG
+0
+```
+
+**Notes:** The final `0` is the load-bearing line — grepping the *entire* trace-level log file
+(startup logging, connection spans, and the `trace`-level argument line included) for either
+password string finds zero matches. The `trace`-level argument-trace line for `AUTH` itself
+renders as `args=<redacted>` rather than the credential; this also covers `HELLO ... AUTH` and
+`REPLICAOF ... AUTH`, which take the same whole-argument-list redaction. Auth success/failure
+events (OBS-11) log the `user` field but never the password, at any level.
+
+**Result:** ☐ Pass ☐ Fail
+
+---
+
+### OBS-10 — `log_value_max_bytes` caps trace-level value rendering
+
+**Precondition:** Same server shape as OBS-09, but started with a small
+`ROCKET_MEM_LOG_VALUE_MAX_BYTES` and `RUST_LOG=trace`:
+```bash
+ROCKET_MEM_LOG_VALUE_MAX_BYTES=8 RUST_LOG=trace "$ROCKET_MEM_BIN" --config /tmp/rm-qa-obs9.toml \
+  --aof-path /tmp/rm-qa-obs10.aof --snapshot-path /tmp/rm-qa-obs10.snap > /tmp/rm-qa-obs10.log 2>&1 &
+PID=$!
+sleep 0.5
+printf 'auth tester secretpw123\nset longkey abcdefghijklmnopqrstuvwxyz0123456789\n' | redis-cli -p 6680
+kill $PID
+```
+
+**Steps:**
+```bash
+grep "command arguments" /tmp/rm-qa-obs10.log | grep SET
+```
+
+**Expected:**
+```
+...cmd{cmd=SET key=longkey argc=2}: rocket_mem::dispatcher: command arguments args=longkey abcdefgh…(28 more)
+```
+
+**Notes:** The cap applies **per argument independently**, in bytes of the stored value: `longkey`
+is 7 bytes, under the 8-byte cap, so it renders whole; the 36-byte value truncates to its first 8
+bytes plus a `…(28 more)` marker. `log_value_max_bytes` defaults to 128 and is only consulted at
+`trace` — raising or lowering it has no effect at `debug` or above.
+
+**Result:** ☐ Pass ☐ Fail
+
+---
+
+### OBS-11 — Auth success/failure logged by username; NOPERM denials logged by username — never the password
+
+**Precondition:** Same ACL server as OBS-09, any log level `info` or above (these events are
+`info`/`warn`, so they're visible at the production default — unlike OBS-08's per-command line).
+
+**Steps:**
+```bash
+redis-cli -p 6680 auth tester wrongpassword123     # bad password
+redis-cli -p 6680 auth tester secretpw123          # good password
+grep -E "auth (success|failure)" /tmp/rm-qa-obs9.log
+```
+
+**Expected:**
+```
+WARN ...: rocket_mem::dispatcher: auth failure user=tester
+INFO ...: rocket_mem::dispatcher: auth success user=tester
+```
+
+**Notes:** Both events carry `user`, never the password, at any level. A `NOPERM` denial (a
+permitted user running a command or touching a key their rules don't grant) logs the same way —
+`user`/`cmd`/`key`, never a secret.
+
+**Result:** ☐ Pass ☐ Fail
+
+---
+
+### OBS-12 — Startup config-summary log line, with redaction
+
+**Precondition:** Any server start with ACL configured, at the default `info` level (this line is
+`info`, no `RUST_LOG` override needed).
+
+**Steps:**
+```bash
+"$ROCKET_MEM_BIN" --config /tmp/rm-qa-obs9.toml \
+  --aof-path /tmp/rm-qa-obs12.aof --snapshot-path /tmp/rm-qa-obs12.snap 2>&1 | head -2
+```
+
+**Expected:** two `INFO` lines before any listener-bound line — a "starting" line with
+`version`/`node_id`, then a "resolved config summary" line enumerating every operationally
+relevant field by name:
+```
+INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=127.0.0.1:6680
+INFO rocket_mem: resolved config summary node_id=127.0.0.1:6680 addr=127.0.0.1:6680 rmp_addr=127.0.0.1:6681 metrics_addr=127.0.0.1:9380 aof_path=... snapshot_path=... log_filter=info log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=true acl_user_count=1 tls_enabled=false tls_replication_enabled=false
+```
+
+**Notes:** No ACL username, password, or TLS key material appears — only `acl_enabled` (bool) and
+`acl_user_count` (a count). `log_filter` reports the *resolved* filter directive (`RUST_LOG` if
+set, else the configured `log_level`) — the log line's field is named `log_filter` even though
+the config key is `log_level`.
+
+**Result:** ☐ Pass ☐ Fail
+
+---
+
+### OBS-13 — `conn` span: connection accepted/closed with `commands_served`, per-protocol listener-bound events
+
+**Precondition:** A server at the default `info` level.
+
+**Steps:**
+```bash
+"$ROCKET_MEM_BIN" --addr 127.0.0.1:6680 --rmp-addr 127.0.0.1:6681 --metrics-addr 127.0.0.1:9380 \
+  --aof-path /tmp/rm-qa-obs13.aof --snapshot-path /tmp/rm-qa-obs13.snap > /tmp/rm-qa-obs13.log 2>&1 &
+PID=$!
+sleep 0.5
+printf 'ping\nset a 1\nset b 2\n' | redis-cli -p 6680
+sleep 0.2
+grep -E "listener bound|connection accepted|connection closed" /tmp/rm-qa-obs13.log
+kill $PID
+```
+
+**Expected:**
+```
+INFO rocket_mem: listener bound protocol=metrics addr=http://127.0.0.1:9380/metrics
+INFO rocket_mem: listener bound protocol=RMP addr=127.0.0.1:6681
+INFO rocket_mem: listener bound protocol=RESP addr=127.0.0.1:6680
+INFO conn{conn_id=1 peer=127.0.0.1:NNNNN protocol=RESP tls=false node_id=127.0.0.1:6680}: rocket_mem::connection: connection accepted
+INFO conn{conn_id=1 peer=127.0.0.1:NNNNN protocol=RESP tls=false node_id=127.0.0.1:6680}: rocket_mem::connection: connection closed elapsed_us=NNN commands_served=3
+```
+
+**Notes:** `protocol` renders unquoted uppercase (`RESP`, `RMP`; `RESP+TLS`/`RMP+TLS` under TLS)
+except the metrics endpoint, which is lowercase `metrics`. `node_id` falls back to `config.addr`
+when the node has no `cluster_node_id`. Every `conn`-scoped line in a session carries the same
+`conn_id`, the correlation key across the connection's lifetime. `commands_served` counts every
+dispatched command, including ones that errored.
+
+**Result:** ☐ Pass ☐ Fail
+
+---
+
+### OBS-14 — Prometheus replica and cluster-peer gauges
+
+**Precondition:** Same server as OBS-04, its metrics endpoint reachable.
+
+**Steps:**
+```bash
+curl -s http://127.0.0.1:9380/metrics | grep -E \
+  "^rocket_mem_(good_replicas|replica_min_ack_offset|master_repl_offset|slave_repl_offset|cluster_peers_reachable|cluster_peers_unreachable) "
+```
+
+**Expected**, on a standalone node with no replicas connected:
+```
+rocket_mem_good_replicas 0
+rocket_mem_replica_min_ack_offset 0
+rocket_mem_master_repl_offset 37
+rocket_mem_slave_repl_offset 0
+```
+
+**Notes:** `rocket_mem_good_replicas`, `rocket_mem_replica_min_ack_offset`,
+`rocket_mem_master_repl_offset`, and `rocket_mem_slave_repl_offset` are reported
+**unconditionally**, even on a standalone node with zero replicas (they read `0`/`0`/non-zero
+write offset/`0` rather than being absent). `rocket_mem_cluster_peers_reachable`/
+`rocket_mem_cluster_peers_unreachable`, by contrast, are emitted **only in cluster mode with a
+peer prober running** — confirmed absent from this standalone instance's `/metrics` output by
+design, not a bug. See CLUSTER-07 for these two gauges' cluster-mode behavior.
+
+**Result:** ☐ Pass ☐ Fail
+
+---
+
 ## Cleanup: configuration, RMP, and observability
 
 ```bash
@@ -3797,20 +5855,39 @@ cat /tmp/acltls-qa/acl-server.log
 **Expected:**
 ```
 PID=2373827
-Recovered state from /tmp/acltls-qa/acl.snap and /tmp/acltls-qa/acl.aof
-Metrics on http://127.0.0.1:9310/metrics
-RMP listening on 127.0.0.1:6511
-Listening on 127.0.0.1:6510
+2026-09-12T05:36:10.429907Z  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=127.0.0.1:6510
+2026-09-12T05:36:10.429946Z  INFO rocket_mem: resolved config summary node_id=127.0.0.1:6510 addr=127.0.0.1:6510 rmp_addr=127.0.0.1:6511 metrics_addr=127.0.0.1:9310 aof_path=/tmp/acltls-qa/acl.aof snapshot_path=/tmp/acltls-qa/acl.snap log_filter=info log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=true acl_user_count=4 tls_enabled=false tls_replication_enabled=false
+2026-09-12T05:36:10.554031Z  INFO rocket_mem::aof: aof recovery replay complete commands=0 bytes=0 elapsed_us=6
+2026-09-12T05:36:10.554361Z  INFO rocket_mem: listener bound protocol=metrics addr=http://127.0.0.1:9310/metrics
+2026-09-12T05:36:10.554413Z  INFO rocket_mem: listener bound protocol=RMP addr=127.0.0.1:6511
+2026-09-12T05:36:10.554437Z  INFO rocket_mem: listener bound protocol=RESP addr=127.0.0.1:6510
+
+┌─────────────────────────────────────────────────┐
+│ rocket-mem v0.1.4                                │
+├─────────────────────────────────────────────────┤
+│ storage   recovered /tmp/acltls-qa/acl.snap + /tmp/acltls-qa/acl.aof (generation 0) │
+│ acl       4 users configured, auth required      │
+│ cluster   standalone (no cluster_config set)     │
+│ replicas  none connected yet -- REPLICAOF is a live command; INFO REPLICATION shows current state │
+│ listeners                                        │
+│           metrics  http://127.0.0.1:9310/metrics │
+│           RMP      127.0.0.1:6511                │
+│           RESP     127.0.0.1:6510                │
+└─────────────────────────────────────────────────┘
 ```
+(box width is sized to the widest line at runtime; don't match it exactly — check for the
+labeled rows. The box border is ANSI-colorized and stripped by piping to a file/non-tty.)
 
-**Notes:** The PID number will differ; that is the only line that varies by value. The three
-listener lines are printed from concurrently-started tasks, so their **order can vary between
-runs** — check that all three are present, not that they are in this sequence.
+**Notes:** The PID number, timestamps, and box width will differ. The three `listener bound`
+lines are logged from concurrently-started tasks, so their **order can vary between runs** —
+check that all three are present, not that they are in this sequence.
 
-The `Recovered state from ...` line is printed even on a completely fresh run where neither
-`acl.snap` nor `acl.aof` exists. It is not evidence that anything was loaded; do not treat its
-presence as a recovery signal. (Flagged as a maintainer-facing wording problem, not a test
-failure.)
+The `aof recovery replay complete commands=0 bytes=0 ...` event fires on every startup, including
+a totally fresh one with nothing to recover, and the banner's `storage` line always says
+`recovered ...` regardless of whether anything was actually recovered. It is not evidence that
+anything was loaded; do not treat its presence as a recovery signal. The banner's `acl` line
+(`4 users configured, auth required`) directly confirms the four-user bootstrap succeeded — a
+useful thing to check on its own.
 
 The four users define the whole ACL surface used by ACL-02 through ACL-10: `admin` is
 full-access, `app` is narrowly scoped (one command, one key pattern), `retired` is a valid but
@@ -4385,8 +6462,12 @@ ss -lnt | grep -E ':(6510|6511|9310)\b' || echo "ports free"
 
 **Expected:**
 ```
+2026-09-12T05:38:30.468491Z  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=127.0.0.1:6510
+2026-09-12T05:38:30.468538Z  INFO rocket_mem: resolved config summary node_id=127.0.0.1:6510 addr=127.0.0.1:6510 rmp_addr=127.0.0.1:6511 metrics_addr=127.0.0.1:9310 aof_path=./appendonly.aof snapshot_path=./dump.snapshot log_filter=info log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=true acl_user_count=1 tls_enabled=false tls_replication_enabled=false
 Error: Custom { kind: InvalidInput, error: "acl bootstrap: ERR syntax error at 'on'" }
 exit=1
+2026-09-12T05:38:30.479274Z  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=127.0.0.1:6510
+2026-09-12T05:38:30.479288Z  INFO rocket_mem: resolved config summary node_id=127.0.0.1:6510 addr=127.0.0.1:6510 rmp_addr=127.0.0.1:6511 metrics_addr=127.0.0.1:9310 aof_path=./appendonly.aof snapshot_path=./dump.snapshot log_filter=info log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=true acl_user_count=1 tls_enabled=false tls_replication_enabled=false
 Error: Custom { kind: InvalidInput, error: "acl bootstrap: ERR syntax error at '<password token>'" }
 exit=1
 ports free
@@ -4398,9 +6479,11 @@ First, the second error says `'<password token>'` — the literal string `secret
 echoed. A misconfigured password must not leak into stderr, journald, container logs or CI output.
 If you ever see the actual password there, that is a security defect worth filing.
 
-Second, no listener lines are printed at all: the ACL bootstrap check runs before *anything* is
-bound, so the process leaves no half-started state. (This differs from the TLS failures in TLS-08,
-which abort after the metrics and RMP listeners are already up.)
+Second, no `listener bound` event is printed at all — the two lines that do appear (`rocket-mem
+starting`, `resolved config summary`) are pure logging with no side effect; the ACL bootstrap
+check still runs before anything is bound, so the process leaves no half-started state. (This
+differs from the TLS failures in TLS-08, which abort after the metrics and RMP listeners are
+already up.)
 
 The `Error: Custom { ... }` wrapper is `std::io::Error`'s `Debug` output rather than a hand-written
 message. Noisy, but the useful part is inside it.
@@ -4496,6 +6579,40 @@ times; only the label shape is fixed. The two findings here are:
 
 ---
 
+### ACL-19 — Verify AUTH success/failure and NOPERM denials are logged by username, never the password
+
+**Precondition:** ACL-01 completed; the server is running on port 6510 with its stderr captured
+to `/tmp/acltls-qa/acl-server.log` (as ACL-01's own steps already do via `2>&1`).
+
+**Steps:**
+```bash
+redis-cli -p 6510 --user admin --pass adminpw --no-auth-warning ping
+redis-cli -p 6510 auth admin wrongpw
+redis-cli -p 6510 --user app --pass apppw --no-auth-warning set app:1 x   # app only has +get
+
+grep -E 'auth success|auth failure|permission denied' /tmp/acltls-qa/acl-server.log | tail -3
+```
+
+**Expected:** three log lines of this shape (timestamps/`conn_id`/`peer` vary):
+```
+...  INFO conn{conn_id=N peer=127.0.0.1:PORT protocol=RESP tls=false node_id=...}: rocket_mem::dispatcher: auth success user=admin
+...  WARN conn{conn_id=N peer=127.0.0.1:PORT protocol=RESP tls=false node_id=...}: rocket_mem::dispatcher: auth failure user=admin
+...  WARN conn{conn_id=N peer=127.0.0.1:PORT protocol=RESP tls=false node_id=...}: rocket_mem::dispatcher: permission denied user=app
+```
+
+**Notes:** `auth success`/`auth failure` log at `INFO`/`WARN` with a `user=` field and never the
+password; `permission denied` logs the same way on every `NOPERM`. Both are at or above the
+server's default `log_level = "info"`, so they land in stderr on any default deployment without
+extra configuration — a real operational signal (e.g. for brute-force or privilege-probing
+alerting), not a trace-only detail. Confirm the password (`wrongpw`) never appears anywhere in
+the log file — it must not, by the same redaction policy ACL-17 already tests for the slow log
+and AOF. This is net-new since the ACL section was first written; ACL-17 covers slowlog/AOF
+redaction specifically, not this stderr-log-by-username behavior.
+
+**Result:** ☐ Pass ☐ Fail
+
+---
+
 ### ACL teardown
 
 ```bash
@@ -4573,12 +6690,17 @@ ss -lnt | grep -E ':(6510|6511|6530|6531|9310)\b'
 
 **Expected:**
 ```
-Recovered state from /tmp/acltls-qa/tls.snap and /tmp/acltls-qa/tls.aof
-Metrics on http://127.0.0.1:9310/metrics
-RMP listening on 127.0.0.1:6511
-TLS listening on 127.0.0.1:6530
-RMP TLS listening on 127.0.0.1:6531
-Listening on 127.0.0.1:6510
+2026-09-12T05:37:57.874854Z  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=127.0.0.1:6510
+2026-09-12T05:37:57.874898Z  INFO rocket_mem: resolved config summary node_id=127.0.0.1:6510 addr=127.0.0.1:6510 rmp_addr=127.0.0.1:6511 metrics_addr=127.0.0.1:9310 aof_path=/tmp/acltls-qa/tls.aof snapshot_path=/tmp/acltls-qa/tls.snap log_filter=info log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=false acl_user_count=0 tls_enabled=true tls_replication_enabled=false
+2026-09-12T05:37:57.875766Z  INFO rocket_mem::aof: aof recovery replay complete commands=0 bytes=0 elapsed_us=5
+2026-09-12T05:37:57.875939Z  INFO rocket_mem: listener bound protocol=metrics addr=http://127.0.0.1:9310/metrics
+2026-09-12T05:37:57.875974Z  INFO rocket_mem: listener bound protocol=RMP addr=127.0.0.1:6511
+2026-09-12T05:37:57.876390Z  INFO rocket_mem: listener bound protocol=RESP+TLS addr=127.0.0.1:6530
+2026-09-12T05:37:57.876707Z  INFO rocket_mem: listener bound protocol=RMP+TLS addr=127.0.0.1:6531
+2026-09-12T05:37:57.876727Z  INFO rocket_mem: listener bound protocol=RESP addr=127.0.0.1:6510
+
+[boxed summary table follows, listing all five listeners: metrics / RMP / RESP+TLS / RMP+TLS / RESP]
+
 LISTEN 0      128                   127.0.0.1:9310       0.0.0.0:*
 LISTEN 0      128                   127.0.0.1:6510       0.0.0.0:*
 LISTEN 0      128                   127.0.0.1:6511       0.0.0.0:*
@@ -4592,9 +6714,11 @@ LISTEN 0      128                   127.0.0.1:6531       0.0.0.0:*
 open and unencrypted. If you need plaintext closed, you must firewall it.
 
 The four settings are available identically as TOML keys (`tls_resp_addr`, `tls_rmp_addr`,
-`tls_cert_path`, `tls_key_path`), as `ROCKET_MEM_TLS_*` env vars, or as `--tls-*` flags.
+`tls_cert_path`, `tls_key_path`), as `ROCKET_MEM_TLS_*` env vars, or as `--tls-*` flags. What used
+to be logged as "TLS listening"/"RMP TLS listening" is now `RESP+TLS`/`RMP+TLS` in both the log
+lines and the boxed summary table.
 
-Banner line order varies between runs; `ss` row order varies too. Check for presence.
+Log-line and banner-row order varies between runs; `ss` row order varies too. Check for presence.
 
 This is server-authentication TLS only. There is no mutual TLS — the server never asks the client
 for a certificate, so anyone who can reach the port can complete a handshake.
@@ -4792,33 +6916,27 @@ ROCKET_MEM_TLS_KEY_PATH=/tmp/acltls-qa/tls/cert.pem \
 "$ROCKET_MEM_BIN"; echo "exit=$?"
 ```
 
-**Expected:**
+**Expected:** (scenario A shown in full; B and C are the same shape with two more `listener bound`
+lines — `metrics` and `RMP` — appearing before their own error)
 ```
-Recovered state from ./dump.snapshot and ./appendonly.aof
-Metrics on http://127.0.0.1:9310/metrics
-RMP listening on 127.0.0.1:6511
+2026-09-12T05:38:17.924036Z  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=127.0.0.1:6510
+2026-09-12T05:38:17.924101Z  INFO rocket_mem: resolved config summary node_id=127.0.0.1:6510 addr=127.0.0.1:6510 rmp_addr=127.0.0.1:6511 metrics_addr=127.0.0.1:9310 aof_path=./appendonly.aof snapshot_path=./dump.snapshot log_filter=info log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=false acl_user_count=0 tls_enabled=true tls_replication_enabled=false
+2026-09-12T05:38:17.925083Z  INFO rocket_mem::aof: aof recovery replay complete commands=0 bytes=0 elapsed_us=7
 Error: Custom { kind: InvalidInput, error: "tls_resp_addr is set but tls_cert_path/tls_key_path is not -- TLS requires both" }
 exit=1
-Recovered state from ./dump.snapshot and ./appendonly.aof
-Metrics on http://127.0.0.1:9310/metrics
-RMP listening on 127.0.0.1:6511
-Error: Os { code: 2, kind: NotFound, message: "No such file or directory" }
-exit=1
-Recovered state from ./dump.snapshot and ./appendonly.aof
-Metrics on http://127.0.0.1:9310/metrics
-RMP listening on 127.0.0.1:6511
-Error: Custom { kind: InvalidData, error: "no certificate found in cert file" }
-exit=1
 ```
+Scenario B ends with `Error: Os { code: 2, kind: NotFound, message: "No such file or directory" }` /
+`exit=1`; scenario C ends with `Error: Custom { kind: InvalidData, error: "no certificate found in
+cert file" }` / `exit=1` — both unchanged, reconfirmed live.
 
 **Notes:** The behavior under test is that all three exit 1. A TLS misconfiguration must never
 result in a server that comes up happily with its TLS listener silently missing — that would look
 healthy while serving nothing but plaintext.
 
-All three abort **after** the metrics and plaintext RMP listeners are already bound and printed,
-so the error scrolls past two success lines. The plaintext `Listening on 127.0.0.1:6510` line
-never appears, which is the reliable signal that startup did not complete. (Contrast ACL-16, where
-the failure happens before anything binds.)
+All three abort **after** the metrics and plaintext RMP listeners are already bound, so the error
+scrolls past the startup/config-summary lines and two `listener bound` events. The `listener
+bound protocol=RESP addr=127.0.0.1:6510` line never appears, which is the reliable signal that
+startup did not complete. (Contrast ACL-16, where the failure happens before anything binds.)
 
 Case B's error does not say **which** path was missing. If you hit `NotFound`, check both
 `tls_cert_path` and `tls_key_path`.
@@ -4865,18 +6983,13 @@ timeout 2 "$ROCKET_MEM_BIN" \
   --config /tmp/acltls-qa/cfgdir/tls-relative.toml; echo "exit=$?"
 ```
 
-**Expected:**
+**Expected:** (structured logging replaces the old plain lines — see TLS-02; substance below is
+unchanged and reconfirmed live)
 ```
-Recovered state from /tmp/acltls-qa/tls.snap and /tmp/acltls-qa/tls.aof
-Metrics on http://127.0.0.1:9310/metrics
-RMP listening on 127.0.0.1:6511
+... startup/config-summary logging, then:
 Error: Os { code: 2, kind: NotFound, message: "No such file or directory" }
 exit=1
-Recovered state from /tmp/acltls-qa/tls.snap and /tmp/acltls-qa/tls.aof
-Metrics on http://127.0.0.1:9310/metrics
-RMP listening on 127.0.0.1:6511
-TLS listening on 127.0.0.1:6530
-Listening on 127.0.0.1:6510
+... startup/config-summary logging, then five `listener bound` events (metrics/RMP/RESP+TLS/RMP+TLS/RESP):
 exit=124
 ```
 
@@ -4886,7 +6999,8 @@ cleanly from another, with no diagnostic naming the path it actually tried. `tls
 directory the config file lives in — which is the intuition most people bring.
 
 `exit=124` on the second run is `timeout` killing a healthy server after 2 seconds. That is the
-pass condition; the five banner lines ending in `Listening on 127.0.0.1:6510` are what matters.
+pass condition; the `listener bound protocol=RESP addr=127.0.0.1:6510` line (last of five) is
+what matters.
 
 Recommendation to pass on: always use absolute paths for `tls_cert_path`/`tls_key_path` unless you
 control the working directory the process is launched from (a systemd unit's `WorkingDirectory`,
@@ -4933,14 +7047,10 @@ redis-cli --tls --cacert /tmp/acltls-qa/tls/cert.pem -p 6530 \
   --user admin --pass adminpw --no-auth-warning ping
 ```
 
-**Expected:**
+**Expected:** (structured logging replaces the old plain lines — see TLS-02 for the full shape;
+substance below is unchanged and reconfirmed live)
 ```
-Recovered state from /tmp/acltls-qa/acltls.snap and /tmp/acltls-qa/acltls.aof
-Metrics on http://127.0.0.1:9310/metrics
-RMP listening on 127.0.0.1:6511
-TLS listening on 127.0.0.1:6530
-RMP TLS listening on 127.0.0.1:6531
-Listening on 127.0.0.1:6510
+... startup/config-summary logging, then five `listener bound` events (metrics/RMP/RESP+TLS/RMP+TLS/RESP)
 NOAUTH Authentication required.
 
 PONG
@@ -4950,6 +7060,38 @@ PONG
 no identity, so a TLS client starts out just as unauthenticated as a plaintext one. Completing the
 handshake is not authentication — there is no mutual TLS and no certificate-derived identity
 anywhere in this build.
+
+**Result:** ☐ Pass ☐ Fail
+
+---
+
+### TLS-11 — Verify the plaintext-announce-address warning when a TLS-serving follower has no `replica_announce_addr`
+
+**Precondition:** TLS-01 completed. Ports free.
+
+**Steps:**
+```bash
+cd /tmp/acltls-qa
+ROCKET_MEM_ADDR=127.0.0.1:6510 ROCKET_MEM_RMP_ADDR=127.0.0.1:6511 \
+ROCKET_MEM_METRICS_ADDR=127.0.0.1:9310 \
+ROCKET_MEM_TLS_RESP_ADDR=127.0.0.1:6530 \
+ROCKET_MEM_TLS_CERT_PATH=/tmp/acltls-qa/tls/cert.pem \
+ROCKET_MEM_TLS_KEY_PATH=/tmp/acltls-qa/tls/key.pem \
+ROCKET_MEM_REPLICAOF=127.0.0.1:1 \
+timeout 2 "$ROCKET_MEM_BIN" 2>&1 | grep -i "plaintext"
+```
+
+**Expected:** one `WARN` line naming the plaintext address:
+```
+...  WARN rocket_mem: replica_announce_addr is unset while a TLS listener is configured -- this node advertises its plaintext address to its leader announced=127.0.0.1:6510
+```
+
+**Notes:** This fires once, at startup, purely from config shape — it does not need a reachable
+leader (`should_warn_plaintext_announce` in `config.rs` is checked before the replication client
+starts, so it logs even though `127.0.0.1:1` refuses the connection). It requires all three of:
+`replicaof` set, at least one of `tls_resp_addr`/`tls_rmp_addr` set, and `replica_announce_addr`
+unset. See REPL-10 for `replica_announce_addr` itself changing what a leader reports about a
+follower.
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -5007,6 +7149,8 @@ Read this before filing anything.
 | Cluster forwarding | No request forwarding. A `-MOVED` reply requires the *client* to reconnect and retry. This server never proxies requests to another shard. | Design choice for simplicity: clients handle redirection, not the server. Standard cluster-aware clients expect and handle this. |
 | `CLUSTER SLOTS` | Not implemented. Deprecated since Redis 7.0 in favor of `CLUSTER SHARDS`. | Intentional: `CLUSTER SHARDS` (implemented) is the modern equivalent. |
 | `/metrics` authentication | Endpoint is unauthenticated. No ACL check on HTTP requests to the metrics port. | Intentional design: loopback-only default and firewall are the security model. Metrics server is separate from command server. |
+| Pub/sub in cluster mode | `PUBLISH` only reaches subscribers connected to the same node that received the command. No cross-shard fan-out — a subscriber on one shard never sees a message published against a different shard, even for the same channel name. `SPUBLISH`/`SSUBSCRIBE` (real Redis's sharded-pub/sub commands) don't exist either. | Design choice, not a bug: cluster mode has fixed hash-slot ownership with no cluster bus/gossip for nodes to fan messages out over. Documented in `docs/superpowers/specs/2026-09-11-pubsub-spec.md`'s "Out of scope" section. |
+| `MULTI`/`EXEC` isolation | A transaction's writes are atomic with respect to other **writers** only — `EXEC` holds the same shard-lock guard ordinary single-command writes already share, just widened to the whole batch, so a concurrent write to an overlapping shard blocks until `EXEC` finishes. A concurrent **read** is not blocked and "could observe the transaction's intermediate state partway through the batch." `WATCH`/`UNWATCH` (optimistic locking) are not implemented. | Deliberate, documented tradeoff — see `docs/superpowers/specs/2026-09-10-multi-exec-transactions-spec.md`, "Decision: writers-only isolation." True read isolation would require reworking `engine.rs`'s `with_mut`/`with_ref` to accept a pre-acquired shard guard (`parking_lot::RwLock` isn't reentrant) — deferred pending real-workload evidence it's needed. |
 
 ### Commands not implemented
 
@@ -5028,13 +7172,7 @@ These real-Redis commands have no counterpart in this project. They are delibera
 - `EVAL`, `EVALSHA` — script execution
 - `SCRIPT LOAD` / `SCRIPT EXISTS` / `SCRIPT FLUSH` — script management
 
-**Pub/sub:**
-- `SUBSCRIBE`, `UNSUBSCRIBE` — subscribe to channels
-- `PUBLISH` — publish to channel
-- `PSUBSCRIBE` / `PUNSUBSCRIBE` — pattern subscriptions
-
 **Transactions:**
-- `MULTI`, `EXEC`, `DISCARD` — transaction blocks
 - `WATCH` / `UNWATCH` — optimistic locking
 
 **Streams:**
@@ -5051,7 +7189,10 @@ These real-Redis commands have no counterpart in this project. They are delibera
 - `FLUSHALL` — clear all databases
 - `ACL HELP` / `ACL CAT` — ACL introspection
 
-**Future backlog note:** Lua scripting, pub/sub, transactions, and streams are explicitly tracked in `docs/rocket-mem-sprint-plan.md` as Phase 5 / follow-on backlog work, not current-sprint out-of-scope.
+**Future backlog note:** Lua scripting and streams are explicitly tracked in
+`docs/rocket-mem-sprint-plan.md` as Phase 5 / follow-on backlog work, not current-sprint
+out-of-scope. (Pub/sub and transactions — `MULTI`/`EXEC`/`DISCARD` — shipped, per the `PUBSUB`
+and `TXN` sections above; `WATCH`/`UNWATCH` remain backlog.)
 
 ### Genuine open gaps — already known
 
