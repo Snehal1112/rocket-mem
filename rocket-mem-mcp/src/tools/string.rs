@@ -273,7 +273,9 @@ impl RocketMemMcpServer {
         description = "Overwrite part of a string starting at a byte offset, zero-padding \
         first if the offset extends past the current length. An empty value is a documented \
         no-op: it will not create a missing key and will not modify an existing one. Returns \
-        the string's length after the write."
+        the string's length after the write. WARNING: Unlike real Redis (which caps string size \
+        at 512MB), rocket-mem does not enforce a size limit — a very large offset drives an \
+        uncapped, proportional server-side memory allocation that could exhaust memory."
     )]
     async fn set_range(
         &self,

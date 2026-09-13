@@ -146,9 +146,9 @@ impl RocketMemMcpServer {
     #[tool(
         description = "Iterate the keyspace one shard at a time. Pass cursor 0 to start; \
         keep calling with the returned cursor until it comes back 0, which means the scan is \
-        complete. rocket-mem's SCAN accepts but ignores a COUNT option in real Redis (its \
-        cursor already advances a whole shard per call), so this tool does not expose one — it \
-        would do nothing."
+        complete. rocket-mem accepts but silently ignores the COUNT option real Redis defines \
+        (its cursor already advances a whole shard per call, so a page-size hint has nothing to \
+        act on) — this tool does not expose a count parameter, since it would do nothing."
     )]
     async fn scan(
         &self,
