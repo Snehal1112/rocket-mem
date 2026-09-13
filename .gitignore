@@ -56,3 +56,7 @@ certs/
 # Exception: checked-in test fixtures, same precedent as crates/server/tests/fixtures/
 # (test-only self-signed cert/key, not real TLS material).
 !rocket-mem-mcp/tests/fixtures/*.pem
+
+# scripts/cluster.sh and scripts/standalone.sh: pidfiles, logs, and standalone's own
+# AOF/snapshot files.
+run/
