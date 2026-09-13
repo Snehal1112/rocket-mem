@@ -9,7 +9,9 @@ async fn set_then_get_round_trips_through_the_mcp_tools() {
     let dir = tempfile::tempdir().unwrap();
     let aof_path = dir.path().join("get-set-tool-test.aof");
     let (_guard, addr) = support::spawn_rocket_mem(&aof_path);
-    let pool = Pool::connect(&addr).await.expect("pool should connect");
+    let pool = Pool::connect(&addr, None, None, None)
+        .await
+        .expect("pool should connect");
     let client = support::connect_client_and_server(pool).await;
 
     client
@@ -34,7 +36,9 @@ async fn get_on_a_missing_key_is_not_an_error() {
     let dir = tempfile::tempdir().unwrap();
     let aof_path = dir.path().join("get-missing-key-test.aof");
     let (_guard, addr) = support::spawn_rocket_mem(&aof_path);
-    let pool = Pool::connect(&addr).await.expect("pool should connect");
+    let pool = Pool::connect(&addr, None, None, None)
+        .await
+        .expect("pool should connect");
     let client = support::connect_client_and_server(pool).await;
 
     let get_result = client
@@ -58,7 +62,9 @@ async fn get_on_a_wrongtype_key_surfaces_the_real_error() {
     let dir = tempfile::tempdir().unwrap();
     let aof_path = dir.path().join("get-wrongtype-test.aof");
     let (_guard, addr) = support::spawn_rocket_mem(&aof_path);
-    let pool = Pool::connect(&addr).await.expect("pool should connect");
+    let pool = Pool::connect(&addr, None, None, None)
+        .await
+        .expect("pool should connect");
 
     // Seed a list key directly, bypassing the tool layer — `get` has no way to create one.
     let mut raw_conn = pool.connection();
@@ -92,7 +98,9 @@ async fn get_on_a_key_whose_value_is_literally_nil_reports_found_true() {
     let dir = tempfile::tempdir().unwrap();
     let aof_path = dir.path().join("get-literal-nil-test.aof");
     let (_guard, addr) = support::spawn_rocket_mem(&aof_path);
-    let pool = Pool::connect(&addr).await.expect("pool should connect");
+    let pool = Pool::connect(&addr, None, None, None)
+        .await
+        .expect("pool should connect");
     let client = support::connect_client_and_server(pool).await;
 
     client

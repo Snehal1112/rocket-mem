@@ -16,7 +16,9 @@ async fn get_after_the_target_process_dies_is_a_protocol_level_error() {
     let dir = tempfile::tempdir().unwrap();
     let aof_path = dir.path().join("errors-test.aof");
     let (mut guard, addr) = support::spawn_rocket_mem(&aof_path);
-    let pool = Pool::connect(&addr).await.expect("pool should connect");
+    let pool = Pool::connect(&addr, None, None, None)
+        .await
+        .expect("pool should connect");
     let client = support::connect_client_and_server(pool).await;
 
     // Confirm the tool genuinely works first, so a failure below is attributable to killing
