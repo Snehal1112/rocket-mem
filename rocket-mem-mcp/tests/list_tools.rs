@@ -207,3 +207,192 @@ async fn rpush_on_a_wrongtype_key_surfaces_the_real_error() {
 
     guard.kill();
 }
+
+#[tokio::test]
+async fn lset_updates_an_element_and_distinguishes_missing_key_from_bad_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut guard, addr) = support::spawn_rocket_mem(&dir.path().join("lset.aof"));
+    let pool = Pool::connect(&addr, None, None, None).await.unwrap();
+    let client = support::connect_client_and_server(pool.clone()).await;
+
+    client
+        .peer()
+        .call_tool(CallToolRequestParams::new("rpush").with_arguments(object!({
+            "key": "l", "values": ["a", "b", "c"]
+        })))
+        .await
+        .unwrap();
+
+    let ok_result = client
+        .peer()
+        .call_tool(CallToolRequestParams::new("lset").with_arguments(object!({
+            "key": "l", "index": 1, "value": "z"
+        })))
+        .await
+        .unwrap();
+    assert_ne!(ok_result.is_error, Some(true));
+    let mut conn = pool.connection();
+    let updated: String = redis::cmd("LINDEX")
+        .arg("l")
+        .arg(1)
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(updated, "z");
+
+    let bad_index_result = client
+        .peer()
+        .call_tool(CallToolRequestParams::new("lset").with_arguments(object!({
+            "key": "l", "index": 99, "value": "z"
+        })))
+        .await
+        .unwrap();
+    assert_eq!(bad_index_result.is_error, Some(true));
+    let bad_index_text = format!("{:?}", bad_index_result.content);
+
+    let missing_key_result = client
+        .peer()
+        .call_tool(CallToolRequestParams::new("lset").with_arguments(object!({
+            "key": "does-not-exist", "index": 0, "value": "z"
+        })))
+        .await
+        .unwrap();
+    assert_eq!(missing_key_result.is_error, Some(true));
+    let missing_key_text = format!("{:?}", missing_key_result.content);
+
+    // The two error messages must be genuinely distinct, not the same generic text.
+    assert_ne!(bad_index_text, missing_key_text);
+
+    guard.kill();
+}
+
+#[tokio::test]
+async fn ltrim_keeps_only_the_requested_range_and_is_a_noop_on_a_missing_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut guard, addr) = support::spawn_rocket_mem(&dir.path().join("ltrim.aof"));
+    let pool = Pool::connect(&addr, None, None, None).await.unwrap();
+    let client = support::connect_client_and_server(pool.clone()).await;
+
+    client
+        .peer()
+        .call_tool(CallToolRequestParams::new("rpush").with_arguments(object!({
+            "key": "l", "values": ["a", "b", "c", "d"]
+        })))
+        .await
+        .unwrap();
+    let trim_result = client
+        .peer()
+        .call_tool(CallToolRequestParams::new("ltrim").with_arguments(object!({
+            "key": "l", "start": 1, "stop": 2
+        })))
+        .await
+        .unwrap();
+    assert_ne!(trim_result.is_error, Some(true));
+    let mut conn = pool.connection();
+    let remaining: Vec<String> = redis::cmd("LRANGE")
+        .arg("l")
+        .arg(0)
+        .arg(-1)
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(remaining, vec!["b".to_string(), "c".to_string()]);
+
+    let noop_result = client
+        .peer()
+        .call_tool(CallToolRequestParams::new("ltrim").with_arguments(object!({
+            "key": "never-existed", "start": 0, "stop": -1
+        })))
+        .await
+        .unwrap();
+    assert_ne!(noop_result.is_error, Some(true));
+    let exists: i64 = redis::cmd("EXISTS")
+        .arg("never-existed")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(exists, 0);
+
+    guard.kill();
+}
+
+#[tokio::test]
+async fn lrem_removes_by_count_direction() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut guard, addr) = support::spawn_rocket_mem(&dir.path().join("lrem.aof"));
+    let pool = Pool::connect(&addr, None, None, None).await.unwrap();
+    let client = support::connect_client_and_server(pool).await;
+
+    client
+        .peer()
+        .call_tool(CallToolRequestParams::new("rpush").with_arguments(object!({
+            "key": "l", "values": ["a", "x", "b", "x", "c"]
+        })))
+        .await
+        .unwrap();
+
+    let result = client
+        .peer()
+        .call_tool(CallToolRequestParams::new("lrem").with_arguments(object!({
+            "key": "l", "count": 0, "value": "x"
+        })))
+        .await
+        .unwrap();
+    assert_eq!(result.structured_content.unwrap()["removed"], 2);
+
+    guard.kill();
+}
+
+#[tokio::test]
+async fn linsert_inserts_relative_to_a_pivot_and_reports_sentinels() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut guard, addr) = support::spawn_rocket_mem(&dir.path().join("linsert.aof"));
+    let pool = Pool::connect(&addr, None, None, None).await.unwrap();
+    let client = support::connect_client_and_server(pool).await;
+
+    client
+        .peer()
+        .call_tool(CallToolRequestParams::new("rpush").with_arguments(object!({
+            "key": "l", "values": ["a", "c"]
+        })))
+        .await
+        .unwrap();
+
+    let insert_result = client
+        .peer()
+        .call_tool(
+            CallToolRequestParams::new("linsert").with_arguments(object!({
+                "key": "l", "before": true, "pivot": "c", "value": "b"
+            })),
+        )
+        .await
+        .unwrap();
+    assert_eq!(insert_result.structured_content.unwrap()["length"], 3);
+
+    let missing_pivot_result = client
+        .peer()
+        .call_tool(
+            CallToolRequestParams::new("linsert").with_arguments(object!({
+                "key": "l", "before": true, "pivot": "not-there", "value": "z"
+            })),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        missing_pivot_result.structured_content.unwrap()["length"],
+        -1
+    );
+
+    let missing_key_result = client
+        .peer()
+        .call_tool(
+            CallToolRequestParams::new("linsert").with_arguments(object!({
+                "key": "does-not-exist", "before": true, "pivot": "p", "value": "z"
+            })),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing_key_result.structured_content.unwrap()["length"], 0);
+
+    guard.kill();
+}

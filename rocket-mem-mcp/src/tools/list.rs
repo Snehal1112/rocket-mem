@@ -38,6 +38,32 @@ pub struct LIndexParams {
     index: i64,
 }
 
+#[derive(Deserialize, JsonSchema)]
+pub struct LSetParams {
+    key: String,
+    /// Negative indices count from the end (-1 is the last element).
+    index: i64,
+    value: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct LRemParams {
+    key: String,
+    /// A positive count removes up to that many matches starting from the head; negative
+    /// removes up to -count matches starting from the tail; 0 removes every match.
+    count: i64,
+    value: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct LInsertParams {
+    key: String,
+    /// true inserts before the pivot element, false inserts after it.
+    before: bool,
+    pivot: String,
+    value: String,
+}
+
 #[tool_router(router = list_router, vis = "pub")]
 impl RocketMemMcpServer {
     #[tool(
@@ -208,6 +234,118 @@ impl RocketMemMcpServer {
                     value.clone().unwrap_or_else(|| "(nil)".to_string()),
                 )]);
                 r.structured_content = Some(json!({ "found": value.is_some(), "value": value }));
+                Ok(r)
+            }
+            Err(err) => redis_error_to_tool_result(err),
+        }
+    }
+
+    #[tool(
+        description = "Set the value at an index in a list, replacing what's there. \
+        Negative indices count from the end (-1 is the last element). Errors NoSuchKey if the \
+        key doesn't exist at all, or IndexOutOfRange if the key exists but the index is out of \
+        bounds — these are two distinct tool-level errors, not one generic failure."
+    )]
+    async fn lset(
+        &self,
+        Parameters(LSetParams { key, index, value }): Parameters<LSetParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let mut conn = self.pool().connection();
+        let result: Result<(), redis::RedisError> = redis::cmd("LSET")
+            .arg(&key)
+            .arg(index)
+            .arg(&value)
+            .query_async(&mut conn)
+            .await;
+        match result {
+            Ok(()) => Ok(CallToolResult::success(vec![ContentBlock::text(
+                "OK".to_string(),
+            )])),
+            Err(err) => redis_error_to_tool_result(err),
+        }
+    }
+
+    #[tool(
+        description = "Trim a list so only the given index range remains, discarding \
+        everything else. Negative indices count from the end (-1 is the last element). A \
+        missing key is a silent no-op, not an error. Trimming to an empty range deletes the \
+        key entirely."
+    )]
+    async fn ltrim(
+        &self,
+        Parameters(ListRangeParams { key, start, stop }): Parameters<ListRangeParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let mut conn = self.pool().connection();
+        let result: Result<(), redis::RedisError> = redis::cmd("LTRIM")
+            .arg(&key)
+            .arg(start)
+            .arg(stop)
+            .query_async(&mut conn)
+            .await;
+        match result {
+            Ok(()) => Ok(CallToolResult::success(vec![ContentBlock::text(
+                "OK".to_string(),
+            )])),
+            Err(err) => redis_error_to_tool_result(err),
+        }
+    }
+
+    #[tool(
+        description = "Remove occurrences of a value from a list. A positive count removes \
+        up to that many matches starting from the head; a negative count removes up to its \
+        absolute value starting from the tail; 0 removes every match. Returns the count \
+        actually removed. A missing key returns 0, not an error."
+    )]
+    async fn lrem(
+        &self,
+        Parameters(LRemParams { key, count, value }): Parameters<LRemParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let mut conn = self.pool().connection();
+        let result: Result<i64, redis::RedisError> = redis::cmd("LREM")
+            .arg(&key)
+            .arg(count)
+            .arg(&value)
+            .query_async(&mut conn)
+            .await;
+        match result {
+            Ok(removed) => {
+                let mut r = CallToolResult::success(vec![ContentBlock::text(removed.to_string())]);
+                r.structured_content = Some(json!({ "removed": removed }));
+                Ok(r)
+            }
+            Err(err) => redis_error_to_tool_result(err),
+        }
+    }
+
+    #[tool(
+        description = "Insert a value immediately before or after the first occurrence of \
+        a pivot value in a list. Returns the list's new length on success, -1 if the pivot \
+        value isn't found anywhere in the list, or 0 if the key doesn't exist at all — a \
+        length of exactly 0 can only mean the key is missing, since a pivot can never be found \
+        in an empty list."
+    )]
+    async fn linsert(
+        &self,
+        Parameters(LInsertParams {
+            key,
+            before,
+            pivot,
+            value,
+        }): Parameters<LInsertParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let mut conn = self.pool().connection();
+        let keyword = if before { "BEFORE" } else { "AFTER" };
+        let result: Result<i64, redis::RedisError> = redis::cmd("LINSERT")
+            .arg(&key)
+            .arg(keyword)
+            .arg(&pivot)
+            .arg(&value)
+            .query_async(&mut conn)
+            .await;
+        match result {
+            Ok(len) => {
+                let mut r = CallToolResult::success(vec![ContentBlock::text(len.to_string())]);
+                r.structured_content = Some(json!({ "length": len }));
                 Ok(r)
             }
             Err(err) => redis_error_to_tool_result(err),
