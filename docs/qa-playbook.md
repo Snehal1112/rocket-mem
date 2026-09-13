@@ -515,6 +515,7 @@ ROCKET_MEM_ADDR=numericlabs.lxd:6379 ROCKET_MEM_RMP_ADDR=numericlabs.lxd:7379 RO
 │           RMP      192.168.1.12:7379                                                              │
 │           RESP     192.168.1.12:6379                                                              │
 └───────────────────────────────────────────────────────────────────────────────────────────────────┘
+
 ```
 
 **Notes:** No `--config` and no `rocket-mem.toml` in the working directory is not an error — this
@@ -797,9 +798,10 @@ format when stdout isn't a TTY — no `1)`/`(integer)` prefixes, one value per l
 blank line for a nil reply — which is what you see below.
 
 Source of truth for the implemented command set: `docs/command-compatibility.md` and
-`crates/server/src/dispatcher.rs`'s `KNOWN_COMMANDS` array. `DBSIZE`, `FLUSHALL`,
+`crates/server/src/dispatcher.rs`'s `KNOWN_COMMANDS` array. `FLUSHALL`,
 `LPOS`, `COPY`, `SETEX`, and `DECRBY` are confirmed absent from that array and are not
-exercised as if they existed (CORE-39 confirms the resulting error for one of them).
+exercised as if they existed (CORE-39 confirms the resulting error for one of them). `DBSIZE`
+used to be in this list too but is now implemented — see CORE-39's notes.
 
 ## Core data types and keys
 
@@ -887,7 +889,6 @@ redis-cli -h numericlabs.lxd -p 6379 get core:bothnxxx3
 OK
 99
 99991
-OK
 OK
 
 initial
@@ -986,6 +987,7 @@ redis-cli -h numericlabs.lxd -p 6379 incr core:nonnum
 10
 OK
 value is not an integer or out of range
+
 ```
 
 **Notes:** The error text has no `ERR` prefix — real Redis's is `ERR value is not an
@@ -994,7 +996,11 @@ integer or out of range`. This engine's error frame is the bare message
 probe). This is a real, undocumented divergence — a client that pattern-matches on
 `ERR value is not an integer` will not match here. `WRONGTYPE` errors, by contrast, do
 carry a literal prefix (see CORE-40) — the missing-prefix issue is specific to this
-kind of value-validation error, not error frames in general.
+kind of value-validation error, not error frames in general. Also confirmed via raw
+byte capture: `redis-cli`'s non-interactive mode ends an error reply with a blank
+line (`...range\n\n` on the wire), the same trailing-blank-line behavior as a nil/empty
+bulk reply, not just a normal value reply's single `\n` — matters when an error is a
+case's last line, as it is here.
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -1248,6 +1254,7 @@ Y2
 b
 c
 index out of range
+
 ```
 
 **Notes:** The error text has no `ERR` prefix, matching the pattern noted in CORE-06/CORE-32. A
@@ -1425,6 +1432,10 @@ e
 b
 ```
 
+**Notes:** `SINTER`/`SUNION` results come back in shard/`HashSet` order, unspecified like
+`SMEMBERS` (see CORE-20) — only the set of members matters, not the order shown above.
+`SDIFF`'s single member has no order to vary.
+
 **Result:** ☐ Pass ☐ Fail
 
 ### CORE-22 — SINTERSTORE/SUNIONSTORE/SDIFFSTORE
@@ -1455,6 +1466,9 @@ e
 b
 ```
 
+**Notes:** Member order within each `SMEMBERS` result is unspecified (hash-set order, same
+caveat as CORE-20) — only the set of members matters, not the order shown above.
+
 **Result:** ☐ Pass ☐ Fail
 
 ### CORE-23 — SPOP/SRANDMEMBER, and their count argument is silently ignored
@@ -1475,13 +1489,15 @@ redis-cli -h numericlabs.lxd -p 6379 scard core:s4
 ```
 0
 5
-a
+<any-member>
 4
-c
+<any-member>
 4
 ```
 
-**Notes:** `SRANDMEMBER` (no count) does not remove the member — `scard` stays `4`.
+**Notes:** `SRANDMEMBER` (no count) does not remove the member — `scard` stays `4`. `SPOP`/
+`SRANDMEMBER`'s own returned member is genuinely random (wildcarded above as `<any-member>`) —
+only assert it's one of `a`/`b`/`c`/`d`/`e`, not a specific one.
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -1502,15 +1518,16 @@ redis-cli -h numericlabs.lxd -p 6379 srandmember core:spopcount 2
 ```
 0
 5
-a
+<any-member>
 4
-b
+<any-member>
 ```
 
 **Notes:** Same gap as CORE-19: the `count` argument is accepted but ignored. `SPOP
 key 2` pops exactly one member (`scard` drops by only 1, from 5 to 4), and
 `SRANDMEMBER key 2` returns exactly one member, not two. Neither errors, so this is
-easy to miss in an integration test that only checks the call succeeds.
+easy to miss in an integration test that only checks the call succeeds. Which member is
+popped/returned is genuinely random (wildcarded above as `<any-member>`, same as CORE-23).
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -1556,58 +1573,12 @@ redis-cli -h numericlabs.lxd -p 6379 zscore core:zz a
 
 **Result:** ☐ Pass ☐ Fail
 
-### CORE-26 — ZRANGE, ZRANGE WITHSCORES, ZRANK
-
-**Precondition:** `core:zbug` has `a` (score 1) and `b` (score 2) — see CORE-28 for
-how it gets there.
-
-**Steps:**
-```bash
-redis-cli -h numericlabs.lxd -p 6379 zrange core:zbug 0 -1
-redis-cli -h numericlabs.lxd -p 6379 zrange core:zbug 0 -1 WITHSCORES
-redis-cli -h numericlabs.lxd -p 6379 zrank core:zbug b
-redis-cli -h numericlabs.lxd -p 6379 zrank core:zbug nosuch
-```
-
-**Expected:**
-```
-a
-b
-a
-1
-b
-2
-1
-
-```
-
-**Notes:** `ZRANK` on a member that isn't in the set returns nil (blank line), not an
-error.
-
-**Result:** ☐ Pass ☐ Fail
-
-### CORE-27 — ZREM
-
-**Precondition:** `core:z1` has members `a` (score 6) and `b` (score 2) — built via
-repeated single-pair `ZADD` calls.
-
-**Steps:**
-```bash
-redis-cli -h numericlabs.lxd -p 6379 zrem core:z1 b
-redis-cli -h numericlabs.lxd -p 6379 zrange core:z1 0 -1
-```
-
-**Expected:**
-```
-1
-a
-```
-
-**Result:** ☐ Pass ☐ Fail
-
 ### CORE-28 — ZADD is NOT variadic: extra score/member pairs are silently dropped
 
-**Precondition:** `core:zbug` does not exist.
+**Precondition:** `core:zbug` does not exist. Placed here, ahead of CORE-26/CORE-27 in
+reading order, because its own steps are what create `core:zbug` — CORE-26 consumes that
+state, so it must run after this case, not before it (case IDs are unchanged; only this
+case's position in the document moved).
 
 **Steps:**
 ```bash
@@ -1637,7 +1608,70 @@ maximum — so `ZADD core:zbug 2 b 3 c` silently adds only `b` (score 2) and dro
 `3 c` with no error and no indication anything was truncated. `ZCARD` after the call
 above is `2` (`a`, `b`), not `3`. Any script or test that assumes multi-pair `ZADD`
 works will silently lose data. Flag this prominently — it is a functional bug, not a
-cosmetic gap like the OBJECT ENCODING naming difference.
+cosmetic gap like the OBJECT ENCODING naming difference. Separately: `WITHSCORES` above
+returns bare members (`a`/`b`), not interleaved score pairs — confirmed via
+`grep -rn WITHSCORES crates/` returning nothing at all, i.e. the flag isn't implemented
+anywhere and is silently ignored. Also undocumented in `docs/command-compatibility.md`;
+see CORE-26 for the same gap confirmed via a plain (not-ZADD-bug-affected) sorted set.
+
+**Result:** ☐ Pass ☐ Fail
+
+### CORE-26 — ZRANGE, ZRANGE WITHSCORES, ZRANK
+
+**Precondition:** `core:zbug` has `a` (score 1) and `b` (score 2) — from CORE-28, run
+immediately above (moved ahead of this case since it's what creates this state).
+
+**Steps:**
+```bash
+redis-cli -h numericlabs.lxd -p 6379 zrange core:zbug 0 -1
+redis-cli -h numericlabs.lxd -p 6379 zrange core:zbug 0 -1 WITHSCORES
+redis-cli -h numericlabs.lxd -p 6379 zrank core:zbug b
+redis-cli -h numericlabs.lxd -p 6379 zrank core:zbug nosuch
+```
+
+**Expected:**
+```
+a
+b
+a
+b
+1
+
+```
+
+**Notes:** `ZRANK` on a member that isn't in the set returns nil (blank line), not an
+error. `WITHSCORES` returns bare members with no scores interleaved (confirmed live: `a`/`b`
+again, identical to the plain `ZRANGE` call right above it) — the flag is accepted but has no
+effect, same gap CORE-28 found via `grep`; this case confirms it independently of CORE-28's
+ZADD-variadic bug, since here every member was added correctly and still comes back scoreless.
+
+**Result:** ☐ Pass ☐ Fail
+
+### CORE-27 — ZREM
+
+**Precondition:** `core:z1` does not exist.
+
+**Steps:**
+```bash
+redis-cli -h numericlabs.lxd -p 6379 del core:z1
+redis-cli -h numericlabs.lxd -p 6379 zadd core:z1 6 a
+redis-cli -h numericlabs.lxd -p 6379 zadd core:z1 2 b
+redis-cli -h numericlabs.lxd -p 6379 zrem core:z1 b
+redis-cli -h numericlabs.lxd -p 6379 zrange core:z1 0 -1
+```
+
+**Expected:**
+```
+0
+1
+1
+1
+a
+```
+
+**Notes:** `core:z1`'s members are built via two single-pair `ZADD` calls (not one variadic
+call) — see CORE-28 for why a variadic `ZADD key score member score member` call can't be used
+here.
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -1654,8 +1688,14 @@ redis-cli -h numericlabs.lxd -p 6379 zcount core:zz 0 10
 **Expected:**
 ```
 ERR unknown command 'ZRANGEBYSCORE'
+
 ERR unknown command 'ZCOUNT'
+
 ```
+
+**Notes:** Each error reply ends with its own blank line on the wire (confirmed via raw byte
+capture, same as CORE-06/CORE-15's single-error cases) — with two errors back to back here,
+that means a blank line between them too, not just after the last one.
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -1746,6 +1786,7 @@ OK
 1
 v4
 no such key
+
 ```
 
 **Notes:** `RENAMENX` returns `0` and leaves both keys alone when the destination
@@ -1768,14 +1809,16 @@ redis-cli -h numericlabs.lxd -p 6379 keys "core:glob:?"
 
 **Expected:**
 ```
-core:l3
+<any-key>
 OK
 core:glob:b
 core:glob:a
 ```
 
-**Notes:** `RANDOMKEY`'s actual value depends on keyspace state at run time; only
-assert it returns *some* existing key, not this exact one. The glob `core:glob:?`
+**Notes:** `RANDOMKEY`'s actual value depends on keyspace state at run time (wildcarded above as
+`<any-key>`) — only assert it returns *some* existing key, not a specific one. `KEYS`'s two
+matches come back in shard/`HashMap` order, unspecified like `SMEMBERS` (see CORE-20) — order
+between `core:glob:a`/`core:glob:b` above isn't guaranteed. The glob `core:glob:?`
 correctly excludes `core:globx:c` (the `?` matches exactly one character, and `:` is
 not what precedes `c` there) — confirms `?`-glob support per
 `docs/command-compatibility.md`.
@@ -1805,7 +1848,9 @@ full keyspace. Per `docs/command-compatibility.md`, this implementation's cursor
 one shard (of 16) per call rather than real Redis's incremental-rehash cursor scheme —
 so cursor values here are small sequential shard indices, not opaque bit-reversed
 cursors. Do not assume cursor-value compatibility with real Redis clients that
-inspect the cursor value itself.
+inspect the cursor value itself. Which 3 keys land in shard 0 is deterministic (shard routing is
+a plain hash, not randomized), but the order they come back in is that shard's own `HashMap`
+iteration order — unspecified, same caveat as `SMEMBERS` (see CORE-20) — do not assert on it.
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -1840,6 +1885,10 @@ OK
 1
 99
 ```
+
+**Notes:** `TTL`/`PTTL` values above are already counting down by the time each follow-up call
+runs, same expected drift as CORE-02/CORE-03 — exact values will be a few units below (or,
+on a fast run, at/slightly above) what's shown.
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -1927,19 +1976,26 @@ OK
 **Steps:**
 ```bash
 redis-cli -h numericlabs.lxd -p 6379 flushall
-redis-cli -h numericlabs.lxd -p 6379 dbsize
+redis-cli -h numericlabs.lxd -p 6379 lpos core:x a
 ```
 
 **Expected:**
 ```
 ERR unknown command 'FLUSHALL'
-ERR unknown command 'DBSIZE'
+
+ERR unknown command 'LPOS'
+
 ```
 
-**Notes:** Confirmed against `crates/server/src/dispatcher.rs`'s `KNOWN_COMMANDS`:
-`FLUSHALL`, `DBSIZE`, `LPOS`, `COPY`, `SETEX`, and `DECRBY` are all absent from that
-list and all produce this same error shape. Do not write positive test cases assuming
-any of them exist.
+**Notes:** Confirmed against `crates/server/src/dispatcher.rs`'s `KNOWN_COMMANDS`: `FLUSHALL`,
+`LPOS`, `COPY`, `SETEX`, and `DECRBY` are absent from that list and all produce this same error
+shape. Do not write positive test cases assuming any of them exist. `DBSIZE` **used to** be in
+this same unimplemented list (an earlier version of this case used it as the second example) but
+is now implemented — confirmed live: `DBSIZE` returns a real integer count today, not this error
+— so it was swapped for `LPOS` here to keep this case accurate; re-check this list before reusing
+any command from it elsewhere in the playbook. Each error reply ends with its own blank line on
+the wire (confirmed via raw byte capture, same as CORE-06/CORE-15/CORE-29/CORE-45) — with two
+errors back to back here, that means a blank line between them too, not just after the last one.
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -1963,16 +2019,22 @@ redis-cli -h numericlabs.lxd -p 6379 get core:wt1
 ```
 OK
 WRONGTYPE Operation against a key holding the wrong kind of value
+
 WRONGTYPE Operation against a key holding the wrong kind of value
+
 WRONGTYPE Operation against a key holding the wrong kind of value
+
 WRONGTYPE Operation against a key holding the wrong kind of value
+
 stringval
 ```
 
 **Notes:** Every collection command against the string key is rejected outright — the
 original string value is untouched (`GET` still returns `stringval`) — never coerced
 or partially applied. Unlike the `INCR`/`RENAME` errors in CORE-06/CORE-32, this error
-text does carry a real prefix (`WRONGTYPE `).
+text does carry a real prefix (`WRONGTYPE `). Like every error reply, each one ends with its
+own blank line on the wire (see CORE-06/CORE-29/CORE-45) — with four back to back here, that's
+a blank line after each one, not just at the very end.
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -2076,6 +2138,7 @@ set
 1
 zset
 ERR no such key
+
 ```
 
 **Notes:** Confirms `docs/command-compatibility.md`: `OBJECT ENCODING` returns this
@@ -2125,9 +2188,16 @@ redis-cli -h numericlabs.lxd -p 6379 notacommand foo bar
 **Expected:**
 ```
 ERR wrong number of arguments for 'get' command
+
 ERR wrong number of arguments for 'set' command
+
 ERR unknown command 'NOTACOMMAND'
+
 ```
+
+**Notes:** Each error reply ends with its own blank line on the wire (confirmed via raw byte
+capture, same as CORE-06/CORE-15/CORE-29) — with three errors back to back here, that means a
+blank line between each pair, not just after the last one.
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -2147,6 +2217,7 @@ redis-cli -h numericlabs.lxd -p 6379 lset core:lsmissing 0 z
 ```
 0
 no such key
+
 ```
 
 **Notes:** Before this was fixed, a missing key and a bad index on an existing list both
@@ -2360,14 +2431,17 @@ redis-cli -h numericlabs.lxd -p 6379 hget core:hovf f
 0
 OK
 increment or decrement would overflow
+
 9223372036854775807
 0
 OK
 increment or decrement would overflow
+
 -9223372036854775808
 0
 1
 increment or decrement would overflow
+
 9223372036854775807
 ```
 
@@ -2378,7 +2452,8 @@ CORE-06/CORE-32/CORE-15 — this project's convention is that engine-originated 
 prefix on the wire, only `WRONGTYPE` does (CORE-40). In every case here the value is left
 completely unchanged by the failed increment, confirmed by the follow-up `GET`/`HGET` still
 showing the pre-overflow value. `9223372036854775807` is `i64::MAX`; `-9223372036854775808` is
-`i64::MIN`.
+`i64::MIN`. Each error reply ends with its own blank line on the wire (see CORE-06/CORE-29/
+CORE-45/CORE-40) — with three of them here, each is followed by a blank line, not just the last.
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -2418,7 +2493,6 @@ redis-cli -h numericlabs.lxd -p 6379 exists core:sds_dest
 0
 0
 1
-1
 0
 0
 0
@@ -2436,7 +2510,9 @@ would correctly show zero members. Now an empty result **deletes** the destinati
 matching real Redis's `*STORE` semantics, whether the destination previously held data (as with
 `core:sis_dest`/`core:sus_dest`/`core:sds_dest` above, each pre-loaded with a member called
 `old`) or never existed at all. The return value (`0` for each `*STORE` call) was already correct
-before the fix and is unchanged — only the phantom-key side effect is new.
+before the fix and is unchanged — only the phantom-key side effect is new. (A stray extra `1`
+line previously sat between the `sadd core:sus_dest old` and `sunionstore` results above — this
+case has 16 steps and 16 reply lines; confirmed live against a fresh keyspace.)
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -2597,10 +2673,13 @@ EOF
 OK
 QUEUED
 OK
-(nil)
+
 ```
 
 **Notes:** `DISCARD` replies `+OK` and the queued `SET` never ran — `txn:b` stays unset.
+`GET` on the missing key returns nil, which `redis-cli`'s non-interactive mode renders as a
+blank line, not the literal text `(nil)` you'd see in its interactive REPL — see the note near
+the top of this document.
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -2812,22 +2891,26 @@ already run (so there's a prior write transaction in the AOF to inspect).
 
 **Steps:**
 ```bash
-wc -l "$DATA/txn.aof"          # note the line count
+wc -l ./appendonly.aof          # note the line count
 redis-cli -h numericlabs.lxd -p 6379 <<'EOF'
 MULTI
 GET txn:a
 GET txn:c
 EXEC
 EOF
-wc -l "$DATA/txn.aof"          # compare -- should be unchanged
-cat -A "$DATA/txn.aof" | head -20
+wc -l ./appendonly.aof          # compare -- should be unchanged
+grep -aB2 -A15 -m1 -P '^MULTI\r$' ./appendonly.aof | cat -A
 ```
 
-**Expected:** The two `wc -l` counts are identical — a read-only transaction appends nothing to
-the AOF. The `cat -A` of TXN-01's transaction shows a bare `*1\r\n$5\r\nMULTI\r\n` marker frame (a
-RESP array of exactly one bulk string, no arguments), then each queued write's own normal
-RESP-encoded command, then a bare `*1\r\n$4\r\nEXEC\r\n` marker:
+**Expected:**
 ```
+<n> ./appendonly.aof
+OK
+QUEUED
+QUEUED
+2
+
+<n> ./appendonly.aof
 *1^M$
 $5^M$
 MULTI^M$
@@ -2848,12 +2931,27 @@ $4^M$
 EXEC^M$
 ```
 
-**Notes:** This confirms the AOF-atomicity *shape* (the markers exist and wrap exactly the
-writes, one contiguous append), not crash atomicity. Proving that a `kill -9` mid-`EXEC` never
-replays a half-written transaction is not practically verifiable through `redis-cli` alone — the
-project's own test suite covers this directly (`crates/server/src/dispatcher.rs`, tests
-`exec_wraps_its_writes_in_multi_and_exec_aof_markers` and
-`a_read_only_transaction_writes_nothing_to_the_aof_at_all`).
+**Notes:** The two `wc -l` counts (`<n>` above — wildcarded since the exact count depends on how
+much every earlier Transactions case in this run has already written) are identical to each
+other — a read-only transaction appends nothing to the AOF. `GET txn:c` (never set) is `EXEC`'s
+second array element, printed as the blank line between `2` and the second count. The `cat -A` of
+TXN-01's transaction shows a bare `*1\r\n$5\r\nMULTI\r\n` marker frame (a RESP array of exactly
+one bulk string, no arguments), then each queued write's own normal RESP-encoded command, then a
+bare `*1\r\n$4\r\nEXEC\r\n` marker — this confirms the AOF-atomicity *shape* (the markers exist
+and wrap exactly the writes, one contiguous append), not crash atomicity. Proving that a `kill -9`
+mid-`EXEC` never replays a half-written transaction is not practically verifiable through
+`redis-cli` alone — the project's own test suite covers this directly
+(`crates/server/src/dispatcher.rs`, tests `exec_wraps_its_writes_in_multi_and_exec_aof_markers`
+and `a_read_only_transaction_writes_nothing_to_the_aof_at_all`). Path note: `./appendonly.aof` above
+is this server's actual default relative to its own working directory — it wasn't started with a
+custom `ROCKET_MEM_AOF_PATH` (unlike the illustrative `$DATA/txn.aof` in this section's setup
+prose above, which describes running a dedicated standalone instance by hand), since automated
+runs reuse the Smoke suite's already-running server instead of starting a new one. The final
+step uses `grep -m1` for the bare `MULTI` marker line rather than `head -20`: TXN-01's is the
+*first* transaction ever written this session, so `-m1` finds its exact frame regardless of how
+much else later cases (e.g. TXN-06's own writes) have since appended to the same file — a fixed
+`head -N` count would silently start drifting off-target the moment anything grows the file
+before it.
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -2972,18 +3070,18 @@ document — stop the live cluster first if it's up). `$DATA/prc-persist.aof` an
 ROCKET_MEM_ADDR=numericlabs.lxd:6379 ROCKET_MEM_RMP_ADDR=numericlabs.lxd:7379 \
 ROCKET_MEM_AOF_PATH=$DATA/prc-persist.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-persist.snap \
 ROCKET_MEM_METRICS_ADDR=numericlabs.lxd:9121 \
-  $BIN &
+  $BIN > /dev/null 2>&1 &
 echo $! > /tmp/prc-persist.pid
 sleep 0.6
 
-wc -c $DATA/prc-persist.aof                 # 0 bytes before any write
+wc -c < $DATA/prc-persist.aof                # 0 bytes before any write
 
 redis-cli -h numericlabs.lxd -p 6379 set foo bar
 redis-cli -h numericlabs.lxd -p 6379 set baz qux
 redis-cli -h numericlabs.lxd -p 6379 get foo
 
 sleep 1.5                                    # default fsync policy is EverySecond
-wc -c $DATA/prc-persist.aof                  # must now be > 0
+wc -c < $DATA/prc-persist.aof                 # must now be > 0
 cat $DATA/prc-persist.aof
 
 kill $(cat /tmp/prc-persist.pid)
@@ -2993,7 +3091,7 @@ sleep 0.3
 ROCKET_MEM_ADDR=numericlabs.lxd:6379 ROCKET_MEM_RMP_ADDR=numericlabs.lxd:7379 \
 ROCKET_MEM_AOF_PATH=$DATA/prc-persist.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-persist.snap \
 ROCKET_MEM_METRICS_ADDR=numericlabs.lxd:9121 \
-  $BIN &
+  $BIN > /dev/null 2>&1 &
 echo $! > /tmp/prc-persist.pid
 sleep 0.6
 redis-cli -h numericlabs.lxd -p 6379 get foo
@@ -3027,7 +3125,16 @@ qux
 
 **Notes:** The AOF is written but not fsynced immediately — a write issued right after startup
 is not on disk until the next `EverySecond` tick (observed here as up to ~1s). Don't check file
-size right after a write with no sleep; it reads 0 and looks broken when it isn't.
+size right after a write with no sleep; it reads 0 and looks broken when it isn't. Both server
+launches above redirect stdout/stderr to `/dev/null` — this case is about AOF file content, not
+startup banners or per-connection logging (confirmed live: without the redirect, the server's own
+structured logs — its startup banner and an `INFO ... connection accepted`/`connection closed`
+pair per `redis-cli` call — interleave into this same output stream and swamp the handful of
+lines actually being tested here). Contrast with PERSIST-02, where the restart banner itself is
+the point and isn't redirected away. `wc -c` also reads its input redirected from the file (`<`)
+rather than taking the path as an argument — with a path argument, `wc` also prints the filename
+after the count, which would make the exact `0`/`62` byte counts below dependent on `$DATA`'s
+own (scratch, run-to-run-variable) path length.
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -3046,6 +3153,7 @@ ls -la $DATA/prc-persist.snap
 kill $(cat /tmp/prc-persist.pid)
 sleep 0.3
 
+RUST_LOG="info,rocket_mem::connection=off" \
 ROCKET_MEM_ADDR=numericlabs.lxd:6379 ROCKET_MEM_RMP_ADDR=numericlabs.lxd:7379 \
 ROCKET_MEM_AOF_PATH=$DATA/prc-persist.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-persist.snap \
 ROCKET_MEM_METRICS_ADDR=numericlabs.lxd:9121 \
@@ -3060,10 +3168,10 @@ redis-cli -h numericlabs.lxd -p 6379 get foo
 ```
 OK
 OK
--rw-rw-r-- 1 numericlabs numericlabs 105 <date> $DATA/prc-persist.snap
+-rw-rw-r-- 1 numericlabs numericlabs 105 <date> <data-dir>/prc-persist.snap
 <date>  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=numericlabs.lxd:6379
-<date>  INFO rocket_mem: resolved config summary node_id=numericlabs.lxd:6379 addr=numericlabs.lxd:6379 rmp_addr=numericlabs.lxd:7379 metrics_addr=numericlabs.lxd:9121 aof_path=$DATA/prc-persist.aof snapshot_path=$DATA/prc-persist.snap log_filter=info log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=false acl_user_count=0 tls_enabled=false tls_replication_enabled=false
-<date>  INFO rocket_mem::aof: snapshot loaded snapshot_path=$DATA/prc-persist.snap bytes=105 elapsed_us=<n>
+<date>  INFO rocket_mem: resolved config summary node_id=numericlabs.lxd:6379 addr=numericlabs.lxd:6379 rmp_addr=numericlabs.lxd:7379 metrics_addr=numericlabs.lxd:9121 aof_path=<data-dir>/prc-persist.aof snapshot_path=<data-dir>/prc-persist.snap log_filter=info,rocket_mem::connection=off log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=false acl_user_count=0 tls_enabled=false tls_replication_enabled=false
+<date>  INFO rocket_mem::aof: snapshot loaded snapshot_path=<data-dir>/prc-persist.snap bytes=105 elapsed_us=<n>
 <date>  INFO rocket_mem::aof: aof recovery replay complete commands=0 bytes=0 elapsed_us=<n>
 <date>  INFO rocket_mem: listener bound protocol=metrics addr=http://192.168.1.12:9121/metrics
 <date>  INFO rocket_mem: listener bound protocol=RMP addr=192.168.1.12:7379
@@ -3072,7 +3180,7 @@ OK
 ┌───────────────────────────────────────────────────────────────────────────────────────────────────┐
 │ rocket-mem v0.1.4                                                                                 │
 ├───────────────────────────────────────────────────────────────────────────────────────────────────┤
-│ storage   recovered $DATA/prc-persist.snap + $DATA/prc-persist.aof (generation 0)                 │
+│ storage   recovered <data-dir>/prc-persist.snap + <data-dir>/prc-persist.aof (generation 0)                 │
 │ acl       no users configured -- auth disabled, every client is trusted                           │
 │ cluster   standalone (no cluster_config set)                                                      │
 │ replicas  none connected yet -- REPLICAOF is a live command; INFO REPLICATION shows current state │
@@ -3081,6 +3189,7 @@ OK
 │           RMP      192.168.1.12:7379                                                              │
 │           RESP     192.168.1.12:6379                                                              │
 └───────────────────────────────────────────────────────────────────────────────────────────────────┘
+
 snapval
 bar
 ```
@@ -3089,7 +3198,12 @@ bar
 section), the restart prints the structured log lines and boxed table shown here, not the old
 plain `Recovered state from ...`/`Metrics on ...` banner this case showed before — real, captured
 output. `snapshot loaded` only appears when a snapshot file existed to load; PERSIST-01's fresh
-restart didn't show it.
+restart didn't show it. The restart sets `RUST_LOG="info,rocket_mem::connection=off"`: its
+startup banner (confirming what got recovered) is the point, but per-connection logging from the
+two final `GET`s isn't — see PERSIST-01's notes for the same reasoning applied the other way
+(full redirect, since PERSIST-01 doesn't want a banner at all). `<data-dir>` wildcards this run's
+scratch `$DATA` value everywhere it'd otherwise appear literally (the `ls -la` line, the config
+summary, the boxed table's `storage` row) — its real path is a fresh scratch directory every run.
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -3112,6 +3226,7 @@ sleep 1.5
 kill $(cat /tmp/prc-persist.pid)
 sleep 0.3
 
+RUST_LOG="info,rocket_mem::connection=off" \
 ROCKET_MEM_ADDR=numericlabs.lxd:6379 ROCKET_MEM_RMP_ADDR=numericlabs.lxd:7379 \
 ROCKET_MEM_AOF_PATH=$DATA/prc-persist.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-persist.snap \
 ROCKET_MEM_METRICS_ADDR=numericlabs.lxd:9121 \
@@ -3128,8 +3243,8 @@ snapval
 bar
 OK
 <date>  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=numericlabs.lxd:6379
-<date>  INFO rocket_mem: resolved config summary node_id=numericlabs.lxd:6379 addr=numericlabs.lxd:6379 rmp_addr=numericlabs.lxd:7379 metrics_addr=numericlabs.lxd:9121 aof_path=$DATA/prc-persist.aof snapshot_path=$DATA/prc-persist.snap log_filter=info log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=false acl_user_count=0 tls_enabled=false tls_replication_enabled=false
-<date>  INFO rocket_mem::aof: snapshot loaded snapshot_path=$DATA/prc-persist.snap bytes=105 elapsed_us=<n>
+<date>  INFO rocket_mem: resolved config summary node_id=numericlabs.lxd:6379 addr=numericlabs.lxd:6379 rmp_addr=numericlabs.lxd:7379 metrics_addr=numericlabs.lxd:9121 aof_path=<data-dir>/prc-persist.aof snapshot_path=<data-dir>/prc-persist.snap log_filter=info,rocket_mem::connection=off log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=false acl_user_count=0 tls_enabled=false tls_replication_enabled=false
+<date>  INFO rocket_mem::aof: snapshot loaded snapshot_path=<data-dir>/prc-persist.snap bytes=105 elapsed_us=<n>
 <date>  INFO rocket_mem::aof: aof recovery replay complete commands=1 bytes=40 elapsed_us=<n>
 <date>  INFO rocket_mem: listener bound protocol=metrics addr=http://192.168.1.12:9121/metrics
 <date>  INFO rocket_mem: listener bound protocol=RMP addr=192.168.1.12:7379
@@ -3138,7 +3253,7 @@ OK
 ┌───────────────────────────────────────────────────────────────────────────────────────────────────┐
 │ rocket-mem v0.1.4                                                                                 │
 ├───────────────────────────────────────────────────────────────────────────────────────────────────┤
-│ storage   recovered $DATA/prc-persist.snap + $DATA/prc-persist.aof (generation 0)                 │
+│ storage   recovered <data-dir>/prc-persist.snap + <data-dir>/prc-persist.aof (generation 0)                 │
 │ acl       no users configured -- auth disabled, every client is trusted                           │
 │ cluster   standalone (no cluster_config set)                                                      │
 │ replicas  none connected yet -- REPLICAOF is a live command; INFO REPLICATION shows current state │
@@ -3147,6 +3262,7 @@ OK
 │           RMP      192.168.1.12:7379                                                              │
 │           RESP     192.168.1.12:6379                                                              │
 └───────────────────────────────────────────────────────────────────────────────────────────────────┘
+
 snapval
 tailval
 ```
@@ -3157,7 +3273,9 @@ where the load order is stated — `snapshot loaded` only appears when a snapsho
 taken at, so only the AOF bytes written after that offset are replayed on top of it — not the
 whole file from scratch (that full-replay-from-empty behavior was Sprint 4's, superseded in
 Sprint 5). The AOF file itself keeps growing forever across every `SAVE`; nothing truncates or
-rewrites it, so don't expect its size to reset after a snapshot.
+rewrites it, so don't expect its size to reset after a snapshot. Same `RUST_LOG` treatment on the
+restart as PERSIST-02 (banner wanted, per-connection logging not), and same trailing blank line
+after the boxed table before real command output resumes.
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -3173,6 +3291,7 @@ rewrites it, so don't expect its size to reset after a snapshot.
 kill $(cat /tmp/prc-persist.pid)
 sleep 0.3
 
+RUST_LOG="info,rocket_mem::connection=off" \
 ROCKET_MEM_ADDR=numericlabs.lxd:6379 ROCKET_MEM_RMP_ADDR=numericlabs.lxd:7379 \
 ROCKET_MEM_AOF_PATH=$DATA/prc-persist-other.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-persist-other.snap \
 ROCKET_MEM_METRICS_ADDR=numericlabs.lxd:9121 \
@@ -3190,7 +3309,7 @@ sleep 0.3
 **Expected:**
 ```
 <date>  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=numericlabs.lxd:6379
-<date>  INFO rocket_mem: resolved config summary node_id=numericlabs.lxd:6379 addr=numericlabs.lxd:6379 rmp_addr=numericlabs.lxd:7379 metrics_addr=numericlabs.lxd:9121 aof_path=$DATA/prc-persist-other.aof snapshot_path=$DATA/prc-persist-other.snap log_filter=info log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=false acl_user_count=0 tls_enabled=false tls_replication_enabled=false
+<date>  INFO rocket_mem: resolved config summary node_id=numericlabs.lxd:6379 addr=numericlabs.lxd:6379 rmp_addr=numericlabs.lxd:7379 metrics_addr=numericlabs.lxd:9121 aof_path=<data-dir>/prc-persist-other.aof snapshot_path=<data-dir>/prc-persist-other.snap log_filter=info,rocket_mem::connection=off log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=false acl_user_count=0 tls_enabled=false tls_replication_enabled=false
 <date>  INFO rocket_mem::aof: aof recovery replay complete commands=0 bytes=0 elapsed_us=<n>
 <date>  INFO rocket_mem: listener bound protocol=metrics addr=http://192.168.1.12:9121/metrics
 <date>  INFO rocket_mem: listener bound protocol=RMP addr=192.168.1.12:7379
@@ -3199,7 +3318,7 @@ sleep 0.3
 ┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │ rocket-mem v0.1.4                                                                                     │
 ├───────────────────────────────────────────────────────────────────────────────────────────────────────┤
-│ storage   recovered $DATA/prc-persist-other.snap + $DATA/prc-persist-other.aof (generation 0)         │
+│ storage   recovered <data-dir>/prc-persist-other.snap + <data-dir>/prc-persist-other.aof (generation 0)         │
 │ acl       no users configured -- auth disabled, every client is trusted                               │
 │ cluster   standalone (no cluster_config set)                                                          │
 │ replicas  none connected yet -- REPLICAOF is a live command; INFO REPLICATION shows current state     │
@@ -3221,7 +3340,9 @@ in its interactive REPL — that's why the three trailing lines above are blank 
 see the note near the top of this document about `redis-cli`'s raw output mode. The
 `aof recovery replay complete commands=0 bytes=0` line fires even though nothing was actually
 recovered — the structured-logging replacement for the old plain banner's misleading-sounding
-"Recovered state from..." line; see the general note above this section.
+"Recovered state from..." line; see the general note above this section. Same `RUST_LOG`
+treatment as PERSIST-02/03 (banner wanted, per-connection logging not); `<data-dir>` wildcards
+this run's scratch `$DATA` value, whose real path varies run to run.
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -3240,19 +3361,20 @@ rm -f $DATA/prc-kill9.aof $DATA/prc-kill9.snap
 ROCKET_MEM_ADDR=numericlabs.lxd:6379 ROCKET_MEM_RMP_ADDR=numericlabs.lxd:7379 \
 ROCKET_MEM_AOF_PATH=$DATA/prc-kill9.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-kill9.snap \
 ROCKET_MEM_METRICS_ADDR=numericlabs.lxd:9121 \
-  $BIN &
+  $BIN > /dev/null 2>&1 &
 echo $! > /tmp/prc-kill9.pid
 sleep 0.6
 
 redis-cli -h numericlabs.lxd -p 6379 set survive yes
 redis-cli -h numericlabs.lxd -p 6379 set counter 1
 sleep 1.5                              # let EverySecond fsync land before the SIGKILL
-wc -c $DATA/prc-kill9.aof
+wc -c < $DATA/prc-kill9.aof
 
 kill -9 $(cat /tmp/prc-kill9.pid)      # no clean shutdown, no chance to flush anything extra
 sleep 0.3
 ps -p $(cat /tmp/prc-kill9.pid)        # confirm it's actually dead
 
+RUST_LOG="info,rocket_mem::connection=off" \
 ROCKET_MEM_ADDR=numericlabs.lxd:6379 ROCKET_MEM_RMP_ADDR=numericlabs.lxd:7379 \
 ROCKET_MEM_AOF_PATH=$DATA/prc-kill9.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-kill9.snap \
 ROCKET_MEM_METRICS_ADDR=numericlabs.lxd:9121 \
@@ -3268,9 +3390,9 @@ redis-cli -h numericlabs.lxd -p 6379 get counter
 OK
 OK
 68
-(stopped, ps shows no matching PID)
+    PID TTY          TIME CMD
 <date>  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=numericlabs.lxd:6379
-<date>  INFO rocket_mem: resolved config summary node_id=numericlabs.lxd:6379 addr=numericlabs.lxd:6379 rmp_addr=numericlabs.lxd:7379 metrics_addr=numericlabs.lxd:9121 aof_path=$DATA/prc-kill9.aof snapshot_path=$DATA/prc-kill9.snap log_filter=info log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=false acl_user_count=0 tls_enabled=false tls_replication_enabled=false
+<date>  INFO rocket_mem: resolved config summary node_id=numericlabs.lxd:6379 addr=numericlabs.lxd:6379 rmp_addr=numericlabs.lxd:7379 metrics_addr=numericlabs.lxd:9121 aof_path=<data-dir>/prc-kill9.aof snapshot_path=<data-dir>/prc-kill9.snap log_filter=info,rocket_mem::connection=off log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=false acl_user_count=0 tls_enabled=false tls_replication_enabled=false
 <date>  INFO rocket_mem::aof: aof recovery replay complete commands=2 bytes=68 elapsed_us=<n>
 <date>  INFO rocket_mem: listener bound protocol=metrics addr=http://192.168.1.12:9121/metrics
 <date>  INFO rocket_mem: listener bound protocol=RMP addr=192.168.1.12:7379
@@ -3279,7 +3401,7 @@ OK
 ┌───────────────────────────────────────────────────────────────────────────────────────────────────┐
 │ rocket-mem v0.1.4                                                                                 │
 ├───────────────────────────────────────────────────────────────────────────────────────────────────┤
-│ storage   recovered $DATA/prc-kill9.snap + $DATA/prc-kill9.aof (generation 0)                     │
+│ storage   recovered <data-dir>/prc-kill9.snap + <data-dir>/prc-kill9.aof (generation 0)                     │
 │ acl       no users configured -- auth disabled, every client is trusted                           │
 │ cluster   standalone (no cluster_config set)                                                      │
 │ replicas  none connected yet -- REPLICAOF is a live command; INFO REPLICATION shows current state │
@@ -3297,7 +3419,16 @@ yes
 under repeated `kill -9`. This case only proves the single-node, single-kill version of it; it
 does not attempt to synthesize a torn/mid-write AOF record. `README.md`'s Sprint 4 entry claims a
 corrupted tail is truncated rather than merely skipped in memory — that specific claim is not
-independently re-verified here, only cited.
+independently re-verified here, only cited. `ps -p <pid>` on a gone PID prints only its header
+row (no data row) on this system's `ps` (procps-ng) — same divergence noted for a `SIGTERM`-based
+check elsewhere in this playbook; a different `ps` may format the header differently or print
+nothing at all, so treat any output confirming no data row for the PID as passing, not just this
+literal text. The first server launch redirects stdout/stderr to `/dev/null` (same reasoning as
+PERSIST-01 — this case isn't testing startup banners); the restart launch sets
+`RUST_LOG="info,rocket_mem::connection=off"` instead, since its banner (confirming the AOF
+survived intact) is the point, but per-connection logging from the two final `GET`s isn't. `wc -c`
+also reads its input redirected (`<`) rather than taking the path as an argument, same reasoning
+as PERSIST-01.
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -7499,7 +7630,6 @@ These real-Redis commands have no counterpart in this project. They are delibera
 
 **Other:**
 - `RESET` — close connection and reset auth
-- `DBSIZE` — count keys
 - `FLUSHALL` — clear all databases
 - `ACL HELP` / `ACL CAT` — ACL introspection
 
