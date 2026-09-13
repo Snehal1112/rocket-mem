@@ -14,10 +14,9 @@ edition = "2021"
 name = "rocket_mem_mcp"
 path = "src/lib.rs"
 
-# The `[[bin]]` table (name = "rocket-mem-mcp", path = "src/main.rs") is added by Task 2, which
-# creates `src/main.rs`. Declaring it before that file exists breaks the build even after Task 1's
-# own pieces (`config`, `pool`) are implemented — see task-1-report.md's "Deviations from the
-# brief" for details.
+[[bin]]
+name = "rocket-mem-mcp"
+path = "src/main.rs"
 
 [dependencies]
 rmcp = { version = "3.3", features = ["server", "client", "macros", "transport-io", "transport-async-rw"] }
