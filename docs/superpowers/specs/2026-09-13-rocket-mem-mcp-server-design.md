@@ -157,6 +157,33 @@ vs. try a different command). A distinct transport-level error class (connection
 a dropped rocket-mem connection) is used for "the server is unreachable, retry" so an agent can
 tell that apart from "your specific command was rejected."
 
+## `structured_content` convention
+
+Every tool that returns a scalar or collection (a count, a boolean, a value, a list, a map) sets
+`CallToolResult::structured_content` alongside its human-readable `content` text — not just the
+tools where a caller obviously needs to parse the result. This was Plan 1's own precedent (`get`
+uses a `{"found": bool, "value": ...}` shape to disambiguate a literal `"(nil)"` string from a
+missing key) but was applied inconsistently through Plan 2 (7 of that plan's 30 tools set it, 23
+didn't, with no stated rule) — Plan 3 settled the convention for all 12 of its own tools and this
+section makes it binding for every plan after it. **Plans 1-2's tools that don't yet set it are a
+known backfill item**, not a deliberate exception — track it as housekeeping in whichever plan
+touches `tools/string.rs`/`tools/keys.rs` next, rather than fixing it opportunistically mid-plan.
+
+This crate declares no formal output schemas (`#[tool]` here hand-builds a `CallToolResult`, it
+doesn't derive one) — the `structured_content` JSON shape for a given tool is documented only by
+that tool's own description and by precedent in a sibling tool. Two things follow from that:
+
+- **Field-name reuse across tools does not imply a shared shape.** `"fields"` holds a
+  `HashMap<String, String>` in `hgetall`/`hscan` but a `Vec<String>` in `hkeys`; `"value"` is a
+  nullable string in `get`/`hget` but an `i64` in `incr`/`hincrby`. Don't assume a field name
+  means the same thing across tools just because earlier tools reused it — check the specific
+  tool's description.
+- **Keep a "missing" case's shape consistent within a tool family where reasonably possible.**
+  `get`'s missing-key reply omits the `value` key entirely (`{"found": false}`); `hget`'s includes
+  it as `null` (`{"found": false, "value": null}`). Both are internally consistent and neither is
+  wrong, but a future plan reusing this pattern should pick one shape and use it for every new
+  tool, rather than let it vary tool-by-tool for no reason.
+
 ## Testing strategy
 
 - Unit tests per tool module run against a real local rocket-mem instance — this project's own
@@ -196,7 +223,12 @@ all along; the "corrected down" pass that dropped both was itself the error.
 `SET` already passes its value as raw `Bytes` at the dispatcher level
 (`crates/server/src/dispatcher.rs:331`) and already supports `EX`/`PX` — Plan 13's widening is
 mostly a **tool-schema** change (accept bytes in the MCP parameter, not just UTF-8 strings), not
-an engine change. Real deviations worth stating in each tool's description (agents will otherwise
+an engine change. **Scope note (added after Plan 3):** "widen the string tools" as worded here
+covers `String`-typed *values*, but by Plan 3 the crate also has `String`-typed *field names*
+(Hash) and will gain `String`-typed *members* (List/Set/Sorted Set in Plans 4-6) — all of which
+hit the same non-UTF-8 failure mode (a raw redis type-conversion error, not a clean tool result).
+Plan 13 should decide whether it widens only values, or every `String`-typed wire parameter across
+every family shipped by then. Real deviations worth stating in each tool's description (agents will otherwise
 assume real-Redis behavior): `KEYS`'s glob support is partial; `OBJECT ENCODING` returns this
 engine's type name (not real encodings) and errors "no such key" on a missing key (unlike
 `TTL`/`PTTL`, which return `-2`); `TTL`/`PTTL` floor at 1 for a sub-second remaining TTL; `MGET`
