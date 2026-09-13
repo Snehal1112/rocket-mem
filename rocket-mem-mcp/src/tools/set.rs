@@ -85,8 +85,7 @@ impl RocketMemMcpServer {
         let result: Result<i64, redis::RedisError> = command.query_async(&mut conn).await;
         match result {
             Ok(removed) => {
-                let mut r =
-                    CallToolResult::success(vec![ContentBlock::text(removed.to_string())]);
+                let mut r = CallToolResult::success(vec![ContentBlock::text(removed.to_string())]);
                 r.structured_content = Some(json!({ "removed": removed }));
                 Ok(r)
             }
@@ -103,8 +102,10 @@ impl RocketMemMcpServer {
         Parameters(SetKeyParams { key }): Parameters<SetKeyParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let mut conn = self.pool().connection();
-        let result: Result<Vec<String>, redis::RedisError> =
-            redis::cmd("SMEMBERS").arg(&key).query_async(&mut conn).await;
+        let result: Result<Vec<String>, redis::RedisError> = redis::cmd("SMEMBERS")
+            .arg(&key)
+            .query_async(&mut conn)
+            .await;
         match result {
             Ok(members) => {
                 let text = members.join(", ");
@@ -142,7 +143,9 @@ impl RocketMemMcpServer {
         }
     }
 
-    #[tool(description = "Get the number of members in a set. A missing key returns 0, not an error.")]
+    #[tool(
+        description = "Get the number of members in a set. A missing key returns 0, not an error."
+    )]
     async fn scard(
         &self,
         Parameters(SetKeyParams { key }): Parameters<SetKeyParams>,
@@ -238,8 +241,7 @@ impl RocketMemMcpServer {
             Ok((next_cursor, members)) => {
                 let text = format!("cursor={next_cursor}, members=[{}]", members.join(", "));
                 let mut r = CallToolResult::success(vec![ContentBlock::text(text)]);
-                r.structured_content =
-                    Some(json!({ "cursor": next_cursor, "members": members }));
+                r.structured_content = Some(json!({ "cursor": next_cursor, "members": members }));
                 Ok(r)
             }
             Err(err) => redis_error_to_tool_result(err),

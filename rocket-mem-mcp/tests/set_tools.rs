@@ -99,27 +99,33 @@ async fn sismember_reports_membership_correctly() {
 
     let result = client
         .peer()
-        .call_tool(CallToolRequestParams::new("sismember").with_arguments(object!({
-            "key": "s", "member": "a"
-        })))
+        .call_tool(
+            CallToolRequestParams::new("sismember").with_arguments(object!({
+                "key": "s", "member": "a"
+            })),
+        )
         .await
         .unwrap();
     assert_eq!(result.structured_content.unwrap()["is_member"], true);
 
     let result = client
         .peer()
-        .call_tool(CallToolRequestParams::new("sismember").with_arguments(object!({
-            "key": "s", "member": "z"
-        })))
+        .call_tool(
+            CallToolRequestParams::new("sismember").with_arguments(object!({
+                "key": "s", "member": "z"
+            })),
+        )
         .await
         .unwrap();
     assert_eq!(result.structured_content.unwrap()["is_member"], false);
 
     let result = client
         .peer()
-        .call_tool(CallToolRequestParams::new("sismember").with_arguments(object!({
-            "key": "missing", "member": "a"
-        })))
+        .call_tool(
+            CallToolRequestParams::new("sismember").with_arguments(object!({
+                "key": "missing", "member": "a"
+            })),
+        )
         .await
         .unwrap();
     assert_eq!(result.structured_content.unwrap()["is_member"], false);

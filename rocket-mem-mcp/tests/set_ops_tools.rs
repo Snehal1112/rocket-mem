@@ -122,12 +122,13 @@ async fn sinterstore_stores_the_intersection_and_returns_its_length() {
 
     let members = client
         .peer()
-        .call_tool(
-            CallToolRequestParams::new("smembers").with_arguments(object!({"key": "dest"})),
-        )
+        .call_tool(CallToolRequestParams::new("smembers").with_arguments(object!({"key": "dest"})))
         .await
         .unwrap();
-    assert_eq!(sorted_members(&members.structured_content.unwrap()), vec!["y"]);
+    assert_eq!(
+        sorted_members(&members.structured_content.unwrap()),
+        vec!["y"]
+    );
 
     guard.kill();
 }
@@ -193,9 +194,7 @@ async fn sdiffstore_stores_the_difference_and_deletes_dest_when_empty() {
     // read its plain text reply instead, per this project's Plans 1-2 backfill note.
     let exists = client
         .peer()
-        .call_tool(
-            CallToolRequestParams::new("exists").with_arguments(object!({"keys": ["dest"]})),
-        )
+        .call_tool(CallToolRequestParams::new("exists").with_arguments(object!({"keys": ["dest"]})))
         .await
         .unwrap();
     assert!(format!("{:?}", exists.content).contains('0'));
