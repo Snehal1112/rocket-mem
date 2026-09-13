@@ -86,8 +86,10 @@ explicitly: an agent with tool access to this MCP server can repoint replication
 rewrite its own ACL grants. That is a deliberate consequence of the security model, not an
 oversight.
 
-This yields roughly 105 tools across all modules (String/Key ~30, Hash 12, List 11, Set 14, Sorted
-Set 7, Server/Cluster/Slowlog ~17, ACL 5, one `run_transaction`, Pub/Sub 7). See "Scale" under Out
+This yields roughly 103 tools across all modules (String/Key ~30, Hash 11, List 11, Set 13, Sorted
+Set 7, Server/Cluster/Slowlog ~17, ACL 5, one `run_transaction`, Pub/Sub 7 — Hash/Set corrected
+down from an initial 12/14 estimate once `HSCAN`/`SSCAN` were confirmed unimplemented, see
+"Command semantics reference" below). See "Scale" under Out
 of scope for the one open question this raises.
 
 ## Connection and session model
@@ -174,9 +176,158 @@ tell that apart from "your specific command was rejected."
   gate, but held to the same "must build and lint clean before any PR" bar as everything else per
   project convention).
 
+## Command semantics reference (verified 2026-09-13)
+
+Ground truth for Plans 2-13, verified against this project's actual engine/dispatcher code (not
+assumed real-Redis behavior) via a decomposed research pass before writing each plan. Corrects
+two tool-count estimates from "Tool surface" above: **Hash is 11, not 12** (`HSCAN` is not
+implemented); **Set is 13, not 14** (`SSCAN` is not implemented) — both confirmed absent from
+`crates/engine/src/commands/{hash,set}.rs` and from `docs/command-compatibility.md`'s own command
+lists.
+
+### Plan 2 — String/Key rest, and Plan 13's `Bytes`/`EX` widening
+
+`SET` already passes its value as raw `Bytes` at the dispatcher level
+(`crates/server/src/dispatcher.rs:331`) and already supports `EX`/`PX` — Plan 13's widening is
+mostly a **tool-schema** change (accept bytes in the MCP parameter, not just UTF-8 strings), not
+an engine change. Real deviations worth stating in each tool's description (agents will otherwise
+assume real-Redis behavior): `KEYS`'s glob support is partial; `OBJECT ENCODING` returns this
+engine's type name (not real encodings) and errors "no such key" on a missing key (unlike
+`TTL`/`PTTL`, which return `-2`); `TTL`/`PTTL` floor at 1 for a sub-second remaining TTL; `MGET`
+never errors on WRONGTYPE (returns `None` for that key instead); `SETRANGE` with an empty value is
+a total no-op, never creates the key; `RENAME`/`RENAMENX` preserve the source's TTL on the
+destination, error `NoSuchKey` if the source is missing, and `RENAMENX` returns `false` (not an
+error) if the destination already exists. Variadic (array-shaped tool params needed): `MSET`/
+`MSETNX` (pairs), `MGET`/`DEL`/`EXISTS` (keys). `SCAN` is the one cursor-based command in this
+family — its tool needs a `cursor` input and must return the `next_cursor` the engine gives back,
+not a single fire-and-forget call like `KEYS`.
+
+### Plan 3 — Hash (11 tools)
+
+`HSET`/`HSETNX` are **single field/value pair at the engine level**
+(`crates/engine/src/commands/hash.rs:8-13,167-172`) — the dispatcher loops per pair to give real
+Redis's variadic multi-pair `HSET` on the wire. The MCP tool needs the same choice: accept one
+pair (matching the engine call 1:1) or accept an array of pairs and loop internally like the
+dispatcher does. `HDEL`/`HMGET` are already variadic at the engine level. `HINCRBY` raises two
+error types beyond WRONGTYPE: `NotAnInteger`, `IncrementOverflow`.
+
+### Plan 4 — List (11 tools)
+
+All 11 map cleanly to fixed-parameter tools. `LPUSH`/`RPUSH` take a variadic values array.
+`LINSERT`'s before/after is a plain `bool` at the engine level, not `BEFORE`/`AFTER` keywords.
+`LSET` distinguishes `NoSuchKey` (key missing entirely) from `IndexOutOfRange` (bad index on an
+existing list) — worth two distinct, separately-worded tool errors rather than collapsing both to
+one message.
+
+### Plan 5 — Set (13 tools)
+
+`SADD`/`SREM` take variadic members; `SINTER`/`SUNION`/`SDIFF` and their `*STORE` variants take a
+**variadic key list** (not a fixed two keys) plus, for the `*STORE` variants, a destination key.
+`SPOP` and `SRANDMEMBER` do **not** support an optional `count` at the engine level — single-member
+only, despite real Redis's `[count]` form; don't add a `count` parameter the engine will ignore.
+
+### Plan 6 — Sorted Set (7 tools)
+
+`ZADD` confirmed single-pair only (`score: f64, member: Bytes`), no `NX`/`XX`/`GT`/`LT`/`CH`/
+`INCR` — matches README exactly. `ZRANGE`'s `start`/`stop` are `i64` with real-Redis
+negative-index semantics and **both ends inclusive** (`crates/engine/src/commands/sorted_set.rs`
+normalizes internally as `norm(stop) + 1`) — state this explicitly in the tool description, since
+"inclusive stop" is the one detail an implementer coming from typical array-slicing conventions
+would get wrong. Neither `ZRANGE` nor `ZRANK` has a `WITHSCORES`/`WITHSCORE` variant — members/rank
+only. Scores are `f64` throughout; the tool's JSON schema uses a plain `number`.
+
+### Plan 7 — Server/Cluster/Slowlog admin (~17 tools)
+
+Reply shapes vary more here than any other family, and three items need real design attention
+rather than a flat pass-through:
+- **`INFO [section]`** replies with a single flat text blob in real Redis's `# Section\r\nkey:
+  value\r\n...` format (`crates/server/src/dispatcher.rs:2085-2296`) — the tool should return that
+  text as-is (or explicitly own parsing it into JSON), not assume a structured reply.
+- **`CLUSTER SHARDS`** is genuinely nested and variable-shaped (`dispatcher.rs:1925-1978`): an
+  array of shards, each alternating `"slots"→[start,end]` and `"nodes"→[array of field/value
+  pairs]`. This is the one reply in the whole remaining surface that needs a real JSON schema
+  designed for it, not a generic "array of strings" guess.
+- **`COMMAND`/`COMMAND INFO`** replies with a nested array per command
+  (`[name, arity, [flags], first_key, last_key, step]`, `dispatcher.rs:1514`) — also needs a
+  proper nested schema.
+
+Two operational-risk flags worth stating in their tool descriptions, not just noting internally:
+**`DEBUG SLEEP <secs>`** genuinely blocks a real Tokio worker thread via `std::thread::sleep`
+(capped at 10s, `dispatcher.rs:1193-1230`) — capped, but still a real stall an agent could trigger
+repeatedly. **`REPLICAOF`** (3 or 6 args: `host port` / `NO ONE` / `host port AUTH user pass`,
+`dispatcher.rs:1691-1755`) actually starts/stops live replication — this is the spec's own
+"high-risk, topology-changing" flag, confirmed real, not hypothetical. `BGREWRITEAOF` is fully
+synchronous despite the name (blocks the calling connection until the rewrite finishes).
+
+### Plan 8 — ACL admin (5 tools)
+
+**`ACL SETUSER`'s parameter must be an array of independent rule-token strings**
+(`crates/server/src/acl.rs:73-111`), not one packed string — real Redis's own wire grammar is
+already a flat list of tokens (`on`/`nopass`/`~pattern`/`+CMD`/etc.), and rocket-mem's
+`AclStore::set_user` applies them **incrementally onto the user's existing state**, never as a
+full replace (`acl.rs:280-318`) — state clearly in the tool description that repeated calls
+compose rather than reset. `ACL DELUSER` is variadic (multiple usernames) and replies with the
+count that *actually existed and were deleted*, not the count of usernames given. `ACL GETUSER`
+returns a structured object (`flags`/`passwords`/`commands`/`keys`), and `passwords` holds the
+Argon2 **hash**, never plaintext. Two real risks, confirmed at the code level, worth a loud
+warning rather than a footnote: `auth_gate` re-resolves the live ACL user on every command
+(`dispatcher.rs:3161-3174`), so an agent calling `DELUSER`/`SETUSER ... off` on **its own
+currently-connected username** locks itself out immediately, mid-session — there is no built-in
+guard against this; and the **first ever successful `SETUSER` turns authentication on for the
+whole server, permanently, with no "turn ACL off" command** (`acl.rs:244-251,315-317`) — calling
+this tool against a previously-open instance is a one-way trip.
+
+### Plan 9 — `run_transaction`
+
+The spec's "list of commands in, ordered list of results out, `EXECABORT` surfaces as one
+tool-level error" design is confirmed correct, with one correction to the mental model:
+**"writers-only isolation" describes the write-write mutual-exclusion guarantee during `EXEC`,
+not what gets queued** — every command type, reads included, is deferred and queued exactly like
+writes (`crates/server/src/dispatcher.rs:3203-3263`); `run_transaction` must accept read commands
+too, not just writes. `EXECABORT` triggers only for two queue-time conditions: an unknown command,
+or a `SUBSCRIBE`-family command (`dispatcher.rs:3239-3256`) — model the tool as validating the
+whole batch against these two cases up front and failing the call with one error if either is
+present, rather than attempting the batch. Everything else (WRONGTYPE, etc.) is a normal
+per-command inline error inside the ordered results array (`dispatcher.rs:3356-3379`), exactly as
+already specced. `DISCARD` has no analog for a single-call tool — confirmed not needed.
+
+### Plan 10 — Pub/Sub + session
+
+The existing pub/sub spec (`docs/superpowers/specs/2026-09-11-pubsub-spec.md`) is still accurate
+against the current `pubsub.rs`/`dispatcher.rs` — `PubSubRegistry`'s shape, single-node-only
+delivery, `PUBLISH`'s integer reply, and `PUBSUB CHANNELS`/`NUMSUB`/`NUMPAT`'s reply shapes all
+match exactly. One unrelated drift surfaced during verification, in the *main* rocket-mem
+codebase, not rocket-mem-mcp's concern: RESP2 subscribe-mode's allowed-command gate
+(`dispatcher.rs:3745`) is missing `RESET` from its allowlist despite both the spec and the gate's
+own error message saying `RESET` is allowed — a real, pre-existing bug, worth a separate report to
+the rocket-mem maintainers, out of scope here.
+
+### Plan 11 — Streamable HTTP transport
+
+`rmcp::transport::streamable_http_server::tower::StreamableHttpService` is tower-compatible (works
+with axum or any tower-based HTTP server), gated behind the `transport-streamable-http-server` +
+`transport-streamable-http-server-session` features. Constructed via
+`StreamableHttpService::new(service_factory, session_manager: Arc<M>, config)`;
+`LocalSessionManager` (in-memory session map) is the default and sufficient for v1 — no need for a
+custom `SessionStore` yet. `.handle(request) -> Response` is the actual per-request entry point,
+meaning `main.rs` needs to bind a TCP listener (or embed axum) and route requests into this
+service, running alongside — not instead of — the existing `stdio` path, selected by config/CLI.
+
+### Plan 12 — TOML config-file layer
+
+rocket-mem's own pattern (`crates/server/src/config.rs:264-279`): `figment` 0.10 (features
+`toml`, `env`), `Figment::from(Serialized::defaults(...)).merge(Toml::file(path)).merge(
+Env::prefixed(...)).extract()`, guarded by a `path.exists()` check so a missing file is silently
+skipped, never an error; a `--config <path>` CLI flag defaults to auto-picking up
+`"rocket-mem.toml"` from the cwd if unset. **Recommendation for rocket-mem-mcp: hand-roll with the
+`toml` crate rather than adding `figment` as a new dependency** — this crate has ~4 flat fields
+(vs. rocket-mem's much larger config), and `clap`'s own `env` attribute already covers the
+env/CLI layers; hand-rolling only needs a defaults→optional-file-merge step ahead of the `clap`
+parse that already happens.
+
 ## Out of scope (v1)
 
-- **Tool-list scale.** ~105 tools in one MCP server is large; whether that materially hurts an
+- **Tool-list scale.** ~103 tools in one MCP server is large; whether that materially hurts an
   agent's tool-selection accuracy or context budget in practice is an open question this spec
   does not resolve — worth watching once this is in use, not a reason to prune the surface
   preemptively given the explicit "everything rocket-mem supports" scope decision.
