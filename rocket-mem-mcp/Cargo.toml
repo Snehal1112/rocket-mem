@@ -1,0 +1,32 @@
+[package]
+name = "rocket-mem-mcp"
+version = "0.1.0"
+edition = "2021"
+
+# Intentionally NOT a member of the root rocket-mem workspace — see
+# docs/superpowers/specs/2026-09-13-rocket-mem-mcp-server-design.md's "Why standalone, not a
+# 6th workspace crate". An empty [workspace] table here stops Cargo from trying to fold this
+# package into the parent directory's workspace (the root Cargo.toml's `members` list doesn't,
+# and must not, include it).
+[workspace]
+
+[lib]
+name = "rocket_mem_mcp"
+path = "src/lib.rs"
+
+# The `[[bin]]` table (name = "rocket-mem-mcp", path = "src/main.rs") is added by Task 2, which
+# creates `src/main.rs`. Declaring it before that file exists breaks the build even after Task 1's
+# own pieces (`config`, `pool`) are implemented — see task-1-report.md's "Deviations from the
+# brief" for details.
+
+[dependencies]
+rmcp = { version = "3.3", features = ["server", "client", "macros", "transport-io", "transport-async-rw"] }
+redis = { version = "1.7", features = ["tokio-comp", "connection-manager"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "io-std"] }
+serde = { version = "1", features = ["derive"] }
+schemars = "1.0"
+clap = { version = "4", features = ["derive", "env"] }
+anyhow = "1"
+
+[dev-dependencies]
+tempfile = "3"
