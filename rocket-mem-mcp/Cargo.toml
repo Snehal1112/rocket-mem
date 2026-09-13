@@ -1,0 +1,41 @@
+[package]
+name = "rocket-mem-mcp"
+version = "0.1.0"
+edition = "2021"
+
+# Intentionally NOT a member of the root rocket-mem workspace — see
+# docs/superpowers/specs/2026-09-13-rocket-mem-mcp-server-design.md's "Why standalone, not a
+# 6th workspace crate". An empty [workspace] table here stops Cargo from trying to fold this
+# package into the parent directory's workspace (the root Cargo.toml's `members` list doesn't,
+# and must not, include it).
+[workspace]
+
+[lib]
+name = "rocket_mem_mcp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rocket-mem-mcp"
+path = "src/main.rs"
+
+[dependencies]
+# Only what the shipped binary needs: `server`/`macros` for the #[tool_router]/#[tool] impl,
+# `transport-io` for the stdio transport main.rs serves over. `client`/`transport-async-rw` are
+# test-only (see [dev-dependencies]) — splitting them out keeps the client half of rmcp out of
+# the release binary.
+rmcp = { version = "3.3", features = ["server", "macros", "transport-io"] }
+redis = { version = "1.7", features = ["tokio-comp", "connection-manager"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "io-std"] }
+serde = { version = "1", features = ["derive"] }
+# Used to build `CallToolResult::structured_content` (see `get`'s found/not-found distinction
+# in src/server.rs), not just by tests.
+serde_json = "1"
+schemars = "1.0"
+clap = { version = "4", features = ["derive", "env"] }
+anyhow = "1"
+
+[dev-dependencies]
+# `client` and `transport-async-rw` are only exercised by tests, which drive the server end to
+# end over an in-process duplex pipe using an `rmcp` client — see tests/support/mod.rs.
+rmcp = { version = "3.3", features = ["client", "transport-async-rw"] }
+tempfile = "3"
