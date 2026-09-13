@@ -69,7 +69,7 @@ snapshot_path = "./dump-shard-b.snapshot"
 # Minimum command duration, in microseconds, that gets recorded to the slow log.
 # 0 disables the slow log entirely.
 # Default: 10000 (10ms)
-slowlog_threshold_micros = 10000
+slowlog_threshold_micros = 60000
 
 # --- Logging -----------------------------------------------------------------
 

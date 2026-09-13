@@ -68,8 +68,8 @@ replica_announce_addr = "numericlabs.lxd:16480"
 #   3. On ALL nodes, update cluster.conf to point shard-b to numericlabs.lxd:16480.
 #   4. Restart all nodes.
 #
-#cluster_config = "/home/numericlabs/data/rocket/rocket-mem/cluster.conf"
-#cluster_node_id = "shard-b"
+cluster_config = "/home/numericlabs/data/rocket/rocket-mem/cluster.conf"
+cluster_node_id = "shard-b"
 # Optional -- both default to 1/15 even if left unset. Uncomment only to tune them.
 #cluster_probe_interval_secs = 1
 #cluster_node_timeout_secs = 15
@@ -124,7 +124,7 @@ snapshot_path = "./dump-shard-b-replica.snapshot"
 # Minimum command duration, in microseconds, that gets recorded to the slow log.
 # 0 disables the slow log entirely.
 # Default: 10000 (10ms)
-slowlog_threshold_micros = 10000
+slowlog_threshold_micros = 60000
 
 # --- Logging -----------------------------------------------------------------
 
