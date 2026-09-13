@@ -255,6 +255,9 @@ pre.expected{background:var(--accent-soft);border-color:var(--accent-line)}
 .vb.f:hover,.vb.f[aria-pressed="true"]{background:var(--fail);border-color:var(--fail);color:#fff}
 .vb.c{margin-left:auto;font-weight:500}
 .vb.c:hover{color:var(--ink)}
+.vb.run{color:var(--accent);border-color:var(--accent-line)}
+.vb.run:hover{background:var(--accent);border-color:var(--accent);color:#fff}
+.vb.run:disabled{opacity:.6;cursor:default}
 
 .empty{padding:40px 4px;color:var(--ink-3);font-family:var(--mono);font-size:13px;text-align:center}
 /* ---- footer: bookends the masthead, so the page opens and closes on --surface ---- */
@@ -443,6 +446,7 @@ export ROCKET_MEM_BIN="$ROCKET_MEM_REPO/target/release/rocket-mem"</pre>
   function save(){ try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) {} }
 
   var filter = 'all', query = '', allOpen = false;
+  var runnable = new Set();
   var list = document.getElementById('list'), nav = document.getElementById('nav');
   var strip = document.getElementById('strip'), runnote = document.getElementById('runnote');
   var cases = [];
@@ -532,6 +536,7 @@ export ROCKET_MEM_BIN="$ROCKET_MEM_REPO/target/release/rocket-mem"</pre>
         if (c.notes) html += '<div class="field"><span class="vh">Notes</span>'
           + '<div class="fnote">'+notesHtml(c.notes)+'</div></div>';
         html += '<div class="verdict">'
+          + (runnable.has(c.id) ? '<button class="vb run" data-run="'+attr(c.id)+'">Run</button>' : '')
           + '<button class="vb p" data-v="pass" aria-pressed="'+(st==='pass')+'">Pass</button>'
           + '<button class="vb f" data-v="fail" aria-pressed="'+(st==='fail')+'">Fail</button>'
           + '<button class="vb c" data-v="todo">Clear</button></div>';
@@ -654,6 +659,43 @@ export ROCKET_MEM_BIN="$ROCKET_MEM_REPO/target/release/rocket-mem"</pre>
     if (hadFocus) again.querySelector('.case-head').focus({ preventScroll: true });
   }
 
+  function triggerRun(id){
+    var btn = list.querySelector('.vb.run[data-run="'+id+'"]');
+    if (btn){ btn.disabled = true; btn.textContent = 'Running…'; }
+    fetch('/api/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ caseId: id })
+    }).catch(function(){ /* results, if any, still arrive over /events */ })
+      .finally(function(){
+        var again = list.querySelector('.vb.run[data-run="'+id+'"]');
+        if (again){ again.disabled = false; again.textContent = 'Run'; }
+      });
+  }
+
+  function connectLive(){
+    fetch('/api/status').then(function(r){
+      if (!r.ok) throw new Error('no server');
+      return r.json();
+    }).then(function(status){
+      runnable = new Set(status.inScope);
+      Object.keys(status.results).forEach(function(id){ state[id] = status.results[id]; });
+      save();
+      render();
+      var es = new EventSource('/events');
+      es.onmessage = function(e){
+        var msg = JSON.parse(e.data);
+        if (!msg.id) return;
+        state[msg.id] = msg.verdict;
+        save();
+        render();
+      };
+    }).catch(function(){
+      // No server reachable (e.g. the page was opened directly as a file) — the page still
+      // works exactly as it does today, just without Run buttons or live updates.
+    });
+  }
+
   // Shared by the per-case copy buttons and the footer's env block.
   function copyFrom(cp){
     var pre = cp.parentNode.querySelector('pre');
@@ -706,6 +748,8 @@ export ROCKET_MEM_BIN="$ROCKET_MEM_REPO/target/release/rocket-mem"</pre>
     }
     var cp = e.target.closest('.copy');
     if (cp){ copyFrom(cp); return; }
+    var runBtn = e.target.closest('.vb.run');
+    if (runBtn){ triggerRun(runBtn.getAttribute('data-run')); return; }
     var vb = e.target.closest('.vb');
     if (vb) setVerdict(art, vb.getAttribute('data-v'));
   });
@@ -818,6 +862,7 @@ export ROCKET_MEM_BIN="$ROCKET_MEM_REPO/target/release/rocket-mem"</pre>
   });
 
   render();
+  connectLive();
 })();
 </script>
 
