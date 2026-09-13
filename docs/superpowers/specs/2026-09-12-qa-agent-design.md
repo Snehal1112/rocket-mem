@@ -11,7 +11,9 @@
 We want an agent that executes the automatable subset of these cases against a real `rocket-mem`
 instance, judges pass/fail itself, and drives the *same* page live — so a tester watching the
 open tab sees ticks flip in real time as the agent works through a suite, exactly as if a human
-were clicking Pass/Fail.
+were clicking Pass/Fail. Beyond bulk suite runs, each in-scope case in the page also gets a
+**Run** button: clicking it executes that one scenario against a live server right then, the way
+a human tester would, rather than requiring a whole-suite batch run.
 
 ## Scope (v1)
 
@@ -77,9 +79,14 @@ tools/qa-agent/
     matcher.ts                 # actual vs `expected`: literal diff, `<...>` wildcard tokens
                               #   (already used throughout `expected`, e.g. `<pid>`, `<n>`,
                               #   `<date>`), plus a small per-case-id tolerance table
+    sessionRunner.ts            # runSuite(suite, {stopAfterCaseId?, alreadyRun}): the one
+                              #   sequential-execution path both the CLI's bulk suite runs and
+                              #   the browser's on-demand Run-button clicks call into — see
+                              #   "On-demand single-case runs" below
     server.ts                 # local HTTP server: serves docs/qa-playbook.html, POST
-                              #   /api/result (from caseRunner), GET /events (SSE fan-out),
-                              #   GET /api/status (snapshot for a freshly opened tab)
+                              #   /api/result (from sessionRunner), POST /api/run {caseId}
+                              #   (triggers an on-demand chained run), GET /events (SSE
+                              #   fan-out), GET /api/status (snapshot for a freshly opened tab)
     reporter.ts                # console summary + writes a JSON run snapshot to
                               #   tools/qa-agent/.run/results/<timestamp>.json (gitignored)
   .run/                       # gitignored: scratch server data dirs, PID tracking, results
@@ -90,12 +97,12 @@ tools/qa-agent/
 1. `yarn serve` starts `server.ts`, which serves `docs/qa-playbook.html` at
    `http://localhost:<port>/qa-playbook.html` (same-origin — no CORS needed) and opens the SSE
    endpoint. The tester opens that URL in a browser and leaves it open.
-2. `yarn run --suite <name>` (or `--all`) starts `caseRunner`, which:
+2. `yarn run --suite <name>` (or `--all`) starts `sessionRunner`, which:
    a. picks the next in-scope suite section, in the JSON's own order;
-   b. for each case in that section, in order: substitutes `<pid>` (see below), runs `steps`
-      verbatim as `bash -c` in a suite-scoped scratch working directory (so a stray
-      `rocket-mem.toml`/AOF/snapshot never leaks between suites — same reasoning the playbook
-      itself gives for per-section data paths), captures combined stdout;
+   b. for each case in that section, in order, calls `caseRunner` to: substitute `<pid>` (see
+      below), run `steps` verbatim as `bash -c` in a suite-scoped scratch working directory (so a
+      stray `rocket-mem.toml`/AOF/snapshot never leaks between suites — same reasoning the
+      playbook itself gives for per-section data paths), and capture combined stdout;
    c. diffs actual output against `expected` via `matcher.ts`;
    d. POSTs `{id, verdict, actual, expected}` to the running `server.ts` (if reachable — the
       runner works standalone without a browser open, it just has nothing to push results to);
@@ -107,6 +114,10 @@ tools/qa-agent/
 4. At the end of a suite run, `processTracker` kills only the PID(s) it resolved via `ss -tlnp`
    on that suite's known ports and confirmed as `rocket-mem` — never a broad pattern kill.
 5. `reporter.ts` prints a final pass/fail/error summary and writes the run snapshot.
+6. Alternatively, clicking a case's **Run** button in the browser POSTs `{caseId}` to
+   `/api/run`; `server.ts` resolves the case's suite and calls the same `sessionRunner.runSuite`
+   used by step 2, with `stopAfterCaseId` set to the clicked case — see "On-demand single-case
+   runs" below for exactly what that runs.
 
 ### Executing `steps` faithfully, including server lifecycle
 
@@ -124,6 +135,33 @@ The one exception: `SMOKE-12` is the only in-scope case whose `steps` contains a
 placeholder (`kill -TERM <pid>` / `ps -p <pid>`), meant for a human to fill in by hand. The
 runner substitutes it with the PID it resolves via `ss -tlnp` for that suite's known port,
 immediately before running that case.
+
+### On-demand single-case runs (Run button)
+
+Most cases' `precondition` assumes earlier cases in the same suite already ran against the same
+still-running server (shared instance, accumulated state — e.g. `CORE-09` assumes `CORE-08` left
+behind a hash key). A bare "run just this one case" click can't satisfy that on its own, so a
+click auto-chains rather than either failing outright or silently running the case against
+unsatisfied state:
+
+- `server.ts` keeps per-suite session state in memory: whether that suite's server is currently
+  running (and its PID, once resolved) and the ordered set of case ids that have successfully
+  run against it *this session* (i.e. since `yarn serve` started, or since the suite's server was
+  last (re)started).
+- On a Run-button click for case `X` in suite `S`: `sessionRunner.runSuite(S, { stopAfterCaseId:
+  X, alreadyRun: <S's already-run set> })` walks `S`'s cases in playbook order, skips any already
+  in `alreadyRun`, and executes (starting `S`'s server first if it isn't up yet) every case up to
+  and including `X` that hasn't run yet this session — reusing the same per-case execution,
+  matching, and result-push path bulk suite runs use, so every case that actually ran in the
+  chain (not just `X`) streams a result to the browser, not a single result for `X` alone.
+- If any case *before* `X` in the chain fails, the chain stops there: `X` itself is never
+  attempted (its precondition is not actually satisfied), and is reported with the same `not run`
+  state the Safety section already defines for a suite whose server failed to start — extended
+  here to also mean "blocked by an earlier failed precondition in this on-demand chain," not only
+  "the suite's server never started."
+- A suite's already-run set is cleared when its server is (re)started from scratch (a fresh
+  `yarn serve` process, or after `processTracker` has torn it down) — so a stale in-memory record
+  never claims a precondition is satisfied against a server that no longer holds that state.
 
 ### Matching `expected`
 
@@ -158,11 +196,13 @@ immediately before running that case.
 - Every case gets a timeout (a case whose server never started, or whose command hangs — e.g. a
   `SUBSCRIBE` accidentally run blocking — must not stall the whole run); a timed-out case reports
   as `fail` with a distinct "timed out" reason and the runner moves on.
-- If a suite's server fails to start, the remaining cases in that suite are reported as
-  `not run` (a fourth state, distinct from pass/fail/todo) rather than silently skipped — pushed
-  to the browser too, but the browser-side script only special-cases `pass`/`fail` (matching the
-  page's existing three-state model); `not run` for now just leaves the case as `todo`, since the
-  page doesn't currently have a fourth visual state and adding one is out of scope for this pass.
+- If a suite's server fails to start, or an on-demand chain's earlier case fails its own
+  precondition-satisfying run (see "On-demand single-case runs" above), the affected case(s) are
+  reported as `not run` (a fourth state, distinct from pass/fail/todo) rather than silently
+  skipped — pushed to the browser too, but the browser-side script only special-cases
+  `pass`/`fail` (matching the page's existing three-state model); `not run` for now just leaves
+  the case as `todo`, since the page doesn't currently have a fourth visual state and adding one
+  is out of scope for this pass.
 
 ## Testing plan
 
@@ -171,8 +211,11 @@ immediately before running that case.
   wildcard match, TTL-drift tolerance, a deliberate mismatch that must fail).
 - One integration-style test that runs the full Smoke suite end-to-end against a real built
   binary in a scratch directory and asserts all 12 cases pass — this is the walking-skeleton
-  proof that `caseRunner`/`processTracker`/`matcher` work together against the real server, not
-  just mocks.
+  proof that `sessionRunner`/`caseRunner`/`processTracker`/`matcher` work together against the
+  real server, not just mocks.
+- A test exercising the on-demand chain specifically: clicking a case partway through a suite
+  (e.g. `CORE-05`) with nothing yet run this session executes every preceding not-yet-run case
+  first, in order, and reports a result for each — not just the clicked case.
 - Manual verification: run `yarn serve`, open the page, run `yarn run --suite smoke`, watch the
   ticks flip live; confirm the live cluster (`ss -tlnp | grep -E ':(6379|6380|6381)\b'`) is
   untouched before and after.
@@ -186,3 +229,14 @@ immediately before running that case.
 - Full seed list for the matcher's numeric-tolerance table — start with the cases already
   identified while writing this spec (`CORE-02`, `CORE-03`, `SMOKE-07`) and extend as real runs
   surface more.
+- **A required Plan 2 design input, found during Plan 1's final review, not a Plan 1 defect:**
+  roughly 12 of the 114 in-scope cases — concentrated in Observability (9 of its 14) — encode
+  variable values in conventions the tolerance table can't express: literal `...` elision
+  (`aof_path=...`, `WARN ...:`), `NNNNN`/`NNN` numeric masks (`peer=127.0.0.1:NNNNN`), values
+  baked in from one specific run (`process_id:2389374`, Prometheus counter values), and at least
+  one case (`OBS-01`) whose `expected` block is a transcribed excerpt of a longer real capture,
+  not the whole thing (its `steps` run a bare `redis-cli info server` with no `grep`, so strict
+  line-count equality rejects the real output outright). This needs a genuinely new matching
+  mode — a `...`/`NNNNN` normalization pass, plus an opt-in "expected is a subset of actual"
+  containment check for excerpted cases — not more tolerance-table entries. Budget for
+  Observability being the hard section when planning `matcher.ts`'s extension in Plan 2.
