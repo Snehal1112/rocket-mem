@@ -642,12 +642,17 @@ export ROCKET_MEM_BIN="$ROCKET_MEM_REPO/target/release/rocket-mem"</pre>
     }
   }
 
-  function setVerdict(art, v){
-    var id = art.getAttribute('data-id');
-    if (v === 'todo') delete state[id]; else state[id] = v;
-    save();
-    var wasOpen = art.getAttribute('open-state') === '1';
-    var hadFocus = art.contains(document.activeElement);
+  // Preserves a case's expanded (open-state) status and keyboard focus around a `render()`
+  // call. `state`/`save()` must already be updated with whatever change is being applied before
+  // this is called — this only re-renders and restores UI state around that re-render. Shared by
+  // `setVerdict` (a manual click) and the SSE handler in `connectLive` (a live result arriving
+  // out of band) — before this was shared, the SSE path's bare `render()` silently collapsed
+  // whatever case the tester had open and dropped focus, which is also what let the Run button's
+  // disabled "Running…" state get reset mid-flight (see the qa-agent-3 final review).
+  function renderPreservingCaseState(id){
+    var art = list.querySelector('.case[data-id="'+id+'"]');
+    var wasOpen = art && art.getAttribute('open-state') === '1';
+    var hadFocus = art && art.contains(document.activeElement);
     render();
     var again = list.querySelector('.case[data-id="'+id+'"]');
     if (!again) return;
@@ -659,6 +664,13 @@ export ROCKET_MEM_BIN="$ROCKET_MEM_REPO/target/release/rocket-mem"</pre>
     if (hadFocus) again.querySelector('.case-head').focus({ preventScroll: true });
   }
 
+  function setVerdict(art, v){
+    var id = art.getAttribute('data-id');
+    if (v === 'todo') delete state[id]; else state[id] = v;
+    save();
+    renderPreservingCaseState(id);
+  }
+
   function triggerRun(id){
     var btn = list.querySelector('.vb.run[data-run="'+id+'"]');
     if (btn){ btn.disabled = true; btn.textContent = 'Running…'; }
@@ -666,6 +678,12 @@ export ROCKET_MEM_BIN="$ROCKET_MEM_REPO/target/release/rocket-mem"</pre>
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ caseId: id })
+    }).then(function(r){
+      if (!r.ok){
+        return r.json().catch(function(){ return {}; }).then(function(body){
+          console.warn('run failed for', id, ':', body.error || r.status);
+        });
+      }
     }).catch(function(){ /* results, if any, still arrive over /events */ })
       .finally(function(){
         var again = list.querySelector('.vb.run[data-run="'+id+'"]');
@@ -678,7 +696,7 @@ export ROCKET_MEM_BIN="$ROCKET_MEM_REPO/target/release/rocket-mem"</pre>
       if (!r.ok) throw new Error('no server');
       return r.json();
     }).then(function(status){
-      runnable = new Set(status.inScope);
+      runnable = new Set(status.runnable);
       Object.keys(status.results).forEach(function(id){ state[id] = status.results[id]; });
       save();
       render();
@@ -688,7 +706,7 @@ export ROCKET_MEM_BIN="$ROCKET_MEM_REPO/target/release/rocket-mem"</pre>
         if (!msg.id) return;
         state[msg.id] = msg.verdict;
         save();
-        render();
+        renderPreservingCaseState(msg.id);
       };
     }).catch(function(){
       // No server reachable (e.g. the page was opened directly as a file) — the page still
