@@ -12,6 +12,8 @@ Post-v1, the project continues against an unscoped Phase 5-9 backlog (`rocket-me
 
 `examples/` holds standalone client-usage demos (Go, using `go-redis`) that exercise rocket-mem as an ordinary Redis-wire client would — not part of the Cargo workspace, not built or tested by CI.
 
+`rocket-mem-mcp/` is a standalone Rust crate (own `Cargo.toml`, outside the root workspace, not CI-gated — same relationship as `examples/`) exposing rocket-mem's command set as MCP tools for LLM agents. See `rocket-mem-mcp/README.md` for what it is and its one build prerequisite, and `docs/superpowers/specs/2026-09-13-rocket-mem-mcp-server-design.md` for the full design.
+
 ## Commands
 
 ```bash

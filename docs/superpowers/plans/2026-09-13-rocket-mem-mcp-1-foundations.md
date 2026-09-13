@@ -704,9 +704,46 @@ git commit -m "Add get/set as the first rocket-mem-mcp tools"
 
 ## Next plan
 
-Plan 2 covers the rest of the String/Key command family (`GETSET`, `GETRANGE`, `SETRANGE`,
-`APPEND`, `STRLEN`, `INCR`/`DECR`/`INCRBY`, `MSET`, `MGET`, `MSETNX`, `RENAME`, `RENAMENX`,
-`TYPE`, `RANDOMKEY`, `KEYS`, `SCAN`, `DEL`/`EXISTS`, `EXPIRE`/`PEXPIRE`/`EXPIREAT`/`PEXPIREAT`,
-`TTL`/`PTTL`, `PERSIST`, `MEMORY USAGE`, `OBJECT ENCODING` — per README.md's "Command coverage"
-table), following the exact `get`/`set` pattern this plan established, and splits `server.rs`'s
-growing tool-method list into a `tools/` module directory once that file gets unwieldy.
+This plan only delivered the foundation (pool, error mapping, stdio server, `get`/`set`). A lot
+of what the spec (`docs/superpowers/specs/2026-09-13-rocket-mem-mcp-server-design.md`) calls for
+is still not started. Future plans need to cover, in no particular priority order:
+
+- **The rest of the String/Key command family**: `GETSET`, `GETRANGE`, `SETRANGE`, `APPEND`,
+  `STRLEN`, `INCR`/`DECR`/`INCRBY`, `MSET`, `MGET`, `MSETNX`, `RENAME`, `RENAMENX`, `TYPE`,
+  `RANDOMKEY`, `KEYS`, `SCAN`, `DEL`/`EXISTS`, `EXPIRE`/`PEXPIRE`/`EXPIREAT`/`PEXPIREAT`,
+  `TTL`/`PTTL`, `PERSIST`, `MEMORY USAGE`, `OBJECT ENCODING` (per README.md's "Command coverage"
+  table), following the exact `get`/`set` pattern this plan established.
+- **A `tools/` module split**: split `server.rs`'s growing tool-method list into a `tools/`
+  module directory (`tools/string.rs`, `tools/keys.rs`, etc., per the spec's "Tool surface"
+  section) once the flat file gets unwieldy — not needed yet at two tools.
+- **ACL username/password credential support.** The spec's security model says the target's
+  "address and optional ACL username/password" are both meant to come from this crate's own
+  config (mirroring rocket-mem's own layered config convention). Today `config.rs`/`pool.rs`
+  only carry `target_addr` — there is no way to authenticate against a target that has ACLs
+  enabled. This needs a real, dedicated fix (e.g. `Config` fields for `acl_username`/
+  `acl_password` plumbed into `Client::open`/`ConnectionManager` setup, with the password sourced
+  from env/CLI the same redacted way rocket-mem's own config layer treats secrets) — interpolating
+  a raw `--target-addr` string with embedded credentials to work around this today would leak the
+  password via `ps`/shell history, so that is explicitly not an acceptable stopgap.
+- **Streamable HTTP transport.** The spec explicitly wants "both stdio and Streamable HTTP from
+  the start" over the same tool implementation, with only `main.rs`'s startup wiring differing
+  (spawn a child process vs. bind an HTTP listener). Only `stdio` exists so far — Streamable HTTP
+  is not implemented at all yet, not even behind a flag.
+- **The TOML config-file layer.** The spec's config precedent is defaults → file → env → CLI,
+  matching rocket-mem's own convention. Today `config.rs` only layers defaults → env → CLI (via
+  `clap`'s `env` attribute) — there is no file layer yet.
+- **`run_transaction`.** The spec collapses `MULTI`/`EXEC`/`DISCARD` into one
+  `run_transaction(commands: [{name, args}])` tool built on `redis::pipe().atomic()` (see the
+  spec's "Connection and session model" section) — not implemented yet.
+- **`session.rs` and the pub/sub tools.** The spec's one place session state is unavoidable:
+  `subscribe`/`poll_messages`/`unsubscribe` need a per-MCP-session `SubscriptionManager` keyed by
+  session id, plus session-teardown cleanup, plus the stateless `publish`/`pubsub_*`
+  introspection tools. None of `session.rs`, `subscription.rs`, or any pub/sub tool exists yet.
+- **Proper `Bytes`/`EX` value typing for string commands.** Today `get`/`set` are `String`-only
+  with no expiry option. The spec's own illustrative signature is
+  `set(key: String, value: Bytes, ex: Option<u64>)` — a future plan needs to widen `SetParams`
+  (and any other string command taking a value) to accept raw bytes rather than only UTF-8
+  strings, and add the `EX`/expiry option `SET` already supports at the rocket-mem wire level.
+
+A future implementer should treat this list, not just the String/Key bullet above, as the
+remaining v1 scope — silence on an item elsewhere in this plan does not mean it's done.
