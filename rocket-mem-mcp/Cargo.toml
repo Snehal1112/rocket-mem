@@ -29,3 +29,6 @@ anyhow = "1"
 
 [dev-dependencies]
 tempfile = "3"
+# Needed because `rmcp::object!` expands to an unqualified `serde_json::json!` call — see
+# rocket-mem-mcp/tests/get_set_tool.rs.
+serde_json = "1"

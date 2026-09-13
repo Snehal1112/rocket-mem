@@ -1,9 +1,27 @@
-use rmcp::{tool_handler, tool_router, ServerHandler};
+use redis::AsyncCommands;
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::{CallToolResult, ContentBlock, ErrorData};
+use rmcp::{tool, tool_handler, tool_router, ServerHandler};
+use schemars::JsonSchema;
+use serde::Deserialize;
 
+use crate::errors::redis_error_to_tool_result;
 use crate::pool::Pool;
 
-/// The MCP-facing view of one rocket-mem instance. Holds a `Pool` (Task 1); each tool method
-/// (added starting in Task 3) borrows a connection from it for the duration of one call.
+#[derive(Deserialize, JsonSchema)]
+struct GetParams {
+    /// The key to read.
+    key: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct SetParams {
+    /// The key to write.
+    key: String,
+    /// The value to store.
+    value: String,
+}
+
 #[derive(Clone)]
 pub struct RocketMemMcpServer {
     pool: Pool,
@@ -15,12 +33,38 @@ impl RocketMemMcpServer {
     }
 }
 
-// `allow_empty` is required here because this impl block has no `#[tool]` fn yet — Task 3 adds
-// the first ones (`get`/`set`). Without it, `#[tool_router]` refuses to generate a router that
-// would serve zero tools.
-#[tool_router(allow_empty)]
+#[tool_router]
 impl RocketMemMcpServer {
-    // Tool methods land here, starting with `get`/`set` in Task 3.
+    #[tool(description = "Get the string value of a key. A missing key is not an error.")]
+    async fn get(
+        &self,
+        Parameters(GetParams { key }): Parameters<GetParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let mut conn = self.pool.connection();
+        let value: Result<Option<String>, redis::RedisError> = conn.get(&key).await;
+        match value {
+            Ok(Some(value)) => Ok(CallToolResult::success(vec![ContentBlock::text(value)])),
+            Ok(None) => Ok(CallToolResult::success(vec![ContentBlock::text(
+                "(nil)".to_string(),
+            )])),
+            Err(err) => redis_error_to_tool_result(err),
+        }
+    }
+
+    #[tool(description = "Set the string value of a key.")]
+    async fn set(
+        &self,
+        Parameters(SetParams { key, value }): Parameters<SetParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let mut conn = self.pool.connection();
+        let result: Result<(), redis::RedisError> = conn.set(&key, &value).await;
+        match result {
+            Ok(()) => Ok(CallToolResult::success(vec![ContentBlock::text(
+                "OK".to_string(),
+            )])),
+            Err(err) => redis_error_to_tool_result(err),
+        }
+    }
 }
 
 #[tool_handler]

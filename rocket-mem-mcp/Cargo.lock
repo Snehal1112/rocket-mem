@@ -847,6 +847,7 @@ dependencies = [
  "rmcp",
  "schemars",
  "serde",
+ "serde_json",
  "tempfile",
  "tokio",
 ]
