@@ -86,10 +86,10 @@ explicitly: an agent with tool access to this MCP server can repoint replication
 rewrite its own ACL grants. That is a deliberate consequence of the security model, not an
 oversight.
 
-This yields roughly 103 tools across all modules (String/Key ~30, Hash 11, List 11, Set 13, Sorted
-Set 7, Server/Cluster/Slowlog ~17, ACL 5, one `run_transaction`, Pub/Sub 7 — Hash/Set corrected
-down from an initial 12/14 estimate once `HSCAN`/`SSCAN` were confirmed unimplemented, see
-"Command semantics reference" below). See "Scale" under Out
+This yields roughly 105 tools across all modules (String/Key ~30, Hash 12, List 11, Set 14, Sorted
+Set 7, Server/Cluster/Slowlog ~17, ACL 5, one `run_transaction`, Pub/Sub 7 — Hash/Set include
+`HSCAN`/`SSCAN`, both confirmed implemented while writing Plan 3, correcting an earlier pass that
+had wrongly marked them absent; see "Command semantics reference" below). See "Scale" under Out
 of scope for the one open question this raises.
 
 ## Connection and session model
@@ -179,11 +179,17 @@ tell that apart from "your specific command was rejected."
 ## Command semantics reference (verified 2026-09-13)
 
 Ground truth for Plans 2-13, verified against this project's actual engine/dispatcher code (not
-assumed real-Redis behavior) via a decomposed research pass before writing each plan. Corrects
-two tool-count estimates from "Tool surface" above: **Hash is 11, not 12** (`HSCAN` is not
-implemented); **Set is 13, not 14** (`SSCAN` is not implemented) — both confirmed absent from
-`crates/engine/src/commands/{hash,set}.rs` and from `docs/command-compatibility.md`'s own command
-lists.
+assumed real-Redis behavior) via a decomposed research pass before writing each plan.
+
+**Correction (found while writing Plan 3, 2026-09-13):** an earlier pass through this section
+claimed `HSCAN`/`SSCAN` were unimplemented, dropping Hash to 11 tools and Set to 13. Re-verified
+directly against `crates/server/src/dispatcher.rs` (`HSCAN` at lines 505-534, `SSCAN` at line 759)
+and `README.md`'s "Command coverage" table: **both are real, implemented commands.** Each is a
+degenerate but working implementation — the underlying collection (a hash or a set) already lives
+fully in memory, so there's no keyspace-style chunking to do; the command internally reads the
+whole collection in one shot, applies `MATCH`, and always reports cursor `"0"` (scan complete) in
+a single page. **Hash is 12 tools, Set is 14** — the original, higher estimate was the correct one
+all along; the "corrected down" pass that dropped both was itself the error.
 
 ### Plan 2 — String/Key rest, and Plan 13's `Bytes`/`EX` widening
 
@@ -202,14 +208,20 @@ error) if the destination already exists. Variadic (array-shaped tool params nee
 family — its tool needs a `cursor` input and must return the `next_cursor` the engine gives back,
 not a single fire-and-forget call like `KEYS`.
 
-### Plan 3 — Hash (11 tools)
+### Plan 3 — Hash (12 tools)
 
-`HSET`/`HSETNX` are **single field/value pair at the engine level**
-(`crates/engine/src/commands/hash.rs:8-13,167-172`) — the dispatcher loops per pair to give real
-Redis's variadic multi-pair `HSET` on the wire. The MCP tool needs the same choice: accept one
-pair (matching the engine call 1:1) or accept an array of pairs and loop internally like the
-dispatcher does. `HDEL`/`HMGET` are already variadic at the engine level. `HINCRBY` raises two
-error types beyond WRONGTYPE: `NotAnInteger`, `IncrementOverflow`.
+`HSET` is **variadic at the wire level** (`dispatcher.rs:444-463` loops over field/value pairs
+from one `HSET` call, summing the newly-added count) even though the engine function itself
+(`crates/engine/src/commands/hash.rs:8-43`) takes only one pair — the MCP tool follows the wire
+command and accepts an array of pairs in one call, exactly like `MSET`'s tool in Plan 2.
+**`HSETNX` is NOT variadic** (`dispatcher.rs:592-599`, exactly 3 args) — its tool takes a single
+field/value pair. `HDEL`/`HMGET` are already variadic at both the engine and wire level. `HINCRBY`
+raises two error types beyond WRONGTYPE: `NotAnInteger`, `IncrementOverflow` — same shape as
+Plan 2's `incr_by`. `HSCAN` is real (see the correction above): reply shape
+`[cursor_bulk, [field, value, field, value, ...]]`, `MATCH` supported, no `TYPE` (real Redis's
+`HSCAN` has none either), `COUNT` not exposed by the tool (parsed-but-ignored at the wire level,
+same as Plan 2's `scan`) since there's no page to size — one call always returns everything and
+the cursor is always `"0"`.
 
 ### Plan 4 — List (11 tools)
 
@@ -219,12 +231,16 @@ All 11 map cleanly to fixed-parameter tools. `LPUSH`/`RPUSH` take a variadic val
 existing list) — worth two distinct, separately-worded tool errors rather than collapsing both to
 one message.
 
-### Plan 5 — Set (13 tools)
+### Plan 5 — Set (14 tools)
 
 `SADD`/`SREM` take variadic members; `SINTER`/`SUNION`/`SDIFF` and their `*STORE` variants take a
 **variadic key list** (not a fixed two keys) plus, for the `*STORE` variants, a destination key.
 `SPOP` and `SRANDMEMBER` do **not** support an optional `count` at the engine level — single-member
 only, despite real Redis's `[count]` form; don't add a `count` parameter the engine will ignore.
+`SSCAN` is real (see the correction above, not dropped from scope) — same degenerate-but-working
+shape as `HSCAN`: reads the whole set in one shot, applies `MATCH`, no `TYPE`, no `COUNT` exposed,
+cursor always `"0"`. Re-verify its exact dispatcher line (`SSCAN` was at `dispatcher.rs:759` as of
+Plan 3, but re-check when Plan 5 is actually written — line numbers drift).
 
 ### Plan 6 — Sorted Set (7 tools)
 
