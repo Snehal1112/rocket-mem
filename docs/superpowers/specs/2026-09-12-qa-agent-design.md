@@ -181,7 +181,7 @@ immediately before running that case.
 
 - Exact heuristic for "does this case's `steps` start a new background server" (needed so
   `processTracker` knows when to re-resolve the tracked PID) — likely: contains
-  `ROCKET_MEM_ADDR=` and ends with `&`, but confirm against all 120 in-scope cases while
+  `ROCKET_MEM_ADDR=` and ends with `&`, but confirm against all 114 in-scope cases while
   implementing rather than enumerating them all in this spec.
 - Full seed list for the matcher's numeric-tolerance table — start with the cases already
   identified while writing this spec (`CORE-02`, `CORE-03`, `SMOKE-07`) and extend as real runs
