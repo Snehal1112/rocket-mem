@@ -225,7 +225,39 @@ unsatisfied state:
 - Exact heuristic for "does this case's `steps` start a new background server" (needed so
   `processTracker` knows when to re-resolve the tracked PID) — likely: contains
   `ROCKET_MEM_ADDR=` and ends with `&`, but confirm against all 114 in-scope cases while
-  implementing rather than enumerating them all in this spec.
+  implementing rather than enumerating them all in this spec. **Resolved in Plan 2, with a
+  caveat found during its final review:** only `SMOKE-01` matches this heuristic (starts a
+  server as its *entire* steps, nothing after). 16 other in-scope cases (`PERSIST-01`..`05`,
+  `CFG-01`..`07`, `RMP-01`, some `OBS-*`) background a server *partway through* their own steps,
+  then run more commands and `kill` it themselves at the end — these take `caseRunner`'s
+  foreground (wait-for-exit) path, not the background-launch path, and rely on their own script
+  reaching its own cleanup step to ever let the process's stdout pipe close. `caseRunner.ts`'s
+  foreground path now resolves on a timeout regardless of whether `close` ever fires (fixed in
+  Plan 2's final review), so a case whose own cleanup never runs reports a clear timeout instead
+  of hanging the whole runner — but be aware these cases exist and take a different path than
+  the single true "background launch" case.
+- **A required Plan 3 design input, found during Plan 2's final review, not a Plan 2 defect:**
+  only the Smoke suite's server is started by one of its own cases' `steps` (`SMOKE-01`). Every
+  other in-scope suite's server — Core, Transactions, Persistence, Configuration/RMP/
+  Observability — is started by *prose setup instructions in the playbook document itself*
+  (e.g. the "Setup notes for configuration, RMP, and observability" section), referencing
+  `$BIN`/`$DATA`/`$ROCKET_MEM_BIN` shell variables the document tells a human to set up front,
+  not anything embedded in a case's own `steps` text. Plan 2's CLI (`index.ts`) therefore only
+  actually works for `--suite "Smoke suite"` today — running any other suite (or `--all`) is
+  explicitly gated behind a clear error rather than silently failing, until Plan 3 (or a
+  follow-on) teaches the runner each suite's own prose-derived setup recipe.
+- **Also found during Plan 2's final review, not fixed there (recorded here so it isn't
+  rediscovered case-by-case):** the v0.1.4 boxed-startup-banner redesign (2026-09-08) that broke
+  `SMOKE-01`/`08`/`09`/`10`/`12` (fixed in Plan 2, commits `5976bed`/`2cdc6d8`) also affects other
+  in-scope cases whose `expected` text still shows the old plain banner or a pre-redesign
+  `INFO`/`replication` shape: `PERSIST-02`..`05`, `CFG-01`..`07`, `RMP-01` (in scope, not yet
+  fixed) — plus out-of-scope `ENV-08`, `ENV-10`, `CLUSTER-02`, noted for whoever eventually
+  automates those suites. Separately, `OBS-02` (out of scope for Plan 2) was deliberately left
+  alone during the SMOKE-09 fix, but for the wrong stated reason — its `expected` text has the
+  *exact same* field-order/trailing-blank-line bug SMOKE-09 had, unrelated to the `...`/`NNNNN`
+  matching-mode gap below that OBS-02 was assumed to need; the playbook currently documents two
+  contradictory `expected` texts for the same `INFO replication` command (`SMOKE-09`'s now-fixed
+  one and `OBS-02`'s stale one), which a manual tester will hit before any automation does.
 - Full seed list for the matcher's numeric-tolerance table — start with the cases already
   identified while writing this spec (`CORE-02`, `CORE-03`, `SMOKE-07`) and extend as real runs
   surface more.

@@ -5334,10 +5334,14 @@ redis-cli -p 6570 info replication
 ```
 # Replication
 role:master
-master_repl_offset:0
 connected_slaves:0
+master_repl_offset:<n>
 
 ```
+
+**Notes:** Field order is `role` / `connected_slaves` / `master_repl_offset` (the real,
+deterministic order the server emits) — `master_repl_offset` is wildcarded since earlier
+commands on this server legitimately advance it. See SMOKE-09's notes for the same shape.
 
 **Result:** ☐ Pass ☐ Fail
 
