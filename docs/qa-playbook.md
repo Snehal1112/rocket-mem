@@ -140,15 +140,25 @@ Audience: a QA engineer with no prior exposure to this codebase. Every command b
 real while writing this section (2026-09-01), against commit `61f40ae` (tag `v0.1.3`) unless a
 case says otherwise. Where reality differed from what the docs claim, this section says so.
 
-**Port note.** `docs/getting-started.md` and `.claude/manual-testing.md` both default to
-`127.0.0.1:6379` (RESP), `127.0.0.1:6380` (RMP), `127.0.0.1:9121` (metrics). This playbook was
-written on a shared host where those defaults are already bound by another tester's instance —
-confirmed directly: starting a second instance with zero env vars failed with
-`Error: Os { code: 98, kind: AddrInUse, message: "Address already in use" }`. Every case below
-therefore uses `ROCKET_MEM_ADDR=127.0.0.1:6540`, `ROCKET_MEM_RMP_ADDR=127.0.0.1:6541`,
-`ROCKET_MEM_METRICS_ADDR=127.0.0.1:9340` (Docker host mappings `16540`/`16541`/`19340`) instead of
-the documented defaults. If you have a machine to yourself, drop those three env vars and use the
-default ports shown in the docs — behavior is otherwise identical.
+**Port note.** `docs/getting-started.md`, `.claude/manual-testing.md`, and the checked-in
+`rocket-mem*.toml` files all agree on `numericlabs.lxd:6379` (RESP), `numericlabs.lxd:7379` (RMP),
+`numericlabs.lxd:9121` (metrics) for shard-a's leader — the address the single-instance suites
+below (`SMOKE`, `CORE`, `TXN`, `PERSIST`, `CFG`, `RMP`, `OBS`) now use, byte-for-byte, instead of an
+unrelated scratch range. `ACL`/`TLS` similarly now match `rocket-mem.toml`'s real listeners,
+including its TLS addresses (`numericlabs.lxd:16379`/`17379`) and certificate paths.
+
+**This means every one of those suites collides with the live hand-started six-node cluster if
+it's running.** Before starting any suite below, confirm the cluster is down:
+`ss -tlnp | grep -E ':(6379|6380|6381|7379|7380|7381|9121|9122|9123|16379|16380|16381|17379|17380|17381)\b'`
+and `pgrep -af rocket-mem` should print nothing. Stop it first if either does — **never**
+`pkill -f rocket-mem` (see "Before you start" below); resolve each PID from `ss`/`pgrep` and `kill`
+it by that PID — then restart the cluster from its own runbook once your QA pass is done. `REPL`,
+`PUBSUB`, and `CLUSTER` are unaffected: they exercise their own synthetic, disposable topologies
+and were left on their existing scratch ports.
+
+If you can't take the live cluster down for a pass, substitute any free scratch `host:port` for
+the addresses shown below — behavior is otherwise identical, and using a scratch range for exactly
+this reason is what an earlier revision of this playbook did.
 
 ## Environment setup
 
@@ -480,18 +490,18 @@ used for every case below in order; stopped at the end. Built via Method A (ENV-
 
 **Steps:**
 ```bash
-ROCKET_MEM_ADDR=127.0.0.1:6540 ROCKET_MEM_RMP_ADDR=127.0.0.1:6541 ROCKET_MEM_METRICS_ADDR=127.0.0.1:9340 \
+ROCKET_MEM_ADDR=numericlabs.lxd:6379 ROCKET_MEM_RMP_ADDR=numericlabs.lxd:7379 ROCKET_MEM_METRICS_ADDR=numericlabs.lxd:9121 \
   ./target/release/rocket-mem &
 ```
 
 **Expected:**
 ```
-<date>  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=127.0.0.1:6540
-<date>  INFO rocket_mem: resolved config summary node_id=127.0.0.1:6540 addr=127.0.0.1:6540 rmp_addr=127.0.0.1:6541 metrics_addr=127.0.0.1:9340 aof_path=./appendonly.aof snapshot_path=./dump.snapshot log_filter=info log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=false acl_user_count=0 tls_enabled=false tls_replication_enabled=false
+<date>  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=numericlabs.lxd:6379
+<date>  INFO rocket_mem: resolved config summary node_id=numericlabs.lxd:6379 addr=numericlabs.lxd:6379 rmp_addr=numericlabs.lxd:7379 metrics_addr=numericlabs.lxd:9121 aof_path=./appendonly.aof snapshot_path=./dump.snapshot log_filter=info log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=false acl_user_count=0 tls_enabled=false tls_replication_enabled=false
 <date>  INFO rocket_mem::aof: aof recovery replay complete commands=0 bytes=0 elapsed_us=<n>
-<date>  INFO rocket_mem: listener bound protocol=metrics addr=http://127.0.0.1:9340/metrics
-<date>  INFO rocket_mem: listener bound protocol=RMP addr=127.0.0.1:6541
-<date>  INFO rocket_mem: listener bound protocol=RESP addr=127.0.0.1:6540
+<date>  INFO rocket_mem: listener bound protocol=metrics addr=http://192.168.1.12:9121/metrics
+<date>  INFO rocket_mem: listener bound protocol=RMP addr=192.168.1.12:7379
+<date>  INFO rocket_mem: listener bound protocol=RESP addr=192.168.1.12:6379
 
 ┌───────────────────────────────────────────────────────────────────────────────────────────────────┐
 │ rocket-mem v0.1.4                                                                                 │
@@ -501,17 +511,21 @@ ROCKET_MEM_ADDR=127.0.0.1:6540 ROCKET_MEM_RMP_ADDR=127.0.0.1:6541 ROCKET_MEM_MET
 │ cluster   standalone (no cluster_config set)                                                      │
 │ replicas  none connected yet -- REPLICAOF is a live command; INFO REPLICATION shows current state │
 │ listeners                                                                                         │
-│           metrics  http://127.0.0.1:9340/metrics                                                  │
-│           RMP      127.0.0.1:6541                                                                 │
-│           RESP     127.0.0.1:6540                                                                 │
+│           metrics  http://192.168.1.12:9121/metrics                                               │
+│           RMP      192.168.1.12:7379                                                              │
+│           RESP     192.168.1.12:6379                                                              │
 └───────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-**Notes:** No `--config` and no `rocket-mem.toml` in the working directory is not an error — see
-the port note at the top of this document for why the addresses aren't the documented defaults.
-On a single-tenant machine, drop the three `ROCKET_MEM_*` env vars entirely and you'll see
-`127.0.0.1:9121` / `127.0.0.1:6380` / `127.0.0.1:6379` instead, which is the literal zero-config
-case the docs describe. Real, captured output as of `v0.1.4`'s boxed-startup-banner redesign
+**Notes:** No `--config` and no `rocket-mem.toml` in the working directory is not an error — this
+is the literal zero-config server, just pointed at shard-a's real address instead of the
+zero-config default (`127.0.0.1:9121`/`6380`/`6379`) — see the port note at the top of this
+document for why, and stop the live cluster first if it's up (same note). `addr`/`rmp_addr`/
+`metrics_addr` in the config-summary line stay the literal configured hostname
+(`numericlabs.lxd:<port>`), but the `listener bound` lines and the banner's own `listeners` block
+show the address as actually resolved and bound (`192.168.1.12:<port>`) — confirmed by a real run;
+don't expect the two to read identically once a real hostname (rather than `127.0.0.1`, which
+resolves to itself) is in play. Real, captured output as of `v0.1.4`'s boxed-startup-banner redesign
 (`crates/server/src/main.rs`, shipped 2026-09-08) — six `tracing`-formatted `INFO` lines to
 stderr, then a box-drawn summary banner to stdout. This replaces the plain four-line banner this
 case documented before that redesign; if you're testing an older build, expect the old plain
@@ -526,7 +540,7 @@ varies run to run. The banner is followed by a blank line before the process kee
 
 **Steps:**
 ```bash
-redis-cli -p 6540 PING
+redis-cli -h numericlabs.lxd -p 6379 PING
 ```
 
 **Expected:**
@@ -542,8 +556,8 @@ PONG
 
 **Steps:**
 ```bash
-redis-cli -p 6540 SET foo bar
-redis-cli -p 6540 GET foo
+redis-cli -h numericlabs.lxd -p 6379 SET foo bar
+redis-cli -h numericlabs.lxd -p 6379 GET foo
 ```
 
 **Expected:**
@@ -560,9 +574,9 @@ bar
 
 **Steps:**
 ```bash
-redis-cli -p 6540 EXISTS foo
-redis-cli -p 6540 DEL foo
-redis-cli -p 6540 EXISTS foo
+redis-cli -h numericlabs.lxd -p 6379 EXISTS foo
+redis-cli -h numericlabs.lxd -p 6379 DEL foo
+redis-cli -h numericlabs.lxd -p 6379 EXISTS foo
 ```
 
 **Expected:**
@@ -580,8 +594,8 @@ redis-cli -p 6540 EXISTS foo
 
 **Steps:**
 ```bash
-redis-cli -p 6540 HSET myhash field1 value1
-redis-cli -p 6540 HGET myhash field1
+redis-cli -h numericlabs.lxd -p 6379 HSET myhash field1 value1
+redis-cli -h numericlabs.lxd -p 6379 HGET myhash field1
 ```
 
 **Expected:**
@@ -598,8 +612,8 @@ value1
 
 **Steps:**
 ```bash
-redis-cli -p 6540 RPUSH mylist a b c
-redis-cli -p 6540 LRANGE mylist 0 -1
+redis-cli -h numericlabs.lxd -p 6379 RPUSH mylist a b c
+redis-cli -h numericlabs.lxd -p 6379 LRANGE mylist 0 -1
 ```
 
 **Expected:**
@@ -618,9 +632,9 @@ c
 
 **Steps:**
 ```bash
-redis-cli -p 6540 SET ttlkey val
-redis-cli -p 6540 EXPIRE ttlkey 100
-redis-cli -p 6540 TTL ttlkey
+redis-cli -h numericlabs.lxd -p 6379 SET ttlkey val
+redis-cli -h numericlabs.lxd -p 6379 EXPIRE ttlkey 100
+redis-cli -h numericlabs.lxd -p 6379 TTL ttlkey
 ```
 
 **Expected:**
@@ -642,7 +656,7 @@ it if it's off by much more, or negative/missing.
 
 **Steps:**
 ```bash
-redis-cli -p 6540 INFO server
+redis-cli -h numericlabs.lxd -p 6379 INFO server
 ```
 
 **Expected:**
@@ -673,7 +687,7 @@ by eye, account for both.
 
 **Steps:**
 ```bash
-redis-cli -p 6540 INFO replication
+redis-cli -h numericlabs.lxd -p 6379 INFO replication
 ```
 
 **Expected:**
@@ -700,8 +714,8 @@ through SMOKE-09), so the counters below aren't all zero.
 
 **Steps:**
 ```bash
-curl -s -o /dev/null -w "HTTP %{http_code}\n" http://127.0.0.1:9340/metrics
-curl -s http://127.0.0.1:9340/metrics | grep -A1 '^# TYPE rocket_mem_commands_total'
+curl -s -o /dev/null -w "HTTP %{http_code}\n" http://numericlabs.lxd:9121/metrics
+curl -s http://numericlabs.lxd:9121/metrics | grep -A1 '^# TYPE rocket_mem_commands_total'
 ```
 
 **Expected:**
@@ -724,7 +738,7 @@ exists and increments per command).
 **Steps:**
 ```bash
 ls dump.snapshot 2>&1
-redis-cli -p 6540 SAVE
+redis-cli -h numericlabs.lxd -p 6379 SAVE
 ls -la dump.snapshot
 ```
 
@@ -749,7 +763,7 @@ did not exist before and does after, with `SAVE` returning `OK`.
 kill -TERM <pid>
 sleep 1
 ps -p <pid>            # should report no such process
-ss -tlnp | grep -E ':(6540|6541|9340)\b'   # should print nothing — ports released
+ss -tlnp | grep -E ':(6379|7379|9121)\b'   # should print nothing — ports released
 ```
 
 **Expected:**
@@ -775,8 +789,8 @@ that confirms no data row for `<pid>`, not just this literal text.
 
 
 Server under test: `target/release/rocket-mem`, started with
-`ROCKET_MEM_ADDR=127.0.0.1:6550`, `ROCKET_MEM_RMP_ADDR=127.0.0.1:6551`,
-`ROCKET_MEM_METRICS_ADDR=127.0.0.1:9350`. All steps below use `redis-cli -p 6550`.
+`ROCKET_MEM_ADDR=numericlabs.lxd:6379`, `ROCKET_MEM_RMP_ADDR=numericlabs.lxd:7379`,
+`ROCKET_MEM_METRICS_ADDR=numericlabs.lxd:9121`. All steps below use `redis-cli -h numericlabs.lxd -p 6379`.
 Every case was run against a live instance; output shown under **Expected** is real
 captured output, not invented. `redis-cli` auto-selects raw (non-interactive) output
 format when stdout isn't a TTY — no `1)`/`(integer)` prefixes, one value per line, a
@@ -797,14 +811,14 @@ exercised as if they existed (CORE-39 confirms the resulting error for one of th
 
 **Steps:**
 ```bash
-redis-cli -p 6550 set core:str1 hello
-redis-cli -p 6550 get core:str1
-redis-cli -p 6550 set core:str1 world NX
-redis-cli -p 6550 set core:str1 world XX
-redis-cli -p 6550 get core:str1
-redis-cli -p 6550 set core:nx1 v1 NX
-redis-cli -p 6550 get core:nx1
-redis-cli -p 6550 set core:missing v1 XX
+redis-cli -h numericlabs.lxd -p 6379 set core:str1 hello
+redis-cli -h numericlabs.lxd -p 6379 get core:str1
+redis-cli -h numericlabs.lxd -p 6379 set core:str1 world NX
+redis-cli -h numericlabs.lxd -p 6379 set core:str1 world XX
+redis-cli -h numericlabs.lxd -p 6379 get core:str1
+redis-cli -h numericlabs.lxd -p 6379 set core:nx1 v1 NX
+redis-cli -h numericlabs.lxd -p 6379 get core:nx1
+redis-cli -h numericlabs.lxd -p 6379 set core:missing v1 XX
 ```
 
 **Expected:**
@@ -831,10 +845,10 @@ create the key.
 
 **Steps:**
 ```bash
-redis-cli -p 6550 set core:ex1 v1 EX 100
-redis-cli -p 6550 ttl core:ex1
-redis-cli -p 6550 set core:px1 v1 PX 100000
-redis-cli -p 6550 pttl core:px1
+redis-cli -h numericlabs.lxd -p 6379 set core:ex1 v1 EX 100
+redis-cli -h numericlabs.lxd -p 6379 ttl core:ex1
+redis-cli -h numericlabs.lxd -p 6379 set core:px1 v1 PX 100000
+redis-cli -h numericlabs.lxd -p 6379 pttl core:px1
 ```
 
 **Expected:**
@@ -857,15 +871,15 @@ expected, not a bug.
 
 **Steps:**
 ```bash
-redis-cli -p 6550 set core:bothexpx v1 EX 100 PX 5000
-redis-cli -p 6550 ttl core:bothexpx
-redis-cli -p 6550 pttl core:bothexpx
-redis-cli -p 6550 set core:bothnxxx2 initial
-redis-cli -p 6550 set core:bothnxxx2 shouldnotset NX XX
-redis-cli -p 6550 get core:bothnxxx2
-redis-cli -p 6550 del core:bothnxxx3
-redis-cli -p 6550 set core:bothnxxx3 v1 NX XX
-redis-cli -p 6550 get core:bothnxxx3
+redis-cli -h numericlabs.lxd -p 6379 set core:bothexpx v1 EX 100 PX 5000
+redis-cli -h numericlabs.lxd -p 6379 ttl core:bothexpx
+redis-cli -h numericlabs.lxd -p 6379 pttl core:bothexpx
+redis-cli -h numericlabs.lxd -p 6379 set core:bothnxxx2 initial
+redis-cli -h numericlabs.lxd -p 6379 set core:bothnxxx2 shouldnotset NX XX
+redis-cli -h numericlabs.lxd -p 6379 get core:bothnxxx2
+redis-cli -h numericlabs.lxd -p 6379 del core:bothnxxx3
+redis-cli -h numericlabs.lxd -p 6379 set core:bothnxxx3 v1 NX XX
+redis-cli -h numericlabs.lxd -p 6379 get core:bothnxxx3
 ```
 
 **Expected:**
@@ -899,8 +913,8 @@ succeeds and creates it, exactly as if `XX` weren't there at all.
 
 **Steps:**
 ```bash
-redis-cli -p 6550 getset core:str1 newval
-redis-cli -p 6550 get core:str1
+redis-cli -h numericlabs.lxd -p 6379 getset core:str1 newval
+redis-cli -h numericlabs.lxd -p 6379 get core:str1
 ```
 
 **Expected:**
@@ -917,16 +931,16 @@ newval
 
 **Steps:**
 ```bash
-redis-cli -p 6550 del core:app1
-redis-cli -p 6550 append core:app1 "Hello "
-redis-cli -p 6550 append core:app1 "World"
-redis-cli -p 6550 get core:app1
-redis-cli -p 6550 strlen core:app1
-redis-cli -p 6550 getrange core:app1 0 4
-redis-cli -p 6550 getrange core:app1 -5 -1
-redis-cli -p 6550 setrange core:app1 6 "Redis"
-redis-cli -p 6550 get core:app1
-redis-cli -p 6550 getrange core:app1 0 100
+redis-cli -h numericlabs.lxd -p 6379 del core:app1
+redis-cli -h numericlabs.lxd -p 6379 append core:app1 "Hello "
+redis-cli -h numericlabs.lxd -p 6379 append core:app1 "World"
+redis-cli -h numericlabs.lxd -p 6379 get core:app1
+redis-cli -h numericlabs.lxd -p 6379 strlen core:app1
+redis-cli -h numericlabs.lxd -p 6379 getrange core:app1 0 4
+redis-cli -h numericlabs.lxd -p 6379 getrange core:app1 -5 -1
+redis-cli -h numericlabs.lxd -p 6379 setrange core:app1 6 "Redis"
+redis-cli -h numericlabs.lxd -p 6379 get core:app1
+redis-cli -h numericlabs.lxd -p 6379 getrange core:app1 0 100
 ```
 
 **Expected:**
@@ -956,12 +970,12 @@ non-numeric string.
 
 **Steps:**
 ```bash
-redis-cli -p 6550 del core:cnt
-redis-cli -p 6550 incr core:cnt
-redis-cli -p 6550 incrby core:cnt 10
-redis-cli -p 6550 decr core:cnt
-redis-cli -p 6550 set core:nonnum abc
-redis-cli -p 6550 incr core:nonnum
+redis-cli -h numericlabs.lxd -p 6379 del core:cnt
+redis-cli -h numericlabs.lxd -p 6379 incr core:cnt
+redis-cli -h numericlabs.lxd -p 6379 incrby core:cnt 10
+redis-cli -h numericlabs.lxd -p 6379 decr core:cnt
+redis-cli -h numericlabs.lxd -p 6379 set core:nonnum abc
+redis-cli -h numericlabs.lxd -p 6379 incr core:nonnum
 ```
 
 **Expected:**
@@ -990,11 +1004,11 @@ kind of value-validation error, not error frames in general.
 
 **Steps:**
 ```bash
-redis-cli -p 6550 mset core:k1 v1 core:k2 v2
-redis-cli -p 6550 mget core:k1 core:k2 core:nosuch
-redis-cli -p 6550 msetnx core:k3 v3 core:k1 vX
-redis-cli -p 6550 get core:k1
-redis-cli -p 6550 get core:k3
+redis-cli -h numericlabs.lxd -p 6379 mset core:k1 v1 core:k2 v2
+redis-cli -h numericlabs.lxd -p 6379 mget core:k1 core:k2 core:nosuch
+redis-cli -h numericlabs.lxd -p 6379 msetnx core:k3 v3 core:k1 vX
+redis-cli -h numericlabs.lxd -p 6379 get core:k1
+redis-cli -h numericlabs.lxd -p 6379 get core:k3
 ```
 
 **Expected:**
@@ -1023,13 +1037,13 @@ batch was rejected (returns `0`) and `core:k3` was **not** created either, even 
 
 **Steps:**
 ```bash
-redis-cli -p 6550 del core:h1
-redis-cli -p 6550 hset core:h1 f1 v1 f2 v2
-redis-cli -p 6550 hget core:h1 f1
-redis-cli -p 6550 hexists core:h1 f1
-redis-cli -p 6550 hexists core:h1 fnosuch
-redis-cli -p 6550 hdel core:h1 f1
-redis-cli -p 6550 hexists core:h1 f1
+redis-cli -h numericlabs.lxd -p 6379 del core:h1
+redis-cli -h numericlabs.lxd -p 6379 hset core:h1 f1 v1 f2 v2
+redis-cli -h numericlabs.lxd -p 6379 hget core:h1 f1
+redis-cli -h numericlabs.lxd -p 6379 hexists core:h1 f1
+redis-cli -h numericlabs.lxd -p 6379 hexists core:h1 fnosuch
+redis-cli -h numericlabs.lxd -p 6379 hdel core:h1 f1
+redis-cli -h numericlabs.lxd -p 6379 hexists core:h1 f1
 ```
 
 **Expected:**
@@ -1054,11 +1068,11 @@ the count of *new* fields set (`2` here, since both `f1` and `f2` were new).
 
 **Steps:**
 ```bash
-redis-cli -p 6550 hset core:h1 f2 v2new f3 v3
-redis-cli -p 6550 hgetall core:h1
-redis-cli -p 6550 hlen core:h1
-redis-cli -p 6550 hkeys core:h1
-redis-cli -p 6550 hvals core:h1
+redis-cli -h numericlabs.lxd -p 6379 hset core:h1 f2 v2new f3 v3
+redis-cli -h numericlabs.lxd -p 6379 hgetall core:h1
+redis-cli -h numericlabs.lxd -p 6379 hlen core:h1
+redis-cli -h numericlabs.lxd -p 6379 hkeys core:h1
+redis-cli -h numericlabs.lxd -p 6379 hvals core:h1
 ```
 
 **Expected:**
@@ -1086,11 +1100,11 @@ insertion order) — do not assert on field order, only on the set of pairs.
 
 **Steps:**
 ```bash
-redis-cli -p 6550 hmget core:h1 f2 f3 fnosuch
-redis-cli -p 6550 hsetnx core:h1 f2 shouldnotchange
-redis-cli -p 6550 hget core:h1 f2
-redis-cli -p 6550 hsetnx core:h1 f4 newval
-redis-cli -p 6550 hget core:h1 f4
+redis-cli -h numericlabs.lxd -p 6379 hmget core:h1 f2 f3 fnosuch
+redis-cli -h numericlabs.lxd -p 6379 hsetnx core:h1 f2 shouldnotchange
+redis-cli -h numericlabs.lxd -p 6379 hget core:h1 f2
+redis-cli -h numericlabs.lxd -p 6379 hsetnx core:h1 f4 newval
+redis-cli -h numericlabs.lxd -p 6379 hget core:h1 f4
 ```
 
 **Expected:**
@@ -1112,9 +1126,9 @@ newval
 
 **Steps:**
 ```bash
-redis-cli -p 6550 hset core:h1 cnt 5
-redis-cli -p 6550 hincrby core:h1 cnt 3
-redis-cli -p 6550 hincrby core:h1 cnt -10
+redis-cli -h numericlabs.lxd -p 6379 hset core:h1 cnt 5
+redis-cli -h numericlabs.lxd -p 6379 hincrby core:h1 cnt 3
+redis-cli -h numericlabs.lxd -p 6379 hincrby core:h1 cnt -10
 ```
 
 **Expected:**
@@ -1132,7 +1146,7 @@ redis-cli -p 6550 hincrby core:h1 cnt -10
 
 **Steps:**
 ```bash
-redis-cli -p 6550 hscan core:h1 0
+redis-cli -h numericlabs.lxd -p 6379 hscan core:h1 0
 ```
 
 **Expected:**
@@ -1161,10 +1175,10 @@ are interleaved like `HGETALL`; order is unspecified.
 
 **Steps:**
 ```bash
-redis-cli -p 6550 del core:l1
-redis-cli -p 6550 rpush core:l1 a b c
-redis-cli -p 6550 lpush core:l1 z y
-redis-cli -p 6550 lrange core:l1 0 -1
+redis-cli -h numericlabs.lxd -p 6379 del core:l1
+redis-cli -h numericlabs.lxd -p 6379 rpush core:l1 a b c
+redis-cli -h numericlabs.lxd -p 6379 lpush core:l1 z y
+redis-cli -h numericlabs.lxd -p 6379 lrange core:l1 0 -1
 ```
 
 **Expected:**
@@ -1190,12 +1204,12 @@ head-to-tail order `y z a b c` — mind the reversal versus argument order.
 
 **Steps:**
 ```bash
-redis-cli -p 6550 lpop core:l1
-redis-cli -p 6550 rpop core:l1
-redis-cli -p 6550 lrange core:l1 0 -1
-redis-cli -p 6550 llen core:l1
-redis-cli -p 6550 lindex core:l1 0
-redis-cli -p 6550 lindex core:l1 -1
+redis-cli -h numericlabs.lxd -p 6379 lpop core:l1
+redis-cli -h numericlabs.lxd -p 6379 rpop core:l1
+redis-cli -h numericlabs.lxd -p 6379 lrange core:l1 0 -1
+redis-cli -h numericlabs.lxd -p 6379 llen core:l1
+redis-cli -h numericlabs.lxd -p 6379 lindex core:l1 0
+redis-cli -h numericlabs.lxd -p 6379 lindex core:l1 -1
 ```
 
 **Expected:**
@@ -1218,11 +1232,11 @@ b
 
 **Steps:**
 ```bash
-redis-cli -p 6550 del core:lsrange
-redis-cli -p 6550 rpush core:lsrange a b c
-redis-cli -p 6550 lset core:lsrange 0 Y2
-redis-cli -p 6550 lrange core:lsrange 0 -1
-redis-cli -p 6550 lset core:lsrange 10 z
+redis-cli -h numericlabs.lxd -p 6379 del core:lsrange
+redis-cli -h numericlabs.lxd -p 6379 rpush core:lsrange a b c
+redis-cli -h numericlabs.lxd -p 6379 lset core:lsrange 0 Y2
+redis-cli -h numericlabs.lxd -p 6379 lrange core:lsrange 0 -1
+redis-cli -h numericlabs.lxd -p 6379 lset core:lsrange 10 z
 ```
 
 **Expected:**
@@ -1248,10 +1262,10 @@ returns a **different** error — `no such key` — instead of this one; see COR
 
 **Steps:**
 ```bash
-redis-cli -p 6550 del core:l2
-redis-cli -p 6550 rpush core:l2 a b c d e
-redis-cli -p 6550 ltrim core:l2 1 3
-redis-cli -p 6550 lrange core:l2 0 -1
+redis-cli -h numericlabs.lxd -p 6379 del core:l2
+redis-cli -h numericlabs.lxd -p 6379 rpush core:l2 a b c d e
+redis-cli -h numericlabs.lxd -p 6379 ltrim core:l2 1 3
+redis-cli -h numericlabs.lxd -p 6379 lrange core:l2 0 -1
 ```
 
 **Expected:**
@@ -1272,10 +1286,10 @@ d
 
 **Steps:**
 ```bash
-redis-cli -p 6550 del core:l3
-redis-cli -p 6550 rpush core:l3 a b a c a
-redis-cli -p 6550 lrem core:l3 2 a
-redis-cli -p 6550 lrange core:l3 0 -1
+redis-cli -h numericlabs.lxd -p 6379 del core:l3
+redis-cli -h numericlabs.lxd -p 6379 rpush core:l3 a b a c a
+redis-cli -h numericlabs.lxd -p 6379 lrem core:l3 2 a
+redis-cli -h numericlabs.lxd -p 6379 lrange core:l3 0 -1
 ```
 
 **Expected:**
@@ -1299,9 +1313,9 @@ leaving the third `a` (which was last in the list) in place.
 
 **Steps:**
 ```bash
-redis-cli -p 6550 linsert core:l3 BEFORE c INSERTED
-redis-cli -p 6550 lrange core:l3 0 -1
-redis-cli -p 6550 linsert core:l3 BEFORE nosuchpivot z
+redis-cli -h numericlabs.lxd -p 6379 linsert core:l3 BEFORE c INSERTED
+redis-cli -h numericlabs.lxd -p 6379 lrange core:l3 0 -1
+redis-cli -h numericlabs.lxd -p 6379 linsert core:l3 BEFORE nosuchpivot z
 ```
 
 **Expected:**
@@ -1322,10 +1336,10 @@ a
 
 **Steps:**
 ```bash
-redis-cli -p 6550 del core:l4
-redis-cli -p 6550 rpush core:l4 x y z
-redis-cli -p 6550 lpop core:l4 2
-redis-cli -p 6550 lrange core:l4 0 -1
+redis-cli -h numericlabs.lxd -p 6379 del core:l4
+redis-cli -h numericlabs.lxd -p 6379 rpush core:l4 x y z
+redis-cli -h numericlabs.lxd -p 6379 lpop core:l4 2
+redis-cli -h numericlabs.lxd -p 6379 lrange core:l4 0 -1
 ```
 
 **Expected:**
@@ -1355,14 +1369,14 @@ a crash.
 
 **Steps:**
 ```bash
-redis-cli -p 6550 del core:s1
-redis-cli -p 6550 sadd core:s1 a b c
-redis-cli -p 6550 sadd core:s1 a
-redis-cli -p 6550 sismember core:s1 a
-redis-cli -p 6550 sismember core:s1 z
-redis-cli -p 6550 scard core:s1
-redis-cli -p 6550 srem core:s1 a
-redis-cli -p 6550 smembers core:s1
+redis-cli -h numericlabs.lxd -p 6379 del core:s1
+redis-cli -h numericlabs.lxd -p 6379 sadd core:s1 a b c
+redis-cli -h numericlabs.lxd -p 6379 sadd core:s1 a
+redis-cli -h numericlabs.lxd -p 6379 sismember core:s1 a
+redis-cli -h numericlabs.lxd -p 6379 sismember core:s1 z
+redis-cli -h numericlabs.lxd -p 6379 scard core:s1
+redis-cli -h numericlabs.lxd -p 6379 srem core:s1 a
+redis-cli -h numericlabs.lxd -p 6379 smembers core:s1
 ```
 
 **Expected:**
@@ -1389,12 +1403,12 @@ Member order in `SMEMBERS` is unspecified (hash-set order).
 
 **Steps:**
 ```bash
-redis-cli -p 6550 del core:s2 core:s3
-redis-cli -p 6550 sadd core:s2 b c d
-redis-cli -p 6550 sadd core:s3 c d e
-redis-cli -p 6550 sinter core:s2 core:s3
-redis-cli -p 6550 sunion core:s2 core:s3
-redis-cli -p 6550 sdiff core:s2 core:s3
+redis-cli -h numericlabs.lxd -p 6379 del core:s2 core:s3
+redis-cli -h numericlabs.lxd -p 6379 sadd core:s2 b c d
+redis-cli -h numericlabs.lxd -p 6379 sadd core:s3 c d e
+redis-cli -h numericlabs.lxd -p 6379 sinter core:s2 core:s3
+redis-cli -h numericlabs.lxd -p 6379 sunion core:s2 core:s3
+redis-cli -h numericlabs.lxd -p 6379 sdiff core:s2 core:s3
 ```
 
 **Expected:**
@@ -1419,12 +1433,12 @@ b
 
 **Steps:**
 ```bash
-redis-cli -p 6550 sinterstore core:sdest core:s2 core:s3
-redis-cli -p 6550 smembers core:sdest
-redis-cli -p 6550 sunionstore core:sudest core:s2 core:s3
-redis-cli -p 6550 smembers core:sudest
-redis-cli -p 6550 sdiffstore core:sddest core:s2 core:s3
-redis-cli -p 6550 smembers core:sddest
+redis-cli -h numericlabs.lxd -p 6379 sinterstore core:sdest core:s2 core:s3
+redis-cli -h numericlabs.lxd -p 6379 smembers core:sdest
+redis-cli -h numericlabs.lxd -p 6379 sunionstore core:sudest core:s2 core:s3
+redis-cli -h numericlabs.lxd -p 6379 smembers core:sudest
+redis-cli -h numericlabs.lxd -p 6379 sdiffstore core:sddest core:s2 core:s3
+redis-cli -h numericlabs.lxd -p 6379 smembers core:sddest
 ```
 
 **Expected:**
@@ -1449,12 +1463,12 @@ b
 
 **Steps:**
 ```bash
-redis-cli -p 6550 del core:s4
-redis-cli -p 6550 sadd core:s4 a b c d e
-redis-cli -p 6550 spop core:s4
-redis-cli -p 6550 scard core:s4
-redis-cli -p 6550 srandmember core:s4
-redis-cli -p 6550 scard core:s4
+redis-cli -h numericlabs.lxd -p 6379 del core:s4
+redis-cli -h numericlabs.lxd -p 6379 sadd core:s4 a b c d e
+redis-cli -h numericlabs.lxd -p 6379 spop core:s4
+redis-cli -h numericlabs.lxd -p 6379 scard core:s4
+redis-cli -h numericlabs.lxd -p 6379 srandmember core:s4
+redis-cli -h numericlabs.lxd -p 6379 scard core:s4
 ```
 
 **Expected:**
@@ -1477,11 +1491,11 @@ c
 
 **Steps:**
 ```bash
-redis-cli -p 6550 del core:spopcount
-redis-cli -p 6550 sadd core:spopcount a b c d e
-redis-cli -p 6550 spop core:spopcount 2
-redis-cli -p 6550 scard core:spopcount
-redis-cli -p 6550 srandmember core:spopcount 2
+redis-cli -h numericlabs.lxd -p 6379 del core:spopcount
+redis-cli -h numericlabs.lxd -p 6379 sadd core:spopcount a b c d e
+redis-cli -h numericlabs.lxd -p 6379 spop core:spopcount 2
+redis-cli -h numericlabs.lxd -p 6379 scard core:spopcount
+redis-cli -h numericlabs.lxd -p 6379 srandmember core:spopcount 2
 ```
 
 **Expected:**
@@ -1508,10 +1522,10 @@ easy to miss in an integration test that only checks the call succeeds.
 
 **Steps:**
 ```bash
-redis-cli -p 6550 del core:zz
-redis-cli -p 6550 zadd core:zz 1 a
-redis-cli -p 6550 zscore core:zz a
-redis-cli -p 6550 zcard core:zz
+redis-cli -h numericlabs.lxd -p 6379 del core:zz
+redis-cli -h numericlabs.lxd -p 6379 zadd core:zz 1 a
+redis-cli -h numericlabs.lxd -p 6379 zscore core:zz a
+redis-cli -h numericlabs.lxd -p 6379 zcard core:zz
 ```
 
 **Expected:**
@@ -1530,8 +1544,8 @@ redis-cli -p 6550 zcard core:zz
 
 **Steps:**
 ```bash
-redis-cli -p 6550 zincrby core:zz 5 a
-redis-cli -p 6550 zscore core:zz a
+redis-cli -h numericlabs.lxd -p 6379 zincrby core:zz 5 a
+redis-cli -h numericlabs.lxd -p 6379 zscore core:zz a
 ```
 
 **Expected:**
@@ -1549,10 +1563,10 @@ how it gets there.
 
 **Steps:**
 ```bash
-redis-cli -p 6550 zrange core:zbug 0 -1
-redis-cli -p 6550 zrange core:zbug 0 -1 WITHSCORES
-redis-cli -p 6550 zrank core:zbug b
-redis-cli -p 6550 zrank core:zbug nosuch
+redis-cli -h numericlabs.lxd -p 6379 zrange core:zbug 0 -1
+redis-cli -h numericlabs.lxd -p 6379 zrange core:zbug 0 -1 WITHSCORES
+redis-cli -h numericlabs.lxd -p 6379 zrank core:zbug b
+redis-cli -h numericlabs.lxd -p 6379 zrank core:zbug nosuch
 ```
 
 **Expected:**
@@ -1579,8 +1593,8 @@ repeated single-pair `ZADD` calls.
 
 **Steps:**
 ```bash
-redis-cli -p 6550 zrem core:z1 b
-redis-cli -p 6550 zrange core:z1 0 -1
+redis-cli -h numericlabs.lxd -p 6379 zrem core:z1 b
+redis-cli -h numericlabs.lxd -p 6379 zrange core:z1 0 -1
 ```
 
 **Expected:**
@@ -1597,11 +1611,11 @@ a
 
 **Steps:**
 ```bash
-redis-cli -p 6550 del core:zbug
-redis-cli -p 6550 zadd core:zbug 1 a
-redis-cli -p 6550 zadd core:zbug 2 b 3 c
-redis-cli -p 6550 zcard core:zbug
-redis-cli -p 6550 zrange core:zbug 0 -1 WITHSCORES
+redis-cli -h numericlabs.lxd -p 6379 del core:zbug
+redis-cli -h numericlabs.lxd -p 6379 zadd core:zbug 1 a
+redis-cli -h numericlabs.lxd -p 6379 zadd core:zbug 2 b 3 c
+redis-cli -h numericlabs.lxd -p 6379 zcard core:zbug
+redis-cli -h numericlabs.lxd -p 6379 zrange core:zbug 0 -1 WITHSCORES
 ```
 
 **Expected:**
@@ -1633,8 +1647,8 @@ cosmetic gap like the OBJECT ENCODING naming difference.
 
 **Steps:**
 ```bash
-redis-cli -p 6550 zrangebyscore core:zz 0 10
-redis-cli -p 6550 zcount core:zz 0 10
+redis-cli -h numericlabs.lxd -p 6379 zrangebyscore core:zz 0 10
+redis-cli -h numericlabs.lxd -p 6379 zcount core:zz 0 10
 ```
 
 **Expected:**
@@ -1653,11 +1667,11 @@ ERR unknown command 'ZCOUNT'
 
 **Steps:**
 ```bash
-redis-cli -p 6550 set core:d1 v1
-redis-cli -p 6550 set core:d2 v2
-redis-cli -p 6550 exists core:d1 core:d2 core:nosuch
-redis-cli -p 6550 del core:d1 core:d2 core:nosuch
-redis-cli -p 6550 exists core:d1
+redis-cli -h numericlabs.lxd -p 6379 set core:d1 v1
+redis-cli -h numericlabs.lxd -p 6379 set core:d2 v2
+redis-cli -h numericlabs.lxd -p 6379 exists core:d1 core:d2 core:nosuch
+redis-cli -h numericlabs.lxd -p 6379 del core:d1 core:d2 core:nosuch
+redis-cli -h numericlabs.lxd -p 6379 exists core:d1
 ```
 
 **Expected:**
@@ -1682,12 +1696,12 @@ absent.
 
 **Steps:**
 ```bash
-redis-cli -p 6550 set core:tstr v
-redis-cli -p 6550 type core:tstr
-redis-cli -p 6550 del core:tlist
-redis-cli -p 6550 rpush core:tlist a
-redis-cli -p 6550 type core:tlist
-redis-cli -p 6550 type core:nosuchkey
+redis-cli -h numericlabs.lxd -p 6379 set core:tstr v
+redis-cli -h numericlabs.lxd -p 6379 type core:tstr
+redis-cli -h numericlabs.lxd -p 6379 del core:tlist
+redis-cli -h numericlabs.lxd -p 6379 rpush core:tlist a
+redis-cli -h numericlabs.lxd -p 6379 type core:tlist
+redis-cli -h numericlabs.lxd -p 6379 type core:nosuchkey
 ```
 
 **Expected:**
@@ -1708,16 +1722,16 @@ none
 
 **Steps:**
 ```bash
-redis-cli -p 6550 set core:rn1 v1
-redis-cli -p 6550 rename core:rn1 core:rn2
-redis-cli -p 6550 get core:rn2
-redis-cli -p 6550 exists core:rn1
-redis-cli -p 6550 set core:rn3 v3
-redis-cli -p 6550 renamenx core:rn3 core:rn2
-redis-cli -p 6550 set core:rn4 v4
-redis-cli -p 6550 renamenx core:rn4 core:rn5
-redis-cli -p 6550 get core:rn5
-redis-cli -p 6550 rename core:nosuchsrc core:whatever
+redis-cli -h numericlabs.lxd -p 6379 set core:rn1 v1
+redis-cli -h numericlabs.lxd -p 6379 rename core:rn1 core:rn2
+redis-cli -h numericlabs.lxd -p 6379 get core:rn2
+redis-cli -h numericlabs.lxd -p 6379 exists core:rn1
+redis-cli -h numericlabs.lxd -p 6379 set core:rn3 v3
+redis-cli -h numericlabs.lxd -p 6379 renamenx core:rn3 core:rn2
+redis-cli -h numericlabs.lxd -p 6379 set core:rn4 v4
+redis-cli -h numericlabs.lxd -p 6379 renamenx core:rn4 core:rn5
+redis-cli -h numericlabs.lxd -p 6379 get core:rn5
+redis-cli -h numericlabs.lxd -p 6379 rename core:nosuchsrc core:whatever
 ```
 
 **Expected:**
@@ -1747,9 +1761,9 @@ pattern noted in CORE-06.
 
 **Steps:**
 ```bash
-redis-cli -p 6550 randomkey
-redis-cli -p 6550 mset core:glob:a 1 core:glob:b 2 core:globx:c 3
-redis-cli -p 6550 keys "core:glob:?"
+redis-cli -h numericlabs.lxd -p 6379 randomkey
+redis-cli -h numericlabs.lxd -p 6379 mset core:glob:a 1 core:glob:b 2 core:globx:c 3
+redis-cli -h numericlabs.lxd -p 6379 keys "core:glob:?"
 ```
 
 **Expected:**
@@ -1774,7 +1788,7 @@ not what precedes `c` there) — confirms `?`-glob support per
 
 **Steps:**
 ```bash
-redis-cli -p 6550 scan 0
+redis-cli -h numericlabs.lxd -p 6379 scan 0
 ```
 
 **Expected:**
@@ -1801,17 +1815,17 @@ inspect the cursor value itself.
 
 **Steps:**
 ```bash
-redis-cli -p 6550 set core:exp1 v1
-redis-cli -p 6550 expire core:exp1 100
-redis-cli -p 6550 ttl core:exp1
-redis-cli -p 6550 pexpire core:exp1 50000
-redis-cli -p 6550 pttl core:exp1
+redis-cli -h numericlabs.lxd -p 6379 set core:exp1 v1
+redis-cli -h numericlabs.lxd -p 6379 expire core:exp1 100
+redis-cli -h numericlabs.lxd -p 6379 ttl core:exp1
+redis-cli -h numericlabs.lxd -p 6379 pexpire core:exp1 50000
+redis-cli -h numericlabs.lxd -p 6379 pttl core:exp1
 FUTURE=$(( $(date +%s) + 100 ))
-redis-cli -p 6550 expireat core:exp1 $FUTURE
-redis-cli -p 6550 ttl core:exp1
+redis-cli -h numericlabs.lxd -p 6379 expireat core:exp1 $FUTURE
+redis-cli -h numericlabs.lxd -p 6379 ttl core:exp1
 FUTUREMS=$(( ($(date +%s) + 100) * 1000 ))
-redis-cli -p 6550 pexpireat core:exp1 $FUTUREMS
-redis-cli -p 6550 ttl core:exp1
+redis-cli -h numericlabs.lxd -p 6379 pexpireat core:exp1 $FUTUREMS
+redis-cli -h numericlabs.lxd -p 6379 ttl core:exp1
 ```
 
 **Expected:**
@@ -1836,13 +1850,13 @@ OK
 
 **Steps:**
 ```bash
-redis-cli -p 6550 persist core:exp1
-redis-cli -p 6550 ttl core:exp1
-redis-cli -p 6550 set core:noexp v1
-redis-cli -p 6550 ttl core:noexp
-redis-cli -p 6550 ttl core:doesnotexist
-redis-cli -p 6550 persist core:noexp
-redis-cli -p 6550 persist core:nosuchpersist
+redis-cli -h numericlabs.lxd -p 6379 persist core:exp1
+redis-cli -h numericlabs.lxd -p 6379 ttl core:exp1
+redis-cli -h numericlabs.lxd -p 6379 set core:noexp v1
+redis-cli -h numericlabs.lxd -p 6379 ttl core:noexp
+redis-cli -h numericlabs.lxd -p 6379 ttl core:doesnotexist
+redis-cli -h numericlabs.lxd -p 6379 persist core:noexp
+redis-cli -h numericlabs.lxd -p 6379 persist core:nosuchpersist
 ```
 
 **Expected:**
@@ -1869,11 +1883,11 @@ don't over-interpret a `0` return as "key not found".
 
 **Steps:**
 ```bash
-redis-cli -p 6550 set core:shortlived v1 PX 300
-redis-cli -p 6550 get core:shortlived
+redis-cli -h numericlabs.lxd -p 6379 set core:shortlived v1 PX 300
+redis-cli -h numericlabs.lxd -p 6379 get core:shortlived
 sleep 0.5
-redis-cli -p 6550 get core:shortlived
-redis-cli -p 6550 exists core:shortlived
+redis-cli -h numericlabs.lxd -p 6379 get core:shortlived
+redis-cli -h numericlabs.lxd -p 6379 exists core:shortlived
 ```
 
 **Expected:**
@@ -1892,9 +1906,9 @@ v1
 
 **Steps:**
 ```bash
-redis-cli -p 6550 set core:negttl v1
-redis-cli -p 6550 expire core:negttl -1
-redis-cli -p 6550 exists core:negttl
+redis-cli -h numericlabs.lxd -p 6379 set core:negttl v1
+redis-cli -h numericlabs.lxd -p 6379 expire core:negttl -1
+redis-cli -h numericlabs.lxd -p 6379 exists core:negttl
 ```
 
 **Expected:**
@@ -1912,8 +1926,8 @@ OK
 
 **Steps:**
 ```bash
-redis-cli -p 6550 flushall
-redis-cli -p 6550 dbsize
+redis-cli -h numericlabs.lxd -p 6379 flushall
+redis-cli -h numericlabs.lxd -p 6379 dbsize
 ```
 
 **Expected:**
@@ -1937,12 +1951,12 @@ any of them exist.
 
 **Steps:**
 ```bash
-redis-cli -p 6550 set core:wt1 stringval
-redis-cli -p 6550 lpush core:wt1 x
-redis-cli -p 6550 sadd core:wt1 x
-redis-cli -p 6550 hset core:wt1 f v
-redis-cli -p 6550 zadd core:wt1 1 x
-redis-cli -p 6550 get core:wt1
+redis-cli -h numericlabs.lxd -p 6379 set core:wt1 stringval
+redis-cli -h numericlabs.lxd -p 6379 lpush core:wt1 x
+redis-cli -h numericlabs.lxd -p 6379 sadd core:wt1 x
+redis-cli -h numericlabs.lxd -p 6379 hset core:wt1 f v
+redis-cli -h numericlabs.lxd -p 6379 zadd core:wt1 1 x
+redis-cli -h numericlabs.lxd -p 6379 get core:wt1
 ```
 
 **Expected:**
@@ -1968,11 +1982,11 @@ text does carry a real prefix (`WRONGTYPE `).
 
 **Steps:**
 ```bash
-redis-cli -p 6550 del core:missinglist
-redis-cli -p 6550 lrange core:missinglist 0 -1
-redis-cli -p 6550 llen core:missinglist
-redis-cli -p 6550 del core:missinghash
-redis-cli -p 6550 hget core:missinghash field1
+redis-cli -h numericlabs.lxd -p 6379 del core:missinglist
+redis-cli -h numericlabs.lxd -p 6379 lrange core:missinglist 0 -1
+redis-cli -h numericlabs.lxd -p 6379 llen core:missinglist
+redis-cli -h numericlabs.lxd -p 6379 del core:missinghash
+redis-cli -h numericlabs.lxd -p 6379 hget core:missinghash field1
 ```
 
 **Expected:**
@@ -1995,15 +2009,15 @@ returns `0`, `HGET` returns nil (blank line) — none of these are errors.
 
 **Steps:**
 ```bash
-redis-cli -p 6550 del core:missinglist
-redis-cli -p 6550 lpop core:missinglist
-redis-cli -p 6550 exists core:missinglist
-redis-cli -p 6550 del core:missingset
-redis-cli -p 6550 srem core:missingset member1
-redis-cli -p 6550 exists core:missingset
-redis-cli -p 6550 del core:missinghash
-redis-cli -p 6550 hdel core:missinghash field1
-redis-cli -p 6550 exists core:missinghash
+redis-cli -h numericlabs.lxd -p 6379 del core:missinglist
+redis-cli -h numericlabs.lxd -p 6379 lpop core:missinglist
+redis-cli -h numericlabs.lxd -p 6379 exists core:missinglist
+redis-cli -h numericlabs.lxd -p 6379 del core:missingset
+redis-cli -h numericlabs.lxd -p 6379 srem core:missingset member1
+redis-cli -h numericlabs.lxd -p 6379 exists core:missingset
+redis-cli -h numericlabs.lxd -p 6379 del core:missinghash
+redis-cli -h numericlabs.lxd -p 6379 hdel core:missinghash field1
+redis-cli -h numericlabs.lxd -p 6379 exists core:missinghash
 ```
 
 **Expected:**
@@ -2036,17 +2050,17 @@ verified here by `EXISTS` returning `0` after each mutation attempt.
 
 **Steps:**
 ```bash
-redis-cli -p 6550 set core:oe_str v
-redis-cli -p 6550 object encoding core:oe_str
-redis-cli -p 6550 rpush core:oe_list a
-redis-cli -p 6550 object encoding core:oe_list
-redis-cli -p 6550 hset core:oe_hash f v
-redis-cli -p 6550 object encoding core:oe_hash
-redis-cli -p 6550 sadd core:oe_set a
-redis-cli -p 6550 object encoding core:oe_set
-redis-cli -p 6550 zadd core:oe_zset 1 a
-redis-cli -p 6550 object encoding core:oe_zset
-redis-cli -p 6550 object encoding core:nosuchkey
+redis-cli -h numericlabs.lxd -p 6379 set core:oe_str v
+redis-cli -h numericlabs.lxd -p 6379 object encoding core:oe_str
+redis-cli -h numericlabs.lxd -p 6379 rpush core:oe_list a
+redis-cli -h numericlabs.lxd -p 6379 object encoding core:oe_list
+redis-cli -h numericlabs.lxd -p 6379 hset core:oe_hash f v
+redis-cli -h numericlabs.lxd -p 6379 object encoding core:oe_hash
+redis-cli -h numericlabs.lxd -p 6379 sadd core:oe_set a
+redis-cli -h numericlabs.lxd -p 6379 object encoding core:oe_set
+redis-cli -h numericlabs.lxd -p 6379 zadd core:oe_zset 1 a
+redis-cli -h numericlabs.lxd -p 6379 object encoding core:oe_zset
+redis-cli -h numericlabs.lxd -p 6379 object encoding core:nosuchkey
 ```
 
 **Expected:**
@@ -2078,9 +2092,9 @@ returns), not real Redis's internal encoding names (`embstr`, `listpack`,
 
 **Steps:**
 ```bash
-redis-cli -p 6550 memory usage core:oe_str
-redis-cli -p 6550 memory usage core:oe_list
-redis-cli -p 6550 memory usage core:nosuchkey
+redis-cli -h numericlabs.lxd -p 6379 memory usage core:oe_str
+redis-cli -h numericlabs.lxd -p 6379 memory usage core:oe_list
+redis-cli -h numericlabs.lxd -p 6379 memory usage core:nosuchkey
 ```
 
 **Expected:**
@@ -2103,9 +2117,9 @@ positive integer" in an assertion, not an exact value.
 
 **Steps:**
 ```bash
-redis-cli -p 6550 get
-redis-cli -p 6550 set core:x
-redis-cli -p 6550 notacommand foo bar
+redis-cli -h numericlabs.lxd -p 6379 get
+redis-cli -h numericlabs.lxd -p 6379 set core:x
+redis-cli -h numericlabs.lxd -p 6379 notacommand foo bar
 ```
 
 **Expected:**
@@ -2125,8 +2139,8 @@ ERR unknown command 'NOTACOMMAND'
 
 **Steps:**
 ```bash
-redis-cli -p 6550 del core:lsmissing
-redis-cli -p 6550 lset core:lsmissing 0 z
+redis-cli -h numericlabs.lxd -p 6379 del core:lsmissing
+redis-cli -h numericlabs.lxd -p 6379 lset core:lsmissing 0 z
 ```
 
 **Expected:**
@@ -2151,21 +2165,21 @@ range` (CORE-15).
 
 **Steps:**
 ```bash
-redis-cli -p 6550 del core:ttlapp
-redis-cli -p 6550 set core:ttlapp hello EX 100
-redis-cli -p 6550 ttl core:ttlapp
-redis-cli -p 6550 append core:ttlapp world
-redis-cli -p 6550 ttl core:ttlapp
-redis-cli -p 6550 del core:ttlincr
-redis-cli -p 6550 set core:ttlincr 10 EX 100
-redis-cli -p 6550 ttl core:ttlincr
-redis-cli -p 6550 incrby core:ttlincr 5
-redis-cli -p 6550 ttl core:ttlincr
-redis-cli -p 6550 del core:ttlsr
-redis-cli -p 6550 set core:ttlsr "Hello World" EX 100
-redis-cli -p 6550 ttl core:ttlsr
-redis-cli -p 6550 setrange core:ttlsr 6 Redis!
-redis-cli -p 6550 ttl core:ttlsr
+redis-cli -h numericlabs.lxd -p 6379 del core:ttlapp
+redis-cli -h numericlabs.lxd -p 6379 set core:ttlapp hello EX 100
+redis-cli -h numericlabs.lxd -p 6379 ttl core:ttlapp
+redis-cli -h numericlabs.lxd -p 6379 append core:ttlapp world
+redis-cli -h numericlabs.lxd -p 6379 ttl core:ttlapp
+redis-cli -h numericlabs.lxd -p 6379 del core:ttlincr
+redis-cli -h numericlabs.lxd -p 6379 set core:ttlincr 10 EX 100
+redis-cli -h numericlabs.lxd -p 6379 ttl core:ttlincr
+redis-cli -h numericlabs.lxd -p 6379 incrby core:ttlincr 5
+redis-cli -h numericlabs.lxd -p 6379 ttl core:ttlincr
+redis-cli -h numericlabs.lxd -p 6379 del core:ttlsr
+redis-cli -h numericlabs.lxd -p 6379 set core:ttlsr "Hello World" EX 100
+redis-cli -h numericlabs.lxd -p 6379 ttl core:ttlsr
+redis-cli -h numericlabs.lxd -p 6379 setrange core:ttlsr 6 Redis!
+redis-cli -h numericlabs.lxd -p 6379 ttl core:ttlsr
 ```
 
 **Expected:**
@@ -2204,12 +2218,12 @@ clock keeps ticking between calls — that is expected, not a bug.
 
 **Steps:**
 ```bash
-redis-cli -p 6550 del core:ttlrnsrc core:ttlrndst
-redis-cli -p 6550 set core:ttlrnsrc v1 EX 100
-redis-cli -p 6550 ttl core:ttlrnsrc
-redis-cli -p 6550 rename core:ttlrnsrc core:ttlrndst
-redis-cli -p 6550 ttl core:ttlrndst
-redis-cli -p 6550 get core:ttlrndst
+redis-cli -h numericlabs.lxd -p 6379 del core:ttlrnsrc core:ttlrndst
+redis-cli -h numericlabs.lxd -p 6379 set core:ttlrnsrc v1 EX 100
+redis-cli -h numericlabs.lxd -p 6379 ttl core:ttlrnsrc
+redis-cli -h numericlabs.lxd -p 6379 rename core:ttlrnsrc core:ttlrndst
+redis-cli -h numericlabs.lxd -p 6379 ttl core:ttlrndst
+redis-cli -h numericlabs.lxd -p 6379 get core:ttlrndst
 ```
 
 **Expected:**
@@ -2237,16 +2251,16 @@ doesn't already exist. A source with no TTL still leaves the destination with no
 
 **Steps:**
 ```bash
-redis-cli -p 6550 del core:ttlltrim
-redis-cli -p 6550 rpush core:ttlltrim a b c d e
-redis-cli -p 6550 expire core:ttlltrim 100
-redis-cli -p 6550 ttl core:ttlltrim
-redis-cli -p 6550 ltrim core:ttlltrim 1 3
-redis-cli -p 6550 ttl core:ttlltrim
-redis-cli -p 6550 lrange core:ttlltrim 0 -1
-redis-cli -p 6550 del core:ltrimmissing
-redis-cli -p 6550 ltrim core:ltrimmissing 0 -1
-redis-cli -p 6550 exists core:ltrimmissing
+redis-cli -h numericlabs.lxd -p 6379 del core:ttlltrim
+redis-cli -h numericlabs.lxd -p 6379 rpush core:ttlltrim a b c d e
+redis-cli -h numericlabs.lxd -p 6379 expire core:ttlltrim 100
+redis-cli -h numericlabs.lxd -p 6379 ttl core:ttlltrim
+redis-cli -h numericlabs.lxd -p 6379 ltrim core:ttlltrim 1 3
+redis-cli -h numericlabs.lxd -p 6379 ttl core:ttlltrim
+redis-cli -h numericlabs.lxd -p 6379 lrange core:ttlltrim 0 -1
+redis-cli -h numericlabs.lxd -p 6379 del core:ltrimmissing
+redis-cli -h numericlabs.lxd -p 6379 ltrim core:ltrimmissing 0 -1
+redis-cli -h numericlabs.lxd -p 6379 exists core:ltrimmissing
 ```
 
 **Expected:**
@@ -2281,16 +2295,16 @@ key stays absent afterward.
 
 **Steps:**
 ```bash
-redis-cli -p 6550 del core:hdelmulti
-redis-cli -p 6550 hset core:hdelmulti f1 v1 f2 v2 f3 v3
-redis-cli -p 6550 hdel core:hdelmulti f1 f2 fnosuch
-redis-cli -p 6550 hgetall core:hdelmulti
-redis-cli -p 6550 del core:zremmulti
-redis-cli -p 6550 zadd core:zremmulti 1 a
-redis-cli -p 6550 zadd core:zremmulti 2 b
-redis-cli -p 6550 zadd core:zremmulti 3 c
-redis-cli -p 6550 zrem core:zremmulti a b nosuch
-redis-cli -p 6550 zrange core:zremmulti 0 -1
+redis-cli -h numericlabs.lxd -p 6379 del core:hdelmulti
+redis-cli -h numericlabs.lxd -p 6379 hset core:hdelmulti f1 v1 f2 v2 f3 v3
+redis-cli -h numericlabs.lxd -p 6379 hdel core:hdelmulti f1 f2 fnosuch
+redis-cli -h numericlabs.lxd -p 6379 hgetall core:hdelmulti
+redis-cli -h numericlabs.lxd -p 6379 del core:zremmulti
+redis-cli -h numericlabs.lxd -p 6379 zadd core:zremmulti 1 a
+redis-cli -h numericlabs.lxd -p 6379 zadd core:zremmulti 2 b
+redis-cli -h numericlabs.lxd -p 6379 zadd core:zremmulti 3 c
+redis-cli -h numericlabs.lxd -p 6379 zrem core:zremmulti a b nosuch
+redis-cli -h numericlabs.lxd -p 6379 zrange core:zremmulti 0 -1
 ```
 
 **Expected:**
@@ -2327,18 +2341,18 @@ via three separate `ZADD` calls.
 
 **Steps:**
 ```bash
-redis-cli -p 6550 del core:ovf
-redis-cli -p 6550 set core:ovf 9223372036854775807
-redis-cli -p 6550 incr core:ovf
-redis-cli -p 6550 get core:ovf
-redis-cli -p 6550 del core:ovfneg
-redis-cli -p 6550 set core:ovfneg -9223372036854775808
-redis-cli -p 6550 incrby core:ovfneg -1
-redis-cli -p 6550 get core:ovfneg
-redis-cli -p 6550 del core:hovf
-redis-cli -p 6550 hset core:hovf f 9223372036854775807
-redis-cli -p 6550 hincrby core:hovf f 1
-redis-cli -p 6550 hget core:hovf f
+redis-cli -h numericlabs.lxd -p 6379 del core:ovf
+redis-cli -h numericlabs.lxd -p 6379 set core:ovf 9223372036854775807
+redis-cli -h numericlabs.lxd -p 6379 incr core:ovf
+redis-cli -h numericlabs.lxd -p 6379 get core:ovf
+redis-cli -h numericlabs.lxd -p 6379 del core:ovfneg
+redis-cli -h numericlabs.lxd -p 6379 set core:ovfneg -9223372036854775808
+redis-cli -h numericlabs.lxd -p 6379 incrby core:ovfneg -1
+redis-cli -h numericlabs.lxd -p 6379 get core:ovfneg
+redis-cli -h numericlabs.lxd -p 6379 del core:hovf
+redis-cli -h numericlabs.lxd -p 6379 hset core:hovf f 9223372036854775807
+redis-cli -h numericlabs.lxd -p 6379 hincrby core:hovf f 1
+redis-cli -h numericlabs.lxd -p 6379 hget core:hovf f
 ```
 
 **Expected:**
@@ -2376,22 +2390,22 @@ showing the pre-overflow value. `9223372036854775807` is `i64::MAX`; `-922337203
 
 **Steps:**
 ```bash
-redis-cli -p 6550 del core:sis_a core:sis_b core:sis_dest
-redis-cli -p 6550 sadd core:sis_a x
-redis-cli -p 6550 sadd core:sis_b y
-redis-cli -p 6550 sadd core:sis_dest old
-redis-cli -p 6550 sinterstore core:sis_dest core:sis_a core:sis_b
-redis-cli -p 6550 exists core:sis_dest
-redis-cli -p 6550 del core:sus_dest
-redis-cli -p 6550 sadd core:sus_dest old
-redis-cli -p 6550 sunionstore core:sus_dest core:missing1 core:missing2
-redis-cli -p 6550 exists core:sus_dest
-redis-cli -p 6550 del core:sds_a core:sds_b core:sds_dest
-redis-cli -p 6550 sadd core:sds_a x
-redis-cli -p 6550 sadd core:sds_b x y
-redis-cli -p 6550 sadd core:sds_dest old
-redis-cli -p 6550 sdiffstore core:sds_dest core:sds_a core:sds_b
-redis-cli -p 6550 exists core:sds_dest
+redis-cli -h numericlabs.lxd -p 6379 del core:sis_a core:sis_b core:sis_dest
+redis-cli -h numericlabs.lxd -p 6379 sadd core:sis_a x
+redis-cli -h numericlabs.lxd -p 6379 sadd core:sis_b y
+redis-cli -h numericlabs.lxd -p 6379 sadd core:sis_dest old
+redis-cli -h numericlabs.lxd -p 6379 sinterstore core:sis_dest core:sis_a core:sis_b
+redis-cli -h numericlabs.lxd -p 6379 exists core:sis_dest
+redis-cli -h numericlabs.lxd -p 6379 del core:sus_dest
+redis-cli -h numericlabs.lxd -p 6379 sadd core:sus_dest old
+redis-cli -h numericlabs.lxd -p 6379 sunionstore core:sus_dest core:missing1 core:missing2
+redis-cli -h numericlabs.lxd -p 6379 exists core:sus_dest
+redis-cli -h numericlabs.lxd -p 6379 del core:sds_a core:sds_b core:sds_dest
+redis-cli -h numericlabs.lxd -p 6379 sadd core:sds_a x
+redis-cli -h numericlabs.lxd -p 6379 sadd core:sds_b x y
+redis-cli -h numericlabs.lxd -p 6379 sadd core:sds_dest old
+redis-cli -h numericlabs.lxd -p 6379 sdiffstore core:sds_dest core:sds_a core:sds_b
+redis-cli -h numericlabs.lxd -p 6379 exists core:sds_dest
 ```
 
 **Expected:**
@@ -2434,31 +2448,31 @@ before the fix and is unchanged — only the phantom-key side effect is new.
 
 **Steps:**
 ```bash
-redis-cli -p 6550 del core:sremlast
-redis-cli -p 6550 sadd core:sremlast onlymember
-redis-cli -p 6550 srem core:sremlast onlymember
-redis-cli -p 6550 exists core:sremlast
-redis-cli -p 6550 type core:sremlast
-redis-cli -p 6550 del core:lpoplast
-redis-cli -p 6550 rpush core:lpoplast onlyelem
-redis-cli -p 6550 lpop core:lpoplast
-redis-cli -p 6550 exists core:lpoplast
-redis-cli -p 6550 type core:lpoplast
-redis-cli -p 6550 del core:rpoplast
-redis-cli -p 6550 rpush core:rpoplast onlyelem
-redis-cli -p 6550 rpop core:rpoplast
-redis-cli -p 6550 exists core:rpoplast
-redis-cli -p 6550 type core:rpoplast
-redis-cli -p 6550 del core:hdellast
-redis-cli -p 6550 hset core:hdellast f v
-redis-cli -p 6550 hdel core:hdellast f
-redis-cli -p 6550 exists core:hdellast
-redis-cli -p 6550 type core:hdellast
-redis-cli -p 6550 del core:zremlast
-redis-cli -p 6550 zadd core:zremlast 1 onlymember
-redis-cli -p 6550 zrem core:zremlast onlymember
-redis-cli -p 6550 exists core:zremlast
-redis-cli -p 6550 type core:zremlast
+redis-cli -h numericlabs.lxd -p 6379 del core:sremlast
+redis-cli -h numericlabs.lxd -p 6379 sadd core:sremlast onlymember
+redis-cli -h numericlabs.lxd -p 6379 srem core:sremlast onlymember
+redis-cli -h numericlabs.lxd -p 6379 exists core:sremlast
+redis-cli -h numericlabs.lxd -p 6379 type core:sremlast
+redis-cli -h numericlabs.lxd -p 6379 del core:lpoplast
+redis-cli -h numericlabs.lxd -p 6379 rpush core:lpoplast onlyelem
+redis-cli -h numericlabs.lxd -p 6379 lpop core:lpoplast
+redis-cli -h numericlabs.lxd -p 6379 exists core:lpoplast
+redis-cli -h numericlabs.lxd -p 6379 type core:lpoplast
+redis-cli -h numericlabs.lxd -p 6379 del core:rpoplast
+redis-cli -h numericlabs.lxd -p 6379 rpush core:rpoplast onlyelem
+redis-cli -h numericlabs.lxd -p 6379 rpop core:rpoplast
+redis-cli -h numericlabs.lxd -p 6379 exists core:rpoplast
+redis-cli -h numericlabs.lxd -p 6379 type core:rpoplast
+redis-cli -h numericlabs.lxd -p 6379 del core:hdellast
+redis-cli -h numericlabs.lxd -p 6379 hset core:hdellast f v
+redis-cli -h numericlabs.lxd -p 6379 hdel core:hdellast f
+redis-cli -h numericlabs.lxd -p 6379 exists core:hdellast
+redis-cli -h numericlabs.lxd -p 6379 type core:hdellast
+redis-cli -h numericlabs.lxd -p 6379 del core:zremlast
+redis-cli -h numericlabs.lxd -p 6379 zadd core:zremlast 1 onlymember
+redis-cli -h numericlabs.lxd -p 6379 zrem core:zremlast onlymember
+redis-cli -h numericlabs.lxd -p 6379 exists core:zremlast
+redis-cli -h numericlabs.lxd -p 6379 type core:zremlast
 ```
 
 **Expected:**
@@ -2511,8 +2525,8 @@ Start a standalone instance from a directory with **no** `rocket-mem.toml` prese
 own root `rocket-mem.toml` turns on ACL/TLS/cluster, none of which these cases need):
 
 ```bash
-ROCKET_MEM_ADDR=127.0.0.1:6620 ROCKET_MEM_RMP_ADDR=127.0.0.1:6621 \
-ROCKET_MEM_METRICS_ADDR=127.0.0.1:9320 \
+ROCKET_MEM_ADDR=numericlabs.lxd:6379 ROCKET_MEM_RMP_ADDR=numericlabs.lxd:7379 \
+ROCKET_MEM_METRICS_ADDR=numericlabs.lxd:9121 \
 ROCKET_MEM_AOF_PATH=$DATA/txn.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/txn.snap \
   "$ROCKET_MEM_BIN" &
 echo $! > /tmp/txn.pid
@@ -2522,7 +2536,7 @@ Every case below sends its `MULTI`/`EXEC` block as a **single pipelined session 
 `redis-cli` connection** — a fresh `redis-cli` invocation per command opens a new connection, and
 `MULTI`/`EXEC` state is per-connection:
 ```bash
-redis-cli -p 6620 <<'EOF'
+redis-cli -h numericlabs.lxd -p 6379 <<'EOF'
 MULTI
 ...
 EXEC
@@ -2535,7 +2549,7 @@ EOF
 
 **Steps:**
 ```bash
-redis-cli -p 6620 <<'EOF'
+redis-cli -h numericlabs.lxd -p 6379 <<'EOF'
 MULTI
 SET txn:a 1
 INCR txn:a
@@ -2570,7 +2584,7 @@ exactly what it would have been outside a transaction.
 
 **Steps:**
 ```bash
-redis-cli -p 6620 <<'EOF'
+redis-cli -h numericlabs.lxd -p 6379 <<'EOF'
 MULTI
 SET txn:b 1
 DISCARD
@@ -2598,7 +2612,7 @@ OK
 
 **Steps:**
 ```bash
-redis-cli -p 6620 --no-raw <<'EOF'
+redis-cli -h numericlabs.lxd -p 6379 --no-raw <<'EOF'
 MULTI
 MULTI
 SET txn:g 1
@@ -2630,7 +2644,7 @@ still runs at `EXEC`.
 
 **Steps:**
 ```bash
-redis-cli -p 6620 --no-raw <<'EOF'
+redis-cli -h numericlabs.lxd -p 6379 --no-raw <<'EOF'
 MULTI
 SET txn:f 1
 NOTACOMMAND foo
@@ -2662,7 +2676,7 @@ confirmed unset afterward.
 
 **Steps:**
 ```bash
-redis-cli -p 6620 --no-raw <<'EOF'
+redis-cli -h numericlabs.lxd -p 6379 --no-raw <<'EOF'
 MULTI
 SET txn:e 1
 SET
@@ -2698,7 +2712,7 @@ a bad-arity call to a real command.
 
 **Steps:**
 ```bash
-redis-cli -p 6620 <<'EOF'
+redis-cli -h numericlabs.lxd -p 6379 <<'EOF'
 LPUSH txn:list a b c
 MULTI
 SET txn:d ok
@@ -2741,7 +2755,7 @@ earlier RESP2-only gate; see the Pub/sub section).
 
 **Steps:**
 ```bash
-redis-cli -p 6620 --no-raw <<'EOF'
+redis-cli -h numericlabs.lxd -p 6379 --no-raw <<'EOF'
 MULTI
 SUBSCRIBE foo
 SET txn:h 1
@@ -2773,7 +2787,7 @@ of what else was queued.
 
 **Steps:**
 ```bash
-redis-cli -p 6620 --no-raw <<'EOF'
+redis-cli -h numericlabs.lxd -p 6379 --no-raw <<'EOF'
 EXEC
 DISCARD
 EOF
@@ -2799,7 +2813,7 @@ already run (so there's a prior write transaction in the AOF to inspect).
 **Steps:**
 ```bash
 wc -l "$DATA/txn.aof"          # note the line count
-redis-cli -p 6620 <<'EOF'
+redis-cli -h numericlabs.lxd -p 6379 <<'EOF'
 MULTI
 GET txn:a
 GET txn:c
@@ -2949,23 +2963,24 @@ exists; the fields above are its structured-logging replacement.)
 
 ### PERSIST-01 — AOF captures writes and survives a graceful restart
 
-**Precondition:** No server running on 6560/6561/9360. `$DATA/prc-persist.aof` and
+**Precondition:** No server running on 6379/7379/9121 (see the port note at the top of this
+document — stop the live cluster first if it's up). `$DATA/prc-persist.aof` and
 `$DATA/prc-persist.snap` do not exist (fresh start).
 
 **Steps:**
 ```bash
-ROCKET_MEM_ADDR=127.0.0.1:6560 ROCKET_MEM_RMP_ADDR=127.0.0.1:6561 \
+ROCKET_MEM_ADDR=numericlabs.lxd:6379 ROCKET_MEM_RMP_ADDR=numericlabs.lxd:7379 \
 ROCKET_MEM_AOF_PATH=$DATA/prc-persist.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-persist.snap \
-ROCKET_MEM_METRICS_ADDR=127.0.0.1:9360 \
+ROCKET_MEM_METRICS_ADDR=numericlabs.lxd:9121 \
   $BIN &
 echo $! > /tmp/prc-persist.pid
 sleep 0.6
 
 wc -c $DATA/prc-persist.aof                 # 0 bytes before any write
 
-redis-cli -p 6560 set foo bar
-redis-cli -p 6560 set baz qux
-redis-cli -p 6560 get foo
+redis-cli -h numericlabs.lxd -p 6379 set foo bar
+redis-cli -h numericlabs.lxd -p 6379 set baz qux
+redis-cli -h numericlabs.lxd -p 6379 get foo
 
 sleep 1.5                                    # default fsync policy is EverySecond
 wc -c $DATA/prc-persist.aof                  # must now be > 0
@@ -2975,14 +2990,14 @@ kill $(cat /tmp/prc-persist.pid)
 sleep 0.3
 
 # restart, same paths
-ROCKET_MEM_ADDR=127.0.0.1:6560 ROCKET_MEM_RMP_ADDR=127.0.0.1:6561 \
+ROCKET_MEM_ADDR=numericlabs.lxd:6379 ROCKET_MEM_RMP_ADDR=numericlabs.lxd:7379 \
 ROCKET_MEM_AOF_PATH=$DATA/prc-persist.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-persist.snap \
-ROCKET_MEM_METRICS_ADDR=127.0.0.1:9360 \
+ROCKET_MEM_METRICS_ADDR=numericlabs.lxd:9121 \
   $BIN &
 echo $! > /tmp/prc-persist.pid
 sleep 0.6
-redis-cli -p 6560 get foo
-redis-cli -p 6560 get baz
+redis-cli -h numericlabs.lxd -p 6379 get foo
+redis-cli -h numericlabs.lxd -p 6379 get baz
 ```
 
 **Expected:**
@@ -3020,25 +3035,25 @@ size right after a write with no sleep; it reads 0 and looks broken when it isn'
 
 ### PERSIST-02 — `SAVE` writes a snapshot file; restart loads it
 
-**Precondition:** Server from PERSIST-01 still running on 6560, with `foo`/`baz` set.
+**Precondition:** Server from PERSIST-01 still running on 6379, with `foo`/`baz` set.
 
 **Steps:**
 ```bash
-redis-cli -p 6560 set snapkey snapval
-redis-cli -p 6560 save
+redis-cli -h numericlabs.lxd -p 6379 set snapkey snapval
+redis-cli -h numericlabs.lxd -p 6379 save
 ls -la $DATA/prc-persist.snap
 
 kill $(cat /tmp/prc-persist.pid)
 sleep 0.3
 
-ROCKET_MEM_ADDR=127.0.0.1:6560 ROCKET_MEM_RMP_ADDR=127.0.0.1:6561 \
+ROCKET_MEM_ADDR=numericlabs.lxd:6379 ROCKET_MEM_RMP_ADDR=numericlabs.lxd:7379 \
 ROCKET_MEM_AOF_PATH=$DATA/prc-persist.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-persist.snap \
-ROCKET_MEM_METRICS_ADDR=127.0.0.1:9360 \
+ROCKET_MEM_METRICS_ADDR=numericlabs.lxd:9121 \
   $BIN &
 echo $! > /tmp/prc-persist.pid
 sleep 0.6
-redis-cli -p 6560 get snapkey
-redis-cli -p 6560 get foo
+redis-cli -h numericlabs.lxd -p 6379 get snapkey
+redis-cli -h numericlabs.lxd -p 6379 get foo
 ```
 
 **Expected:**
@@ -3046,13 +3061,35 @@ redis-cli -p 6560 get foo
 OK
 OK
 -rw-rw-r-- 1 numericlabs numericlabs 105 <date> $DATA/prc-persist.snap
-Recovered state from $DATA/prc-persist.snap and $DATA/prc-persist.aof
-Metrics on http://127.0.0.1:9360/metrics
-RMP listening on 127.0.0.1:6561
-Listening on 127.0.0.1:6560
+<date>  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=numericlabs.lxd:6379
+<date>  INFO rocket_mem: resolved config summary node_id=numericlabs.lxd:6379 addr=numericlabs.lxd:6379 rmp_addr=numericlabs.lxd:7379 metrics_addr=numericlabs.lxd:9121 aof_path=$DATA/prc-persist.aof snapshot_path=$DATA/prc-persist.snap log_filter=info log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=false acl_user_count=0 tls_enabled=false tls_replication_enabled=false
+<date>  INFO rocket_mem::aof: snapshot loaded snapshot_path=$DATA/prc-persist.snap bytes=105 elapsed_us=<n>
+<date>  INFO rocket_mem::aof: aof recovery replay complete commands=0 bytes=0 elapsed_us=<n>
+<date>  INFO rocket_mem: listener bound protocol=metrics addr=http://192.168.1.12:9121/metrics
+<date>  INFO rocket_mem: listener bound protocol=RMP addr=192.168.1.12:7379
+<date>  INFO rocket_mem: listener bound protocol=RESP addr=192.168.1.12:6379
+
+┌───────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ rocket-mem v0.1.4                                                                                 │
+├───────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ storage   recovered $DATA/prc-persist.snap + $DATA/prc-persist.aof (generation 0)                 │
+│ acl       no users configured -- auth disabled, every client is trusted                           │
+│ cluster   standalone (no cluster_config set)                                                      │
+│ replicas  none connected yet -- REPLICAOF is a live command; INFO REPLICATION shows current state │
+│ listeners                                                                                         │
+│           metrics  http://192.168.1.12:9121/metrics                                               │
+│           RMP      192.168.1.12:7379                                                              │
+│           RESP     192.168.1.12:6379                                                              │
+└───────────────────────────────────────────────────────────────────────────────────────────────────┘
 snapval
 bar
 ```
+
+**Notes:** As of the `v0.1.4` boxed-startup-banner redesign (see the general note above this
+section), the restart prints the structured log lines and boxed table shown here, not the old
+plain `Recovered state from ...`/`Metrics on ...` banner this case showed before — real, captured
+output. `snapshot loaded` only appears when a snapshot file existed to load; PERSIST-01's fresh
+restart didn't show it.
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -3060,29 +3097,29 @@ bar
 
 ### PERSIST-03 — Snapshot plus AOF tail load together, in that order
 
-**Precondition:** Server from PERSIST-02 running on 6560, snapshot already contains
+**Precondition:** Server from PERSIST-02 running on 6379, snapshot already contains
 `foo`/`baz`/`snapkey`. `$DATA/prc-persist.aof` is **not** truncated or rewritten by `SAVE` — it
 still holds the full command history from before the snapshot, plus whatever is appended after.
 
 **Steps:**
 ```bash
-redis-cli -p 6560 get snapkey             # proves snapshot half loaded
-redis-cli -p 6560 get foo                 # proves it, plus the pre-snapshot AOF portion, loaded
+redis-cli -h numericlabs.lxd -p 6379 get snapkey             # proves snapshot half loaded
+redis-cli -h numericlabs.lxd -p 6379 get foo                 # proves it, plus the pre-snapshot AOF portion, loaded
 
-redis-cli -p 6560 set posttail tailval    # written AFTER the snapshot, only in the AOF tail
+redis-cli -h numericlabs.lxd -p 6379 set posttail tailval    # written AFTER the snapshot, only in the AOF tail
 sleep 1.5
 
 kill $(cat /tmp/prc-persist.pid)
 sleep 0.3
 
-ROCKET_MEM_ADDR=127.0.0.1:6560 ROCKET_MEM_RMP_ADDR=127.0.0.1:6561 \
+ROCKET_MEM_ADDR=numericlabs.lxd:6379 ROCKET_MEM_RMP_ADDR=numericlabs.lxd:7379 \
 ROCKET_MEM_AOF_PATH=$DATA/prc-persist.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-persist.snap \
-ROCKET_MEM_METRICS_ADDR=127.0.0.1:9360 \
+ROCKET_MEM_METRICS_ADDR=numericlabs.lxd:9121 \
   $BIN &
 echo $! > /tmp/prc-persist.pid
 sleep 0.6
-redis-cli -p 6560 get snapkey    # from the snapshot
-redis-cli -p 6560 get posttail   # from the AOF tail written after the snapshot offset
+redis-cli -h numericlabs.lxd -p 6379 get snapkey    # from the snapshot
+redis-cli -h numericlabs.lxd -p 6379 get posttail   # from the AOF tail written after the snapshot offset
 ```
 
 **Expected:**
@@ -3090,17 +3127,33 @@ redis-cli -p 6560 get posttail   # from the AOF tail written after the snapshot 
 snapval
 bar
 OK
-Recovered state from $DATA/prc-persist.snap and $DATA/prc-persist.aof
-Metrics on http://127.0.0.1:9360/metrics
-RMP listening on 127.0.0.1:6561
-Listening on 127.0.0.1:6560
+<date>  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=numericlabs.lxd:6379
+<date>  INFO rocket_mem: resolved config summary node_id=numericlabs.lxd:6379 addr=numericlabs.lxd:6379 rmp_addr=numericlabs.lxd:7379 metrics_addr=numericlabs.lxd:9121 aof_path=$DATA/prc-persist.aof snapshot_path=$DATA/prc-persist.snap log_filter=info log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=false acl_user_count=0 tls_enabled=false tls_replication_enabled=false
+<date>  INFO rocket_mem::aof: snapshot loaded snapshot_path=$DATA/prc-persist.snap bytes=105 elapsed_us=<n>
+<date>  INFO rocket_mem::aof: aof recovery replay complete commands=1 bytes=40 elapsed_us=<n>
+<date>  INFO rocket_mem: listener bound protocol=metrics addr=http://192.168.1.12:9121/metrics
+<date>  INFO rocket_mem: listener bound protocol=RMP addr=192.168.1.12:7379
+<date>  INFO rocket_mem: listener bound protocol=RESP addr=192.168.1.12:6379
+
+┌───────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ rocket-mem v0.1.4                                                                                 │
+├───────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ storage   recovered $DATA/prc-persist.snap + $DATA/prc-persist.aof (generation 0)                 │
+│ acl       no users configured -- auth disabled, every client is trusted                           │
+│ cluster   standalone (no cluster_config set)                                                      │
+│ replicas  none connected yet -- REPLICAOF is a live command; INFO REPLICATION shows current state │
+│ listeners                                                                                         │
+│           metrics  http://192.168.1.12:9121/metrics                                               │
+│           RMP      192.168.1.12:7379                                                              │
+│           RESP     192.168.1.12:6379                                                              │
+└───────────────────────────────────────────────────────────────────────────────────────────────────┘
 snapval
 tailval
 ```
 
-**Notes:** The one-line "Recovered state from `<snapshot>` and `<aof>`" banner is the only place
-the load order is stated; there's no separate "loading snapshot..." / "replaying AOF tail..."
-pair of lines. Per `README.md`'s Sprint 5 entry, the snapshot embeds the AOF byte offset it was
+**Notes:** The `snapshot loaded` / `aof recovery replay complete` pair of structured log lines is
+where the load order is stated — `snapshot loaded` only appears when a snapshot file existed
+(compare PERSIST-01's fresh restart, which has no such line). Per `README.md`'s Sprint 5 entry, the snapshot embeds the AOF byte offset it was
 taken at, so only the AOF bytes written after that offset are replayed on top of it — not the
 whole file from scratch (that full-replay-from-empty behavior was Sprint 4's, superseded in
 Sprint 5). The AOF file itself keeps growing forever across every `SAVE`; nothing truncates or
@@ -3112,7 +3165,7 @@ rewrites it, so don't expect its size to reset after a snapshot.
 
 ### PERSIST-04 — Different AOF/snapshot path starts empty
 
-**Precondition:** Server from PERSIST-03 running on 6560. `$DATA/prc-persist-other.aof` and
+**Precondition:** Server from PERSIST-03 running on 6379. `$DATA/prc-persist-other.aof` and
 `$DATA/prc-persist-other.snap` do not exist.
 
 **Steps:**
@@ -3120,15 +3173,15 @@ rewrites it, so don't expect its size to reset after a snapshot.
 kill $(cat /tmp/prc-persist.pid)
 sleep 0.3
 
-ROCKET_MEM_ADDR=127.0.0.1:6560 ROCKET_MEM_RMP_ADDR=127.0.0.1:6561 \
+ROCKET_MEM_ADDR=numericlabs.lxd:6379 ROCKET_MEM_RMP_ADDR=numericlabs.lxd:7379 \
 ROCKET_MEM_AOF_PATH=$DATA/prc-persist-other.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-persist-other.snap \
-ROCKET_MEM_METRICS_ADDR=127.0.0.1:9360 \
+ROCKET_MEM_METRICS_ADDR=numericlabs.lxd:9121 \
   $BIN &
 echo $! > /tmp/prc-persist.pid
 sleep 0.6
-redis-cli -p 6560 get foo
-redis-cli -p 6560 get snapkey
-redis-cli -p 6560 keys '*'
+redis-cli -h numericlabs.lxd -p 6379 get foo
+redis-cli -h numericlabs.lxd -p 6379 get snapkey
+redis-cli -h numericlabs.lxd -p 6379 keys '*'
 
 kill $(cat /tmp/prc-persist.pid)
 sleep 0.3
@@ -3136,19 +3189,39 @@ sleep 0.3
 
 **Expected:**
 ```
-Recovered state from $DATA/prc-persist-other.snap and $DATA/prc-persist-other.aof
-Metrics on http://127.0.0.1:9360/metrics
-RMP listening on 127.0.0.1:6561
-Listening on 127.0.0.1:6560
-(nil)
-(nil)
-(empty array)
+<date>  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=numericlabs.lxd:6379
+<date>  INFO rocket_mem: resolved config summary node_id=numericlabs.lxd:6379 addr=numericlabs.lxd:6379 rmp_addr=numericlabs.lxd:7379 metrics_addr=numericlabs.lxd:9121 aof_path=$DATA/prc-persist-other.aof snapshot_path=$DATA/prc-persist-other.snap log_filter=info log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=false acl_user_count=0 tls_enabled=false tls_replication_enabled=false
+<date>  INFO rocket_mem::aof: aof recovery replay complete commands=0 bytes=0 elapsed_us=<n>
+<date>  INFO rocket_mem: listener bound protocol=metrics addr=http://192.168.1.12:9121/metrics
+<date>  INFO rocket_mem: listener bound protocol=RMP addr=192.168.1.12:7379
+<date>  INFO rocket_mem: listener bound protocol=RESP addr=192.168.1.12:6379
+
+┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ rocket-mem v0.1.4                                                                                     │
+├───────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ storage   recovered $DATA/prc-persist-other.snap + $DATA/prc-persist-other.aof (generation 0)         │
+│ acl       no users configured -- auth disabled, every client is trusted                               │
+│ cluster   standalone (no cluster_config set)                                                          │
+│ replicas  none connected yet -- REPLICAOF is a live command; INFO REPLICATION shows current state     │
+│ listeners                                                                                             │
+│           metrics  http://192.168.1.12:9121/metrics                                                   │
+│           RMP      192.168.1.12:7379                                                                  │
+│           RESP     192.168.1.12:6379                                                                  │
+└───────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+
+
 ```
 
 **Notes:** This is the control case proving PERSIST-01 through -03 actually read the data back
 from the file, not from some other in-process cache — same binary, same host, only the path
-changed, and the store comes up empty. The banner still says "Recovered state from..." even
-though nothing was actually recovered; see the note at the top of this document.
+changed, and the store comes up empty. `redis-cli`'s non-interactive mode prints a nil reply and
+an empty array both as a single blank line, not the literal text `(nil)`/`(empty array)` you'd see
+in its interactive REPL — that's why the three trailing lines above are blank rather than words;
+see the note near the top of this document about `redis-cli`'s raw output mode. The
+`aof recovery replay complete commands=0 bytes=0` line fires even though nothing was actually
+recovered — the structured-logging replacement for the old plain banner's misleading-sounding
+"Recovered state from..." line; see the general note above this section.
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -3156,22 +3229,23 @@ though nothing was actually recovered; see the note at the top of this document.
 
 ### PERSIST-05 — Data survives an ungraceful `kill -9`
 
-**Precondition:** No server running on 6560/6561/9360. `$DATA/prc-kill9.aof` and
+**Precondition:** No server running on 6379/7379/9121 (see the port note at the top of this
+document — stop the live cluster first if it's up). `$DATA/prc-kill9.aof` and
 `$DATA/prc-kill9.snap` removed if present, for a clean slate.
 
 **Steps:**
 ```bash
 rm -f $DATA/prc-kill9.aof $DATA/prc-kill9.snap
 
-ROCKET_MEM_ADDR=127.0.0.1:6560 ROCKET_MEM_RMP_ADDR=127.0.0.1:6561 \
+ROCKET_MEM_ADDR=numericlabs.lxd:6379 ROCKET_MEM_RMP_ADDR=numericlabs.lxd:7379 \
 ROCKET_MEM_AOF_PATH=$DATA/prc-kill9.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-kill9.snap \
-ROCKET_MEM_METRICS_ADDR=127.0.0.1:9360 \
+ROCKET_MEM_METRICS_ADDR=numericlabs.lxd:9121 \
   $BIN &
 echo $! > /tmp/prc-kill9.pid
 sleep 0.6
 
-redis-cli -p 6560 set survive yes
-redis-cli -p 6560 set counter 1
+redis-cli -h numericlabs.lxd -p 6379 set survive yes
+redis-cli -h numericlabs.lxd -p 6379 set counter 1
 sleep 1.5                              # let EverySecond fsync land before the SIGKILL
 wc -c $DATA/prc-kill9.aof
 
@@ -3179,14 +3253,14 @@ kill -9 $(cat /tmp/prc-kill9.pid)      # no clean shutdown, no chance to flush a
 sleep 0.3
 ps -p $(cat /tmp/prc-kill9.pid)        # confirm it's actually dead
 
-ROCKET_MEM_ADDR=127.0.0.1:6560 ROCKET_MEM_RMP_ADDR=127.0.0.1:6561 \
+ROCKET_MEM_ADDR=numericlabs.lxd:6379 ROCKET_MEM_RMP_ADDR=numericlabs.lxd:7379 \
 ROCKET_MEM_AOF_PATH=$DATA/prc-kill9.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-kill9.snap \
-ROCKET_MEM_METRICS_ADDR=127.0.0.1:9360 \
+ROCKET_MEM_METRICS_ADDR=numericlabs.lxd:9121 \
   $BIN &
 echo $! > /tmp/prc-kill9.pid
 sleep 0.6
-redis-cli -p 6560 get survive
-redis-cli -p 6560 get counter
+redis-cli -h numericlabs.lxd -p 6379 get survive
+redis-cli -h numericlabs.lxd -p 6379 get counter
 ```
 
 **Expected:**
@@ -3195,10 +3269,25 @@ OK
 OK
 68
 (stopped, ps shows no matching PID)
-Recovered state from $DATA/prc-kill9.snap and $DATA/prc-kill9.aof
-Metrics on http://127.0.0.1:9360/metrics
-RMP listening on 127.0.0.1:6561
-Listening on 127.0.0.1:6560
+<date>  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=numericlabs.lxd:6379
+<date>  INFO rocket_mem: resolved config summary node_id=numericlabs.lxd:6379 addr=numericlabs.lxd:6379 rmp_addr=numericlabs.lxd:7379 metrics_addr=numericlabs.lxd:9121 aof_path=$DATA/prc-kill9.aof snapshot_path=$DATA/prc-kill9.snap log_filter=info log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=false acl_user_count=0 tls_enabled=false tls_replication_enabled=false
+<date>  INFO rocket_mem::aof: aof recovery replay complete commands=2 bytes=68 elapsed_us=<n>
+<date>  INFO rocket_mem: listener bound protocol=metrics addr=http://192.168.1.12:9121/metrics
+<date>  INFO rocket_mem: listener bound protocol=RMP addr=192.168.1.12:7379
+<date>  INFO rocket_mem: listener bound protocol=RESP addr=192.168.1.12:6379
+
+┌───────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ rocket-mem v0.1.4                                                                                 │
+├───────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ storage   recovered $DATA/prc-kill9.snap + $DATA/prc-kill9.aof (generation 0)                     │
+│ acl       no users configured -- auth disabled, every client is trusted                           │
+│ cluster   standalone (no cluster_config set)                                                      │
+│ replicas  none connected yet -- REPLICAOF is a live command; INFO REPLICATION shows current state │
+│ listeners                                                                                         │
+│           metrics  http://192.168.1.12:9121/metrics                                               │
+│           RMP      192.168.1.12:7379                                                              │
+│           RESP     192.168.1.12:6379                                                              │
+└───────────────────────────────────────────────────────────────────────────────────────────────────┘
 yes
 1
 ```
@@ -4733,8 +4822,14 @@ invented.
 
 - Binary: `"$ROCKET_MEM_BIN"`. Build once with
   `cargo build --release --workspace` if it isn't already built.
-- Ports used throughout: `6570`/`6571`/`6572`/`6573` for RESP/RMP, `9370` for the Prometheus
-  endpoint. Do not use other ports — other test runs may be using them concurrently.
+- Ports used throughout: `numericlabs.lxd:6379`/`7379` (RESP/RMP) for the base TOML config used
+  by most cases below — shard-a leader's real address, matching `rocket-mem.toml` — plus
+  `numericlabs.lxd:9121` for the Prometheus endpoint. `CFG-06`/`CFG-07` additionally use
+  `numericlabs.lxd:6479` (shard-a's replica address) and `numericlabs.lxd:6380` (shard-b leader's
+  address) purely as env-var/CLI override *values*, to prove precedence — no replica or shard-b
+  process is actually involved. This means every case below collides with the live hand-started
+  cluster if it's running: see the port note at the top of this document, and stop the cluster
+  first.
 - Every server is started in the background with `&`, its PID captured, and killed by that exact
   PID when the case is done. Never use `pkill -f rocket-mem` — it will kill other people's test
   servers too.
@@ -4742,7 +4837,14 @@ invented.
   `rocket-mem.toml` doesn't change the outcome. Create one before you start:
   `mkdir -p /tmp/rm-qa-work && cd /tmp/rm-qa-work`.
 - After every case, confirm the port(s) are free before moving to the next:
-  `ss -tlnp | grep -E ':(6570|6571|6572|6573|9370)\b'` should print nothing.
+  `ss -tlnp | grep -E ':(6379|7379|9121|6479|6380)\b'` should print nothing.
+- As of the `v0.1.4` boxed-startup-banner redesign, a server start prints six structured
+  `INFO`-level log lines (`rocket-mem starting`, `resolved config summary`,
+  `aof recovery replay complete`, then a `listener bound` line per listener) followed by a
+  colorized boxed summary table — see the general note before the "Persistence" section above for
+  the full field-by-field description. Every "Expected" block below shows the real, current form
+  of both; earlier revisions of these cases showed the old plain `Recovered state from ...`/
+  `Metrics on ...`/`RMP listening on ...`/`Listening on ...` banner, which no longer exists.
 
 ---
 
@@ -4760,9 +4862,9 @@ layering"), source: `crates/server/src/config.rs`.
 ```bash
 mkdir -p /tmp/rm-qa-cfg
 cat > /tmp/rm-qa-cfg/my-config.toml <<'EOF'
-addr = "127.0.0.1:6570"
-rmp_addr = "127.0.0.1:6571"
-metrics_addr = "127.0.0.1:9370"
+addr = "numericlabs.lxd:6379"
+rmp_addr = "numericlabs.lxd:7379"
+metrics_addr = "numericlabs.lxd:9121"
 aof_path = "/tmp/rm-qa-cfg1.aof"
 snapshot_path = "/tmp/rm-qa-cfg1.snap"
 EOF
@@ -4773,22 +4875,37 @@ rm -f /tmp/rm-qa-cfg1.aof /tmp/rm-qa-cfg1.snap
   --config /tmp/rm-qa-cfg/my-config.toml &
 PID=$!
 sleep 0.5
-redis-cli -p 6570 ping
+redis-cli -h numericlabs.lxd -p 6379 ping
 kill $PID
 ```
 
 **Expected:**
 ```
-Recovered state from /tmp/rm-qa-cfg1.snap and /tmp/rm-qa-cfg1.aof
-Metrics on http://127.0.0.1:9370/metrics
-RMP listening on 127.0.0.1:6571
-Listening on 127.0.0.1:6570
+<date>  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=numericlabs.lxd:6379
+<date>  INFO rocket_mem: resolved config summary node_id=numericlabs.lxd:6379 addr=numericlabs.lxd:6379 rmp_addr=numericlabs.lxd:7379 metrics_addr=numericlabs.lxd:9121 aof_path=/tmp/rm-qa-cfg1.aof snapshot_path=/tmp/rm-qa-cfg1.snap log_filter=info log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=false acl_user_count=0 tls_enabled=false tls_replication_enabled=false
+<date>  INFO rocket_mem::aof: aof recovery replay complete commands=0 bytes=0 elapsed_us=<n>
+<date>  INFO rocket_mem: listener bound protocol=metrics addr=http://192.168.1.12:9121/metrics
+<date>  INFO rocket_mem: listener bound protocol=RMP addr=192.168.1.12:7379
+<date>  INFO rocket_mem: listener bound protocol=RESP addr=192.168.1.12:6379
+
+┌───────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ rocket-mem v0.1.4                                                                                 │
+├───────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ storage   recovered /tmp/rm-qa-cfg1.snap + /tmp/rm-qa-cfg1.aof (generation 0)                     │
+│ acl       no users configured -- auth disabled, every client is trusted                           │
+│ cluster   standalone (no cluster_config set)                                                      │
+│ replicas  none connected yet -- REPLICAOF is a live command; INFO REPLICATION shows current state │
+│ listeners                                                                                         │
+│           metrics  http://192.168.1.12:9121/metrics                                               │
+│           RMP      192.168.1.12:7379                                                              │
+│           RESP     192.168.1.12:6379                                                              │
+└───────────────────────────────────────────────────────────────────────────────────────────────────┘
 PONG
 ```
 
-**Notes:** The "Recovered state from ..." line prints even on a brand-new AOF/snapshot path with
-nothing to recover — it is not proof a prior snapshot actually existed. Don't read it as a
-warning sign.
+**Notes:** The `aof recovery replay complete commands=0 bytes=0` line (and the boxed table's
+`storage` row) print even on a brand-new AOF/snapshot path with nothing to recover — not proof a
+prior snapshot actually existed. Don't read it as a warning sign.
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -4807,21 +4924,36 @@ rm -f /tmp/rm-qa-cfg1.aof /tmp/rm-qa-cfg1.snap
 "$ROCKET_MEM_BIN" &
 PID=$!
 sleep 0.5
-redis-cli -p 6570 ping
+redis-cli -h numericlabs.lxd -p 6379 ping
 kill $PID
 ```
 
 **Expected:**
 ```
-Recovered state from /tmp/rm-qa-cfg1.snap and /tmp/rm-qa-cfg1.aof
-Metrics on http://127.0.0.1:9370/metrics
-RMP listening on 127.0.0.1:6571
-Listening on 127.0.0.1:6570
+<date>  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=numericlabs.lxd:6379
+<date>  INFO rocket_mem: resolved config summary node_id=numericlabs.lxd:6379 addr=numericlabs.lxd:6379 rmp_addr=numericlabs.lxd:7379 metrics_addr=numericlabs.lxd:9121 aof_path=/tmp/rm-qa-cfg1.aof snapshot_path=/tmp/rm-qa-cfg1.snap log_filter=info log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=false acl_user_count=0 tls_enabled=false tls_replication_enabled=false
+<date>  INFO rocket_mem::aof: aof recovery replay complete commands=0 bytes=0 elapsed_us=<n>
+<date>  INFO rocket_mem: listener bound protocol=metrics addr=http://192.168.1.12:9121/metrics
+<date>  INFO rocket_mem: listener bound protocol=RMP addr=192.168.1.12:7379
+<date>  INFO rocket_mem: listener bound protocol=RESP addr=192.168.1.12:6379
+
+┌───────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ rocket-mem v0.1.4                                                                                 │
+├───────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ storage   recovered /tmp/rm-qa-cfg1.snap + /tmp/rm-qa-cfg1.aof (generation 0)                     │
+│ acl       no users configured -- auth disabled, every client is trusted                           │
+│ cluster   standalone (no cluster_config set)                                                      │
+│ replicas  none connected yet -- REPLICAOF is a live command; INFO REPLICATION shows current state │
+│ listeners                                                                                         │
+│           metrics  http://192.168.1.12:9121/metrics                                               │
+│           RMP      192.168.1.12:7379                                                              │
+│           RESP     192.168.1.12:6379                                                              │
+└───────────────────────────────────────────────────────────────────────────────────────────────────┘
 PONG
 ```
 
 **Notes:** No `--config` flag was passed at all. The `./rocket-mem.toml` sitting in the current
-directory was picked up automatically and its `addr` (6570) is what got bound.
+directory was picked up automatically and its `addr` (`numericlabs.lxd:6379`) is what got bound.
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -4836,24 +4968,39 @@ directory was picked up automatically and its `addr` (6570) is what got bound.
 mkdir -p /tmp/rm-qa-empty && cd /tmp/rm-qa-empty
 ls   # confirm it's empty — no rocket-mem.toml here
 rm -f /tmp/rm-qa-envonly.aof /tmp/rm-qa-envonly.snap
-ROCKET_MEM_ADDR=127.0.0.1:6570 ROCKET_MEM_RMP_ADDR=127.0.0.1:6571 \
-ROCKET_MEM_METRICS_ADDR=127.0.0.1:9370 \
+ROCKET_MEM_ADDR=numericlabs.lxd:6379 ROCKET_MEM_RMP_ADDR=numericlabs.lxd:7379 \
+ROCKET_MEM_METRICS_ADDR=numericlabs.lxd:9121 \
 ROCKET_MEM_AOF_PATH=/tmp/rm-qa-envonly.aof ROCKET_MEM_SNAPSHOT_PATH=/tmp/rm-qa-envonly.snap \
   "$ROCKET_MEM_BIN" &
 PID=$!
 sleep 0.5
-redis-cli -p 6570 ping
-redis-cli -p 6570 set envkey envval
-redis-cli -p 6570 get envkey
+redis-cli -h numericlabs.lxd -p 6379 ping
+redis-cli -h numericlabs.lxd -p 6379 set envkey envval
+redis-cli -h numericlabs.lxd -p 6379 get envkey
 kill $PID
 ```
 
 **Expected:**
 ```
-Recovered state from /tmp/rm-qa-envonly.snap and /tmp/rm-qa-envonly.aof
-Metrics on http://127.0.0.1:9370/metrics
-RMP listening on 127.0.0.1:6571
-Listening on 127.0.0.1:6570
+<date>  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=numericlabs.lxd:6379
+<date>  INFO rocket_mem: resolved config summary node_id=numericlabs.lxd:6379 addr=numericlabs.lxd:6379 rmp_addr=numericlabs.lxd:7379 metrics_addr=numericlabs.lxd:9121 aof_path=/tmp/rm-qa-envonly.aof snapshot_path=/tmp/rm-qa-envonly.snap log_filter=info log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=false acl_user_count=0 tls_enabled=false tls_replication_enabled=false
+<date>  INFO rocket_mem::aof: aof recovery replay complete commands=0 bytes=0 elapsed_us=<n>
+<date>  INFO rocket_mem: listener bound protocol=metrics addr=http://192.168.1.12:9121/metrics
+<date>  INFO rocket_mem: listener bound protocol=RMP addr=192.168.1.12:7379
+<date>  INFO rocket_mem: listener bound protocol=RESP addr=192.168.1.12:6379
+
+┌───────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ rocket-mem v0.1.4                                                                                 │
+├───────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ storage   recovered /tmp/rm-qa-envonly.snap + /tmp/rm-qa-envonly.aof (generation 0)               │
+│ acl       no users configured -- auth disabled, every client is trusted                           │
+│ cluster   standalone (no cluster_config set)                                                      │
+│ replicas  none connected yet -- REPLICAOF is a live command; INFO REPLICATION shows current state │
+│ listeners                                                                                         │
+│           metrics  http://192.168.1.12:9121/metrics                                               │
+│           RMP      192.168.1.12:7379                                                              │
+│           RESP     192.168.1.12:6379                                                              │
+└───────────────────────────────────────────────────────────────────────────────────────────────────┘
 PONG
 OK
 envval
@@ -4876,15 +5023,15 @@ TOML anywhere works exactly as it did before config layering existed. A missing 
 cd /tmp/rm-qa-empty
 ls /tmp/rm-qa-cfg/does-not-exist.toml   # confirm it really doesn't exist
 rm -f /tmp/rm-qa-envonly.aof /tmp/rm-qa-envonly.snap
-ROCKET_MEM_ADDR=127.0.0.1:6570 ROCKET_MEM_RMP_ADDR=127.0.0.1:6571 \
-ROCKET_MEM_METRICS_ADDR=127.0.0.1:9370 \
+ROCKET_MEM_ADDR=numericlabs.lxd:6379 ROCKET_MEM_RMP_ADDR=numericlabs.lxd:7379 \
+ROCKET_MEM_METRICS_ADDR=numericlabs.lxd:9121 \
 ROCKET_MEM_AOF_PATH=/tmp/rm-qa-envonly.aof ROCKET_MEM_SNAPSHOT_PATH=/tmp/rm-qa-envonly.snap \
   "$ROCKET_MEM_BIN" \
   --config /tmp/rm-qa-cfg/does-not-exist.toml &
 PID=$!
 sleep 0.5
 kill -0 $PID && echo STILL_RUNNING
-redis-cli -p 6570 ping
+redis-cli -h numericlabs.lxd -p 6379 ping
 kill $PID
 ```
 
@@ -4892,10 +5039,25 @@ kill $PID
 ```
 ls: cannot access '/tmp/rm-qa-cfg/does-not-exist.toml': No such file or directory
 STILL_RUNNING
-Recovered state from /tmp/rm-qa-envonly.snap and /tmp/rm-qa-envonly.aof
-Metrics on http://127.0.0.1:9370/metrics
-RMP listening on 127.0.0.1:6571
-Listening on 127.0.0.1:6570
+<date>  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=numericlabs.lxd:6379
+<date>  INFO rocket_mem: resolved config summary node_id=numericlabs.lxd:6379 addr=numericlabs.lxd:6379 rmp_addr=numericlabs.lxd:7379 metrics_addr=numericlabs.lxd:9121 aof_path=/tmp/rm-qa-envonly.aof snapshot_path=/tmp/rm-qa-envonly.snap log_filter=info log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=false acl_user_count=0 tls_enabled=false tls_replication_enabled=false
+<date>  INFO rocket_mem::aof: aof recovery replay complete commands=0 bytes=0 elapsed_us=<n>
+<date>  INFO rocket_mem: listener bound protocol=metrics addr=http://192.168.1.12:9121/metrics
+<date>  INFO rocket_mem: listener bound protocol=RMP addr=192.168.1.12:7379
+<date>  INFO rocket_mem: listener bound protocol=RESP addr=192.168.1.12:6379
+
+┌───────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ rocket-mem v0.1.4                                                                                 │
+├───────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ storage   recovered /tmp/rm-qa-envonly.snap + /tmp/rm-qa-envonly.aof (generation 0)               │
+│ acl       no users configured -- auth disabled, every client is trusted                           │
+│ cluster   standalone (no cluster_config set)                                                      │
+│ replicas  none connected yet -- REPLICAOF is a live command; INFO REPLICATION shows current state │
+│ listeners                                                                                         │
+│           metrics  http://192.168.1.12:9121/metrics                                               │
+│           RMP      192.168.1.12:7379                                                              │
+│           RESP     192.168.1.12:6379                                                              │
+└───────────────────────────────────────────────────────────────────────────────────────────────────┘
 PONG
 ```
 
@@ -4910,8 +5072,8 @@ loading will not notice a typo.
 
 ### CFG-05 — Precedence step 1: TOML file alone sets the bound address
 
-**Precondition:** `/tmp/rm-qa-cfg/my-config.toml` from CFG-01 exists (addr=6570, rmp_addr=6571,
-metrics_addr=9370).
+**Precondition:** `/tmp/rm-qa-cfg/my-config.toml` from CFG-01 exists (addr=`numericlabs.lxd:6379`,
+rmp_addr=`numericlabs.lxd:7379`, metrics_addr=`numericlabs.lxd:9121`).
 
 **Steps:**
 ```bash
@@ -4926,10 +5088,25 @@ kill $PID
 
 **Expected:**
 ```
-Recovered state from /tmp/rm-qa-cfg1.snap and /tmp/rm-qa-cfg1.aof
-Metrics on http://127.0.0.1:9370/metrics
-RMP listening on 127.0.0.1:6571
-Listening on 127.0.0.1:6570
+<date>  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=numericlabs.lxd:6379
+<date>  INFO rocket_mem: resolved config summary node_id=numericlabs.lxd:6379 addr=numericlabs.lxd:6379 rmp_addr=numericlabs.lxd:7379 metrics_addr=numericlabs.lxd:9121 aof_path=/tmp/rm-qa-cfg1.aof snapshot_path=/tmp/rm-qa-cfg1.snap log_filter=info log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=false acl_user_count=0 tls_enabled=false tls_replication_enabled=false
+<date>  INFO rocket_mem::aof: aof recovery replay complete commands=0 bytes=0 elapsed_us=<n>
+<date>  INFO rocket_mem: listener bound protocol=metrics addr=http://192.168.1.12:9121/metrics
+<date>  INFO rocket_mem: listener bound protocol=RMP addr=192.168.1.12:7379
+<date>  INFO rocket_mem: listener bound protocol=RESP addr=192.168.1.12:6379
+
+┌───────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ rocket-mem v0.1.4                                                                                 │
+├───────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ storage   recovered /tmp/rm-qa-cfg1.snap + /tmp/rm-qa-cfg1.aof (generation 0)                     │
+│ acl       no users configured -- auth disabled, every client is trusted                           │
+│ cluster   standalone (no cluster_config set)                                                      │
+│ replicas  none connected yet -- REPLICAOF is a live command; INFO REPLICATION shows current state │
+│ listeners                                                                                         │
+│           metrics  http://192.168.1.12:9121/metrics                                               │
+│           RMP      192.168.1.12:7379                                                              │
+│           RESP     192.168.1.12:6379                                                              │
+└───────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 **Result:** ☐ Pass ☐ Fail
@@ -4944,7 +5121,7 @@ Listening on 127.0.0.1:6570
 ```bash
 cd /tmp/rm-qa-work
 rm -f /tmp/rm-qa-cfg1.aof /tmp/rm-qa-cfg1.snap
-ROCKET_MEM_ADDR=127.0.0.1:6572 \
+ROCKET_MEM_ADDR=numericlabs.lxd:6479 \
   "$ROCKET_MEM_BIN" \
   --config /tmp/rm-qa-cfg/my-config.toml &
 PID=$!
@@ -4954,14 +5131,31 @@ kill $PID
 
 **Expected:**
 ```
-Recovered state from /tmp/rm-qa-cfg1.snap and /tmp/rm-qa-cfg1.aof
-Metrics on http://127.0.0.1:9370/metrics
-RMP listening on 127.0.0.1:6571
-Listening on 127.0.0.1:6572
+<date>  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=numericlabs.lxd:6479
+<date>  INFO rocket_mem: resolved config summary node_id=numericlabs.lxd:6479 addr=numericlabs.lxd:6479 rmp_addr=numericlabs.lxd:7379 metrics_addr=numericlabs.lxd:9121 aof_path=/tmp/rm-qa-cfg1.aof snapshot_path=/tmp/rm-qa-cfg1.snap log_filter=info log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=false acl_user_count=0 tls_enabled=false tls_replication_enabled=false
+<date>  INFO rocket_mem::aof: aof recovery replay complete commands=0 bytes=0 elapsed_us=<n>
+<date>  INFO rocket_mem: listener bound protocol=metrics addr=http://192.168.1.12:9121/metrics
+<date>  INFO rocket_mem: listener bound protocol=RMP addr=192.168.1.12:7379
+<date>  INFO rocket_mem: listener bound protocol=RESP addr=192.168.1.12:6479
+
+┌───────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ rocket-mem v0.1.4                                                                                 │
+├───────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ storage   recovered /tmp/rm-qa-cfg1.snap + /tmp/rm-qa-cfg1.aof (generation 0)                     │
+│ acl       no users configured -- auth disabled, every client is trusted                           │
+│ cluster   standalone (no cluster_config set)                                                      │
+│ replicas  none connected yet -- REPLICAOF is a live command; INFO REPLICATION shows current state │
+│ listeners                                                                                         │
+│           metrics  http://192.168.1.12:9121/metrics                                               │
+│           RMP      192.168.1.12:7379                                                              │
+│           RESP     192.168.1.12:6479                                                              │
+└───────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-**Notes:** `addr` bound on **6572** (the env value), not 6570 (the TOML value) — env beats file.
-`rmp_addr`/`metrics_addr` are untouched, still from the TOML, since no env var set them.
+**Notes:** `addr` bound on **`numericlabs.lxd:6479`** (the env value — shard-a's real replica
+address, used here purely as a distinct override value), not `numericlabs.lxd:6379` (the TOML
+value) — env beats file. `rmp_addr`/`metrics_addr` are untouched, still from the TOML, since no
+env var set them.
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -4975,28 +5169,45 @@ Listening on 127.0.0.1:6572
 ```bash
 cd /tmp/rm-qa-work
 rm -f /tmp/rm-qa-cfg1.aof /tmp/rm-qa-cfg1.snap
-ROCKET_MEM_ADDR=127.0.0.1:6572 \
+ROCKET_MEM_ADDR=numericlabs.lxd:6479 \
   "$ROCKET_MEM_BIN" \
-  --config /tmp/rm-qa-cfg/my-config.toml --addr 127.0.0.1:6573 &
+  --config /tmp/rm-qa-cfg/my-config.toml --addr numericlabs.lxd:6380 &
 PID=$!
 sleep 0.5
-redis-cli -p 6573 ping
+redis-cli -h numericlabs.lxd -p 6380 ping
 kill $PID
 ```
 
 **Expected:**
 ```
-Recovered state from /tmp/rm-qa-cfg1.snap and /tmp/rm-qa-cfg1.aof
-Metrics on http://127.0.0.1:9370/metrics
-RMP listening on 127.0.0.1:6571
-Listening on 127.0.0.1:6573
+<date>  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=numericlabs.lxd:6380
+<date>  INFO rocket_mem: resolved config summary node_id=numericlabs.lxd:6380 addr=numericlabs.lxd:6380 rmp_addr=numericlabs.lxd:7379 metrics_addr=numericlabs.lxd:9121 aof_path=/tmp/rm-qa-cfg1.aof snapshot_path=/tmp/rm-qa-cfg1.snap log_filter=info log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=false acl_user_count=0 tls_enabled=false tls_replication_enabled=false
+<date>  INFO rocket_mem::aof: aof recovery replay complete commands=0 bytes=0 elapsed_us=<n>
+<date>  INFO rocket_mem: listener bound protocol=metrics addr=http://192.168.1.12:9121/metrics
+<date>  INFO rocket_mem: listener bound protocol=RMP addr=192.168.1.12:7379
+<date>  INFO rocket_mem: listener bound protocol=RESP addr=192.168.1.12:6380
+
+┌───────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ rocket-mem v0.1.4                                                                                 │
+├───────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ storage   recovered /tmp/rm-qa-cfg1.snap + /tmp/rm-qa-cfg1.aof (generation 0)                     │
+│ acl       no users configured -- auth disabled, every client is trusted                           │
+│ cluster   standalone (no cluster_config set)                                                      │
+│ replicas  none connected yet -- REPLICAOF is a live command; INFO REPLICATION shows current state │
+│ listeners                                                                                         │
+│           metrics  http://192.168.1.12:9121/metrics                                               │
+│           RMP      192.168.1.12:7379                                                              │
+│           RESP     192.168.1.12:6380                                                              │
+└───────────────────────────────────────────────────────────────────────────────────────────────────┘
 PONG
 ```
 
-**Notes:** Only `--addr` was passed on the command line. `addr` bound on 6573 (CLI beats env
-beats file). `rmp_addr` (6571) and `metrics_addr` (9370) are still the TOML's values, not the
-built-in defaults (`127.0.0.1:6380`/`127.0.0.1:9121`) and not reset by the unpassed flags — an
-unset CLI flag is genuinely absent from the merge, not serialized as null.
+**Notes:** Only `--addr` was passed on the command line. `addr` bound on `numericlabs.lxd:6380`
+(shard-b leader's real address, used here purely as a distinct override value — CLI beats env
+beats file). `rmp_addr` (`numericlabs.lxd:7379`) and `metrics_addr` (`numericlabs.lxd:9121`) are
+still the TOML's values, not the built-in defaults (`127.0.0.1:6380`/`127.0.0.1:9121`) and not
+reset by the unpassed flags — an unset CLI flag is genuinely absent from the merge, not serialized
+as null.
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -5036,7 +5247,7 @@ before any listener starts.
 ```bash
 cd /tmp/rm-qa-empty
 cat > /tmp/rm-qa-cfg/bad.toml <<'EOF'
-addr = "127.0.0.1:6570"
+addr = "numericlabs.lxd:6379"
 slowlog_threshold_micros = "not-a-number"
 EOF
 "$ROCKET_MEM_BIN" --config /tmp/rm-qa-cfg/bad.toml
@@ -5045,7 +5256,7 @@ echo "exit=$?"
 
 **Expected:**
 ```
-Error: Custom { kind: InvalidInput, error: "config error: invalid type: found string \"not-a-number\", expected u64 for key \"default.slowlog_threshold_micros\" in ../cro-cfg/bad.toml TOML file" }
+Error: Custom { kind: InvalidInput, error: "config error: invalid type: found string \"not-a-number\", expected u64 for key \"default.slowlog_threshold_micros\" in ../rm-qa-cfg/bad.toml TOML file" }
 exit=1
 ```
 
@@ -5070,8 +5281,8 @@ workspace, so exercising it by hand means writing a small Rust program. Referenc
 ```bash
 cd /tmp/rm-qa-work
 rm -f /tmp/rm-qa-rmp.aof /tmp/rm-qa-rmp.snap
-ROCKET_MEM_ADDR=127.0.0.1:6570 ROCKET_MEM_RMP_ADDR=127.0.0.1:6571 \
-ROCKET_MEM_METRICS_ADDR=127.0.0.1:9370 \
+ROCKET_MEM_ADDR=numericlabs.lxd:6379 ROCKET_MEM_RMP_ADDR=numericlabs.lxd:7379 \
+ROCKET_MEM_METRICS_ADDR=numericlabs.lxd:9121 \
 ROCKET_MEM_AOF_PATH=/tmp/rm-qa-rmp.aof ROCKET_MEM_SNAPSHOT_PATH=/tmp/rm-qa-rmp.snap \
   "$ROCKET_MEM_BIN" &
 PID=$!
@@ -5085,20 +5296,35 @@ sleep 0.5
 **Steps:**
 ```bash
 # (just re-check the server's already-printed startup banner, or PING RESP to confirm it's up)
-redis-cli -p 6570 ping
+redis-cli -h numericlabs.lxd -p 6379 ping
 ```
 
 **Expected (banner from the setup block's stdout):**
 ```
-Recovered state from /tmp/rm-qa-rmp.snap and /tmp/rm-qa-rmp.aof
-Metrics on http://127.0.0.1:9370/metrics
-RMP listening on 127.0.0.1:6571
-Listening on 127.0.0.1:6570
+<date>  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=numericlabs.lxd:6379
+<date>  INFO rocket_mem: resolved config summary node_id=numericlabs.lxd:6379 addr=numericlabs.lxd:6379 rmp_addr=numericlabs.lxd:7379 metrics_addr=numericlabs.lxd:9121 aof_path=/tmp/rm-qa-rmp.aof snapshot_path=/tmp/rm-qa-rmp.snap log_filter=info log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=false acl_user_count=0 tls_enabled=false tls_replication_enabled=false
+<date>  INFO rocket_mem::aof: aof recovery replay complete commands=0 bytes=0 elapsed_us=<n>
+<date>  INFO rocket_mem: listener bound protocol=metrics addr=http://192.168.1.12:9121/metrics
+<date>  INFO rocket_mem: listener bound protocol=RMP addr=192.168.1.12:7379
+<date>  INFO rocket_mem: listener bound protocol=RESP addr=192.168.1.12:6379
+
+┌───────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ rocket-mem v0.1.4                                                                                 │
+├───────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ storage   recovered /tmp/rm-qa-rmp.snap + /tmp/rm-qa-rmp.aof (generation 0)                       │
+│ acl       no users configured -- auth disabled, every client is trusted                           │
+│ cluster   standalone (no cluster_config set)                                                      │
+│ replicas  none connected yet -- REPLICAOF is a live command; INFO REPLICATION shows current state │
+│ listeners                                                                                         │
+│           metrics  http://192.168.1.12:9121/metrics                                               │
+│           RMP      192.168.1.12:7379                                                              │
+│           RESP     192.168.1.12:6379                                                              │
+└───────────────────────────────────────────────────────────────────────────────────────────────────┘
 PONG
 ```
 
-**Notes:** `RMP listening on 127.0.0.1:6571` is printed with no config needed to turn it on and
-no flag that turns it off.
+**Notes:** `listener bound protocol=RMP addr=192.168.1.12:7379` (and the boxed table's `RMP` row)
+print with no config needed to turn RMP on and no flag that turns it off.
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -5106,7 +5332,7 @@ no flag that turns it off.
 
 ### RMP-02 — Round trip via a throwaway `rmp-client` example
 
-**Precondition:** Server from the setup block still running on 6570/6571/9370. This case writes
+**Precondition:** Server from the setup block still running on 6379/7379/9121. This case writes
 a temporary file into the repo under `crates/rmp-client/examples/` and deletes it afterward —
 never commit it.
 
@@ -5115,7 +5341,7 @@ never commit it.
 cat > crates/rmp-client/examples/qa_scratch.rs <<'EOF'
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = rmp_client::RmpClient::connect("127.0.0.1:6571").await?;
+    let client = rmp_client::RmpClient::connect("numericlabs.lxd:7379").await?;
     client.set("foo", "bar").await?;
     let got = client.get("foo").await?;
     println!("round-trip: foo -> {:?}", got);
@@ -5153,12 +5379,12 @@ RMP-02 (harmless either way).
 **Steps:**
 ```bash
 # Direction 1: write over RESP, read over RMP.
-redis-cli -p 6570 set fromresp viaresp
+redis-cli -h numericlabs.lxd -p 6379 set fromresp viaresp
 
 cat > crates/rmp-client/examples/qa_scratch2.rs <<'EOF'
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = rmp_client::RmpClient::connect("127.0.0.1:6571").await?;
+    let client = rmp_client::RmpClient::connect("numericlabs.lxd:7379").await?;
     let v = client.get("fromresp").await?;
     println!("RESP->RMP: fromresp -> {:?}", v.map(|b| String::from_utf8_lossy(&b).into_owned()));
     // Direction 2: write over RMP, will be read back over RESP below.
@@ -5172,7 +5398,7 @@ cargo run -p rmp-client --example qa_scratch2
 rm crates/rmp-client/examples/qa_scratch2.rs
 
 # Direction 2 check: read back over RESP.
-redis-cli -p 6570 get fromrmp
+redis-cli -h numericlabs.lxd -p 6379 get fromrmp
 ```
 
 **Expected:**
@@ -5199,7 +5425,7 @@ cat > crates/rmp-client/examples/qa_scratch3.rs <<'EOF'
 use bytes::Bytes;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = rmp_client::RmpClient::connect("127.0.0.1:6571").await?;
+    let client = rmp_client::RmpClient::connect("numericlabs.lxd:7379").await?;
     let info = client.call(vec![Bytes::from_static(b"INFO"), Bytes::from_static(b"server")]).await?;
     println!("INFO server -> {:?}", info);
     let save = client.call(vec![Bytes::from_static(b"SAVE")]).await?;
@@ -5241,7 +5467,7 @@ cat > crates/rmp-client/examples/qa_scratch4.rs <<'EOF'
 use bytes::Bytes;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = rmp_client::RmpClient::connect("127.0.0.1:6571").await?;
+    let client = rmp_client::RmpClient::connect("numericlabs.lxd:7379").await?;
     let reply = client.call(vec![Bytes::from_static(b"PSYNC")]).await?;
     println!("PSYNC -> {:?}", reply);
     Ok(())
@@ -5287,15 +5513,15 @@ Reference: `.claude/manual-testing.md` ("Standalone mode"), source: `crates/serv
 
 ### OBS-01 — `INFO server` returns real values, not stubs
 
-**Precondition:** A server running with `ROCKET_MEM_ADDR=127.0.0.1:6570`,
-`ROCKET_MEM_RMP_ADDR=127.0.0.1:6571`, `ROCKET_MEM_METRICS_ADDR=127.0.0.1:9370` (same shape as the
-RMP setup block above; start it the same way and keep it running through OBS-05).
+**Precondition:** A server running with `ROCKET_MEM_ADDR=numericlabs.lxd:6379`,
+`ROCKET_MEM_RMP_ADDR=numericlabs.lxd:7379`, `ROCKET_MEM_METRICS_ADDR=numericlabs.lxd:9121` (same
+shape as the RMP setup block above; start it the same way and keep it running through OBS-05).
 
 **Steps:**
 ```bash
-redis-cli -p 6570 info server
+redis-cli -h numericlabs.lxd -p 6379 info server
 sleep 3
-redis-cli -p 6570 info server | grep uptime_in_seconds
+redis-cli -h numericlabs.lxd -p 6379 info server | grep uptime_in_seconds
 ```
 
 **Expected:**
@@ -5306,16 +5532,17 @@ rocket_mem_version:0.1.4
 redis_mode:standalone
 os:linux
 arch_bits:64
-process_id:2389374
-uptime_in_seconds:17
+process_id:<pid>
+uptime_in_seconds:<n>
 uptime_in_days:0
 
-uptime_in_seconds:24
+uptime_in_seconds:<n>
 ```
 
-**Notes:** `process_id` is the real PID of the running process (yours will differ).
-`uptime_in_seconds` visibly increased across the 3-second sleep — proof it's a live clock, not a
-hardcoded `0`.
+**Notes:** `process_id` is the real PID of the running process — wildcarded here since it (and
+both `uptime_in_seconds` readings) vary every run. The second `uptime_in_seconds` should read
+about 3 higher than the first — real captured values were `0` then `3` — proof it's a live clock,
+not a hardcoded `0`.
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -5327,7 +5554,7 @@ hardcoded `0`.
 
 **Steps:**
 ```bash
-redis-cli -p 6570 info replication
+redis-cli -h numericlabs.lxd -p 6379 info replication
 ```
 
 **Expected:**
@@ -5353,7 +5580,7 @@ commands on this server legitimately advance it. See SMOKE-09's notes for the sa
 
 **Steps:**
 ```bash
-redis-cli -p 6570 info | grep -E "^# "
+redis-cli -h numericlabs.lxd -p 6379 info | grep -E "^# "
 ```
 
 **Expected:**
@@ -5374,44 +5601,39 @@ redis-cli -p 6570 info | grep -E "^# "
 
 ### OBS-04 — `/metrics` Prometheus endpoint
 
-**Precondition:** Same server. Its metrics endpoint is at `http://127.0.0.1:9370/metrics`.
+**Precondition:** Same server. Its metrics endpoint is at `http://numericlabs.lxd:9121/metrics`.
 
 **Steps:**
 ```bash
-curl -s http://127.0.0.1:9370/metrics | grep -E "^rocket_mem_commands_total|^rocket_mem_connected_clients|^rocket_mem_command_errors_total"
+curl -s http://numericlabs.lxd:9121/metrics | grep -E "^rocket_mem_commands_total|^rocket_mem_connected_clients|^rocket_mem_command_errors_total"
 
 # Generate a command error and confirm it's counted.
-redis-cli -p 6570 set   # missing args -> error
-curl -s http://127.0.0.1:9370/metrics | grep "rocket_mem_command_errors_total"
+redis-cli -h numericlabs.lxd -p 6379 set   # missing args -> error
+curl -s http://numericlabs.lxd:9121/metrics | grep "rocket_mem_command_errors_total"
 ```
 
-**Expected:**
+**Expected** (example — see the Notes below):
 ```
-rocket_mem_commands_total{cmd="set"} 3
-rocket_mem_commands_total{cmd="save"} 1
-rocket_mem_commands_total{cmd="ping"} 1
-rocket_mem_commands_total{cmd="get"} 4
-rocket_mem_commands_total{cmd="psync"} 1
-rocket_mem_commands_total{cmd="info"} 5
-rocket_mem_commands_total{cmd="slowlog"} 1
-rocket_mem_command_errors_total{cmd="psync"} 1
+rocket_mem_commands_total{cmd="info"} <n>
 rocket_mem_connected_clients 0
 
 ERR wrong number of arguments for 'set' command
 
 # TYPE rocket_mem_command_errors_total counter
-rocket_mem_command_errors_total{cmd="psync"} 1
-rocket_mem_command_errors_total{cmd="set"} 1
+rocket_mem_command_errors_total{cmd="set"} <n>
 ```
 
-**Notes:** Exact counter values depend on what ran on this server instance before you got here
-(this capture followed the RMP cases, hence `cmd="psync"` already present) — what matters is that
-the families exist and increase with real traffic, not the specific numbers.
-`rocket_mem_connected_clients` reads 0 here because `redis-cli` closes its connection after each
-command; it only shows non-zero while a connection is actually open (e.g. inside a pipe held open
-with `printf ... | redis-cli`). `/metrics` has **no authentication of its own** — it is
-unauthenticated by design, which is why it defaults to binding loopback only; never expose it
-publicly without a reverse-proxy or firewall in front of it.
+**Notes:** Exact counter values, and which `cmd="..."` families appear at all, depend entirely on
+what ran on this server instance before you got here — OBS-01 through OBS-03's `INFO` calls are
+the only traffic by this point in a fresh run, hence only `cmd="info"` shows above; running the
+suites in a different order or repeating a case adds more families and higher counts. What
+matters is that the families exist and increase with real traffic, not the specific numbers — both
+counts above are wildcarded for exactly that reason. `rocket_mem_connected_clients` reads 0 here
+because `redis-cli` closes its connection after each command; it only shows non-zero while a
+connection is actually open (e.g. inside a pipe held open with `printf ... | redis-cli`).
+`/metrics` has **no authentication of its own** — it is unauthenticated by design, which is why it
+defaults to binding loopback only; never expose it publicly without a reverse-proxy or firewall in
+front of it.
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -5423,19 +5645,19 @@ publicly without a reverse-proxy or firewall in front of it.
 
 **Steps:**
 ```bash
-redis-cli -p 6570 slowlog len
-redis-cli -p 6570 slowlog reset
-redis-cli -p 6570 slowlog len
+redis-cli -h numericlabs.lxd -p 6379 slowlog len
+redis-cli -h numericlabs.lxd -p 6379 slowlog reset
+redis-cli -h numericlabs.lxd -p 6379 slowlog len
 
-redis-cli -p 6570 debug sleep 0.05
-redis-cli -p 6570 slowlog len
-redis-cli -p 6570 slowlog get
+redis-cli -h numericlabs.lxd -p 6379 debug sleep 0.05
+redis-cli -h numericlabs.lxd -p 6379 slowlog len
+redis-cli -h numericlabs.lxd -p 6379 slowlog get
 
-redis-cli -p 6570 slowlog reset
-redis-cli -p 6570 slowlog len
+redis-cli -h numericlabs.lxd -p 6379 slowlog reset
+redis-cli -h numericlabs.lxd -p 6379 slowlog len
 
 # DEBUG SLEEP is capped at 10 seconds.
-redis-cli -p 6570 debug sleep 15
+redis-cli -h numericlabs.lxd -p 6379 debug sleep 15
 ```
 
 **Expected:**
@@ -5446,8 +5668,8 @@ OK
 OK
 1
 0
-1788234694
-50102
+<n>
+<n>
 DEBUG
 sleep
 ... (1 more arguments)
@@ -5457,12 +5679,14 @@ ERR DEBUG SLEEP duration exceeds the 10s maximum allowed on this server
 ```
 
 **Notes:** A slow-log entry has **4 fields** (id, unix time, duration in microseconds, and an args
-array), not real Redis's 6 — there is no client-address or client-name field. The args array
-carries only the command name as sent (here lowercase `sleep`... actually `debug`, verbatim as
-typed) plus its first argument (`sleep`, the DEBUG subcommand acting as the "key" position), and
-summarizes anything past that with real Redis's own `... (N more arguments)` truncation marker —
-here 1 more argument (the `0.05` duration) was not carried. `DEBUG SLEEP` above 10 seconds is
-rejected outright rather than clamped.
+array), not real Redis's 6 — there is no client-address or client-name field. Unix time and
+duration are both wildcarded above since they vary every run — real captured values were a
+timestamp around 1.79 billion and a duration around 50000 (microseconds) for a 50ms sleep. The
+args array carries only the command name as sent (here lowercase `sleep`... actually `debug`,
+verbatim as typed) plus its first argument (`sleep`, the DEBUG subcommand acting as the "key"
+position), and summarizes anything past that with real Redis's own `... (N more arguments)`
+truncation marker — here 1 more argument (the `0.05` duration) was not carried. `DEBUG SLEEP`
+above 10 seconds is rejected outright rather than clamped.
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -5470,21 +5694,21 @@ rejected outright rather than clamped.
 
 ### OBS-06 — `ROCKET_MEM_SLOWLOG_THRESHOLD_MICROS=0` disables the slow log entirely
 
-**Precondition:** Kill any server bound to 6570/6571/9370 first (`ss -tlnp | grep -E ':(6570|6571|9370)'` should be empty), since the threshold can only be set at startup.
+**Precondition:** Kill any server bound to 6379/7379/9121 first (`ss -tlnp | grep -E ':(6379|7379|9121)'` should be empty — see the port note at the top of this document), since the threshold can only be set at startup.
 
 **Steps:**
 ```bash
 cd /tmp/rm-qa-work
 rm -f /tmp/rm-qa-obs6.aof /tmp/rm-qa-obs6.snap
-ROCKET_MEM_ADDR=127.0.0.1:6570 ROCKET_MEM_RMP_ADDR=127.0.0.1:6571 \
-ROCKET_MEM_METRICS_ADDR=127.0.0.1:9370 \
+ROCKET_MEM_ADDR=numericlabs.lxd:6379 ROCKET_MEM_RMP_ADDR=numericlabs.lxd:7379 \
+ROCKET_MEM_METRICS_ADDR=numericlabs.lxd:9121 \
 ROCKET_MEM_AOF_PATH=/tmp/rm-qa-obs6.aof ROCKET_MEM_SNAPSHOT_PATH=/tmp/rm-qa-obs6.snap \
 ROCKET_MEM_SLOWLOG_THRESHOLD_MICROS=0 \
   "$ROCKET_MEM_BIN" &
 PID=$!
 sleep 0.5
-redis-cli -p 6570 debug sleep 0.2
-redis-cli -p 6570 slowlog len
+redis-cli -h numericlabs.lxd -p 6379 debug sleep 0.2
+redis-cli -h numericlabs.lxd -p 6379 slowlog len
 kill $PID
 ```
 
@@ -5504,33 +5728,33 @@ entries when the threshold is `0`. `0` disables the slow log entirely rather tha
 
 ### OBS-07 — `expired_keys` counts only active expiry, not passive
 
-**Precondition:** A fresh server on 6570/6571/9370 (default threshold is fine), nothing else
+**Precondition:** A fresh server on 6379/7379/9121 (default threshold is fine), nothing else
 touching TTL'd keys on it during this case.
 
 **Steps:**
 ```bash
 cd /tmp/rm-qa-work
 rm -f /tmp/rm-qa-obs7.aof /tmp/rm-qa-obs7.snap
-ROCKET_MEM_ADDR=127.0.0.1:6570 ROCKET_MEM_RMP_ADDR=127.0.0.1:6571 \
-ROCKET_MEM_METRICS_ADDR=127.0.0.1:9370 \
+ROCKET_MEM_ADDR=numericlabs.lxd:6379 ROCKET_MEM_RMP_ADDR=numericlabs.lxd:7379 \
+ROCKET_MEM_METRICS_ADDR=numericlabs.lxd:9121 \
 ROCKET_MEM_AOF_PATH=/tmp/rm-qa-obs7.aof ROCKET_MEM_SNAPSHOT_PATH=/tmp/rm-qa-obs7.snap \
   "$ROCKET_MEM_BIN" &
 PID=$!
 sleep 0.5
-redis-cli -p 6570 info stats | grep expired_keys
+redis-cli -h numericlabs.lxd -p 6379 info stats | grep expired_keys
 
 # Passive path: read the key yourself after it expires.
-redis-cli -p 6570 set pkey pval px 50
+redis-cli -h numericlabs.lxd -p 6379 set pkey pval px 50
 sleep 0.15
-redis-cli -p 6570 get pkey                      # -> nil, passive removal on read
+redis-cli -h numericlabs.lxd -p 6379 get pkey                      # -> nil, passive removal on read
 sleep 2                                          # > one full active-sweep rotation (16 shards x 100ms)
-redis-cli -p 6570 info stats | grep expired_keys # still 0 -- passive removal is invisible to it
+redis-cli -h numericlabs.lxd -p 6379 info stats | grep expired_keys # still 0 -- passive removal is invisible to it
 
 # Active path: never read the key, let the background sweep find it.
-redis-cli -p 6570 set akey aval px 50
+redis-cli -h numericlabs.lxd -p 6379 set akey aval px 50
 sleep 2
-redis-cli -p 6570 info stats | grep expired_keys # now 1 -- only the never-read key counted
-redis-cli -p 6570 get akey                       # -> nil, confirms it's gone
+redis-cli -h numericlabs.lxd -p 6379 info stats | grep expired_keys # now 1 -- only the never-read key counted
+redis-cli -h numericlabs.lxd -p 6379 get akey                       # -> nil, confirms it's gone
 
 kill $PID
 ```
@@ -5539,14 +5763,17 @@ kill $PID
 ```
 expired_keys:0
 OK
-(nil)
+
 expired_keys:0
 OK
 expired_keys:1
-(nil)
+
 ```
 
-**Notes:** `expired_keys` is only incremented from the background active-expiry sweep
+**Notes:** The two `get pkey`/`get akey` nil replies render as blank lines above, not the literal
+text `(nil)` — `redis-cli`'s non-interactive output mode shows one value per line and a blank line
+for a nil reply; see the note near the top of this document. `expired_keys` is only incremented
+from the background active-expiry sweep
 (`crates/server/src/connection.rs`'s `active_expire_loop`, which walks one of the 16 shards every
 100ms). A key removed by a client's own read (lazy/passive expiry) is deleted from its shard
 before the sweep ever gets there, so the sweep finds nothing and the counter never moves for that
@@ -5569,13 +5796,13 @@ spans, and the replica/cluster-peer Prometheus gauges.
 
 **Steps:**
 ```bash
-RUST_LOG=debug "$ROCKET_MEM_BIN" --addr 127.0.0.1:6680 --rmp-addr 127.0.0.1:6681 \
-  --metrics-addr 127.0.0.1:9380 --aof-path /tmp/rm-qa-obs8.aof --snapshot-path /tmp/rm-qa-obs8.snap &
+RUST_LOG=debug "$ROCKET_MEM_BIN" --addr numericlabs.lxd:6379 --rmp-addr numericlabs.lxd:7379 \
+  --metrics-addr numericlabs.lxd:9121 --aof-path /tmp/rm-qa-obs8.aof --snapshot-path /tmp/rm-qa-obs8.snap &
 PID=$!
 sleep 0.5
-redis-cli -p 6680 set k1 v1
-redis-cli -p 6680 get k1
-redis-cli -p 6680 nosuchcommand
+redis-cli -h numericlabs.lxd -p 6379 set k1 v1
+redis-cli -h numericlabs.lxd -p 6379 get k1
+redis-cli -h numericlabs.lxd -p 6379 nosuchcommand
 kill $PID
 ```
 
@@ -5603,9 +5830,9 @@ which increment regardless of log level.
 moment any `[[acl.users]]` entry exists — see "ACL and authentication"), and `RUST_LOG=trace`:
 ```bash
 cat > /tmp/rm-qa-obs9.toml <<'EOF'
-addr = "127.0.0.1:6680"
-rmp_addr = "127.0.0.1:6681"
-metrics_addr = "127.0.0.1:9380"
+addr = "numericlabs.lxd:6379"
+rmp_addr = "numericlabs.lxd:7379"
+metrics_addr = "numericlabs.lxd:9121"
 
 [[acl.users]]
 username = "tester"
@@ -5621,8 +5848,8 @@ sleep 0.5
 
 **Steps:**
 ```bash
-redis-cli -p 6680 auth tester wrongpassword123
-printf 'auth tester secretpw123\nping\n' | redis-cli -p 6680
+redis-cli -h numericlabs.lxd -p 6379 auth tester wrongpassword123
+printf 'auth tester secretpw123\nping\n' | redis-cli -h numericlabs.lxd -p 6379
 grep -c "secretpw123\|wrongpassword123" /tmp/rm-qa-obs9.log
 kill $PID
 ```
@@ -5656,7 +5883,7 @@ ROCKET_MEM_LOG_VALUE_MAX_BYTES=8 RUST_LOG=trace "$ROCKET_MEM_BIN" --config /tmp/
   --aof-path /tmp/rm-qa-obs10.aof --snapshot-path /tmp/rm-qa-obs10.snap > /tmp/rm-qa-obs10.log 2>&1 &
 PID=$!
 sleep 0.5
-printf 'auth tester secretpw123\nset longkey abcdefghijklmnopqrstuvwxyz0123456789\n' | redis-cli -p 6680
+printf 'auth tester secretpw123\nset longkey abcdefghijklmnopqrstuvwxyz0123456789\n' | redis-cli -h numericlabs.lxd -p 6379
 kill $PID
 ```
 
@@ -5686,8 +5913,8 @@ bytes plus a `…(28 more)` marker. `log_value_max_bytes` defaults to 128 and is
 
 **Steps:**
 ```bash
-redis-cli -p 6680 auth tester wrongpassword123     # bad password
-redis-cli -p 6680 auth tester secretpw123          # good password
+redis-cli -h numericlabs.lxd -p 6379 auth tester wrongpassword123     # bad password
+redis-cli -h numericlabs.lxd -p 6379 auth tester secretpw123          # good password
 grep -E "auth (success|failure)" /tmp/rm-qa-obs9.log
 ```
 
@@ -5720,8 +5947,8 @@ permitted user running a command or touching a key their rules don't grant) logs
 `version`/`node_id`, then a "resolved config summary" line enumerating every operationally
 relevant field by name:
 ```
-INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=127.0.0.1:6680
-INFO rocket_mem: resolved config summary node_id=127.0.0.1:6680 addr=127.0.0.1:6680 rmp_addr=127.0.0.1:6681 metrics_addr=127.0.0.1:9380 aof_path=... snapshot_path=... log_filter=info log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=true acl_user_count=1 tls_enabled=false tls_replication_enabled=false
+<date>  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=numericlabs.lxd:6379
+<date>  INFO rocket_mem: resolved config summary node_id=numericlabs.lxd:6379 addr=numericlabs.lxd:6379 rmp_addr=numericlabs.lxd:7379 metrics_addr=numericlabs.lxd:9121 aof_path=... snapshot_path=... log_filter=info log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=true acl_user_count=1 tls_enabled=false tls_replication_enabled=false
 ```
 
 **Notes:** No ACL username, password, or TLS key material appears — only `acl_enabled` (bool) and
@@ -5739,11 +5966,11 @@ the config key is `log_level`.
 
 **Steps:**
 ```bash
-"$ROCKET_MEM_BIN" --addr 127.0.0.1:6680 --rmp-addr 127.0.0.1:6681 --metrics-addr 127.0.0.1:9380 \
+"$ROCKET_MEM_BIN" --addr numericlabs.lxd:6379 --rmp-addr numericlabs.lxd:7379 --metrics-addr numericlabs.lxd:9121 \
   --aof-path /tmp/rm-qa-obs13.aof --snapshot-path /tmp/rm-qa-obs13.snap > /tmp/rm-qa-obs13.log 2>&1 &
 PID=$!
 sleep 0.5
-printf 'ping\nset a 1\nset b 2\n' | redis-cli -p 6680
+printf 'ping\nset a 1\nset b 2\n' | redis-cli -h numericlabs.lxd -p 6379
 sleep 0.2
 grep -E "listener bound|connection accepted|connection closed" /tmp/rm-qa-obs13.log
 kill $PID
@@ -5751,11 +5978,11 @@ kill $PID
 
 **Expected:**
 ```
-INFO rocket_mem: listener bound protocol=metrics addr=http://127.0.0.1:9380/metrics
-INFO rocket_mem: listener bound protocol=RMP addr=127.0.0.1:6681
-INFO rocket_mem: listener bound protocol=RESP addr=127.0.0.1:6680
-INFO conn{conn_id=1 peer=127.0.0.1:NNNNN protocol=RESP tls=false node_id=127.0.0.1:6680}: rocket_mem::connection: connection accepted
-INFO conn{conn_id=1 peer=127.0.0.1:NNNNN protocol=RESP tls=false node_id=127.0.0.1:6680}: rocket_mem::connection: connection closed elapsed_us=NNN commands_served=3
+<date>  INFO rocket_mem: listener bound protocol=metrics addr=http://192.168.1.12:9121/metrics
+<date>  INFO rocket_mem: listener bound protocol=RMP addr=192.168.1.12:7379
+<date>  INFO rocket_mem: listener bound protocol=RESP addr=192.168.1.12:6379
+<date>  INFO conn{conn_id=1 peer=192.168.1.12:NNNNN protocol=RESP tls=false node_id=numericlabs.lxd:6379}: rocket_mem::connection: connection accepted
+<date>  INFO conn{conn_id=1 peer=192.168.1.12:NNNNN protocol=RESP tls=false node_id=numericlabs.lxd:6379}: rocket_mem::connection: connection closed elapsed_us=NNN commands_served=3
 ```
 
 **Notes:** `protocol` renders unquoted uppercase (`RESP`, `RMP`; `RESP+TLS`/`RMP+TLS` under TLS)
@@ -5774,7 +6001,7 @@ dispatched command, including ones that errored.
 
 **Steps:**
 ```bash
-curl -s http://127.0.0.1:9380/metrics | grep -E \
+curl -s http://numericlabs.lxd:9121/metrics | grep -E \
   "^rocket_mem_(good_replicas|replica_min_ack_offset|master_repl_offset|slave_repl_offset|cluster_peers_reachable|cluster_peers_unreachable) "
 ```
 
@@ -5782,7 +6009,7 @@ curl -s http://127.0.0.1:9380/metrics | grep -E \
 ```
 rocket_mem_good_replicas 0
 rocket_mem_replica_min_ack_offset 0
-rocket_mem_master_repl_offset 37
+rocket_mem_master_repl_offset <n>
 rocket_mem_slave_repl_offset 0
 ```
 
@@ -5802,7 +6029,7 @@ design, not a bug. See CLUSTER-07 for these two gauges' cluster-mode behavior.
 
 ```bash
 ps aux | grep rocket-mem | grep -v grep
-ss -tlnp | grep -E ':(6570|6571|6572|6573|9370)\b'
+ss -tlnp | grep -E ':(6379|7379|9121|6479|6380)\b'
 ```
 
 Both should show nothing of yours. Kill any stray PID individually — never `pkill -f rocket-mem`.
@@ -5827,10 +6054,20 @@ Working directory used throughout. Create it once; every case writes only inside
 mkdir -p /tmp/acltls-qa
 ```
 
-Ports used by this playbook: `6510` (plaintext RESP), `6511` (plaintext RMP), `6530` (TLS RESP),
-`6531` (TLS RMP), `9310` (Prometheus metrics). Do not reuse them for anything else while running.
+Ports used by the ACL cases below: `6510` (plaintext RESP), `6511` (plaintext RMP), `9310`
+(Prometheus metrics). Do not reuse them for anything else while running.
 
-Tools required: `redis-cli` (verified with 8.10.1), `openssl` (verified with 3.0.13), `curl`, `ss`.
+The TLS cases (`TLS-01` onward) use a different set of ports and a different certificate
+convention from the ACL cases above — `numericlabs.lxd:6379`/`7379`/`9121` (plaintext, matching
+`rocket-mem.toml`'s real shard-a leader address) and `numericlabs.lxd:16379`/`17379` (TLS,
+likewise matching `rocket-mem.toml`), plus a throwaway certificate generated fresh in TLS-01. This
+means the TLS cases collide with the live hand-started cluster if it's running — see the port note
+at the top of this document, and stop the cluster first. The ACL cases' own ports above are
+unaffected and stay distinct from both the TLS cases and the live cluster.
+
+Tools required: `redis-cli` (verified with 8.10.1), `openssl` (verified with 3.0.13, used by
+TLS-06's `s_client` check only), Smallstep's `step` (verified with 0.30.6, TLS cases' certificate
+generation only), `curl`, `ss`.
 
 Three things about `redis-cli` that affect how you read every "Expected" block:
 
@@ -6679,33 +6916,45 @@ Kill by that PID only. Never `pkill -f rocket-mem` — a broad pattern kill also
 
 ### TLS-01 — Generate a self-signed certificate for local testing
 
-**Precondition:** `openssl` is installed and `/tmp/acltls-qa` exists.
+**Precondition:** [Smallstep's `step` CLI](https://smallstep.com/docs/step-cli/installation/) is
+installed and `/tmp/acltls-qa` exists. If `step version` doesn't resolve, install it first — e.g.
+`brew install step` (macOS), `apt install step-cli` after adding Smallstep's apt repo (Debian/
+Ubuntu), or download a release binary from
+[github.com/smallstep/cli/releases](https://github.com/smallstep/cli/releases) for anything else.
+Verified here with `Smallstep CLI/0.30.6`.
 
 **Steps:**
 ```bash
 mkdir -p /tmp/acltls-qa/tls
 cd /tmp/acltls-qa/tls
-openssl req -x509 -newkey rsa:2048 \
-  -keyout key.pem -out cert.pem -days 3650 -nodes -subj "/CN=localhost"
+step certificate create localhost cert.pem key.pem \
+  --profile self-signed --subtle --no-password --insecure
 echo "exit=$?"
 ls -l /tmp/acltls-qa/tls
 ```
 
 **Expected:**
 ```
+Your certificate has been saved in cert.pem.
+Your private key has been saved in key.pem.
 exit=0
 total 8
--rw-rw-r-- 1 numericlabs numericlabs 1115 Sep  1 09:18 cert.pem
--rw------- 1 numericlabs numericlabs 1704 Sep  1 09:18 key.pem
+-rw------- 1 numericlabs numericlabs 599 Sep 13 08:36 cert.pem
+-rw------- 1 numericlabs numericlabs 227 Sep 13 08:36 key.pem
 ```
 
-**Notes:** `openssl req` also prints a long line of dots and `+` characters to stderr while
-generating the key. That is progress output, not an error; ignore it.
+**Notes:** `--profile self-signed` needs `--subtle` — Smallstep's own guard against generating a
+self-signed leaf by accident, since its normal workflow is signing through a CA; `--no-password
+--insecure` skip the passphrase prompt the same way `openssl req -nodes` did in older revisions of
+this case. The subject (`localhost`) becomes the certificate's `CN` and is deliberately *not* the
+address these cases actually connect to (`numericlabs.lxd`) — TLS-03/TLS-06 rely on that mismatch
+to demonstrate that this build does no hostname verification. Default key type is ECDSA P-256, not
+RSA; rocket-mem's TLS listener accepts either. Default validity is 10 years.
 
 **This certificate is for local testing only.** It is self-signed, so it has no trust chain any
-third party will accept, and it must never be pointed at a real deployment. `-nodes` leaves the
-private key unencrypted, which is required here — the server has no way to prompt for a
-passphrase, so a passphrase-protected key simply fails to load.
+third party will accept, and it must never be pointed at a real deployment — it is unrelated to
+the real certificate the checked-in `rocket-mem*.toml` files reference
+(`/home/numericlabs/data/tls/server.crt`), which this suite never touches.
 
 Exact byte sizes vary slightly per key; owner and timestamp will be yours.
 
@@ -6715,16 +6964,16 @@ Exact byte sizes vary slightly per key; owner and timestamp will be yours.
 
 ### TLS-02 — Verify TLS listeners run alongside the plaintext ones, not instead of them
 
-**Precondition:** TLS-01 completed. Ports 6510, 6511, 6530, 6531 and 9310 are all free — run the
-ACL teardown above first if the ACL server is still up.
+**Precondition:** TLS-01 completed. Ports 6379, 7379, 16379, 17379 and 9121 are all free — stop
+the live cluster first if it's running (see the port note at the top of this document).
 
 **Steps:**
 ```bash
 cd /tmp/acltls-qa
-ROCKET_MEM_ADDR=127.0.0.1:6510 ROCKET_MEM_RMP_ADDR=127.0.0.1:6511 \
-ROCKET_MEM_METRICS_ADDR=127.0.0.1:9310 \
+ROCKET_MEM_ADDR=numericlabs.lxd:6379 ROCKET_MEM_RMP_ADDR=numericlabs.lxd:7379 \
+ROCKET_MEM_METRICS_ADDR=numericlabs.lxd:9121 \
 ROCKET_MEM_AOF_PATH=/tmp/acltls-qa/tls.aof ROCKET_MEM_SNAPSHOT_PATH=/tmp/acltls-qa/tls.snap \
-ROCKET_MEM_TLS_RESP_ADDR=127.0.0.1:6530 ROCKET_MEM_TLS_RMP_ADDR=127.0.0.1:6531 \
+ROCKET_MEM_TLS_RESP_ADDR=numericlabs.lxd:16379 ROCKET_MEM_TLS_RMP_ADDR=numericlabs.lxd:17379 \
 ROCKET_MEM_TLS_CERT_PATH=/tmp/acltls-qa/tls/cert.pem \
 ROCKET_MEM_TLS_KEY_PATH=/tmp/acltls-qa/tls/key.pem \
 nohup "$ROCKET_MEM_BIN" \
@@ -6733,33 +6982,48 @@ echo "PID=$!" > /tmp/acltls-qa/tls.pid
 
 sleep 1.5
 cat /tmp/acltls-qa/tls-server.log
-ss -lnt | grep -E ':(6510|6511|6530|6531|9310)\b'
+ss -lnt | grep -E ':(6379|7379|16379|17379|9121)\b'
 ```
 
 **Expected:**
 ```
-2026-09-12T05:37:57.874854Z  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=127.0.0.1:6510
-2026-09-12T05:37:57.874898Z  INFO rocket_mem: resolved config summary node_id=127.0.0.1:6510 addr=127.0.0.1:6510 rmp_addr=127.0.0.1:6511 metrics_addr=127.0.0.1:9310 aof_path=/tmp/acltls-qa/tls.aof snapshot_path=/tmp/acltls-qa/tls.snap log_filter=info log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=false acl_user_count=0 tls_enabled=true tls_replication_enabled=false
-2026-09-12T05:37:57.875766Z  INFO rocket_mem::aof: aof recovery replay complete commands=0 bytes=0 elapsed_us=5
-2026-09-12T05:37:57.875939Z  INFO rocket_mem: listener bound protocol=metrics addr=http://127.0.0.1:9310/metrics
-2026-09-12T05:37:57.875974Z  INFO rocket_mem: listener bound protocol=RMP addr=127.0.0.1:6511
-2026-09-12T05:37:57.876390Z  INFO rocket_mem: listener bound protocol=RESP+TLS addr=127.0.0.1:6530
-2026-09-12T05:37:57.876707Z  INFO rocket_mem: listener bound protocol=RMP+TLS addr=127.0.0.1:6531
-2026-09-12T05:37:57.876727Z  INFO rocket_mem: listener bound protocol=RESP addr=127.0.0.1:6510
+<date>  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=numericlabs.lxd:6379
+<date>  INFO rocket_mem: resolved config summary node_id=numericlabs.lxd:6379 addr=numericlabs.lxd:6379 rmp_addr=numericlabs.lxd:7379 metrics_addr=numericlabs.lxd:9121 aof_path=/tmp/acltls-qa/tls.aof snapshot_path=/tmp/acltls-qa/tls.snap log_filter=info log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=false acl_user_count=0 tls_enabled=true tls_replication_enabled=false
+<date>  INFO rocket_mem::aof: aof recovery replay complete commands=0 bytes=0 elapsed_us=<n>
+<date>  INFO rocket_mem: listener bound protocol=metrics addr=http://192.168.1.12:9121/metrics
+<date>  INFO rocket_mem: listener bound protocol=RMP addr=192.168.1.12:7379
+<date>  INFO rocket_mem: listener bound protocol=RESP+TLS addr=192.168.1.12:16379
+<date>  INFO rocket_mem: listener bound protocol=RMP+TLS addr=192.168.1.12:17379
+<date>  INFO rocket_mem: listener bound protocol=RESP addr=192.168.1.12:6379
 
-[boxed summary table follows, listing all five listeners: metrics / RMP / RESP+TLS / RMP+TLS / RESP]
+┌───────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ rocket-mem v0.1.4                                                                                 │
+├───────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ storage   recovered /tmp/acltls-qa/tls.snap + /tmp/acltls-qa/tls.aof (generation 0)               │
+│ acl       no users configured -- auth disabled, every client is trusted                           │
+│ cluster   standalone (no cluster_config set)                                                      │
+│ replicas  none connected yet -- REPLICAOF is a live command; INFO REPLICATION shows current state │
+│ listeners                                                                                         │
+│           metrics   http://192.168.1.12:9121/metrics                                              │
+│           RMP       192.168.1.12:7379                                                             │
+│           RESP+TLS  192.168.1.12:16379                                                            │
+│           RMP+TLS   192.168.1.12:17379                                                            │
+│           RESP      192.168.1.12:6379                                                             │
+└───────────────────────────────────────────────────────────────────────────────────────────────────┘
 
-LISTEN 0      128                   127.0.0.1:9310       0.0.0.0:*
-LISTEN 0      128                   127.0.0.1:6510       0.0.0.0:*
-LISTEN 0      128                   127.0.0.1:6511       0.0.0.0:*
-LISTEN 0      128                   127.0.0.1:6530       0.0.0.0:*
-LISTEN 0      128                   127.0.0.1:6531       0.0.0.0:*
+LISTEN 0      128                192.168.1.12:16379      0.0.0.0:*
+LISTEN 0      128                192.168.1.12:17379      0.0.0.0:*
+LISTEN 0      128                192.168.1.12:6379       0.0.0.0:*
+LISTEN 0      128                192.168.1.12:7379       0.0.0.0:*
+LISTEN 0      128                192.168.1.12:9121       0.0.0.0:*
 ```
 
-**Notes:** Five listeners, not three. Enabling TLS does **not** disable or replace the plaintext
-`addr`/`rmp_addr` listeners — there is no setting that turns them off. Anyone who assumes
-"TLS is configured, therefore traffic is encrypted" is wrong on this build: 6510 is still fully
-open and unencrypted. If you need plaintext closed, you must firewall it.
+**Notes:** Five listeners, not three — and, unlike the three-listener box, the `metrics`/`RMP`/
+`RESP` labels now pad to align with the longer `RESP+TLS`/`RMP+TLS` labels; this is real captured
+alignment, not a formatting choice made for this doc. Enabling TLS does **not** disable or replace
+the plaintext `addr`/`rmp_addr` listeners — there is no setting that turns them off. Anyone who
+assumes "TLS is configured, therefore traffic is encrypted" is wrong on this build: 6379 is still
+fully open and unencrypted. If you need plaintext closed, you must firewall it.
 
 The four settings are available identically as TOML keys (`tls_resp_addr`, `tls_rmp_addr`,
 `tls_cert_path`, `tls_key_path`), as `ROCKET_MEM_TLS_*` env vars, or as `--tls-*` flags. What used
@@ -6777,14 +7041,14 @@ for a certificate, so anyone who can reach the port can complete a handshake.
 
 ### TLS-03 — Verify a working `redis-cli --tls --cacert` round-trip
 
-**Precondition:** TLS-02 completed; the server is running with TLS on 6530.
+**Precondition:** TLS-02 completed; the server is running with TLS on 16379.
 
 **Steps:**
 ```bash
-redis-cli --tls --cacert /tmp/acltls-qa/tls/cert.pem -p 6530 ping
-redis-cli --tls --cacert /tmp/acltls-qa/tls/cert.pem -p 6530 set tlskey 1
-redis-cli --tls --cacert /tmp/acltls-qa/tls/cert.pem -p 6530 get tlskey
-redis-cli --tls --cacert /tmp/acltls-qa/tls/cert.pem -p 6530 -3 ping
+redis-cli --tls --cacert /tmp/acltls-qa/tls/cert.pem -h numericlabs.lxd -p 16379 ping
+redis-cli --tls --cacert /tmp/acltls-qa/tls/cert.pem -h numericlabs.lxd -p 16379 set tlskey 1
+redis-cli --tls --cacert /tmp/acltls-qa/tls/cert.pem -h numericlabs.lxd -p 16379 get tlskey
+redis-cli --tls --cacert /tmp/acltls-qa/tls/cert.pem -h numericlabs.lxd -p 16379 -3 ping
 ```
 
 **Expected:**
@@ -6801,9 +7065,9 @@ PONG
 RESP3 (`-3`) works over TLS exactly as it does in plaintext; the TLS layer wraps the socket and
 changes nothing above it.
 
-There is **no hostname check**. This command addresses `127.0.0.1` while the certificate says
-`CN=localhost`, and it still connects. Do not read a successful connection as proof the name
-matched.
+There is **no hostname check**. This command addresses `numericlabs.lxd` while the certificate
+says `CN=localhost` (TLS-01 deliberately generated it that way), and it still connects. Do not
+read a successful connection as proof the name matched.
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -6811,13 +7075,13 @@ matched.
 
 ### TLS-04 — Verify the TLS and plaintext ports share one keyspace
 
-**Precondition:** TLS-03 completed; the server is running with both 6510 and 6530 up.
+**Precondition:** TLS-03 completed; the server is running with both 6379 and 16379 up.
 
 **Steps:**
 ```bash
-redis-cli --tls --cacert /tmp/acltls-qa/tls/cert.pem -p 6530 set both 1
-redis-cli -p 6510 incr both
-redis-cli --tls --cacert /tmp/acltls-qa/tls/cert.pem -p 6530 get both
+redis-cli --tls --cacert /tmp/acltls-qa/tls/cert.pem -h numericlabs.lxd -p 16379 set both 1
+redis-cli -h numericlabs.lxd -p 6379 incr both
+redis-cli --tls --cacert /tmp/acltls-qa/tls/cert.pem -h numericlabs.lxd -p 16379 get both
 ```
 
 **Expected:**
@@ -6829,7 +7093,7 @@ OK
 
 **Notes:** One `Engine`, one set of shards, four RESP/RMP front doors. There is no per-listener
 isolation and no synchronization involved — a write over TLS is immediately visible in plaintext
-and vice versa. That also means a plaintext client on 6510 can read anything a TLS client wrote,
+and vice versa. That also means a plaintext client on 6379 can read anything a TLS client wrote,
 which is the practical reason TLS-02's "plaintext is still open" note matters.
 
 **Result:** ☐ Pass ☐ Fail
@@ -6838,13 +7102,13 @@ which is the practical reason TLS-02's "plaintext is still open" note matters.
 
 ### TLS-05 — Verify `--insecure` skips verification and omitting `--cacert` fails it
 
-**Precondition:** TLS-02 completed; the server is running with TLS on 6530.
+**Precondition:** TLS-02 completed; the server is running with TLS on 16379.
 
 **Steps:**
 ```bash
-redis-cli --tls --insecure -p 6530 ping
+redis-cli --tls --insecure -h numericlabs.lxd -p 16379 ping
 echo "exit=$?"
-redis-cli --tls -p 6530 ping
+redis-cli --tls -h numericlabs.lxd -p 16379 ping
 echo "exit=$?"
 ```
 
@@ -6852,7 +7116,7 @@ echo "exit=$?"
 ```
 PONG
 exit=0
-Could not connect to Redis at 127.0.0.1:6530: SSL_connect failed: certificate verify failed
+Could not connect to Redis at numericlabs.lxd:16379: SSL_connect failed: certificate verify failed
 exit=1
 ```
 
@@ -6872,11 +7136,11 @@ must never appear in anything resembling a production client configuration.
 
 ### TLS-06 — Verify the TLS RMP listener with `openssl s_client`
 
-**Precondition:** TLS-02 completed; the server is running with TLS RMP on 6531.
+**Precondition:** TLS-02 completed; the server is running with TLS RMP on 17379.
 
 **Steps:**
 ```bash
-echo | openssl s_client -connect 127.0.0.1:6531 \
+echo | openssl s_client -connect numericlabs.lxd:17379 \
   -CAfile /tmp/acltls-qa/tls/cert.pem -servername localhost 2>&1 \
   | grep -E 'New, TLS|Verify return code'
 ```
@@ -6888,16 +7152,16 @@ Verify return code: 0 (ok)
 ```
 
 **Notes:** RMP is rocket-mem's own binary protocol and `redis-cli` cannot speak it, so `s_client`
-is the only hand-testing route for 6531 — the `rmp-client` crate in the workspace speaks plaintext
+is the only hand-testing route for 17379 — the `rmp-client` crate in the workspace speaks plaintext
 RMP only and has no TLS mode. This case proves the listener is up and the handshake completes; it
 does not exercise any RMP command.
 
-The same command against `-connect 127.0.0.1:6530` produces the same two lines, which is a quick
-way to confirm both TLS listeners share the one certificate.
+The same command against `-connect numericlabs.lxd:16379` produces the same two lines, which is a
+quick way to confirm both TLS listeners share the one certificate.
 
 `s_client` does not verify the hostname unless you pass `-verify_hostname`, so `Verify return
-code: 0 (ok)` against `127.0.0.1` with a `CN=localhost` certificate is expected here and is not
-evidence of a name match. Same caveat as TLS-03.
+code: 0 (ok)` against `numericlabs.lxd` with a `CN=localhost` certificate is expected here and is
+not evidence of a name match. Same caveat as TLS-03.
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -6905,11 +7169,11 @@ evidence of a name match. Same caveat as TLS-03.
 
 ### TLS-07 — Verify what a plaintext client gets on the TLS port
 
-**Precondition:** TLS-02 completed; the server is running with TLS on 6530.
+**Precondition:** TLS-02 completed; the server is running with TLS on 16379.
 
 **Steps:**
 ```bash
-redis-cli -p 6530 ping
+redis-cli -h numericlabs.lxd -p 16379 ping
 echo "exit=$?"
 ```
 
@@ -6936,8 +7200,8 @@ instead of this error, that is a genuine regression.
 
 ### TLS-08 — Verify a TLS address without a cert/key is a startup error, not an unbound listener
 
-**Precondition:** The server from TLS-02 is **stopped** and ports 6510, 6511, 6530, 6531 and 9310
-are free. These runs bind the metrics and RMP listeners before aborting, so a running server would
+**Precondition:** The server from TLS-02 is **stopped** and ports 6379, 7379, 16379 and 9121 are
+free. These runs bind the metrics and RMP listeners before aborting, so a running server would
 mask the real error with `AddrInUse`.
 
 **Steps:**
@@ -6945,20 +7209,20 @@ mask the real error with `AddrInUse`.
 cd /tmp/acltls-qa
 
 # A: TLS address set, no cert or key at all.
-ROCKET_MEM_ADDR=127.0.0.1:6510 ROCKET_MEM_RMP_ADDR=127.0.0.1:6511 \
-ROCKET_MEM_METRICS_ADDR=127.0.0.1:9310 ROCKET_MEM_TLS_RESP_ADDR=127.0.0.1:6530 \
+ROCKET_MEM_ADDR=numericlabs.lxd:6379 ROCKET_MEM_RMP_ADDR=numericlabs.lxd:7379 \
+ROCKET_MEM_METRICS_ADDR=numericlabs.lxd:9121 ROCKET_MEM_TLS_RESP_ADDR=numericlabs.lxd:16379 \
 "$ROCKET_MEM_BIN"; echo "exit=$?"
 
 # B: cert path points at a file that does not exist.
-ROCKET_MEM_ADDR=127.0.0.1:6510 ROCKET_MEM_RMP_ADDR=127.0.0.1:6511 \
-ROCKET_MEM_METRICS_ADDR=127.0.0.1:9310 ROCKET_MEM_TLS_RESP_ADDR=127.0.0.1:6530 \
+ROCKET_MEM_ADDR=numericlabs.lxd:6379 ROCKET_MEM_RMP_ADDR=numericlabs.lxd:7379 \
+ROCKET_MEM_METRICS_ADDR=numericlabs.lxd:9121 ROCKET_MEM_TLS_RESP_ADDR=numericlabs.lxd:16379 \
 ROCKET_MEM_TLS_CERT_PATH=/tmp/acltls-qa/tls/missing.pem \
 ROCKET_MEM_TLS_KEY_PATH=/tmp/acltls-qa/tls/key.pem \
 "$ROCKET_MEM_BIN"; echo "exit=$?"
 
 # C: cert and key swapped.
-ROCKET_MEM_ADDR=127.0.0.1:6510 ROCKET_MEM_RMP_ADDR=127.0.0.1:6511 \
-ROCKET_MEM_METRICS_ADDR=127.0.0.1:9310 ROCKET_MEM_TLS_RESP_ADDR=127.0.0.1:6530 \
+ROCKET_MEM_ADDR=numericlabs.lxd:6379 ROCKET_MEM_RMP_ADDR=numericlabs.lxd:7379 \
+ROCKET_MEM_METRICS_ADDR=numericlabs.lxd:9121 ROCKET_MEM_TLS_RESP_ADDR=numericlabs.lxd:16379 \
 ROCKET_MEM_TLS_CERT_PATH=/tmp/acltls-qa/tls/key.pem \
 ROCKET_MEM_TLS_KEY_PATH=/tmp/acltls-qa/tls/cert.pem \
 "$ROCKET_MEM_BIN"; echo "exit=$?"
@@ -6967,9 +7231,9 @@ ROCKET_MEM_TLS_KEY_PATH=/tmp/acltls-qa/tls/cert.pem \
 **Expected:** (scenario A shown in full; B and C are the same shape with two more `listener bound`
 lines — `metrics` and `RMP` — appearing before their own error)
 ```
-2026-09-12T05:38:17.924036Z  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=127.0.0.1:6510
-2026-09-12T05:38:17.924101Z  INFO rocket_mem: resolved config summary node_id=127.0.0.1:6510 addr=127.0.0.1:6510 rmp_addr=127.0.0.1:6511 metrics_addr=127.0.0.1:9310 aof_path=./appendonly.aof snapshot_path=./dump.snapshot log_filter=info log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=false acl_user_count=0 tls_enabled=true tls_replication_enabled=false
-2026-09-12T05:38:17.925083Z  INFO rocket_mem::aof: aof recovery replay complete commands=0 bytes=0 elapsed_us=7
+<date>  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=numericlabs.lxd:6379
+<date>  INFO rocket_mem: resolved config summary node_id=numericlabs.lxd:6379 addr=numericlabs.lxd:6379 rmp_addr=numericlabs.lxd:7379 metrics_addr=numericlabs.lxd:9121 aof_path=./appendonly.aof snapshot_path=./dump.snapshot log_filter=info log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=false acl_user_count=0 tls_enabled=true tls_replication_enabled=false
+<date>  INFO rocket_mem::aof: aof recovery replay complete commands=0 bytes=0 elapsed_us=<n>
 Error: Custom { kind: InvalidInput, error: "tls_resp_addr is set but tls_cert_path/tls_key_path is not -- TLS requires both" }
 exit=1
 ```
@@ -6983,8 +7247,8 @@ healthy while serving nothing but plaintext.
 
 All three abort **after** the metrics and plaintext RMP listeners are already bound, so the error
 scrolls past the startup/config-summary lines and two `listener bound` events. The `listener
-bound protocol=RESP addr=127.0.0.1:6510` line never appears, which is the reliable signal that
-startup did not complete. (Contrast ACL-16, where the failure happens before anything binds.)
+bound protocol=RESP addr=192.168.1.12:6379` line never appears, which is the reliable signal
+that startup did not complete. (Contrast ACL-16, where the failure happens before anything binds.)
 
 Case B's error does not say **which** path was missing. If you hit `NotFound`, check both
 `tls_cert_path` and `tls_key_path`.
@@ -7001,19 +7265,19 @@ the plaintext listener dies with `AddrInUse` and nothing hints that the two sett
 
 ### TLS-09 — Verify cert/key paths resolve against the process CWD, not the config file
 
-**Precondition:** TLS-01 completed (certificates exist in `/tmp/acltls-qa/tls`). Ports 6510, 6511,
-6530 and 9310 are free.
+**Precondition:** TLS-01 completed (certificates exist in `/tmp/acltls-qa/tls`). Ports 6379, 7379,
+16379 and 9121 are free.
 
 **Steps:**
 ```bash
 mkdir -p /tmp/acltls-qa/cfgdir
 cat > /tmp/acltls-qa/cfgdir/tls-relative.toml <<'EOF'
-addr = "127.0.0.1:6510"
-rmp_addr = "127.0.0.1:6511"
-metrics_addr = "127.0.0.1:9310"
+addr = "numericlabs.lxd:6379"
+rmp_addr = "numericlabs.lxd:7379"
+metrics_addr = "numericlabs.lxd:9121"
 aof_path = "/tmp/acltls-qa/tls.aof"
 snapshot_path = "/tmp/acltls-qa/tls.snap"
-tls_resp_addr = "127.0.0.1:6530"
+tls_resp_addr = "numericlabs.lxd:16379"
 tls_cert_path = "cert.pem"
 tls_key_path = "key.pem"
 EOF
@@ -7037,7 +7301,8 @@ unchanged and reconfirmed live)
 ... startup/config-summary logging, then:
 Error: Os { code: 2, kind: NotFound, message: "No such file or directory" }
 exit=1
-... startup/config-summary logging, then five `listener bound` events (metrics/RMP/RESP+TLS/RMP+TLS/RESP):
+... startup/config-summary logging, then four `listener bound` events (metrics/RMP/RESP+TLS/RESP —
+this config only sets tls_resp_addr, not tls_rmp_addr, so there is no RMP+TLS listener here):
 exit=124
 ```
 
@@ -7047,7 +7312,7 @@ cleanly from another, with no diagnostic naming the path it actually tried. `tls
 directory the config file lives in — which is the intuition most people bring.
 
 `exit=124` on the second run is `timeout` killing a healthy server after 2 seconds. That is the
-pass condition; the `listener bound protocol=RESP addr=127.0.0.1:6510` line (last of five) is
+pass condition; the `listener bound protocol=RESP addr=192.168.1.12:6379` line (last of four) is
 what matters.
 
 Recommendation to pass on: always use absolute paths for `tls_cert_path`/`tls_key_path` unless you
@@ -7066,13 +7331,13 @@ stopped.
 **Steps:**
 ```bash
 cat > /tmp/acltls-qa/acl-tls.toml <<'EOF'
-addr = "127.0.0.1:6510"
-rmp_addr = "127.0.0.1:6511"
-metrics_addr = "127.0.0.1:9310"
+addr = "numericlabs.lxd:6379"
+rmp_addr = "numericlabs.lxd:7379"
+metrics_addr = "numericlabs.lxd:9121"
 aof_path = "/tmp/acltls-qa/acltls.aof"
 snapshot_path = "/tmp/acltls-qa/acltls.snap"
-tls_resp_addr = "127.0.0.1:6530"
-tls_rmp_addr = "127.0.0.1:6531"
+tls_resp_addr = "numericlabs.lxd:16379"
+tls_rmp_addr = "numericlabs.lxd:17379"
 tls_cert_path = "/tmp/acltls-qa/tls/cert.pem"
 tls_key_path = "/tmp/acltls-qa/tls/key.pem"
 
@@ -7090,13 +7355,14 @@ echo "PID=$!" > /tmp/acltls-qa/acltls.pid
 sleep 1.5
 cat /tmp/acltls-qa/acltls-server.log
 
-redis-cli --tls --cacert /tmp/acltls-qa/tls/cert.pem -p 6530 ping
-redis-cli --tls --cacert /tmp/acltls-qa/tls/cert.pem -p 6530 \
+redis-cli --tls --cacert /tmp/acltls-qa/tls/cert.pem -h numericlabs.lxd -p 16379 ping
+redis-cli --tls --cacert /tmp/acltls-qa/tls/cert.pem -h numericlabs.lxd -p 16379 \
   --user admin --pass adminpw --no-auth-warning ping
 ```
 
 **Expected:** (structured logging replaces the old plain lines — see TLS-02 for the full shape;
-substance below is unchanged and reconfirmed live)
+substance below is unchanged and reconfirmed live — note the boxed table's `acl` row now reads
+`1 user configured, auth required` instead of TLS-02's `no users configured`)
 ```
 ... startup/config-summary logging, then five `listener bound` events (metrics/RMP/RESP+TLS/RMP+TLS/RESP)
 NOAUTH Authentication required.
@@ -7120,23 +7386,23 @@ anywhere in this build.
 **Steps:**
 ```bash
 cd /tmp/acltls-qa
-ROCKET_MEM_ADDR=127.0.0.1:6510 ROCKET_MEM_RMP_ADDR=127.0.0.1:6511 \
-ROCKET_MEM_METRICS_ADDR=127.0.0.1:9310 \
-ROCKET_MEM_TLS_RESP_ADDR=127.0.0.1:6530 \
+ROCKET_MEM_ADDR=numericlabs.lxd:6379 ROCKET_MEM_RMP_ADDR=numericlabs.lxd:7379 \
+ROCKET_MEM_METRICS_ADDR=numericlabs.lxd:9121 \
+ROCKET_MEM_TLS_RESP_ADDR=numericlabs.lxd:16379 \
 ROCKET_MEM_TLS_CERT_PATH=/tmp/acltls-qa/tls/cert.pem \
 ROCKET_MEM_TLS_KEY_PATH=/tmp/acltls-qa/tls/key.pem \
-ROCKET_MEM_REPLICAOF=127.0.0.1:1 \
+ROCKET_MEM_REPLICAOF=numericlabs.lxd:1 \
 timeout 2 "$ROCKET_MEM_BIN" 2>&1 | grep -i "plaintext"
 ```
 
 **Expected:** one `WARN` line naming the plaintext address:
 ```
-...  WARN rocket_mem: replica_announce_addr is unset while a TLS listener is configured -- this node advertises its plaintext address to its leader announced=127.0.0.1:6510
+...  WARN rocket_mem: replica_announce_addr is unset while a TLS listener is configured -- this node advertises its plaintext address to its leader announced=numericlabs.lxd:6379
 ```
 
 **Notes:** This fires once, at startup, purely from config shape — it does not need a reachable
 leader (`should_warn_plaintext_announce` in `config.rs` is checked before the replication client
-starts, so it logs even though `127.0.0.1:1` refuses the connection). It requires all three of:
+starts, so it logs even though `numericlabs.lxd:1` refuses the connection). It requires all three of:
 `replicaof` set, at least one of `tls_resp_addr`/`tls_rmp_addr` set, and `replica_announce_addr`
 unset. See REPL-10 for `replica_announce_addr` itself changing what a leader reports about a
 follower.
@@ -7152,7 +7418,7 @@ for f in /tmp/acltls-qa/tls.pid /tmp/acltls-qa/acltls.pid; do
   [ -f "$f" ] && kill "$(cut -d= -f2 "$f")" 2>/dev/null
 done
 sleep 1
-ss -lnt | grep -E ':(6510|6511|6530|6531|9310)\b' || echo "ports free"
+ss -lnt | grep -E ':(6379|7379|16379|17379|9121)\b' || echo "ports free"
 ```
 
 Expected final line: `ports free`.
@@ -7335,9 +7601,9 @@ reference the case ID and this section rather than opening a duplicate.
 The most serious of the four: it loses data and reports a wrong count, with no error.
 
 ```bash
-redis-cli -p 6550 zadd myzset 1 a 2 b 3 c
+redis-cli -h numericlabs.lxd -p 6379 zadd myzset 1 a 2 b 3 c
 # actual:   1          <- claims one member added
-redis-cli -p 6550 zrange myzset 0 -1
+redis-cli -h numericlabs.lxd -p 6379 zrange myzset 0 -1
 # actual:   a          <- b and c were silently discarded
 # real Redis: ZADD returns 3, and the set contains a, b, c.
 ```
@@ -7349,8 +7615,8 @@ accepted and ignored rather than rejected. Case CORE-28.
 #### `LPOP`, `RPOP`, `SPOP`, and `SRANDMEMBER` accept a `count` argument and ignore it
 
 ```bash
-redis-cli -p 6550 rpush mylist x y z
-redis-cli -p 6550 lpop mylist 2
+redis-cli -h numericlabs.lxd -p 6379 rpush mylist x y z
+redis-cli -h numericlabs.lxd -p 6379 lpop mylist 2
 # actual:   x          <- a single bulk reply, count ignored
 # real Redis: an array of two elements, [x, y].
 ```
@@ -7360,12 +7626,12 @@ Same root cause as `ZADD`: a minimum-arity check with no upper bound. Cases CORE
 #### Some error replies omit the `ERR` prefix
 
 ```bash
-redis-cli -p 6550 set strk abc
-redis-cli -p 6550 incr strk
+redis-cli -h numericlabs.lxd -p 6379 set strk abc
+redis-cli -h numericlabs.lxd -p 6379 incr strk
 # actual:   value is not an integer or out of range
 # real Redis: ERR value is not an integer or out of range
 
-redis-cli -p 6550 rename nosuchkey other
+redis-cli -h numericlabs.lxd -p 6379 rename nosuchkey other
 # actual:   no such key
 # real Redis: ERR no such key
 ```
@@ -7376,8 +7642,8 @@ matters for clients that branch on the error code. Cases CORE-06, CORE-32.
 #### `SET` accepts mutually exclusive flags instead of rejecting them
 
 ```bash
-redis-cli -p 6550 set ck v1 NX XX          # actual: OK   (real Redis: ERR syntax error)
-redis-cli -p 6550 set ck2 v EX 100 PX 5000 # actual: OK, TTL 100s — EX silently wins
+redis-cli -h numericlabs.lxd -p 6379 set ck v1 NX XX          # actual: OK   (real Redis: ERR syntax error)
+redis-cli -h numericlabs.lxd -p 6379 set ck2 v EX 100 PX 5000 # actual: OK, TTL 100s — EX silently wins
 ```
 
 Only `NX` is honored when both are given. Case CORE-03.

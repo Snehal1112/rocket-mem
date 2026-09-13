@@ -181,12 +181,24 @@ unsatisfied state:
 
 ### Safety
 
-- Ports for all in-scope suites (6540/41, 6550/51, 6560/61, 6570-73, 6620/21, plus their
-  9340/9350/9370 metrics ports) are already distinct from both the live hand-started cluster's
-  ports (6379-6381/7379-7381/9121-9123, confirmed against the checked-in `rocket-mem*.toml`
-  files) and the out-of-scope suites' ports (7101-7103 cluster, 6600s/6610s pubsub, 6630/6640
-  replication-adjacent, 65xx TLS) — the runner never needs to invent new ports, it reuses exactly
-  what the playbook already documents per suite.
+- **STALE, now FALSE — read before trusting anything below about port isolation:** this section
+  originally described the in-scope suites' ports (6540/41, 6550/51, 6560/61, 6570-73, 6620/21) as
+  deliberately distinct from the live hand-started cluster's ports (6379-6381/7379-7381/9121-9123).
+  That is no longer true. On 2026-09-13, `docs/qa-playbook.md`/`.html` were rewritten so every
+  in-scope single-instance suite (Smoke, Core, Transactions, Persistence, Configuration layering,
+  RMP protocol, Observability) — plus the out-of-scope TLS suite — now uses
+  `numericlabs.lxd:6379`/`7379`/`9121` (and `16379`/`17379` for TLS) to match the checked-in
+  `rocket-mem*.toml` files' real addresses, at the requester's explicit direction, accepting the
+  collision this creates. **Running any in-scope suite while the live cluster is up will either
+  fail with `AddrInUse` or, worse, cause `processTracker`'s `ss -tlnp`-based PID resolution to
+  find the live cluster's own process on that port and kill it as if it were the suite's own test
+  server.** Before `tools/qa-agent` (or a human) runs any suite in this list, it must now confirm
+  the live cluster is stopped first — see the port note at the top of `docs/qa-playbook.md`.
+  `processTracker`'s "confirmed to be a `rocket-mem` process" check (next bullet) is necessary but
+  not sufficient here: the live cluster's processes also pass that check. Replication, Pub/sub,
+  Cluster, and ACL remain on their own untouched scratch ports (7101-7103 cluster, 6600s/6610s
+  pubsub, 6630/6640 replication-adjacent, 6510/6511/6530/6531/9310 ACL), still distinct from the
+  live cluster and from each other.
 - PID resolution is always via `ss -tlnp` on a suite's known port, confirmed to be a
   `rocket-mem` process, before any kill — never `pkill -f rocket-mem` (this has caused real
   confusion before, per the playbook's own warning and this project's own operating history).
