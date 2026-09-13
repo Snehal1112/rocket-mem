@@ -22,7 +22,12 @@ impl RocketMemMcpServer {
 
 impl RocketMemMcpServer {
     fn tool_router() -> rmcp::handler::server::router::tool::ToolRouter<Self> {
-        Self::string_router() + Self::keys_router() + Self::hash_router() + Self::list_router()
+        Self::string_router()
+            + Self::keys_router()
+            + Self::hash_router()
+            + Self::list_router()
+            + Self::set_router()
+            + Self::set_ops_router()
     }
 }
 
