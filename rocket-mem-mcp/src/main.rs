@@ -11,7 +11,13 @@ use rocket_mem_mcp::server::RocketMemMcpServer;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let config = Config::parse();
-    let pool = Pool::connect(&config.target_addr).await?;
+    let pool = Pool::connect(
+        &config.target_addr,
+        config.acl_username.as_deref(),
+        config.acl_password.as_deref(),
+        config.tls_ca_path.as_deref(),
+    )
+    .await?;
     let server = RocketMemMcpServer::new(pool);
 
     let running = server.serve(stdio()).await?;

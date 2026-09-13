@@ -7,7 +7,9 @@ async fn mcp_handshake_and_list_tools_succeed_over_a_duplex_transport() {
     let dir = tempfile::tempdir().unwrap();
     let aof_path = dir.path().join("handshake-test.aof");
     let (_guard, addr) = support::spawn_rocket_mem(&aof_path);
-    let pool = Pool::connect(&addr).await.expect("pool should connect");
+    let pool = Pool::connect(&addr, None, None, None)
+        .await
+        .expect("pool should connect");
     let client = support::connect_client_and_server(pool).await;
 
     let tools = client.peer().list_tools(Default::default()).await;
