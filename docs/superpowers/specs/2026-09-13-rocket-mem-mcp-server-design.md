@@ -255,13 +255,20 @@ Plan 2's `incr_by`. `HSCAN` is real (see the correction above): reply shape
 same as Plan 2's `scan`) since there's no page to size — one call always returns everything and
 the cursor is always `"0"`.
 
-### Plan 4 — List (11 tools)
+### Plan 4 — List (11 tools) — shipped 2026-09-13
 
-All 11 map cleanly to fixed-parameter tools. `LPUSH`/`RPUSH` take a variadic values array.
-`LINSERT`'s before/after is a plain `bool` at the engine level, not `BEFORE`/`AFTER` keywords.
-`LSET` distinguishes `NoSuchKey` (key missing entirely) from `IndexOutOfRange` (bad index on an
-existing list) — worth two distinct, separately-worded tool errors rather than collapsing both to
-one message.
+All 11 map cleanly. `LPUSH`/`RPUSH` take a variadic values array, one wire command per call
+(matching `MSET`'s precedent); `LPUSH` with multiple values prepends each in argument order, so
+the *last* argument ends up at the front. `LPOP`/`RPOP` have no optional `count` — always pop at
+most one element. `LINSERT`'s before/after choice is a wire-level keyword
+(`"BEFORE"`/`"AFTER"`, case-insensitive), not a plain flag — the tool takes a friendlier `before:
+bool` and translates it before building the command; its reply is a three-way sentinel (new
+length / `-1` pivot not found / `0` key missing). `LSET` distinguishes `NoSuchKey` (key missing
+entirely) from `IndexOutOfRange` (bad index on an existing list) as two genuinely distinct
+tool-level errors — **when documenting this in a tool description, quote the literal wire error
+text an agent will actually receive** (`"no such key"` / `"index out of range"`,
+`crates/common/src/lib.rs`'s `#[error(...)]` strings), not the internal `EngineError` variant
+names — Plan 4's own first draft named the Rust enum variants instead and had to be corrected.
 
 ### Plan 5 — Set (14 tools)
 

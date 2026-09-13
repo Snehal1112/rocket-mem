@@ -242,9 +242,10 @@ impl RocketMemMcpServer {
 
     #[tool(
         description = "Set the value at an index in a list, replacing what's there. \
-        Negative indices count from the end (-1 is the last element). Errors NoSuchKey if the \
-        key doesn't exist at all, or IndexOutOfRange if the key exists but the index is out of \
-        bounds — these are two distinct tool-level errors, not one generic failure."
+        Negative indices count from the end (-1 is the last element). Errors with \"no such \
+        key\" if the key doesn't exist at all, or \"index out of range\" if the key exists but \
+        the index is out of bounds — these are two distinct tool-level errors, not one generic \
+        failure."
     )]
     async fn lset(
         &self,
