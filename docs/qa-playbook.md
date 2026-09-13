@@ -656,7 +656,14 @@ arch_bits:64
 process_id:<pid>
 uptime_in_seconds:<n>
 uptime_in_days:0
+
 ```
+
+**Notes:** `redis-cli` shows raw mode here (no `#`/blank framing beyond what's in the reply
+itself). The real RESP reply uses `\r\n` as its internal line separator (standard `INFO`
+behavior, matching real Redis) and ends with a blank line — i.e. one more trailing blank line
+than you might expect from eyeballing the field list. If you're diffing byte-for-byte rather than
+by eye, account for both.
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -673,9 +680,16 @@ redis-cli -p 6540 INFO replication
 ```
 # Replication
 role:master
-master_repl_offset:0
 connected_slaves:0
+master_repl_offset:<n>
+
 ```
+
+**Notes:** Field order is `role` / `connected_slaves` / `master_repl_offset` (not alphabetical or
+insertion order you might guess) — this is the real, deterministic order the server emits, not
+arbitrary. `master_repl_offset` is wildcarded: by the time this case runs, earlier Smoke cases
+have already issued writes, so the offset is legitimately nonzero. The reply ends with a blank
+line (a second trailing newline) same as `INFO server`'s — see SMOKE-08's notes.
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -693,13 +707,13 @@ curl -s http://127.0.0.1:9340/metrics | grep -A1 '^# TYPE rocket_mem_commands_to
 **Expected:**
 ```
 HTTP 200
-```
-```
 # TYPE rocket_mem_commands_total counter
-rocket_mem_commands_total{cmd="ttl"} 1
+rocket_mem_commands_total{cmd="<cmd>"} <n>
 ```
-(exact `cmd` label and count depend on which commands you've run and in what order; the point is
-the metric family exists and increments per command).
+(the two `curl`s run back to back with nothing printed between them — no blank line separates
+their output when actually captured, unlike the two-block layout above might suggest. `cmd` and
+the count depend on which commands you've run and in what order; the point is the metric family
+exists and increments per command).
 
 **Result:** ☐ Pass ☐ Fail
 
