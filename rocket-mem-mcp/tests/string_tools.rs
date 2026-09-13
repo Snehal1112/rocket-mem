@@ -3,36 +3,13 @@ mod support;
 use rmcp::model::CallToolRequestParams;
 use rmcp::object;
 use rocket_mem_mcp::pool::Pool;
-use rocket_mem_mcp::server::RocketMemMcpServer;
-
-async fn connect_client_and_server(
-    pool: Pool,
-) -> rmcp::service::RunningService<rmcp::service::RoleClient, ()> {
-    use rmcp::ServiceExt;
-    let (server_io, client_io) = tokio::io::duplex(4096);
-    let (server_read, server_write) = tokio::io::split(server_io);
-    let (client_read, client_write) = tokio::io::split(client_io);
-
-    let server = RocketMemMcpServer::new(pool);
-    tokio::spawn(async move {
-        let running = server
-            .serve((server_read, server_write))
-            .await
-            .expect("server should complete the MCP handshake");
-        running.waiting().await.ok();
-    });
-
-    ().serve((client_read, client_write))
-        .await
-        .expect("client should complete the MCP handshake")
-}
 
 #[tokio::test]
 async fn getset_returns_the_old_value_and_writes_the_new_one() {
     let dir = tempfile::tempdir().unwrap();
     let (mut child, addr) = support::spawn_rocket_mem(&dir.path().join("getset.aof"));
     let pool = Pool::connect(&addr, None, None, None).await.unwrap();
-    let client = connect_client_and_server(pool.clone()).await;
+    let client = support::connect_client_and_server(pool.clone()).await;
 
     let mut conn = pool.connection();
     let _: () = redis::cmd("SET")
@@ -65,7 +42,7 @@ async fn append_extends_an_existing_value_and_reports_the_new_length() {
     let dir = tempfile::tempdir().unwrap();
     let (mut child, addr) = support::spawn_rocket_mem(&dir.path().join("append.aof"));
     let pool = Pool::connect(&addr, None, None, None).await.unwrap();
-    let client = connect_client_and_server(pool).await;
+    let client = support::connect_client_and_server(pool).await;
 
     client
         .peer()
@@ -95,7 +72,7 @@ async fn strlen_on_a_missing_key_is_zero_not_an_error() {
     let dir = tempfile::tempdir().unwrap();
     let (mut child, addr) = support::spawn_rocket_mem(&dir.path().join("strlen.aof"));
     let pool = Pool::connect(&addr, None, None, None).await.unwrap();
-    let client = connect_client_and_server(pool).await;
+    let client = support::connect_client_and_server(pool).await;
 
     let result = client
         .peer()
@@ -114,7 +91,7 @@ async fn incr_decr_and_incr_by_move_a_counter() {
     let dir = tempfile::tempdir().unwrap();
     let (mut child, addr) = support::spawn_rocket_mem(&dir.path().join("incr.aof"));
     let pool = Pool::connect(&addr, None, None, None).await.unwrap();
-    let client = connect_client_and_server(pool).await;
+    let client = support::connect_client_and_server(pool).await;
 
     let r1 = client
         .peer()
@@ -148,7 +125,7 @@ async fn incr_on_a_non_integer_string_surfaces_not_an_integer() {
     let dir = tempfile::tempdir().unwrap();
     let (mut child, addr) = support::spawn_rocket_mem(&dir.path().join("incr-bad.aof"));
     let pool = Pool::connect(&addr, None, None, None).await.unwrap();
-    let client = connect_client_and_server(pool).await;
+    let client = support::connect_client_and_server(pool).await;
 
     client
         .peer()
@@ -172,7 +149,7 @@ async fn getrange_and_setrange_slice_and_patch_a_string() {
     let dir = tempfile::tempdir().unwrap();
     let (mut child, addr) = support::spawn_rocket_mem(&dir.path().join("range.aof"));
     let pool = Pool::connect(&addr, None, None, None).await.unwrap();
-    let client = connect_client_and_server(pool.clone()).await;
+    let client = support::connect_client_and_server(pool.clone()).await;
 
     client
         .peer()
@@ -217,7 +194,7 @@ async fn setrange_with_an_empty_value_on_a_missing_key_does_not_create_it() {
     let dir = tempfile::tempdir().unwrap();
     let (mut child, addr) = support::spawn_rocket_mem(&dir.path().join("setrange-noop.aof"));
     let pool = Pool::connect(&addr, None, None, None).await.unwrap();
-    let client = connect_client_and_server(pool.clone()).await;
+    let client = support::connect_client_and_server(pool.clone()).await;
 
     client
         .peer()
@@ -243,7 +220,7 @@ async fn mset_mget_and_msetnx_round_trip_multiple_keys() {
     let dir = tempfile::tempdir().unwrap();
     let (mut child, addr) = support::spawn_rocket_mem(&dir.path().join("mset.aof"));
     let pool = Pool::connect(&addr, None, None, None).await.unwrap();
-    let client = connect_client_and_server(pool.clone()).await;
+    let client = support::connect_client_and_server(pool.clone()).await;
 
     client
         .peer()
