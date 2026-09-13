@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
+use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
 use rmcp::service::{RoleClient, RunningService};
 use rmcp::ServiceExt;
@@ -48,6 +50,29 @@ impl RocketMemGuard {
 impl Drop for RocketMemGuard {
     fn drop(&mut self) {
         self.kill();
+    }
+}
+
+/// Blocks until `addr` actually accepts a TCP connection, or panics after a bounded wait.
+/// `rocket-mem` prints its listener line to stdout the moment the socket is bound, but under
+/// heavy process load (many spawned instances at once, as happens across this crate's test
+/// suite) there can be a brief window after that print before the OS has scheduled the accept
+/// loop — a caller's `Pool::connect` racing that window is what produces the intermittent
+/// "Connection refused" this closes. A plain TCP connect (not a full protocol handshake) is
+/// enough to confirm the socket is live, even for a TLS listener.
+fn wait_for_listener(addr: &str) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if TcpStream::connect(addr).is_ok() {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "rocket-mem never accepted a connection on {addr} within 2s of printing its \
+                 banner line"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -120,7 +145,9 @@ pub fn spawn_rocket_mem(aof_path: &std::path::Path) -> (RocketMemGuard, String) 
         },
         &["RESP"],
     );
-    (guard, found.remove("RESP").unwrap())
+    let addr = found.remove("RESP").unwrap();
+    wait_for_listener(&addr);
+    (guard, addr)
 }
 
 /// Like `spawn_rocket_mem`, but also binds a TLS RESP listener using the shared self-signed
@@ -147,6 +174,8 @@ pub fn spawn_rocket_mem_with_tls(aof_path: &std::path::Path) -> (RocketMemGuard,
     );
     let plain = found.remove("RESP").unwrap();
     let tls = found.remove("RESP+TLS").unwrap();
+    wait_for_listener(&plain);
+    wait_for_listener(&tls);
     (guard, plain, tls)
 }
 
@@ -184,7 +213,9 @@ pub fn spawn_rocket_mem_with_acl(
         },
         &["RESP"],
     );
-    (guard, found.remove("RESP").unwrap())
+    let addr = found.remove("RESP").unwrap();
+    wait_for_listener(&addr);
+    (guard, addr)
 }
 
 /// Like `spawn_rocket_mem_with_acl`, but also binds a TLS RESP listener (see
@@ -223,7 +254,9 @@ pub fn spawn_rocket_mem_with_acl_and_tls(
         },
         &["RESP", "RESP+TLS"],
     );
-    (guard, found.remove("RESP+TLS").unwrap())
+    let tls = found.remove("RESP+TLS").unwrap();
+    wait_for_listener(&tls);
+    (guard, tls)
 }
 
 /// Wires up an `RocketMemMcpServer` and an `rmcp` client on opposite ends of an in-process
