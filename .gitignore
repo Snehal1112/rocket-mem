@@ -43,6 +43,11 @@ tools/*/.yarn/install-state.gz
 *.aof
 tools
 
+# Exception: rocket-mem-mcp/src/tools/ is committed crate source (one file per MCP tool
+# family), not the local/generated top-level tools/ directory the bare pattern above targets.
+!rocket-mem-mcp/src/tools/
+!rocket-mem-mcp/src/tools/**
+
 # Local TLS material (self-signed dev certs/keys generated for manual testing)
 certs/
 *.pem
