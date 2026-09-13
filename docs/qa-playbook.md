@@ -486,17 +486,37 @@ ROCKET_MEM_ADDR=127.0.0.1:6540 ROCKET_MEM_RMP_ADDR=127.0.0.1:6541 ROCKET_MEM_MET
 
 **Expected:**
 ```
-Recovered state from ./dump.snapshot and ./appendonly.aof
-Metrics on http://127.0.0.1:9340/metrics
-RMP listening on 127.0.0.1:6541
-Listening on 127.0.0.1:6540
+<date>  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=127.0.0.1:6540
+<date>  INFO rocket_mem: resolved config summary node_id=127.0.0.1:6540 addr=127.0.0.1:6540 rmp_addr=127.0.0.1:6541 metrics_addr=127.0.0.1:9340 aof_path=./appendonly.aof snapshot_path=./dump.snapshot log_filter=info log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=false acl_user_count=0 tls_enabled=false tls_replication_enabled=false
+<date>  INFO rocket_mem::aof: aof recovery replay complete commands=0 bytes=0 elapsed_us=<n>
+<date>  INFO rocket_mem: listener bound protocol=metrics addr=http://127.0.0.1:9340/metrics
+<date>  INFO rocket_mem: listener bound protocol=RMP addr=127.0.0.1:6541
+<date>  INFO rocket_mem: listener bound protocol=RESP addr=127.0.0.1:6540
+
+┌───────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ rocket-mem v0.1.4                                                                                 │
+├───────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ storage   recovered ./dump.snapshot + ./appendonly.aof (generation 0)                             │
+│ acl       no users configured -- auth disabled, every client is trusted                           │
+│ cluster   standalone (no cluster_config set)                                                      │
+│ replicas  none connected yet -- REPLICAOF is a live command; INFO REPLICATION shows current state │
+│ listeners                                                                                         │
+│           metrics  http://127.0.0.1:9340/metrics                                                  │
+│           RMP      127.0.0.1:6541                                                                 │
+│           RESP     127.0.0.1:6540                                                                 │
+└───────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 **Notes:** No `--config` and no `rocket-mem.toml` in the working directory is not an error — see
 the port note at the top of this document for why the addresses aren't the documented defaults.
 On a single-tenant machine, drop the three `ROCKET_MEM_*` env vars entirely and you'll see
 `127.0.0.1:9121` / `127.0.0.1:6380` / `127.0.0.1:6379` instead, which is the literal zero-config
-case the docs describe.
+case the docs describe. Real, captured output as of `v0.1.4`'s boxed-startup-banner redesign
+(`crates/server/src/main.rs`, shipped 2026-09-08) — six `tracing`-formatted `INFO` lines to
+stderr, then a box-drawn summary banner to stdout. This replaces the plain four-line banner this
+case documented before that redesign; if you're testing an older build, expect the old plain
+lines instead. `<date>` covers each line's ISO-8601 timestamp; `<n>` covers `elapsed_us`, which
+varies run to run. The banner is followed by a blank line before the process keeps running.
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -718,12 +738,22 @@ ps -p <pid>            # should report no such process
 ss -tlnp | grep -E ':(6540|6541|9340)\b'   # should print nothing — ports released
 ```
 
-**Expected:** the process exits and all three ports are free within about a second; no shutdown
-banner is printed to stdout/stderr — the process just stops.
+**Expected:**
+```
+    PID TTY          TIME CMD
+```
+
+The process exits and all three ports are free within about a second; no shutdown banner is
+printed to stdout/stderr — the process just stops. `ps -p <pid>` on an already-gone PID prints
+only its header row (no data row) on this system's `ps`; the `ss | grep` immediately after finds
+nothing, so it contributes no lines of its own.
 
 **Notes:** Confirmed no special log line on `SIGTERM` — don't wait for one. This is the plain
 host-process case (not PID 1 in a container); see ENV-08's notes for how this differs when
-rocket-mem is PID 1 inside Docker.
+rocket-mem is PID 1 inside Docker. The exact header text and column spacing above are this
+system's `ps` (procps-ng); a different `ps` implementation (e.g. BusyBox) may format the header
+differently or print nothing at all for a gone PID — treat the case as passing on any output
+that confirms no data row for `<pid>`, not just this literal text.
 
 **Result:** ☐ Pass ☐ Fail
 
