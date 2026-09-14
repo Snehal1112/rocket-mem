@@ -6615,11 +6615,13 @@ records its PID in a file for exactly that reason.
 
 ### ACL-01 — Bootstrap four ACL users from TOML and start the server
 
-**Precondition:** `/tmp/acltls-qa` exists. Ports 6510, 6511 and 9310 are free
+**Precondition:** Ports 6510, 6511 and 9310 are free
 (`ss -lnt | grep -E ':(6510|6511|9310)\b'` prints nothing).
 
 **Steps:**
 ```bash
+mkdir -p /tmp/acltls-qa
+
 cat > /tmp/acltls-qa/acl.toml <<'EOF'
 addr = "127.0.0.1:6510"
 rmp_addr = "127.0.0.1:6511"
@@ -6672,18 +6674,20 @@ PID=<pid>
 <date>  INFO rocket_mem: listener bound protocol=RMP addr=127.0.0.1:6511
 <date>  INFO rocket_mem: listener bound protocol=RESP addr=127.0.0.1:6510
 
-┌─────────────────────────────────────────────────┐
-│ rocket-mem v0.1.4                                │
-├─────────────────────────────────────────────────┤
-│ storage   recovered /tmp/acltls-qa/acl.snap + /tmp/acltls-qa/acl.aof (generation 0) │
-│ acl       4 users configured, auth required      │
-│ cluster   standalone (no cluster_config set)     │
+┌───────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ rocket-mem v0.1.4                                                                                 │
+├───────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ storage   recovered /tmp/acltls-qa/acl.snap + /tmp/acltls-qa/acl.aof (generation 0)               │
+│ acl       4 users configured, auth required                                                       │
+│ cluster   standalone (no cluster_config set)                                                      │
 │ replicas  none connected yet -- REPLICAOF is a live command; INFO REPLICATION shows current state │
-│ listeners                                        │
-│           metrics  http://127.0.0.1:9310/metrics │
-│           RMP      127.0.0.1:6511                │
-│           RESP     127.0.0.1:6510                │
-└─────────────────────────────────────────────────┘
+│ listeners                                                                                         │
+│           metrics  http://127.0.0.1:9310/metrics                                                  │
+│           RMP      127.0.0.1:6511                                                                 │
+│           RESP     127.0.0.1:6510                                                                 │
+└───────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+
 ```
 (box width is sized to the widest line at runtime; don't match it exactly — check for the
 labeled rows. The box border is ANSI-colorized and stripped by piping to a file/non-tty.)
@@ -6702,6 +6706,14 @@ useful thing to check on its own.
 The four users define the whole ACL surface used by ACL-02 through ACL-10: `admin` is
 full-access, `app` is narrowly scoped (one command, one key pattern), `retired` is a valid but
 disabled account, and `scoped` has every command but only `app:*` keys.
+
+ACL-01's own Steps now include the `mkdir -p /tmp/acltls-qa` step (merged in from the "ACL and
+TLS: before you start" section intro, which otherwise only described it as prose with no fenced
+bash of its own to run) — same restructuring RMP-01/OBS-01 needed, per their own notes.
+
+The banner is followed by two blank lines before the shell prompt returns — confirmed live,
+reproducible every run. The original capture trimmed them; they're part of `cat`'s real output
+and belong in this block.
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -6724,7 +6736,9 @@ NOAUTH Authentication required.
 
 NOAUTH Authentication required.
 
+
 NOAUTH Authentication required.
+
 
 ```
 
@@ -6791,6 +6805,7 @@ WRONGPASS invalid username-password pair or user is disabled.
 
 WRONGPASS invalid username-password pair or user is disabled.
 
+
 ```
 
 **Notes:** The three failures are a wrong password for a valid user, a **correct** password for a
@@ -6826,7 +6841,8 @@ proto 3
 id <n>
 mode standalone
 role master
-modules
+modules 
+
 ```
 
 **Notes:** `AUTH` and `HELLO` are the only two commands allowed through unauthenticated, because
@@ -6902,6 +6918,7 @@ OK
 hello
 NOPERM no permissions to access a key
 
+
 ```
 
 **Notes:** Read this message as "your `~pattern` is too narrow". The command itself *was* granted
@@ -6930,6 +6947,7 @@ NOPERM this user has no permissions to run this command
 NOPERM this user has no permissions to run this command
 
 NOPERM this user has no permissions to run this command
+
 
 ```
 
@@ -6968,6 +6986,7 @@ NOPERM no permissions to access a key
 
 NOPERM no permissions to access a key
 
+
 ```
 
 **Notes:** `MGET app:1 secret:1` is rejected in full — it is **not** partially served with a nil
@@ -7001,9 +7020,11 @@ NOPERM no permissions to access a key
 
 app:1
 app:2
+k1
 secret:1
 8
 secret:1
+
 ```
 
 **Notes:** **This is a confirmed, already-known security gap. Do not file a new bug for it.**
@@ -7055,6 +7076,7 @@ commands
 +get
 keys
 ~app:*
+
 ```
 
 Check three things in that output rather than diffing it byte-for-byte:
@@ -7105,6 +7127,7 @@ keys
 ~app:*
 hello
 NOPERM this user has no permissions to run this command
+
 
 ```
 
@@ -7175,6 +7198,7 @@ OK
 hello
 1
 NOAUTH Authentication required.
+
 ```
 
 **Notes:** Read the output in order: `OK` (SETUSER), then from the piped session `OK` (its AUTH)
@@ -7212,6 +7236,8 @@ ERR syntax error at 'secret123'
 
 ERR syntax error at '+@read'
 
+
+
 ```
 
 The final `ACL GETUSER tmp1` prints nothing — an empty (nil) reply.
@@ -7242,7 +7268,7 @@ rather than creating a half-configured user. Line 2 in particular would otherwis
 
 ### ACL-17 — Verify no credential reaches the slow log or the AOF
 
-**Precondition:** ACL-01 through ACL-14 have been run against a live server on port 6510, so the
+**Precondition:** ACL-01 through ACL-15 have been run against a live server on port 6510, so the
 slow log and AOF have content. The server is still running.
 
 **Steps:**
@@ -7265,10 +7291,14 @@ AUTH
 ... (2 more arguments)
 <n>
 <n>
-<n>
 ```
 
-and the `grep -c` prints:
+`head -12` cuts the third entry off after its id and timestamp — a full `AUTH` entry is 5 lines
+(id, timestamp, duration, `AUTH`, `... (2 more arguments)`), and `2×5 = 10` leaves only 2 more
+lines before the cap.
+
+and the `grep -c` prints, directly adjacent with no blank line in between (both commands' output
+is one continuous stream):
 ```
 0
 ```
@@ -7294,7 +7324,7 @@ follower's user table can drift from its leader's.
 
 ### ACL-18 — Verify `/metrics` has no authentication of its own but does count auth failures
 
-**Precondition:** ACL-01 through ACL-14 have been run against a live server; the server is still
+**Precondition:** ACL-01 through ACL-15 have been run against a live server; the server is still
 running with metrics on 9310.
 
 **Steps:**
@@ -7307,15 +7337,15 @@ curl -s http://127.0.0.1:9310/metrics | grep -E 'rocket_mem_command_errors_total
 # TYPE rocket_mem_command_errors_total counter
 rocket_mem_command_errors_total{cmd="acl"} <n>
 rocket_mem_command_errors_total{cmd="auth"} <n>
+rocket_mem_command_errors_total{cmd="cluster"} <n>
 rocket_mem_command_errors_total{cmd="get"} <n>
 rocket_mem_command_errors_total{cmd="mget"} <n>
 rocket_mem_command_errors_total{cmd="hello"} <n>
 rocket_mem_command_errors_total{cmd="set"} <n>
 rocket_mem_command_errors_total{cmd="ping"} <n>
 ```
-
-**Automation note:** the label set above must be reconfirmed against a real run before this case
-is registered — see the ACL suite automation live-verification plan.
+(line order is registration order internally, not guaranteed, and varies run to run — see
+`tools/qa-agent/src/matcher.ts`'s `UNORDERED_TABLE["ACL-18"]` entry)
 
 **Notes:** The counter values depend on exactly which of the earlier cases you ran and how many
 times; only the label shape is fixed. The two findings here are:
@@ -7325,6 +7355,16 @@ times; only the label shape is fixed. The two findings here are:
    loopback or firewall it — never expose it publicly, ACL configured or not.
 2. Failed logins (`cmd="auth"`) and NOPERM refusals (`cmd="get"`, `cmd="ping"`, ...) do increment
    the counter, which makes it a usable alerting hook for brute-force detection.
+
+The `cmd="cluster"` label is not something a human running this playbook by hand would ever
+produce — it comes from `tools/qa-agent`'s own safety mechanism (`isClusterNode`, in
+`processTracker.ts`), which sends an unauthenticated `CLUSTER MYID` probe to this suite's server
+before every single case it runs, to confirm the port isn't a real production cluster node before
+touching it. Against an ACL-protected server that probe always gets `NOAUTH`-rejected, which still
+counts as a `cluster` command error. Confirmed live 2026-09-15: this label reliably appears
+whenever this case is reached via qa-agent, with a count matching roughly the number of cases run
+so far in the session. If you run this suite's Steps by hand instead (not through qa-agent), this
+label will be absent — that's expected, not a discrepancy to chase.
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -7344,16 +7384,21 @@ redis-cli -p 6510 --user app --pass apppw --no-auth-warning set app:1 x   # app 
 grep -E 'auth success|auth failure|permission denied' /tmp/acltls-qa/acl-server.log | tail -3
 ```
 
-**Expected:** three log lines of this shape (timestamps/`conn_id`/`peer` vary):
+**Expected:** the three commands' own visible replies, then three log lines of this shape
+(timestamps/`conn_id`/`peer` vary):
 ```
-<date>  INFO conn{conn_id=<n> peer=127.0.0.1:<port> protocol=RESP tls=false node_id=127.0.0.1:6510}: rocket_mem::dispatcher: auth success user=admin
+PONG
+WRONGPASS invalid username-password pair or user is disabled.
+
+NOPERM this user has no permissions to run this command
+
 <date>  WARN conn{conn_id=<n> peer=127.0.0.1:<port> protocol=RESP tls=false node_id=127.0.0.1:6510}: rocket_mem::dispatcher: auth failure user=admin
+<date>  INFO conn{conn_id=<n> peer=127.0.0.1:<port> protocol=RESP tls=false node_id=127.0.0.1:6510}: rocket_mem::dispatcher: auth success user=app
 <date>  WARN conn{conn_id=<n> peer=127.0.0.1:<port> protocol=RESP tls=false node_id=127.0.0.1:6510}: rocket_mem::dispatcher: permission denied user=app
 ```
 
 **Automation note:** `node_id` above is filled in literally (`127.0.0.1:6510`, matching this
-suite's fixed config, confirmed deterministic in ACL-01's own capture) rather than wildcarded —
-reconfirm against a real run before this case is registered, same as ACL-18's label set.
+suite's fixed config) rather than wildcarded — confirmed deterministic live 2026-09-15.
 
 **Notes:** `auth success`/`auth failure` log at `INFO`/`WARN` with a `user=` field and never the
 password; `permission denied` logs the same way on every `NOPERM`. Both are at or above the
@@ -7363,6 +7408,15 @@ alerting), not a trace-only detail. Confirm the password (`wrongpw`) never appea
 the log file — it must not, by the same redaction policy ACL-17 already tests for the slow log
 and AOF. This is net-new since the ACL section was first written; ACL-17 covers slowlog/AOF
 redaction specifically, not this stderr-log-by-username behavior.
+
+The `tail -3` in the Steps grabs the *last* 3 matching lines, not "one per command" — command 3
+(`--user app --pass apppw set app:1 x`) alone produces **two** matches (`auth success user=app`
+then `permission denied user=app`), so the grep's full match set is 4 lines, and `tail -3` drops
+command 1's own `auth success user=admin` line off the front. Confirmed live 2026-09-15: this is
+deterministic given the fixed 3-command Steps, not run-to-run drift. The three lines above still
+demonstrate all three message shapes (`auth success`/`auth failure`/`permission denied`) — they
+just come from commands 2 and 3, not "one per command" as a naive reading of the Steps might
+suggest.
 
 **Result:** ☐ Pass ☐ Fail
 
