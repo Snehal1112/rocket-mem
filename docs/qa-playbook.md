@@ -3072,7 +3072,7 @@ ROCKET_MEM_AOF_PATH=$DATA/prc-persist.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-per
 ROCKET_MEM_METRICS_ADDR=numericlabs.lxd:9121 \
   $BIN > /dev/null 2>&1 &
 disown
-echo $! > /tmp/prc-persist.pid
+echo $! > $DATA/prc-persist.pid
 sleep 0.6
 
 wc -c < $DATA/prc-persist.aof                # 0 bytes before any write
@@ -3085,7 +3085,7 @@ sleep 1.5                                    # default fsync policy is EverySeco
 wc -c < $DATA/prc-persist.aof                 # must now be > 0
 cat $DATA/prc-persist.aof
 
-kill $(cat /tmp/prc-persist.pid)
+kill $(cat $DATA/prc-persist.pid)
 sleep 0.3
 
 # restart, same paths
@@ -3094,7 +3094,7 @@ ROCKET_MEM_AOF_PATH=$DATA/prc-persist.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-per
 ROCKET_MEM_METRICS_ADDR=numericlabs.lxd:9121 \
   $BIN > /dev/null 2>&1 &
 disown
-echo $! > /tmp/prc-persist.pid
+echo $! > $DATA/prc-persist.pid
 sleep 0.6
 redis-cli -h numericlabs.lxd -p 6379 get foo
 redis-cli -h numericlabs.lxd -p 6379 get baz
@@ -3157,7 +3157,7 @@ redis-cli -h numericlabs.lxd -p 6379 set snapkey snapval
 redis-cli -h numericlabs.lxd -p 6379 save
 ls -la $DATA/prc-persist.snap
 
-kill $(cat /tmp/prc-persist.pid)
+kill $(cat $DATA/prc-persist.pid)
 sleep 0.3
 
 RUST_LOG="info,rocket_mem::connection=off" \
@@ -3166,7 +3166,7 @@ ROCKET_MEM_AOF_PATH=$DATA/prc-persist.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-per
 ROCKET_MEM_METRICS_ADDR=numericlabs.lxd:9121 \
   $BIN &
 disown
-echo $! > /tmp/prc-persist.pid
+echo $! > $DATA/prc-persist.pid
 sleep 0.6
 redis-cli -h numericlabs.lxd -p 6379 get snapkey
 redis-cli -h numericlabs.lxd -p 6379 get foo
@@ -3231,7 +3231,7 @@ redis-cli -h numericlabs.lxd -p 6379 get foo                 # proves it, plus t
 redis-cli -h numericlabs.lxd -p 6379 set posttail tailval    # written AFTER the snapshot, only in the AOF tail
 sleep 1.5
 
-kill $(cat /tmp/prc-persist.pid)
+kill $(cat $DATA/prc-persist.pid)
 sleep 0.3
 
 RUST_LOG="info,rocket_mem::connection=off" \
@@ -3240,7 +3240,7 @@ ROCKET_MEM_AOF_PATH=$DATA/prc-persist.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-per
 ROCKET_MEM_METRICS_ADDR=numericlabs.lxd:9121 \
   $BIN &
 disown
-echo $! > /tmp/prc-persist.pid
+echo $! > $DATA/prc-persist.pid
 sleep 0.6
 redis-cli -h numericlabs.lxd -p 6379 get snapkey    # from the snapshot
 redis-cli -h numericlabs.lxd -p 6379 get posttail   # from the AOF tail written after the snapshot offset
@@ -3297,7 +3297,7 @@ after the boxed table before real command output resumes.
 
 **Steps:**
 ```bash
-kill $(cat /tmp/prc-persist.pid)
+kill $(cat $DATA/prc-persist.pid)
 sleep 0.3
 
 RUST_LOG="info,rocket_mem::connection=off" \
@@ -3306,13 +3306,13 @@ ROCKET_MEM_AOF_PATH=$DATA/prc-persist-other.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/p
 ROCKET_MEM_METRICS_ADDR=numericlabs.lxd:9121 \
   $BIN &
 disown
-echo $! > /tmp/prc-persist.pid
+echo $! > $DATA/prc-persist.pid
 sleep 0.6
 redis-cli -h numericlabs.lxd -p 6379 get foo
 redis-cli -h numericlabs.lxd -p 6379 get snapkey
 redis-cli -h numericlabs.lxd -p 6379 keys '*'
 
-kill $(cat /tmp/prc-persist.pid)
+kill $(cat $DATA/prc-persist.pid)
 sleep 0.3
 ```
 
