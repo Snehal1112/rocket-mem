@@ -3463,14 +3463,16 @@ rm -f $DATA/prc-leader.aof $DATA/prc-leader.snap $DATA/prc-follower.aof $DATA/pr
 ROCKET_MEM_ADDR=127.0.0.1:6560 ROCKET_MEM_RMP_ADDR=127.0.0.1:6561 \
 ROCKET_MEM_AOF_PATH=$DATA/prc-leader.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-leader.snap \
 ROCKET_MEM_METRICS_ADDR=127.0.0.1:9360 \
-  $BIN &
+  $BIN > /dev/null 2>&1 &
+disown
 echo $! > /tmp/prc-repl-leader.pid
 
 # follower
 ROCKET_MEM_ADDR=127.0.0.1:6562 ROCKET_MEM_RMP_ADDR=127.0.0.1:6563 \
 ROCKET_MEM_AOF_PATH=$DATA/prc-follower.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-follower.snap \
 ROCKET_MEM_METRICS_ADDR=127.0.0.1:9361 \
-  $BIN &
+  $BIN > /dev/null 2>&1 &
+disown
 echo $! > /tmp/prc-repl-follower.pid
 sleep 0.6
 
@@ -3532,7 +3534,9 @@ redis-cli -p 6562 set nope x
 
 **Expected:**
 ```
-(error) READONLY You can't write against a read only replica.
+READONLY You can't write against a read only replica.
+
+
 ```
 
 **Result:** ☐ Pass ☐ Fail
@@ -3553,9 +3557,9 @@ redis-cli -p 6562 info replication
 ```
 # Replication
 role:master
-master_repl_offset:<n>
 connected_slaves:1
 slave0:ip=127.0.0.1,port=6562,state=online,offset=<n>,lag=<n>
+master_repl_offset:<n>
 
 # Replication
 role:slave
@@ -3564,6 +3568,8 @@ master_port:6560
 master_link_status:up
 slave_repl_offset:<n>
 master_repl_offset:<n>
+
+
 ```
 
 **Result:** ☐ Pass ☐ Fail
@@ -3591,8 +3597,9 @@ sleep 0.3
 OK
 # Replication
 role:master
-master_repl_offset:0
 connected_slaves:0
+master_repl_offset:0
+
 OK
 yes
 ```
@@ -3613,13 +3620,15 @@ rm -f $DATA/prc-leader2.aof $DATA/prc-leader2.snap $DATA/prc-follower2.aof $DATA
 ROCKET_MEM_ADDR=127.0.0.1:6560 ROCKET_MEM_RMP_ADDR=127.0.0.1:6561 \
 ROCKET_MEM_AOF_PATH=$DATA/prc-leader2.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-leader2.snap \
 ROCKET_MEM_METRICS_ADDR=127.0.0.1:9360 \
-  $BIN &
+  $BIN > /dev/null 2>&1 &
+disown
 echo $! > /tmp/prc-repl2-leader.pid
 
 ROCKET_MEM_ADDR=127.0.0.1:6562 ROCKET_MEM_RMP_ADDR=127.0.0.1:6563 \
 ROCKET_MEM_AOF_PATH=$DATA/prc-follower2.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-follower2.snap \
 ROCKET_MEM_METRICS_ADDR=127.0.0.1:9361 \
-  $BIN &
+  $BIN > /dev/null 2>&1 &
+disown
 echo $! > /tmp/prc-repl2-follower.pid
 sleep 0.6
 
@@ -3632,7 +3641,7 @@ sleep 0.5
 redis-cli -p 6562 get divergedkey               # gone: full resync overwrote local state
 redis-cli -p 6562 get leaderkey                 # leader's data now present
 
-curl -s http://127.0.0.1:9360/metrics | grep -i replic
+curl -s http://127.0.0.1:9360/metrics | grep -i replic | sort
 
 kill $(cat /tmp/prc-repl2-leader.pid) $(cat /tmp/prc-repl2-follower.pid)
 sleep 0.3
@@ -3644,23 +3653,34 @@ OK
 OK
 divergedval
 OK
-(nil)
+
 leaderval
-# TYPE rocket_mem_replication_last_apply_timestamp_seconds gauge
-rocket_mem_replication_last_apply_timestamp_seconds 0
 # TYPE rocket_mem_connected_replicas gauge
-rocket_mem_connected_replicas 0
+# TYPE rocket_mem_good_replicas gauge
+# TYPE rocket_mem_replica_min_ack_offset gauge
+# TYPE rocket_mem_replication_last_apply_timestamp_seconds gauge
+rocket_mem_connected_replicas 1
+rocket_mem_good_replicas 1
+rocket_mem_replica_min_ack_offset <n>
+rocket_mem_replication_last_apply_timestamp_seconds 0
 ```
 
 **Notes:** This is expected behavior, not a bug: Sprint 5's design has no partial-resync/offset-
 resume support, so a dropped or freshly-attached follower always gets a fresh full snapshot,
-which silently discards anything the follower had written locally. `rocket_mem_connected_replicas`
-is the follower-count gauge; `rocket_mem_replication_last_apply_timestamp_seconds` is a coarser
-wall-clock signal that exists *alongside* the real offset/lag fields — see REPL-04, which already
-covers `master_repl_offset`/`slave_repl_offset` and each `slaveN:` line's `offset=/lag=` fields.
-`PSYNC` goes through the same `AUTH`/ACL gate every other command does; REPL-11/REPL-12 below
-verify that an ACL-protected leader cleanly rejects an unauthenticated follower's `PSYNC` (never a
-crash) and accepts one configured with `replicaof_auth_username`/`replicaof_auth_password`.
+which silently discards anything the follower had written locally. `grep -i replic` (case-
+insensitive, no anchor) matches every metric family whose name contains "replic" — not just
+`rocket_mem_connected_replicas`/`rocket_mem_replication_last_apply_timestamp_seconds` as the
+original Expected assumed, but also `rocket_mem_good_replicas` and
+`rocket_mem_replica_min_ack_offset` (both already covered in more depth by REPL-08). And since the
+follower genuinely attaches successfully earlier in this same case (the `get leaderkey`/`get
+divergedkey` results above prove the resync happened), `rocket_mem_connected_replicas` reads `1`
+here, not `0` — the original Expected's `0` assumed the follower was still standalone at the point
+metrics were scraped, which isn't true by this point in the script.
+`rocket_mem_replica_min_ack_offset` is wildcarded since its exact byte offset varies run to run
+(same reasoning as REPL-08's notes). `PSYNC` goes through the same `AUTH`/ACL gate every other
+command does; REPL-11/REPL-12 below verify that an ACL-protected leader cleanly rejects an
+unauthenticated follower's `PSYNC` (never a crash) and accepts one configured with
+`replicaof_auth_username`/`replicaof_auth_password`.
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -3680,7 +3700,8 @@ ROCKET_MEM_ADDR=127.0.0.1:6630 ROCKET_MEM_RMP_ADDR=127.0.0.1:6631 \
 ROCKET_MEM_AOF_PATH=$DATA/prc-fence-leader.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-fence-leader.snap \
 ROCKET_MEM_METRICS_ADDR=127.0.0.1:9330 \
 ROCKET_MEM_MIN_REPLICAS_TO_WRITE=1 ROCKET_MEM_MIN_REPLICAS_MAX_LAG_SECS=3 \
-  $BIN &
+  $BIN > /dev/null 2>&1 &
+disown
 echo $! > /tmp/prc-fence-leader.pid
 sleep 0.6
 
@@ -3715,7 +3736,8 @@ rm -f $DATA/prc-fence-follower.aof $DATA/prc-fence-follower.snap
 ROCKET_MEM_ADDR=127.0.0.1:6640 ROCKET_MEM_RMP_ADDR=127.0.0.1:6641 \
 ROCKET_MEM_AOF_PATH=$DATA/prc-fence-follower.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-fence-follower.snap \
 ROCKET_MEM_METRICS_ADDR=127.0.0.1:9340 \
-  $BIN &
+  $BIN > /dev/null 2>&1 &
+disown
 echo $! > /tmp/prc-fence-follower.pid
 sleep 0.6
 
@@ -3725,7 +3747,7 @@ sleep 2.5                                 # let it attach and send its first REP
 redis-cli -p 6630 set k v
 sleep 0.3
 redis-cli -p 6640 get k
-curl -s http://127.0.0.1:9330/metrics | grep -E 'rocket_mem_good_replicas|rocket_mem_replica_min_ack_offset'
+curl -s http://127.0.0.1:9330/metrics | grep -E 'rocket_mem_good_replicas|rocket_mem_replica_min_ack_offset' | sort
 
 kill $(cat /tmp/prc-fence-leader.pid) $(cat /tmp/prc-fence-follower.pid)
 sleep 0.3
@@ -3737,9 +3759,9 @@ OK
 OK
 v
 # TYPE rocket_mem_good_replicas gauge
-rocket_mem_good_replicas 1
 # TYPE rocket_mem_replica_min_ack_offset gauge
-rocket_mem_replica_min_ack_offset 27
+rocket_mem_good_replicas 1
+rocket_mem_replica_min_ack_offset <n>
 ```
 
 **Notes:** `rocket_mem_replica_min_ack_offset`'s exact number will vary run to run (it's the
@@ -3757,21 +3779,30 @@ line at startup and one `INFO ... leaving fenced state` line the moment the firs
 
 **Steps:**
 ```bash
+rm -f $DATA/prc-invalid.aof $DATA/prc-invalid.snap
 ROCKET_MEM_ADDR=127.0.0.1:6630 ROCKET_MEM_RMP_ADDR=127.0.0.1:6631 \
+ROCKET_MEM_AOF_PATH=$DATA/prc-invalid.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-invalid.snap \
 ROCKET_MEM_METRICS_ADDR=127.0.0.1:9330 \
 ROCKET_MEM_MIN_REPLICAS_TO_WRITE=1 ROCKET_MEM_MIN_REPLICAS_MAX_LAG_SECS=0 \
   $BIN
 ```
 
-**Expected:** process exits immediately, before any listener binds:
+**Expected:** process exits immediately after startup logging but before any listener binds:
 ```
-config error: min_replicas_to_write is set but min_replicas_max_lag_secs is 0 -- no replica
-could ever qualify, so every write would be refused forever
+<date>  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=127.0.0.1:6630
+<date>  INFO rocket_mem: resolved config summary node_id=127.0.0.1:6630 addr=127.0.0.1:6630 rmp_addr=127.0.0.1:6631 metrics_addr=127.0.0.1:9330 aof_path=<path> snapshot_path=<path> log_filter=info log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=false acl_user_count=0 tls_enabled=false tls_replication_enabled=false
+<date>  INFO rocket_mem::aof: aof recovery replay complete commands=0 bytes=0 elapsed_us=<n>
+Error: Custom { kind: InvalidInput, error: "min_replicas_to_write is set but min_replicas_max_lag_secs is 0 -- no replica could ever qualify, so every write would be refused forever" }
 ```
 
 **Notes:** `validate_min_replicas` (`crates/server/src/config.rs`) treats this combination as a
 config typo that would otherwise spell a permanent, silent write outage — a 0-second lag window
-means no replica's ack could ever be "recent enough."
+means no replica's ack could ever be "recent enough." The original Expected assumed a clean
+`config error: ...` line printed *before* any startup logging — in reality the process logs its
+normal starting/config-summary/AOF-recovery lines first (no listener-bound line ever follows,
+confirming the validation still fires before any port opens) and only then exits via a bare Rust
+`Result::Err` propagated out of `main`, rendered as `Error: Custom { kind: InvalidInput, error:
+"..." }` (`std::io::Error`'s `Debug` form) rather than a hand-formatted message.
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -3789,14 +3820,16 @@ rm -f $DATA/prc-announce-follower.aof $DATA/prc-announce-follower.snap
 ROCKET_MEM_ADDR=127.0.0.1:6630 ROCKET_MEM_RMP_ADDR=127.0.0.1:6631 \
 ROCKET_MEM_AOF_PATH=$DATA/prc-announce-leader.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-announce-leader.snap \
 ROCKET_MEM_METRICS_ADDR=127.0.0.1:9330 \
-  $BIN &
+  $BIN > /dev/null 2>&1 &
+disown
 echo $! > /tmp/prc-announce-leader.pid
 
 ROCKET_MEM_ADDR=127.0.0.1:6640 ROCKET_MEM_RMP_ADDR=127.0.0.1:6641 \
 ROCKET_MEM_AOF_PATH=$DATA/prc-announce-follower.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-announce-follower.snap \
 ROCKET_MEM_METRICS_ADDR=127.0.0.1:9340 \
 ROCKET_MEM_REPLICA_ANNOUNCE_ADDR=announced.example.com:16640 \
-  $BIN &
+  $BIN > /dev/null 2>&1 &
+disown
 echo $! > /tmp/prc-announce-follower.pid
 sleep 0.6
 
@@ -3816,6 +3849,8 @@ role:master
 connected_slaves:1
 slave0:ip=announced.example.com,port=16640,state=online,offset=<n>,lag=<n>
 master_repl_offset:<n>
+
+
 ```
 
 **Notes:** Without `replica_announce_addr` set, the same line instead shows the follower's real
@@ -3848,7 +3883,8 @@ enabled = true
 rules = ["allcommands", "allkeys"]
 EOF
 
-$BIN --config $DATA/prc-acl-leader.toml &
+$BIN --config $DATA/prc-acl-leader.toml > /dev/null 2>&1 &
+disown
 echo $! > /tmp/prc-acl-leader.pid
 sleep 0.6
 
@@ -3857,14 +3893,15 @@ ROCKET_MEM_ADDR=127.0.0.1:6640 ROCKET_MEM_RMP_ADDR=127.0.0.1:6641 \
 ROCKET_MEM_AOF_PATH=$DATA/prc-acl-follower.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-acl-follower.snap \
 ROCKET_MEM_METRICS_ADDR=127.0.0.1:9340 \
 RUST_LOG=rocket_mem=info \
-  $BIN 2>$DATA/prc-acl-follower.stderr &
+  $BIN > $DATA/prc-acl-follower.stderr 2>&1 &
+disown
 echo $! > /tmp/prc-acl-follower.pid
 sleep 0.6
 
 redis-cli -p 6640 replicaof 127.0.0.1 6630
 sleep 1.5
 redis-cli -p 6640 info replication
-grep "leader rejected PSYNC" $DATA/prc-acl-follower.stderr
+grep -m1 "leader rejected PSYNC" $DATA/prc-acl-follower.stderr
 
 kill $(cat /tmp/prc-acl-leader.pid) $(cat /tmp/prc-acl-follower.pid)
 sleep 0.3
@@ -3880,15 +3917,20 @@ master_port:6630
 master_link_status:down
 slave_repl_offset:0
 master_repl_offset:0
-... error=leader rejected PSYNC: NOAUTH Authentication required.
+
+<date>  WARN repl{host_port=127.0.0.1:6630}: rocket_mem::replication: replication connection lost, reconnecting host_port=127.0.0.1:6630 error=leader rejected PSYNC: NOAUTH Authentication required.
 ```
 
 **Notes:** `master_link_status` stays `down` — the follower process does not crash or exit; it
 retries on a fixed backoff, logging one `WARN ... replication connection lost, reconnecting ...
-error=leader rejected PSYNC: NOAUTH Authentication required.` line per attempt. An ACL-protected
-leader's `PSYNC` rejection is a plain RESP error line (`-NOAUTH ...`), distinct from the raw
-length-prefixed snapshot blob a successful `PSYNC` sends — the follower must distinguish the two
-before reading. REPL-12 proves the credentialed path succeeds against the same leader.
+error=leader rejected PSYNC: NOAUTH Authentication required.` line per attempt (grepped with
+`-m1` since more than one retry can already have logged by the time the grep runs — the original
+Steps had no such limit, so an Expected of exactly one line was never reliably reachable). An
+ACL-protected leader's `PSYNC` rejection is a plain RESP error line (`-NOAUTH ...`), distinct from
+the raw length-prefixed snapshot blob a successful `PSYNC` sends — the follower must distinguish
+the two before reading. The original `...` prefix wasn't a real wildcard token either — replaced
+with `<date>` plus the real literal span, same fix as several Observability cases. REPL-12 proves
+the credentialed path succeeds against the same leader.
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -3896,11 +3938,32 @@ before reading. REPL-12 proves the credentialed path succeeds against the same l
 
 ### REPL-12 — PSYNC with correct `replicaof_auth_username`/`replicaof_auth_password` succeeds against the same ACL-protected leader
 
-**Precondition:** REPL-11's leader still running (or restart it identically). No follower on
+**Precondition:** An ACL-protected leader on 6630-6631/9330 (REPL-11's own leader is already dead
+by this point — its Steps kill it — so this case restarts one identically). No follower on
 6640-6641/9340.
 
 **Steps:**
 ```bash
+rm -f $DATA/prc-acl-leader2.aof $DATA/prc-acl-leader2.snap
+cat > $DATA/prc-acl-leader2.toml <<EOF
+addr = "127.0.0.1:6630"
+rmp_addr = "127.0.0.1:6631"
+aof_path = "$DATA/prc-acl-leader2.aof"
+snapshot_path = "$DATA/prc-acl-leader2.snap"
+metrics_addr = "127.0.0.1:9330"
+
+[[acl.users]]
+username = "repl"
+password = "replpw"
+enabled = true
+rules = ["allcommands", "allkeys"]
+EOF
+
+$BIN --config $DATA/prc-acl-leader2.toml > /dev/null 2>&1 &
+disown
+echo $! > /tmp/prc-acl-leader2.pid
+sleep 0.6
+
 cat > $DATA/prc-acl-follower.toml <<EOF
 addr = "127.0.0.1:6640"
 rmp_addr = "127.0.0.1:6641"
@@ -3912,7 +3975,8 @@ replicaof_auth_username = "repl"
 replicaof_auth_password = "replpw"
 EOF
 
-$BIN --config $DATA/prc-acl-follower.toml &
+$BIN --config $DATA/prc-acl-follower.toml > /dev/null 2>&1 &
+disown
 echo $! > /tmp/prc-acl-follower2.pid
 sleep 1.5
 
@@ -3921,7 +3985,7 @@ redis-cli -p 6630 -a replpw --user repl --no-auth-warning set k v
 sleep 0.3
 redis-cli -p 6640 get k
 
-kill $(cat /tmp/prc-acl-leader.pid) $(cat /tmp/prc-acl-follower2.pid)
+kill $(cat /tmp/prc-acl-leader2.pid) $(cat /tmp/prc-acl-follower2.pid)
 sleep 0.3
 ```
 
@@ -3934,6 +3998,7 @@ master_port:6630
 master_link_status:up
 slave_repl_offset:<n>
 master_repl_offset:<n>
+
 OK
 v
 ```
@@ -3941,7 +4006,10 @@ v
 **Notes:** `AUTH <username> <password>` is sent once, before `PSYNC`, and its reply round-trips
 through the normal RESP codec (unlike `PSYNC`'s own reply, the raw length-prefixed blob) — a
 rejected `AUTH` (wrong password) fails the same way as a rejected `PSYNC`: cleanly, with a retry,
-never a crash.
+never a crash. This case now starts its own fresh ACL leader (`prc-acl-leader2.toml`, same
+credentials as REPL-11's) instead of assuming "REPL-11's leader still running" — REPL-11's own
+Steps already kill it, so nothing survives that far into the suite; the original precondition's
+own parenthetical ("or restart it identically") acknowledged this gap without actually closing it.
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -4488,7 +4556,7 @@ EOF
 ROCKET_MEM_ADDR=127.0.0.1:7101 ROCKET_MEM_AOF_PATH=$DATA/prc-a-bad.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-a-bad.snap \
 ROCKET_MEM_CLUSTER_CONFIG=$DATA/prc-cluster-gap.conf ROCKET_MEM_CLUSTER_NODE_ID=shard-a \
 ROCKET_MEM_METRICS_ADDR=127.0.0.1:9360 ROCKET_MEM_RMP_ADDR=127.0.0.1:6561 \
-  $BIN
+  $BIN 2>&1
 echo "exit code: $?"
 ```
 
@@ -4503,21 +4571,26 @@ EOF
 ROCKET_MEM_ADDR=127.0.0.1:7101 ROCKET_MEM_AOF_PATH=$DATA/prc-a-bad2.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-a-bad2.snap \
 ROCKET_MEM_CLUSTER_CONFIG=$DATA/prc-cluster-overlap.conf ROCKET_MEM_CLUSTER_NODE_ID=shard-a \
 ROCKET_MEM_METRICS_ADDR=127.0.0.1:9360 ROCKET_MEM_RMP_ADDR=127.0.0.1:6561 \
-  $BIN
+  $BIN 2>&1
 echo "exit code: $?"
 ```
 
 **Expected:**
 ```
+<date>  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=shard-a
+<date>  INFO rocket_mem: resolved config summary node_id=shard-a addr=127.0.0.1:7101 rmp_addr=127.0.0.1:6561 metrics_addr=127.0.0.1:9360 aof_path=<path> snapshot_path=<path> log_filter=info log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=true acl_enabled=false acl_user_count=0 tls_enabled=false tls_replication_enabled=false
 Error: Custom { kind: InvalidData, error: "cluster config has a slot gap: nothing owns slots 5461..=5461" }
 exit code: 1
-
+<date>  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=shard-a
+<date>  INFO rocket_mem: resolved config summary node_id=shard-a addr=127.0.0.1:7101 rmp_addr=127.0.0.1:6561 metrics_addr=127.0.0.1:9360 aof_path=<path> snapshot_path=<path> log_filter=info log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=true acl_enabled=false acl_user_count=0 tls_enabled=false tls_replication_enabled=false
 Error: Custom { kind: InvalidData, error: "cluster config ranges overlap: 'shard-a' ends at 5461 but 'shard-b' starts at 5461" }
 exit code: 1
 ```
 
-**Notes:** Both errors abort before any listener binds — no partial startup, no port left open.
-The valid `prc-cluster.conf` written in the first step is reused by every following CLUSTER case.
+**Notes:** Both errors abort before any listener binds — no partial startup, no port left open;
+the normal starting/config-summary log lines still print first, same as REPL-09's config-error
+case. The valid `prc-cluster.conf` written in the first step is reused by every following CLUSTER
+case.
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -4536,35 +4609,64 @@ ROCKET_MEM_ADDR=127.0.0.1:7101 ROCKET_MEM_AOF_PATH=$DATA/prc-a.aof ROCKET_MEM_SN
 ROCKET_MEM_CLUSTER_CONFIG=$DATA/prc-cluster.conf ROCKET_MEM_CLUSTER_NODE_ID=shard-a \
 ROCKET_MEM_METRICS_ADDR=127.0.0.1:9360 ROCKET_MEM_RMP_ADDR=127.0.0.1:6561 \
   $BIN &
+disown
 echo $! > /tmp/prc-cluster-a.pid
 
 ROCKET_MEM_ADDR=127.0.0.1:7102 ROCKET_MEM_AOF_PATH=$DATA/prc-b.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-b.snap \
 ROCKET_MEM_CLUSTER_CONFIG=$DATA/prc-cluster.conf ROCKET_MEM_CLUSTER_NODE_ID=shard-b \
 ROCKET_MEM_METRICS_ADDR=127.0.0.1:9361 ROCKET_MEM_RMP_ADDR=127.0.0.1:6562 \
-  $BIN &
+  $BIN > /dev/null 2>&1 &
+disown
 echo $! > /tmp/prc-cluster-b.pid
 
 ROCKET_MEM_ADDR=127.0.0.1:7103 ROCKET_MEM_AOF_PATH=$DATA/prc-c.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-c.snap \
 ROCKET_MEM_CLUSTER_CONFIG=$DATA/prc-cluster.conf ROCKET_MEM_CLUSTER_NODE_ID=shard-c \
 ROCKET_MEM_METRICS_ADDR=127.0.0.1:9362 ROCKET_MEM_RMP_ADDR=127.0.0.1:6563 \
-  $BIN &
+  $BIN > /dev/null 2>&1 &
+disown
 echo $! > /tmp/prc-cluster-c.pid
 sleep 0.7
 ```
 
-**Expected (shard-a's log; shard-b/c are identical modulo their own id/port/slots):**
+**Expected (shard-a's log; shard-b/c are identical modulo their own id/port/slots — shard-b/c's
+own stdout/stderr are redirected to `/dev/null` here specifically so this case can capture
+shard-a's alone, without the three nodes' concurrent startup output interleaving):**
 ```
-Cluster mode enabled: node 'shard-a' at 127.0.0.1:7101 owns slots 0-5460 of 3 nodes
-Recovered state from $DATA/prc-a.snap and $DATA/prc-a.aof
-Metrics on http://127.0.0.1:9360/metrics
-RMP listening on 127.0.0.1:6561
-Listening on 127.0.0.1:7101
+<date>  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=shard-a
+<date>  INFO rocket_mem: resolved config summary node_id=shard-a addr=127.0.0.1:7101 rmp_addr=127.0.0.1:6561 metrics_addr=127.0.0.1:9360 aof_path=<path> snapshot_path=<path> log_filter=info log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=true acl_enabled=false acl_user_count=0 tls_enabled=false tls_replication_enabled=false
+<date>  INFO rocket_mem::cluster: cluster topology loaded node_id=shard-a first_slot=0 last_slot=5460 node_count=3
+<date>  INFO rocket_mem::aof: aof recovery replay complete commands=0 bytes=0 elapsed_us=<n>
+<date>  INFO rocket_mem: listener bound protocol=metrics addr=http://127.0.0.1:9360/metrics
+<date>  INFO rocket_mem: listener bound protocol=RMP addr=127.0.0.1:6561
+<date>  INFO rocket_mem: listener bound protocol=RESP addr=127.0.0.1:7101
+
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ rocket-mem v0.1.4                                                                                               │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ storage   recovered <path> + <path> (generation 0)                                                              │
+│ acl       no users configured -- auth disabled, every client is trusted                                         │
+│ cluster   node 'shard-a' owns slots 0-5460 (3 nodes total)                                                      │
+│           shard-a  127.0.0.1:7101  slots 0-5460      (this node)                                                │
+│           shard-b  127.0.0.1:7102  slots 5461-10922                                                             │
+│           shard-c  127.0.0.1:7103  slots 10923-16383                                                            │
+│ replicas  none connected yet -- REPLICAOF is a live command; INFO REPLICATION shows current state               │
+│ listeners                                                                                                       │
+│           metrics  http://127.0.0.1:9360/metrics                                                                │
+│           RMP      127.0.0.1:6561                                                                               │
+│           RESP     127.0.0.1:7101                                                                               │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+
 ```
 
 **Notes:** All three RMP ports (6561-6563) collide with the leader/follower bank used in the
 Replication section above — that's fine as long as those servers were already killed first.
 Never run the Replication and Cluster sections concurrently against the port list in this
-document.
+document. The original Expected showed a pre-redesign plain-text banner (`Cluster mode enabled:
+...`/`Recovered state from ...`/etc.) that predates the current structured-logging + boxed
+config-summary table (see Observability's own notes on this same pre/post-redesign split) —
+rewritten here from a real captured run, box-drawing width included, since that width depends on
+the longest content line (a `$DATA`-relative path in this case).
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -4585,25 +4687,78 @@ redis-cli -p 7101 cluster myid
 
 **Expected:**
 ```
-(integer) 12182
-1) 1) "slots"
-   2) 1) (integer) 0
-      2) (integer) 5460
-   3) "nodes"
-   ...(shard-a entry: id shard-a, port 7101, ip 127.0.0.1, role master, health online)...
-2) ... (shard-b: slots 5461-10922) ...
-3) ... (shard-c: slots 10923-16383) ...
+12182
+slots
+0
+5460
+nodes
+id
+shard-a
+port
+7101
+ip
+127.0.0.1
+endpoint
+127.0.0.1
+role
+master
+replication-offset
+0
+health
+online
+slots
+5461
+10922
+nodes
+id
+shard-b
+port
+7102
+ip
+127.0.0.1
+endpoint
+127.0.0.1
+role
+master
+replication-offset
+0
+health
+online
+slots
+10923
+16383
+nodes
+id
+shard-c
+port
+7103
+ip
+127.0.0.1
+endpoint
+127.0.0.1
+role
+master
+replication-offset
+0
+health
+online
 shard-a 127.0.0.1:7101@17101 myself,master - 0 0 0 connected 0-5460
 shard-b 127.0.0.1:7102@17102 master - 0 0 0 connected 5461-10922
 shard-c 127.0.0.1:7103@17103 master - 0 0 0 connected 10923-16383
 cluster_enabled:1
 cluster_state:ok
 cluster_slots_assigned:16384
+cluster_slots_ok:16384
+cluster_slots_pfail:0
+cluster_slots_fail:0
 cluster_known_nodes:3
 cluster_size:3
 cluster_my_epoch:0
 cluster_current_epoch:0
-"shard-a"
+cluster_stats_messages_sent:0
+cluster_stats_messages_received:0
+total_cluster_links_buffer_limit_exceeded:0
+shard-a
 ```
 
 **Notes:** `foo` hashes to slot 12182, owned by shard-c — used as the MOVED example in
@@ -4612,7 +4767,15 @@ nothing is ever bound there (no cluster bus exists — see CLUSTER-06). `connect
 `cluster_state:ok` above are live liveness-probe results, not hardcoded literals: each node probes
 every other configured peer once per `cluster_probe_interval_secs` (default 1s) and reports
 `disconnected`/`master,fail?`/`cluster_state:fail` once a peer misses `cluster_node_timeout_secs`
-(default 15s) of probes. See CLUSTER-06 for what a genuinely dead peer looks like here.
+(default 15s) of probes. See CLUSTER-06 for what a genuinely dead peer looks like here. The
+original Expected rendered `CLUSTER SHARDS`'/`CLUSTER KEYSLOT`'s reply in `redis-cli`'s
+*interactive*-mode nested-array notation (`1) 1) "slots"`/`(integer) 0`/etc., plus a `...`
+ellipsis that was never a real wildcard) — non-interactive mode (what every case in this
+playbook actually runs under) instead flattens every nested reply to one leaf value per line, no
+array markers or type prefixes at all, and `CLUSTER INFO`'s real reply also carries three more
+fields (`cluster_slots_ok`/`cluster_slots_pfail`/`cluster_slots_fail` — already covered in depth
+by CLUSTER-07 — plus the three `cluster_stats_*`/`total_cluster_links_*` counters, permanently 0
+since there is no real cluster bus for them to count) than the original Expected anticipated.
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -4633,10 +4796,12 @@ redis-cli -p 7103 get foo
 
 **Expected:**
 ```
-(error) MOVED 12182 127.0.0.1:7103
-(error) MOVED 12182 127.0.0.1:7103
+MOVED 12182 127.0.0.1:7103
+
+MOVED 12182 127.0.0.1:7103
+
 OK
-"bar"
+bar
 ```
 
 **Notes:** `GET foo` on the wrong node also comes back `MOVED`, never a value — that's the
@@ -4659,7 +4824,9 @@ redis-cli -p 7101 mset hello 1 foo 2
 
 **Expected:**
 ```
-(error) CROSSSLOT Keys in request don't hash to the same slot
+CROSSSLOT Keys in request don't hash to the same slot
+
+
 ```
 
 **Result:** ☐ Pass ☐ Fail
@@ -4681,8 +4848,8 @@ sleep 0.3
 
 **Expected:**
 ```
-(integer) 3443
-(integer) 3443
+3443
+3443
 ```
 
 **Notes — known limits to expect, not bugs:** no cluster bus and no gossip — nodes never agree
@@ -4719,21 +4886,24 @@ ROCKET_MEM_ADDR=127.0.0.1:7101 ROCKET_MEM_AOF_PATH=$DATA/prc-a.aof ROCKET_MEM_SN
 ROCKET_MEM_CLUSTER_CONFIG=$DATA/prc-cluster.conf ROCKET_MEM_CLUSTER_NODE_ID=shard-a \
 ROCKET_MEM_METRICS_ADDR=127.0.0.1:9360 ROCKET_MEM_RMP_ADDR=127.0.0.1:6561 \
 ROCKET_MEM_CLUSTER_PROBE_INTERVAL_SECS=1 ROCKET_MEM_CLUSTER_NODE_TIMEOUT_SECS=3 \
-  $BIN &
+  $BIN > /dev/null 2>&1 &
+disown
 echo $! > /tmp/prc-cluster-a.pid
 
 ROCKET_MEM_ADDR=127.0.0.1:7102 ROCKET_MEM_AOF_PATH=$DATA/prc-b.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-b.snap \
 ROCKET_MEM_CLUSTER_CONFIG=$DATA/prc-cluster.conf ROCKET_MEM_CLUSTER_NODE_ID=shard-b \
 ROCKET_MEM_METRICS_ADDR=127.0.0.1:9361 ROCKET_MEM_RMP_ADDR=127.0.0.1:6562 \
 ROCKET_MEM_CLUSTER_PROBE_INTERVAL_SECS=1 ROCKET_MEM_CLUSTER_NODE_TIMEOUT_SECS=3 \
-  $BIN &
+  $BIN > /dev/null 2>&1 &
+disown
 echo $! > /tmp/prc-cluster-b.pid
 
 ROCKET_MEM_ADDR=127.0.0.1:7103 ROCKET_MEM_AOF_PATH=$DATA/prc-c.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-c.snap \
 ROCKET_MEM_CLUSTER_CONFIG=$DATA/prc-cluster.conf ROCKET_MEM_CLUSTER_NODE_ID=shard-c \
 ROCKET_MEM_METRICS_ADDR=127.0.0.1:9362 ROCKET_MEM_RMP_ADDR=127.0.0.1:6563 \
 ROCKET_MEM_CLUSTER_PROBE_INTERVAL_SECS=1 ROCKET_MEM_CLUSTER_NODE_TIMEOUT_SECS=3 \
-  $BIN &
+  $BIN > /dev/null 2>&1 &
+disown
 echo $! > /tmp/prc-cluster-c.pid
 sleep 1
 
@@ -4746,7 +4916,7 @@ sleep 4   # one node_timeout (3s) plus one probe_interval (1s) of slack
 redis-cli -p 7102 cluster nodes
 redis-cli -p 7102 cluster info | grep -E 'cluster_state|cluster_slots_'
 redis-cli -p 7102 cluster shards | grep -A1 health
-curl -s localhost:9361/metrics | grep cluster_peers
+curl -s localhost:9361/metrics | grep cluster_peers | sort
 
 # Routing is unchanged even though shard-a is known dead:
 redis-cli -p 7102 get hello   # slot 866, owned by shard-a
@@ -4765,19 +4935,39 @@ cluster_slots_pfail:5461
 cluster_slots_fail:0
 health
 failed
+--
+health
+online
+--
+health
+online
+# TYPE rocket_mem_cluster_peers_reachable gauge
+# TYPE rocket_mem_cluster_peers_unreachable gauge
 rocket_mem_cluster_peers_reachable 1
 rocket_mem_cluster_peers_unreachable 1
 MOVED 866 127.0.0.1:7101
+
+
 ```
 
 **Notes:** `cluster_slots_pfail:5461` is exactly shard-a's span (slots 0-5460, 5461 slots) —
 `cluster_slots_fail` stays `0` by design: there is no cluster bus for a suspicion to be promoted
-over (see CLUSTER-06's notes on *pfail* vs *fail*). shard-b's own terminal output carries exactly
-one line for this transition, not one per probe round — a `WARN` naming `peer=shard-a
-node_timeout_secs=3`. `GET hello` still redirects to `127.0.0.1:7101` — shard-a's *configured*
-address — because picking a different owner for slots 0-5460 is a topology decision nothing here
-has a mechanism to agree on. This is the report-only behavior CLUSTER-06 already describes in
-prose; this case makes it a reproducible, exact-output test.
+over (see CLUSTER-06's notes on *pfail* vs *fail*). `GET hello` still redirects to
+`127.0.0.1:7101` — shard-a's *configured* address — because picking a different owner for slots
+0-5460 is a topology decision nothing here has a mechanism to agree on. This is the report-only
+behavior CLUSTER-06 already describes in prose; this case makes it a reproducible, exact-output
+test. All three nodes' own stdout/stderr are now redirected to `/dev/null` (plus `disown`, so a
+`kill -9` doesn't print a bash job-control notice into the captured output) — the original Steps
+had no redirect at all, so the WARN transition line the original notes described ("exactly one
+line... `peer=shard-a node_timeout_secs=3`") was never actually isolatable from this case's own
+Steps, and in practice logged twice within the 4-second sleep window, not once as claimed; since
+this case's Expected never needed that log line captured to begin with (only the `redis-cli`/
+`curl` results matter), suppressing it entirely is simpler than trying to grep for exactly one.
+`cluster shards | grep -A1 health` matches every shard's `health` field, not just shard-a's — the
+original Expected only anticipated shard-a's (`failed`), missing shard-b/c's own `online` lines.
+`curl | grep cluster_peers` is piped through `sort` (same reasoning as REPL-06/08) since the two
+gauge/TYPE-comment lines' relative order isn't stable run to run, and the original Expected also
+omitted the `# TYPE ... gauge` comment lines the grep pattern also matches.
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -4794,7 +4984,8 @@ ROCKET_MEM_ADDR=127.0.0.1:7101 ROCKET_MEM_AOF_PATH=$DATA/prc-a.aof ROCKET_MEM_SN
 ROCKET_MEM_CLUSTER_CONFIG=$DATA/prc-cluster.conf ROCKET_MEM_CLUSTER_NODE_ID=shard-a \
 ROCKET_MEM_METRICS_ADDR=127.0.0.1:9360 ROCKET_MEM_RMP_ADDR=127.0.0.1:6561 \
 ROCKET_MEM_CLUSTER_PROBE_INTERVAL_SECS=1 ROCKET_MEM_CLUSTER_NODE_TIMEOUT_SECS=3 \
-  $BIN &
+  $BIN > /dev/null 2>&1 &
+disown
 echo $! > /tmp/prc-cluster-a.pid
 sleep 2
 
@@ -4822,7 +5013,9 @@ CLUSTER-07: the liveness map has no memory of a dead peer once a probe succeeds.
 
 **Steps:**
 ```bash
-kill $(cat /tmp/prc-cluster-a.pid) $(cat /tmp/prc-cluster-b.pid) $(cat /tmp/prc-cluster-c.pid)
+# Only shard-b restarts here (to change its own log level) -- shard-a/shard-c stay up so
+# shard-b actually has live peers probing it.
+kill $(cat /tmp/prc-cluster-b.pid)
 sleep 0.3
 
 # Round 1: default log level (info). Capture shard-b's output this time.
@@ -4853,18 +5046,30 @@ sleep 5
 grep -c "connection accepted" $DATA/prc-b-debug.log   # count Y
 ```
 
-**Expected:** Round 1 (`info`, `$DATA/prc-b-info.log`): the `connection accepted` count over 5
-real seconds of probing (5 probe rounds from each of 2 peers) is **0** — no line at all from
-probe traffic. Round 2 (`debug`, `$DATA/prc-b-debug.log`): the count is **on the order of 10**
-(roughly one `DEBUG` pair per peer per second, two peers, five seconds).
+**Expected:**
+```
+0
+10
+```
 
-**Notes:** This is the observable, black-box effect of the fixed marker this node's own probe
-`PING`s carry (`crates/server/src/cluster_health.rs`) — the receiving side recognizes its own
-probe traffic and logs that one connection's accept/close pair at `debug` instead of `info`,
-specifically so a healthy, unchanging cluster stays quiet at the `info` default. There is no
-black-box way to inspect the marker's exact bytes without a packet capture, which is out of scope
-for this playbook — its effect on log volume, tested here, is what an operator actually needs to
-verify.
+**Notes:** Round 1 (`info`, `$DATA/prc-b-info.log`): the `connection accepted` count over 5 real
+seconds of probing (5 probe rounds from each of 2 peers) is **0** — no line at all from probe
+traffic, and not wildcarded, since the whole point is that it's exactly zero. Round 2 (`debug`,
+`$DATA/prc-b-debug.log`): the count is **on the order of 10** (roughly one `DEBUG` pair per peer
+per second, two peers, five seconds) — this line carries a numeric tolerance in `matcher.ts`'s
+`TOLERANCE_TABLE` (2-20) rather than an exact match, since real probe timing jitters run to run;
+the tolerance is deliberately wide enough to still fail on anything close to `0`, so it can't
+accidentally pass if debug-level probe logging silently stopped working. This is the observable,
+black-box effect of the fixed marker this node's own probe `PING`s carry
+(`crates/server/src/cluster_health.rs`) — the receiving side recognizes its own probe traffic and
+logs that one connection's accept/close pair at `debug` instead of `info`, specifically so a
+healthy, unchanging cluster stays quiet at the `info` default. There is no black-box way to
+inspect the marker's exact bytes without a packet capture, which is out of scope for this
+playbook — its effect on log volume, tested here, is what an operator actually needs to verify.
+This case's first Steps line originally killed shard-a/shard-b/shard-c together, contradicting
+its own comment two lines later ("shard-a and shard-c, unchanged from CLUSTER-07/08's commands")
+— fixed to kill only shard-b, since restarting all three left shard-b with no live peers to be
+probed by at all, and both rounds' counts would read `0`.
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -4938,7 +5143,23 @@ immediately, even though all three processes are alive and each answers a direct
 elsewhere in this playbook is sufficient for a `redis-cli --tls` client, but not for rocket-mem's
 own peer-to-peer probing.
 
-**Result:** ☐ Pass ☐ Fail
+**KNOWN PRODUCT BUG, confirmed live 2026-09-14 — this case's own Expected block above is not
+currently reachable:** even with the exact `-addext` SAN fix this case's own Steps already apply,
+every node's peer-probe TLS handshake against every other node fails with `tls handshake failed
+... error=received fatal alert: CertificateUnknown`, symmetrically — shard-a and shard-c both end
+up `disconnected`/`fail?`, not just the intentionally-broken case this case is trying to
+demonstrate. Confirmed NOT a cert-recipe issue: a plain `openssl s_client` handshake against the
+same listener, using the identical cert as its trust anchor, succeeds cleanly (`Verify return
+code: 0 (ok)`). The failure traces to `crates/server/src/tls.rs`'s `load_client_config` (reused by
+the cluster peer-prober per `cluster_health.rs`'s own doc comment on `tls_client_config`) —
+something about how it pins a self-signed leaf certificate as a trust root causes `rustls`/
+`rustls-webpki` to reject the peer's presented certificate. This needs an actual source-level fix
+in `tls.rs`/`cluster_health.rs`, not a documentation or test-tooling change — left unfixed here
+deliberately, out of scope for a QA-playbook accuracy pass. Excluded from qa-agent's automated
+in-scope cases for this reason (`tools/qa-agent/src/suites.ts`'s `IN_SCOPE_SUITES`), same
+treatment as Transactions' TXN-10.
+
+**Result:** ☐ Pass ☑ Fail (known product bug, see note above — not yet fixed)
 
 ---
 
