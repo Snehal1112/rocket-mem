@@ -3071,6 +3071,7 @@ ROCKET_MEM_ADDR=numericlabs.lxd:6379 ROCKET_MEM_RMP_ADDR=numericlabs.lxd:7379 \
 ROCKET_MEM_AOF_PATH=$DATA/prc-persist.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-persist.snap \
 ROCKET_MEM_METRICS_ADDR=numericlabs.lxd:9121 \
   $BIN > /dev/null 2>&1 &
+disown
 echo $! > /tmp/prc-persist.pid
 sleep 0.6
 
@@ -3092,6 +3093,7 @@ ROCKET_MEM_ADDR=numericlabs.lxd:6379 ROCKET_MEM_RMP_ADDR=numericlabs.lxd:7379 \
 ROCKET_MEM_AOF_PATH=$DATA/prc-persist.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-persist.snap \
 ROCKET_MEM_METRICS_ADDR=numericlabs.lxd:9121 \
   $BIN > /dev/null 2>&1 &
+disown
 echo $! > /tmp/prc-persist.pid
 sleep 0.6
 redis-cli -h numericlabs.lxd -p 6379 get foo
@@ -3134,7 +3136,12 @@ lines actually being tested here). Contrast with PERSIST-02, where the restart b
 the point and isn't redirected away. `wc -c` also reads its input redirected from the file (`<`)
 rather than taking the path as an argument — with a path argument, `wc` also prints the filename
 after the count, which would make the exact `0`/`62` byte counts below dependent on `$DATA`'s
-own (scratch, run-to-run-variable) path length.
+own (scratch, run-to-run-variable) path length. `disown` right after each background launch
+throughout this section (not just here) stops the shell from later printing its own
+`[job] Killed ...`/`Terminated` job-control notice for that PID to this same output stream —
+confirmed live, this notice is otherwise printed (at an unpredictable point — observed right
+before the *next* background launch, not immediately after the kill) whenever a backgrounded
+job is killed by an unusual signal, most reliably reproduced by PERSIST-05's `kill -9`.
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -3158,6 +3165,7 @@ ROCKET_MEM_ADDR=numericlabs.lxd:6379 ROCKET_MEM_RMP_ADDR=numericlabs.lxd:7379 \
 ROCKET_MEM_AOF_PATH=$DATA/prc-persist.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-persist.snap \
 ROCKET_MEM_METRICS_ADDR=numericlabs.lxd:9121 \
   $BIN &
+disown
 echo $! > /tmp/prc-persist.pid
 sleep 0.6
 redis-cli -h numericlabs.lxd -p 6379 get snapkey
@@ -3177,18 +3185,18 @@ OK
 <date>  INFO rocket_mem: listener bound protocol=RMP addr=192.168.1.12:7379
 <date>  INFO rocket_mem: listener bound protocol=RESP addr=192.168.1.12:6379
 
-┌───────────────────────────────────────────────────────────────────────────────────────────────────┐
-│ rocket-mem v0.1.4                                                                                 │
-├───────────────────────────────────────────────────────────────────────────────────────────────────┤
-│ storage   recovered <data-dir>/prc-persist.snap + <data-dir>/prc-persist.aof (generation 0)                 │
-│ acl       no users configured -- auth disabled, every client is trusted                           │
-│ cluster   standalone (no cluster_config set)                                                      │
-│ replicas  none connected yet -- REPLICAOF is a live command; INFO REPLICATION shows current state │
-│ listeners                                                                                         │
-│           metrics  http://192.168.1.12:9121/metrics                                               │
-│           RMP      192.168.1.12:7379                                                              │
-│           RESP     192.168.1.12:6379                                                              │
-└───────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ rocket-mem v0.1.4                                                                                                           │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ storage   recovered <data-dir>/prc-persist.snap + <data-dir>/prc-persist.aof (generation 0) │
+│ acl       no users configured -- auth disabled, every client is trusted                                                     │
+│ cluster   standalone (no cluster_config set)                                                                                │
+│ replicas  none connected yet -- REPLICAOF is a live command; INFO REPLICATION shows current state                           │
+│ listeners                                                                                                                   │
+│           metrics  http://192.168.1.12:9121/metrics                                                                         │
+│           RMP      192.168.1.12:7379                                                                                        │
+│           RESP     192.168.1.12:6379                                                                                        │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 
 snapval
 bar
@@ -3231,6 +3239,7 @@ ROCKET_MEM_ADDR=numericlabs.lxd:6379 ROCKET_MEM_RMP_ADDR=numericlabs.lxd:7379 \
 ROCKET_MEM_AOF_PATH=$DATA/prc-persist.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-persist.snap \
 ROCKET_MEM_METRICS_ADDR=numericlabs.lxd:9121 \
   $BIN &
+disown
 echo $! > /tmp/prc-persist.pid
 sleep 0.6
 redis-cli -h numericlabs.lxd -p 6379 get snapkey    # from the snapshot
@@ -3250,18 +3259,18 @@ OK
 <date>  INFO rocket_mem: listener bound protocol=RMP addr=192.168.1.12:7379
 <date>  INFO rocket_mem: listener bound protocol=RESP addr=192.168.1.12:6379
 
-┌───────────────────────────────────────────────────────────────────────────────────────────────────┐
-│ rocket-mem v0.1.4                                                                                 │
-├───────────────────────────────────────────────────────────────────────────────────────────────────┤
-│ storage   recovered <data-dir>/prc-persist.snap + <data-dir>/prc-persist.aof (generation 0)                 │
-│ acl       no users configured -- auth disabled, every client is trusted                           │
-│ cluster   standalone (no cluster_config set)                                                      │
-│ replicas  none connected yet -- REPLICAOF is a live command; INFO REPLICATION shows current state │
-│ listeners                                                                                         │
-│           metrics  http://192.168.1.12:9121/metrics                                               │
-│           RMP      192.168.1.12:7379                                                              │
-│           RESP     192.168.1.12:6379                                                              │
-└───────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ rocket-mem v0.1.4                                                                                                           │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ storage   recovered <data-dir>/prc-persist.snap + <data-dir>/prc-persist.aof (generation 0) │
+│ acl       no users configured -- auth disabled, every client is trusted                                                     │
+│ cluster   standalone (no cluster_config set)                                                                                │
+│ replicas  none connected yet -- REPLICAOF is a live command; INFO REPLICATION shows current state                           │
+│ listeners                                                                                                                   │
+│           metrics  http://192.168.1.12:9121/metrics                                                                         │
+│           RMP      192.168.1.12:7379                                                                                        │
+│           RESP     192.168.1.12:6379                                                                                        │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 
 snapval
 tailval
@@ -3296,6 +3305,7 @@ ROCKET_MEM_ADDR=numericlabs.lxd:6379 ROCKET_MEM_RMP_ADDR=numericlabs.lxd:7379 \
 ROCKET_MEM_AOF_PATH=$DATA/prc-persist-other.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-persist-other.snap \
 ROCKET_MEM_METRICS_ADDR=numericlabs.lxd:9121 \
   $BIN &
+disown
 echo $! > /tmp/prc-persist.pid
 sleep 0.6
 redis-cli -h numericlabs.lxd -p 6379 get foo
@@ -3315,18 +3325,19 @@ sleep 0.3
 <date>  INFO rocket_mem: listener bound protocol=RMP addr=192.168.1.12:7379
 <date>  INFO rocket_mem: listener bound protocol=RESP addr=192.168.1.12:6379
 
-┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│ rocket-mem v0.1.4                                                                                     │
-├───────────────────────────────────────────────────────────────────────────────────────────────────────┤
-│ storage   recovered <data-dir>/prc-persist-other.snap + <data-dir>/prc-persist-other.aof (generation 0)         │
-│ acl       no users configured -- auth disabled, every client is trusted                               │
-│ cluster   standalone (no cluster_config set)                                                          │
-│ replicas  none connected yet -- REPLICAOF is a live command; INFO REPLICATION shows current state     │
-│ listeners                                                                                             │
-│           metrics  http://192.168.1.12:9121/metrics                                                   │
-│           RMP      192.168.1.12:7379                                                                  │
-│           RESP     192.168.1.12:6379                                                                  │
-└───────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ rocket-mem v0.1.4                                                                                                                       │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ storage   recovered <data-dir>/prc-persist-other.snap + <data-dir>/prc-persist-other.aof (generation 0) │
+│ acl       no users configured -- auth disabled, every client is trusted                                                                 │
+│ cluster   standalone (no cluster_config set)                                                                                            │
+│ replicas  none connected yet -- REPLICAOF is a live command; INFO REPLICATION shows current state                                       │
+│ listeners                                                                                                                               │
+│           metrics  http://192.168.1.12:9121/metrics                                                                                     │
+│           RMP      192.168.1.12:7379                                                                                                    │
+│           RESP     192.168.1.12:6379                                                                                                    │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
 
 
 
@@ -3362,6 +3373,7 @@ ROCKET_MEM_ADDR=numericlabs.lxd:6379 ROCKET_MEM_RMP_ADDR=numericlabs.lxd:7379 \
 ROCKET_MEM_AOF_PATH=$DATA/prc-kill9.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-kill9.snap \
 ROCKET_MEM_METRICS_ADDR=numericlabs.lxd:9121 \
   $BIN > /dev/null 2>&1 &
+disown
 echo $! > /tmp/prc-kill9.pid
 sleep 0.6
 
@@ -3379,6 +3391,7 @@ ROCKET_MEM_ADDR=numericlabs.lxd:6379 ROCKET_MEM_RMP_ADDR=numericlabs.lxd:7379 \
 ROCKET_MEM_AOF_PATH=$DATA/prc-kill9.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/prc-kill9.snap \
 ROCKET_MEM_METRICS_ADDR=numericlabs.lxd:9121 \
   $BIN &
+disown
 echo $! > /tmp/prc-kill9.pid
 sleep 0.6
 redis-cli -h numericlabs.lxd -p 6379 get survive
@@ -3398,18 +3411,19 @@ OK
 <date>  INFO rocket_mem: listener bound protocol=RMP addr=192.168.1.12:7379
 <date>  INFO rocket_mem: listener bound protocol=RESP addr=192.168.1.12:6379
 
-┌───────────────────────────────────────────────────────────────────────────────────────────────────┐
-│ rocket-mem v0.1.4                                                                                 │
-├───────────────────────────────────────────────────────────────────────────────────────────────────┤
-│ storage   recovered <data-dir>/prc-kill9.snap + <data-dir>/prc-kill9.aof (generation 0)                     │
-│ acl       no users configured -- auth disabled, every client is trusted                           │
-│ cluster   standalone (no cluster_config set)                                                      │
-│ replicas  none connected yet -- REPLICAOF is a live command; INFO REPLICATION shows current state │
-│ listeners                                                                                         │
-│           metrics  http://192.168.1.12:9121/metrics                                               │
-│           RMP      192.168.1.12:7379                                                              │
-│           RESP     192.168.1.12:6379                                                              │
-└───────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ rocket-mem v0.1.4                                                                                                       │
+├─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ storage   recovered <data-dir>/prc-kill9.snap + <data-dir>/prc-kill9.aof (generation 0) │
+│ acl       no users configured -- auth disabled, every client is trusted                                                 │
+│ cluster   standalone (no cluster_config set)                                                                            │
+│ replicas  none connected yet -- REPLICAOF is a live command; INFO REPLICATION shows current state                       │
+│ listeners                                                                                                               │
+│           metrics  http://192.168.1.12:9121/metrics                                                                     │
+│           RMP      192.168.1.12:7379                                                                                    │
+│           RESP     192.168.1.12:6379                                                                                    │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
 yes
 1
 ```
@@ -5000,10 +5014,13 @@ aof_path = "/tmp/rm-qa-cfg1.aof"
 snapshot_path = "/tmp/rm-qa-cfg1.snap"
 EOF
 
+mkdir -p /tmp/rm-qa-work
 cd /tmp/rm-qa-work
 rm -f /tmp/rm-qa-cfg1.aof /tmp/rm-qa-cfg1.snap
-"$ROCKET_MEM_BIN" \
+RUST_LOG="info,rocket_mem::connection=off" \
+  "$ROCKET_MEM_BIN" \
   --config /tmp/rm-qa-cfg/my-config.toml &
+disown
 PID=$!
 sleep 0.5
 redis-cli -h numericlabs.lxd -p 6379 ping
@@ -5013,7 +5030,7 @@ kill $PID
 **Expected:**
 ```
 <date>  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=numericlabs.lxd:6379
-<date>  INFO rocket_mem: resolved config summary node_id=numericlabs.lxd:6379 addr=numericlabs.lxd:6379 rmp_addr=numericlabs.lxd:7379 metrics_addr=numericlabs.lxd:9121 aof_path=/tmp/rm-qa-cfg1.aof snapshot_path=/tmp/rm-qa-cfg1.snap log_filter=info log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=false acl_user_count=0 tls_enabled=false tls_replication_enabled=false
+<date>  INFO rocket_mem: resolved config summary node_id=numericlabs.lxd:6379 addr=numericlabs.lxd:6379 rmp_addr=numericlabs.lxd:7379 metrics_addr=numericlabs.lxd:9121 aof_path=/tmp/rm-qa-cfg1.aof snapshot_path=/tmp/rm-qa-cfg1.snap log_filter=info,rocket_mem::connection=off log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=false acl_user_count=0 tls_enabled=false tls_replication_enabled=false
 <date>  INFO rocket_mem::aof: aof recovery replay complete commands=0 bytes=0 elapsed_us=<n>
 <date>  INFO rocket_mem: listener bound protocol=metrics addr=http://192.168.1.12:9121/metrics
 <date>  INFO rocket_mem: listener bound protocol=RMP addr=192.168.1.12:7379
@@ -5031,12 +5048,18 @@ kill $PID
 │           RMP      192.168.1.12:7379                                                              │
 │           RESP     192.168.1.12:6379                                                              │
 └───────────────────────────────────────────────────────────────────────────────────────────────────┘
+
 PONG
 ```
 
 **Notes:** The `aof recovery replay complete commands=0 bytes=0` line (and the boxed table's
 `storage` row) print even on a brand-new AOF/snapshot path with nothing to recover — not proof a
-prior snapshot actually existed. Don't read it as a warning sign.
+prior snapshot actually existed. Don't read it as a warning sign. `mkdir -p /tmp/rm-qa-work`
+above makes this case self-contained rather than relying on the one-time manual setup note
+above this section. Every server launch throughout this section sets
+`RUST_LOG="info,rocket_mem::connection=off"` and runs `disown` right after backgrounding — same
+reasoning as the Persistence suite's identical pattern (banner wanted, per-connection logging and
+shell job-control notices not).
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -5052,7 +5075,8 @@ mkdir -p /tmp/rm-qa-auto
 cp /tmp/rm-qa-cfg/my-config.toml /tmp/rm-qa-auto/rocket-mem.toml
 cd /tmp/rm-qa-auto
 rm -f /tmp/rm-qa-cfg1.aof /tmp/rm-qa-cfg1.snap
-"$ROCKET_MEM_BIN" &
+RUST_LOG="info,rocket_mem::connection=off" "$ROCKET_MEM_BIN" &
+disown
 PID=$!
 sleep 0.5
 redis-cli -h numericlabs.lxd -p 6379 ping
@@ -5062,7 +5086,7 @@ kill $PID
 **Expected:**
 ```
 <date>  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=numericlabs.lxd:6379
-<date>  INFO rocket_mem: resolved config summary node_id=numericlabs.lxd:6379 addr=numericlabs.lxd:6379 rmp_addr=numericlabs.lxd:7379 metrics_addr=numericlabs.lxd:9121 aof_path=/tmp/rm-qa-cfg1.aof snapshot_path=/tmp/rm-qa-cfg1.snap log_filter=info log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=false acl_user_count=0 tls_enabled=false tls_replication_enabled=false
+<date>  INFO rocket_mem: resolved config summary node_id=numericlabs.lxd:6379 addr=numericlabs.lxd:6379 rmp_addr=numericlabs.lxd:7379 metrics_addr=numericlabs.lxd:9121 aof_path=/tmp/rm-qa-cfg1.aof snapshot_path=/tmp/rm-qa-cfg1.snap log_filter=info,rocket_mem::connection=off log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=false acl_user_count=0 tls_enabled=false tls_replication_enabled=false
 <date>  INFO rocket_mem::aof: aof recovery replay complete commands=0 bytes=0 elapsed_us=<n>
 <date>  INFO rocket_mem: listener bound protocol=metrics addr=http://192.168.1.12:9121/metrics
 <date>  INFO rocket_mem: listener bound protocol=RMP addr=192.168.1.12:7379
@@ -5080,6 +5104,7 @@ kill $PID
 │           RMP      192.168.1.12:7379                                                              │
 │           RESP     192.168.1.12:6379                                                              │
 └───────────────────────────────────────────────────────────────────────────────────────────────────┘
+
 PONG
 ```
 
@@ -5102,7 +5127,9 @@ rm -f /tmp/rm-qa-envonly.aof /tmp/rm-qa-envonly.snap
 ROCKET_MEM_ADDR=numericlabs.lxd:6379 ROCKET_MEM_RMP_ADDR=numericlabs.lxd:7379 \
 ROCKET_MEM_METRICS_ADDR=numericlabs.lxd:9121 \
 ROCKET_MEM_AOF_PATH=/tmp/rm-qa-envonly.aof ROCKET_MEM_SNAPSHOT_PATH=/tmp/rm-qa-envonly.snap \
+RUST_LOG="info,rocket_mem::connection=off" \
   "$ROCKET_MEM_BIN" &
+disown
 PID=$!
 sleep 0.5
 redis-cli -h numericlabs.lxd -p 6379 ping
@@ -5114,7 +5141,7 @@ kill $PID
 **Expected:**
 ```
 <date>  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=numericlabs.lxd:6379
-<date>  INFO rocket_mem: resolved config summary node_id=numericlabs.lxd:6379 addr=numericlabs.lxd:6379 rmp_addr=numericlabs.lxd:7379 metrics_addr=numericlabs.lxd:9121 aof_path=/tmp/rm-qa-envonly.aof snapshot_path=/tmp/rm-qa-envonly.snap log_filter=info log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=false acl_user_count=0 tls_enabled=false tls_replication_enabled=false
+<date>  INFO rocket_mem: resolved config summary node_id=numericlabs.lxd:6379 addr=numericlabs.lxd:6379 rmp_addr=numericlabs.lxd:7379 metrics_addr=numericlabs.lxd:9121 aof_path=/tmp/rm-qa-envonly.aof snapshot_path=/tmp/rm-qa-envonly.snap log_filter=info,rocket_mem::connection=off log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=false acl_user_count=0 tls_enabled=false tls_replication_enabled=false
 <date>  INFO rocket_mem::aof: aof recovery replay complete commands=0 bytes=0 elapsed_us=<n>
 <date>  INFO rocket_mem: listener bound protocol=metrics addr=http://192.168.1.12:9121/metrics
 <date>  INFO rocket_mem: listener bound protocol=RMP addr=192.168.1.12:7379
@@ -5132,6 +5159,7 @@ kill $PID
 │           RMP      192.168.1.12:7379                                                              │
 │           RESP     192.168.1.12:6379                                                              │
 └───────────────────────────────────────────────────────────────────────────────────────────────────┘
+
 PONG
 OK
 envval
@@ -5157,8 +5185,10 @@ rm -f /tmp/rm-qa-envonly.aof /tmp/rm-qa-envonly.snap
 ROCKET_MEM_ADDR=numericlabs.lxd:6379 ROCKET_MEM_RMP_ADDR=numericlabs.lxd:7379 \
 ROCKET_MEM_METRICS_ADDR=numericlabs.lxd:9121 \
 ROCKET_MEM_AOF_PATH=/tmp/rm-qa-envonly.aof ROCKET_MEM_SNAPSHOT_PATH=/tmp/rm-qa-envonly.snap \
+RUST_LOG="info,rocket_mem::connection=off" \
   "$ROCKET_MEM_BIN" \
   --config /tmp/rm-qa-cfg/does-not-exist.toml &
+disown
 PID=$!
 sleep 0.5
 kill -0 $PID && echo STILL_RUNNING
@@ -5169,9 +5199,8 @@ kill $PID
 **Expected:**
 ```
 ls: cannot access '/tmp/rm-qa-cfg/does-not-exist.toml': No such file or directory
-STILL_RUNNING
 <date>  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=numericlabs.lxd:6379
-<date>  INFO rocket_mem: resolved config summary node_id=numericlabs.lxd:6379 addr=numericlabs.lxd:6379 rmp_addr=numericlabs.lxd:7379 metrics_addr=numericlabs.lxd:9121 aof_path=/tmp/rm-qa-envonly.aof snapshot_path=/tmp/rm-qa-envonly.snap log_filter=info log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=false acl_user_count=0 tls_enabled=false tls_replication_enabled=false
+<date>  INFO rocket_mem: resolved config summary node_id=numericlabs.lxd:6379 addr=numericlabs.lxd:6379 rmp_addr=numericlabs.lxd:7379 metrics_addr=numericlabs.lxd:9121 aof_path=/tmp/rm-qa-envonly.aof snapshot_path=/tmp/rm-qa-envonly.snap log_filter=info,rocket_mem::connection=off log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=false acl_user_count=0 tls_enabled=false tls_replication_enabled=false
 <date>  INFO rocket_mem::aof: aof recovery replay complete commands=0 bytes=0 elapsed_us=<n>
 <date>  INFO rocket_mem: listener bound protocol=metrics addr=http://192.168.1.12:9121/metrics
 <date>  INFO rocket_mem: listener bound protocol=RMP addr=192.168.1.12:7379
@@ -5189,13 +5218,17 @@ STILL_RUNNING
 │           RMP      192.168.1.12:7379                                                              │
 │           RESP     192.168.1.12:6379                                                              │
 └───────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+STILL_RUNNING
 PONG
 ```
 
 **Notes:** A typo'd `--config` path fails open, not loud: the process starts normally, the TOML
 layer is silently skipped, and configuration falls through to the env-var layer (here) or
 defaults. There is no warning printed anywhere. A deployment that relies on `--config` actually
-loading will not notice a typo.
+loading will not notice a typo. The startup banner appears in the transcript *before*
+`STILL_RUNNING`, not after — the server prints it almost immediately on its own, well before the
+0.5s `sleep` (and therefore the `kill -0`/`echo`) ever runs; confirmed live.
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -5210,8 +5243,10 @@ rmp_addr=`numericlabs.lxd:7379`, metrics_addr=`numericlabs.lxd:9121`).
 ```bash
 cd /tmp/rm-qa-work
 rm -f /tmp/rm-qa-cfg1.aof /tmp/rm-qa-cfg1.snap
-"$ROCKET_MEM_BIN" \
+RUST_LOG="info,rocket_mem::connection=off" \
+  "$ROCKET_MEM_BIN" \
   --config /tmp/rm-qa-cfg/my-config.toml &
+disown
 PID=$!
 sleep 0.5
 kill $PID
@@ -5220,7 +5255,7 @@ kill $PID
 **Expected:**
 ```
 <date>  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=numericlabs.lxd:6379
-<date>  INFO rocket_mem: resolved config summary node_id=numericlabs.lxd:6379 addr=numericlabs.lxd:6379 rmp_addr=numericlabs.lxd:7379 metrics_addr=numericlabs.lxd:9121 aof_path=/tmp/rm-qa-cfg1.aof snapshot_path=/tmp/rm-qa-cfg1.snap log_filter=info log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=false acl_user_count=0 tls_enabled=false tls_replication_enabled=false
+<date>  INFO rocket_mem: resolved config summary node_id=numericlabs.lxd:6379 addr=numericlabs.lxd:6379 rmp_addr=numericlabs.lxd:7379 metrics_addr=numericlabs.lxd:9121 aof_path=/tmp/rm-qa-cfg1.aof snapshot_path=/tmp/rm-qa-cfg1.snap log_filter=info,rocket_mem::connection=off log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=false acl_user_count=0 tls_enabled=false tls_replication_enabled=false
 <date>  INFO rocket_mem::aof: aof recovery replay complete commands=0 bytes=0 elapsed_us=<n>
 <date>  INFO rocket_mem: listener bound protocol=metrics addr=http://192.168.1.12:9121/metrics
 <date>  INFO rocket_mem: listener bound protocol=RMP addr=192.168.1.12:7379
@@ -5238,6 +5273,7 @@ kill $PID
 │           RMP      192.168.1.12:7379                                                              │
 │           RESP     192.168.1.12:6379                                                              │
 └───────────────────────────────────────────────────────────────────────────────────────────────────┘
+
 ```
 
 **Result:** ☐ Pass ☐ Fail
@@ -5253,8 +5289,10 @@ kill $PID
 cd /tmp/rm-qa-work
 rm -f /tmp/rm-qa-cfg1.aof /tmp/rm-qa-cfg1.snap
 ROCKET_MEM_ADDR=numericlabs.lxd:6479 \
+RUST_LOG="info,rocket_mem::connection=off" \
   "$ROCKET_MEM_BIN" \
   --config /tmp/rm-qa-cfg/my-config.toml &
+disown
 PID=$!
 sleep 0.5
 kill $PID
@@ -5263,7 +5301,7 @@ kill $PID
 **Expected:**
 ```
 <date>  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=numericlabs.lxd:6479
-<date>  INFO rocket_mem: resolved config summary node_id=numericlabs.lxd:6479 addr=numericlabs.lxd:6479 rmp_addr=numericlabs.lxd:7379 metrics_addr=numericlabs.lxd:9121 aof_path=/tmp/rm-qa-cfg1.aof snapshot_path=/tmp/rm-qa-cfg1.snap log_filter=info log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=false acl_user_count=0 tls_enabled=false tls_replication_enabled=false
+<date>  INFO rocket_mem: resolved config summary node_id=numericlabs.lxd:6479 addr=numericlabs.lxd:6479 rmp_addr=numericlabs.lxd:7379 metrics_addr=numericlabs.lxd:9121 aof_path=/tmp/rm-qa-cfg1.aof snapshot_path=/tmp/rm-qa-cfg1.snap log_filter=info,rocket_mem::connection=off log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=false acl_user_count=0 tls_enabled=false tls_replication_enabled=false
 <date>  INFO rocket_mem::aof: aof recovery replay complete commands=0 bytes=0 elapsed_us=<n>
 <date>  INFO rocket_mem: listener bound protocol=metrics addr=http://192.168.1.12:9121/metrics
 <date>  INFO rocket_mem: listener bound protocol=RMP addr=192.168.1.12:7379
@@ -5281,6 +5319,7 @@ kill $PID
 │           RMP      192.168.1.12:7379                                                              │
 │           RESP     192.168.1.12:6479                                                              │
 └───────────────────────────────────────────────────────────────────────────────────────────────────┘
+
 ```
 
 **Notes:** `addr` bound on **`numericlabs.lxd:6479`** (the env value — shard-a's real replica
@@ -5301,8 +5340,10 @@ env var set them.
 cd /tmp/rm-qa-work
 rm -f /tmp/rm-qa-cfg1.aof /tmp/rm-qa-cfg1.snap
 ROCKET_MEM_ADDR=numericlabs.lxd:6479 \
+RUST_LOG="info,rocket_mem::connection=off" \
   "$ROCKET_MEM_BIN" \
   --config /tmp/rm-qa-cfg/my-config.toml --addr numericlabs.lxd:6380 &
+disown
 PID=$!
 sleep 0.5
 redis-cli -h numericlabs.lxd -p 6380 ping
@@ -5312,7 +5353,7 @@ kill $PID
 **Expected:**
 ```
 <date>  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=numericlabs.lxd:6380
-<date>  INFO rocket_mem: resolved config summary node_id=numericlabs.lxd:6380 addr=numericlabs.lxd:6380 rmp_addr=numericlabs.lxd:7379 metrics_addr=numericlabs.lxd:9121 aof_path=/tmp/rm-qa-cfg1.aof snapshot_path=/tmp/rm-qa-cfg1.snap log_filter=info log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=false acl_user_count=0 tls_enabled=false tls_replication_enabled=false
+<date>  INFO rocket_mem: resolved config summary node_id=numericlabs.lxd:6380 addr=numericlabs.lxd:6380 rmp_addr=numericlabs.lxd:7379 metrics_addr=numericlabs.lxd:9121 aof_path=/tmp/rm-qa-cfg1.aof snapshot_path=/tmp/rm-qa-cfg1.snap log_filter=info,rocket_mem::connection=off log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=false acl_user_count=0 tls_enabled=false tls_replication_enabled=false
 <date>  INFO rocket_mem::aof: aof recovery replay complete commands=0 bytes=0 elapsed_us=<n>
 <date>  INFO rocket_mem: listener bound protocol=metrics addr=http://192.168.1.12:9121/metrics
 <date>  INFO rocket_mem: listener bound protocol=RMP addr=192.168.1.12:7379
@@ -5330,6 +5371,7 @@ kill $PID
 │           RMP      192.168.1.12:7379                                                              │
 │           RESP     192.168.1.12:6380                                                              │
 └───────────────────────────────────────────────────────────────────────────────────────────────────┘
+
 PONG
 ```
 
@@ -5426,14 +5468,24 @@ sleep 0.5
 
 **Steps:**
 ```bash
-# (just re-check the server's already-printed startup banner, or PING RESP to confirm it's up)
+mkdir -p /tmp/rm-qa-work
+cd /tmp/rm-qa-work
+rm -f /tmp/rm-qa-rmp.aof /tmp/rm-qa-rmp.snap
+RUST_LOG="info,rocket_mem::connection=off" \
+ROCKET_MEM_ADDR=numericlabs.lxd:6379 ROCKET_MEM_RMP_ADDR=numericlabs.lxd:7379 \
+ROCKET_MEM_METRICS_ADDR=numericlabs.lxd:9121 \
+ROCKET_MEM_AOF_PATH=/tmp/rm-qa-rmp.aof ROCKET_MEM_SNAPSHOT_PATH=/tmp/rm-qa-rmp.snap \
+  "$ROCKET_MEM_BIN" &
+disown
+PID=$!
+sleep 0.5
 redis-cli -h numericlabs.lxd -p 6379 ping
 ```
 
 **Expected (banner from the setup block's stdout):**
 ```
 <date>  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=numericlabs.lxd:6379
-<date>  INFO rocket_mem: resolved config summary node_id=numericlabs.lxd:6379 addr=numericlabs.lxd:6379 rmp_addr=numericlabs.lxd:7379 metrics_addr=numericlabs.lxd:9121 aof_path=/tmp/rm-qa-rmp.aof snapshot_path=/tmp/rm-qa-rmp.snap log_filter=info log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=false acl_user_count=0 tls_enabled=false tls_replication_enabled=false
+<date>  INFO rocket_mem: resolved config summary node_id=numericlabs.lxd:6379 addr=numericlabs.lxd:6379 rmp_addr=numericlabs.lxd:7379 metrics_addr=numericlabs.lxd:9121 aof_path=/tmp/rm-qa-rmp.aof snapshot_path=/tmp/rm-qa-rmp.snap log_filter=info,rocket_mem::connection=off log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=false acl_user_count=0 tls_enabled=false tls_replication_enabled=false
 <date>  INFO rocket_mem::aof: aof recovery replay complete commands=0 bytes=0 elapsed_us=<n>
 <date>  INFO rocket_mem: listener bound protocol=metrics addr=http://192.168.1.12:9121/metrics
 <date>  INFO rocket_mem: listener bound protocol=RMP addr=192.168.1.12:7379
@@ -5451,6 +5503,7 @@ redis-cli -h numericlabs.lxd -p 6379 ping
 │           RMP      192.168.1.12:7379                                                              │
 │           RESP     192.168.1.12:6379                                                              │
 └───────────────────────────────────────────────────────────────────────────────────────────────────┘
+
 PONG
 ```
 
@@ -5469,6 +5522,8 @@ never commit it.
 
 **Steps:**
 ```bash
+cd "$ROCKET_MEM_REPO"
+mkdir -p crates/rmp-client/examples
 cat > crates/rmp-client/examples/qa_scratch.rs <<'EOF'
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -5480,23 +5535,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 EOF
 
-cd "$ROCKET_MEM_REPO"
-cargo run -p rmp-client --example qa_scratch
+cargo run -q -p rmp-client --example qa_scratch
 
 rm crates/rmp-client/examples/qa_scratch.rs
-git status --porcelain   # must print nothing — confirms the scratch file is gone
+git status --porcelain crates/rmp-client/examples/   # must print nothing — confirms cleanup
 ```
 
 **Expected:**
 ```
 round-trip: foo -> Some(b"bar")
 ```
-(plus normal `cargo run` compile/finished/running lines before it; `git status --porcelain`
-prints nothing after cleanup)
 
 **Notes:** `rmp-client` is library-only — there is no CLI equivalent to `redis-cli` for RMP. This
 is the one area of the product where testing it by hand requires a Rust toolchain, not just a
-terminal.
+terminal. `cd "$ROCKET_MEM_REPO"` now runs *before* the `cat >`/`mkdir -p` above (this and every
+other RMP case): a relative `crates/rmp-client/examples/...` path only resolves correctly once
+the shell is actually inside the repo, and the directory itself doesn't exist by default —
+without both fixes the very first step fails outright. `cargo run -q` (every RMP case that runs
+an example) suppresses cargo's own `Compiling`/`Finished`/`Running` lines, which are otherwise
+nondeterministic (they depend on whether `target/` already has a fresh build of `rmp-client`) —
+without `-q` the Expected block would need to tolerate either 0 or 3 extra lines depending on
+build-cache state. `git status --porcelain` is scoped to `crates/rmp-client/examples/` rather than
+the whole repo — a bare `git status --porcelain` would also report any unrelated uncommitted
+changes elsewhere in the working tree (e.g. in-progress edits to this very doc), which have
+nothing to do with what this case is actually verifying.
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -5512,6 +5574,7 @@ RMP-02 (harmless either way).
 # Direction 1: write over RESP, read over RMP.
 redis-cli -h numericlabs.lxd -p 6379 set fromresp viaresp
 
+cd "$ROCKET_MEM_REPO"
 cat > crates/rmp-client/examples/qa_scratch2.rs <<'EOF'
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -5524,8 +5587,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 EOF
-cd "$ROCKET_MEM_REPO"
-cargo run -p rmp-client --example qa_scratch2
+cargo run -q -p rmp-client --example qa_scratch2
 rm crates/rmp-client/examples/qa_scratch2.rs
 
 # Direction 2 check: read back over RESP.
@@ -5552,6 +5614,7 @@ viarmp
 
 **Steps:**
 ```bash
+cd "$ROCKET_MEM_REPO"
 cat > crates/rmp-client/examples/qa_scratch3.rs <<'EOF'
 use bytes::Bytes;
 #[tokio::main]
@@ -5566,19 +5629,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 EOF
-cd "$ROCKET_MEM_REPO"
-cargo run -p rmp-client --example qa_scratch3
+cargo run -q -p rmp-client --example qa_scratch3
 rm crates/rmp-client/examples/qa_scratch3.rs
 ```
 
 **Expected:**
 ```
-INFO server -> Bulk(b"# Server\r\nredis_version:rocket-mem-0.1.4\r\nrocket_mem_version:0.1.4\r\n...")
+INFO server -> Bulk(b"# Server\r\nredis_version:rocket-mem-0.1.4\r\nrocket_mem_version:0.1.4\r\n<rest>")
 SAVE -> Simple("OK")
 SLOWLOG LEN -> Integer(0)
 ```
-(actual captured run: `SAVE -> Simple("OK")`, `SLOWLOG LEN -> Integer(0)`, `INFO server` first
-three lines were `# Server | redis_version:rocket-mem-0.1.4 | rocket_mem_version:0.1.4`)
+`<rest>` wildcards the rest of the `INFO server` bulk payload (uptime/connected-clients/etc. — the
+same fields RESP's own `INFO server` returns, just wrapped in RMP's `Bulk(b"...")` debug form).
 
 **Notes:** `client.call(vec![...])` builds the same `Array`-of-`Bulk` shape RESP sends and reaches
 the identical `dispatch_and_log` — `INFO`, `SAVE`, `SLOWLOG`, `CLUSTER`, `REPLICAOF` all work over
@@ -5594,6 +5656,7 @@ RMP with AOF logging and the replica fan-out applying exactly as over RESP.
 
 **Steps:**
 ```bash
+cd "$ROCKET_MEM_REPO"
 cat > crates/rmp-client/examples/qa_scratch4.rs <<'EOF'
 use bytes::Bytes;
 #[tokio::main]
@@ -5604,12 +5667,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 EOF
-cd "$ROCKET_MEM_REPO"
-cargo run -p rmp-client --example qa_scratch4
+cargo run -q -p rmp-client --example qa_scratch4
 rm crates/rmp-client/examples/qa_scratch4.rs
 
 # Tear down the server started for RMP-01..05.
-kill $PID
+kill <pid>
 ```
 
 **Expected:**
@@ -5620,7 +5682,10 @@ PSYNC -> Error("ERR unknown command 'PSYNC'")
 **Notes:** RESP intercepts `PSYNC` in `connection.rs` above `dispatch_and_log` for its raw-socket
 takeover to stream replication data; RMP's handler has no equivalent, so the command falls all the
 way through to "unknown command". `HELLO` is *not* an exception the same way — it succeeds over
-RMP as a stateless no-op, since RMP has no per-connection negotiation state to persist.
+RMP as a stateless no-op, since RMP has no per-connection negotiation state to persist. `kill
+<pid>` (not `kill $PID`): each case runs as its own fresh shell script, so a `PID` shell variable
+set in RMP-01's script does not survive into RMP-05's — same `<pid>` substitution mechanism
+Smoke suite's SMOKE-12 already relies on to kill the server it started earlier in the suite.
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -5646,17 +5711,49 @@ Reference: `.claude/manual-testing.md` ("Standalone mode"), source: `crates/serv
 
 **Precondition:** A server running with `ROCKET_MEM_ADDR=numericlabs.lxd:6379`,
 `ROCKET_MEM_RMP_ADDR=numericlabs.lxd:7379`, `ROCKET_MEM_METRICS_ADDR=numericlabs.lxd:9121` (same
-shape as the RMP setup block above; start it the same way and keep it running through OBS-05).
+shape as the RMP setup block; start it the same way and keep it running through OBS-05).
 
 **Steps:**
 ```bash
+mkdir -p /tmp/rm-qa-work
+cd /tmp/rm-qa-work
+rm -f /tmp/rm-qa-obs1.aof /tmp/rm-qa-obs1.snap
+RUST_LOG="info,rocket_mem::connection=off" \
+ROCKET_MEM_ADDR=numericlabs.lxd:6379 ROCKET_MEM_RMP_ADDR=numericlabs.lxd:7379 \
+ROCKET_MEM_METRICS_ADDR=numericlabs.lxd:9121 \
+ROCKET_MEM_AOF_PATH=/tmp/rm-qa-obs1.aof ROCKET_MEM_SNAPSHOT_PATH=/tmp/rm-qa-obs1.snap \
+  "$ROCKET_MEM_BIN" &
+disown
+PID=$!
+sleep 0.5
+
 redis-cli -h numericlabs.lxd -p 6379 info server
 sleep 3
 redis-cli -h numericlabs.lxd -p 6379 info server | grep uptime_in_seconds
 ```
 
-**Expected:**
+**Expected (banner from this case's own server start):**
 ```
+<date>  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=numericlabs.lxd:6379
+<date>  INFO rocket_mem: resolved config summary node_id=numericlabs.lxd:6379 addr=numericlabs.lxd:6379 rmp_addr=numericlabs.lxd:7379 metrics_addr=numericlabs.lxd:9121 aof_path=/tmp/rm-qa-obs1.aof snapshot_path=/tmp/rm-qa-obs1.snap log_filter=info,rocket_mem::connection=off log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=false acl_user_count=0 tls_enabled=false tls_replication_enabled=false
+<date>  INFO rocket_mem::aof: aof recovery replay complete commands=0 bytes=0 elapsed_us=<n>
+<date>  INFO rocket_mem: listener bound protocol=metrics addr=http://192.168.1.12:9121/metrics
+<date>  INFO rocket_mem: listener bound protocol=RMP addr=192.168.1.12:7379
+<date>  INFO rocket_mem: listener bound protocol=RESP addr=192.168.1.12:6379
+
+┌───────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ rocket-mem v0.1.4                                                                                 │
+├───────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ storage   recovered /tmp/rm-qa-obs1.snap + /tmp/rm-qa-obs1.aof (generation 0)                     │
+│ acl       no users configured -- auth disabled, every client is trusted                           │
+│ cluster   standalone (no cluster_config set)                                                      │
+│ replicas  none connected yet -- REPLICAOF is a live command; INFO REPLICATION shows current state │
+│ listeners                                                                                         │
+│           metrics  http://192.168.1.12:9121/metrics                                               │
+│           RMP      192.168.1.12:7379                                                              │
+│           RESP     192.168.1.12:6379                                                              │
+└───────────────────────────────────────────────────────────────────────────────────────────────────┘
+
 # Server
 redis_version:rocket-mem-0.1.4
 rocket_mem_version:0.1.4
@@ -5673,7 +5770,9 @@ uptime_in_seconds:<n>
 **Notes:** `process_id` is the real PID of the running process — wildcarded here since it (and
 both `uptime_in_seconds` readings) vary every run. The second `uptime_in_seconds` should read
 about 3 higher than the first — real captured values were `0` then `3` — proof it's a live clock,
-not a hardcoded `0`.
+not a hardcoded `0`. OBS-01's own Steps now include the server start (merged in from this suite's
+prose precondition, same restructuring RMP-01 needed) since the doc's original prose described it
+as a precondition with no fenced bash of its own to run.
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -5736,7 +5835,7 @@ redis-cli -h numericlabs.lxd -p 6379 info | grep -E "^# "
 
 **Steps:**
 ```bash
-curl -s http://numericlabs.lxd:9121/metrics | grep -E "^rocket_mem_commands_total|^rocket_mem_connected_clients|^rocket_mem_command_errors_total"
+curl -s http://numericlabs.lxd:9121/metrics | grep -E "^rocket_mem_commands_total\{cmd=\"info\"\}|^rocket_mem_connected_clients"
 
 # Generate a command error and confirm it's counted.
 redis-cli -h numericlabs.lxd -p 6379 set   # missing args -> error
@@ -5747,21 +5846,21 @@ curl -s http://numericlabs.lxd:9121/metrics | grep "rocket_mem_command_errors_to
 ```
 rocket_mem_commands_total{cmd="info"} <n>
 rocket_mem_connected_clients 0
-
 ERR wrong number of arguments for 'set' command
 
 # TYPE rocket_mem_command_errors_total counter
 rocket_mem_command_errors_total{cmd="set"} <n>
 ```
 
-**Notes:** Exact counter values, and which `cmd="..."` families appear at all, depend entirely on
-what ran on this server instance before you got here — OBS-01 through OBS-03's `INFO` calls are
-the only traffic by this point in a fresh run, hence only `cmd="info"` shows above; running the
-suites in a different order or repeating a case adds more families and higher counts. What
-matters is that the families exist and increase with real traffic, not the specific numbers — both
-counts above are wildcarded for exactly that reason. `rocket_mem_connected_clients` reads 0 here
-because `redis-cli` closes its connection after each command; it only shows non-zero while a
-connection is actually open (e.g. inside a pipe held open with `printf ... | redis-cli`).
+**Notes:** Exact counter values depend entirely on what ran on this server instance before you got
+here — both counts above are wildcarded for exactly that reason. The first `grep` is scoped to the
+literal `cmd="info"` family rather than every `rocket_mem_commands_total*` line: which OTHER
+families exist at all depends on what else has talked to this server (a QA harness's own health
+checks included — e.g. qa-agent's own `<pid>`-substitution safety check issues a `CLUSTER MYID`
+probe against every own-server suite before each case, which would otherwise inject an unrelated
+`cmd="cluster"` line ahead of `cmd="info"` and break a broader grep). `rocket_mem_connected_clients`
+reads 0 here because `redis-cli` closes its connection after each command; it only shows non-zero
+while a connection is actually open (e.g. inside a pipe held open with `printf ... | redis-cli`).
 `/metrics` has **no authentication of its own** — it is unauthenticated by design, which is why it
 defaults to binding loopback only; never expose it publicly without a reverse-proxy or firewall in
 front of it.
@@ -5807,6 +5906,8 @@ sleep
 OK
 0
 ERR DEBUG SLEEP duration exceeds the 10s maximum allowed on this server
+
+
 ```
 
 **Notes:** A slow-log entry has **4 fields** (id, unix time, duration in microseconds, and an args
@@ -5829,13 +5930,18 @@ above 10 seconds is rejected outright rather than clamped.
 
 **Steps:**
 ```bash
+# Kill the server left running from OBS-01..05 — the threshold can only be set at startup.
+kill <pid>
+sleep 0.5
+
 cd /tmp/rm-qa-work
 rm -f /tmp/rm-qa-obs6.aof /tmp/rm-qa-obs6.snap
 ROCKET_MEM_ADDR=numericlabs.lxd:6379 ROCKET_MEM_RMP_ADDR=numericlabs.lxd:7379 \
 ROCKET_MEM_METRICS_ADDR=numericlabs.lxd:9121 \
 ROCKET_MEM_AOF_PATH=/tmp/rm-qa-obs6.aof ROCKET_MEM_SNAPSHOT_PATH=/tmp/rm-qa-obs6.snap \
 ROCKET_MEM_SLOWLOG_THRESHOLD_MICROS=0 \
-  "$ROCKET_MEM_BIN" &
+  "$ROCKET_MEM_BIN" > /dev/null 2>&1 &
+disown
 PID=$!
 sleep 0.5
 redis-cli -h numericlabs.lxd -p 6379 debug sleep 0.2
@@ -5851,7 +5957,12 @@ OK
 
 **Notes:** A 200ms `DEBUG SLEEP` — 20x the default 10ms threshold — produces zero slow-log
 entries when the threshold is `0`. `0` disables the slow log entirely rather than meaning
-"log everything."
+"log everything." The doc's own precondition prose ("kill any server bound to 6379/7379/9121
+first") is now an actual `kill <pid>` step (same substitution mechanism as SMOKE-12/RMP-05) rather
+than an instruction with no corresponding Steps content — OBS-01 through OBS-05 leave their shared
+server running, and this case is the one that owns tearing it down before starting its own. This
+case's own new server's startup banner is redirected to `/dev/null` since Expected doesn't include
+it (matches PERSIST-01's convention for a case whose Expected excludes the banner entirely).
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -5869,7 +5980,8 @@ rm -f /tmp/rm-qa-obs7.aof /tmp/rm-qa-obs7.snap
 ROCKET_MEM_ADDR=numericlabs.lxd:6379 ROCKET_MEM_RMP_ADDR=numericlabs.lxd:7379 \
 ROCKET_MEM_METRICS_ADDR=numericlabs.lxd:9121 \
 ROCKET_MEM_AOF_PATH=/tmp/rm-qa-obs7.aof ROCKET_MEM_SNAPSHOT_PATH=/tmp/rm-qa-obs7.snap \
-  "$ROCKET_MEM_BIN" &
+  "$ROCKET_MEM_BIN" > /dev/null 2>&1 &
+disown
 PID=$!
 sleep 0.5
 redis-cli -h numericlabs.lxd -p 6379 info stats | grep expired_keys
@@ -5899,6 +6011,7 @@ expired_keys:0
 OK
 expired_keys:1
 
+
 ```
 
 **Notes:** The two `get pkey`/`get akey` nil replies render as blank lines above, not the literal
@@ -5927,29 +6040,41 @@ spans, and the replica/cluster-peer Prometheus gauges.
 
 **Steps:**
 ```bash
+cd /tmp/rm-qa-work
+rm -f /tmp/rm-qa-obs8.aof /tmp/rm-qa-obs8.snap /tmp/rm-qa-obs8.log
 RUST_LOG=debug "$ROCKET_MEM_BIN" --addr numericlabs.lxd:6379 --rmp-addr numericlabs.lxd:7379 \
-  --metrics-addr numericlabs.lxd:9121 --aof-path /tmp/rm-qa-obs8.aof --snapshot-path /tmp/rm-qa-obs8.snap &
+  --metrics-addr numericlabs.lxd:9121 --aof-path /tmp/rm-qa-obs8.aof --snapshot-path /tmp/rm-qa-obs8.snap \
+  > /tmp/rm-qa-obs8.log 2>&1 &
+disown
 PID=$!
 sleep 0.5
-redis-cli -h numericlabs.lxd -p 6379 set k1 v1
-redis-cli -h numericlabs.lxd -p 6379 get k1
-redis-cli -h numericlabs.lxd -p 6379 nosuchcommand
+redis-cli -h numericlabs.lxd -p 6379 set k1 v1 > /dev/null
+redis-cli -h numericlabs.lxd -p 6379 get k1 > /dev/null
+redis-cli -h numericlabs.lxd -p 6379 nosuchcommand > /dev/null
+grep -E "command dispatched|unknown command" /tmp/rm-qa-obs8.log
 kill $PID
 ```
 
 **Expected:** one `DEBUG`-level `command dispatched` line per command, inside the `cmd{cmd=...
 key=... argc=...}` span, carrying `elapsed_us` and a quoted `reply` kind:
 ```
-DEBUG ...cmd{cmd=SET key=k1 argc=2}: rocket_mem::dispatcher: command dispatched elapsed_us=58 reply="ok"
-DEBUG ...cmd{cmd=GET key=k1 argc=1}: rocket_mem::dispatcher: command dispatched elapsed_us=7 reply="ok"
-DEBUG ...cmd{cmd=NOSUCHCOMMAND key= argc=0}: rocket_mem::dispatcher: unknown command cmd=NOSUCHCOMMAND
-DEBUG ...cmd{cmd=NOSUCHCOMMAND key= argc=0}: rocket_mem::dispatcher: command dispatched elapsed_us=13 reply="error"
+<date> DEBUG <conn>:cmd{cmd=SET key=k1 argc=2}: rocket_mem::dispatcher: command dispatched elapsed_us=<n> reply="ok"
+<date> DEBUG <conn>:cmd{cmd=GET key=k1 argc=1}: rocket_mem::dispatcher: command dispatched elapsed_us=<n> reply="ok"
+<date> DEBUG <conn>:cmd{cmd=NOSUCHCOMMAND key= argc=0}: rocket_mem::dispatcher: unknown command cmd=NOSUCHCOMMAND
+<date> DEBUG <conn>:cmd{cmd=NOSUCHCOMMAND key= argc=0}: rocket_mem::dispatcher: command dispatched elapsed_us=<n> reply="error"
 ```
 
 **Notes:** `reply` is `"ok"` or `"error"`, not the reply body — that stays out of the log at
 `debug`. `elapsed_us` is present on every `command dispatched` line regardless of outcome. This
 event is invisible at the production default of `info`, unlike OBS-04's Prometheus counters,
-which increment regardless of log level.
+which increment regardless of log level. Steps now redirect the server's own stdout/stderr to a
+log file and `grep` the two target line kinds out of it — the original Steps had no such filter
+(and no output redirect at all), so its "Expected" was never actually reachable from its own
+Steps: the real terminal output also carries the startup banner, connection accepted/closed
+lines, and each `redis-cli`'s own reply text interleaved in between, none of which the original
+Expected accounted for. `<conn>` wildcards each line's leading `conn{conn_id=... peer=...
+protocol=RESP tls=false node_id=...}:` span — this case is about the per-command dispatch line's
+own fields, not the connection span, which OBS-13 already covers.
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -5958,8 +6083,11 @@ which increment regardless of log level.
 ### OBS-09 — Credential redaction: AUTH/HELLO/REPLICAOF passwords never appear in the log, even at `trace`
 
 **Precondition:** A server started with an ACL user configured (auth becomes mandatory the
-moment any `[[acl.users]]` entry exists — see "ACL and authentication"), and `RUST_LOG=trace`:
+moment any `[[acl.users]]` entry exists — see "ACL and authentication"), and `RUST_LOG=trace`.
+
+**Steps:**
 ```bash
+cd /tmp/rm-qa-work
 cat > /tmp/rm-qa-obs9.toml <<'EOF'
 addr = "numericlabs.lxd:6379"
 rmp_addr = "numericlabs.lxd:7379"
@@ -5971,14 +6099,13 @@ password = "secretpw123"
 enabled = true
 rules = ["allcommands", "allkeys"]
 EOF
+rm -f /tmp/rm-qa-obs9.aof /tmp/rm-qa-obs9.snap /tmp/rm-qa-obs9.log
 RUST_LOG=trace "$ROCKET_MEM_BIN" --config /tmp/rm-qa-obs9.toml \
   --aof-path /tmp/rm-qa-obs9.aof --snapshot-path /tmp/rm-qa-obs9.snap > /tmp/rm-qa-obs9.log 2>&1 &
+disown
 PID=$!
 sleep 0.5
-```
 
-**Steps:**
-```bash
 redis-cli -h numericlabs.lxd -p 6379 auth tester wrongpassword123
 printf 'auth tester secretpw123\nping\n' | redis-cli -h numericlabs.lxd -p 6379
 grep -c "secretpw123\|wrongpassword123" /tmp/rm-qa-obs9.log
@@ -6008,30 +6135,36 @@ events (OBS-11) log the `user` field but never the password, at any level.
 ### OBS-10 — `log_value_max_bytes` caps trace-level value rendering
 
 **Precondition:** Same server shape as OBS-09, but started with a small
-`ROCKET_MEM_LOG_VALUE_MAX_BYTES` and `RUST_LOG=trace`:
-```bash
-ROCKET_MEM_LOG_VALUE_MAX_BYTES=8 RUST_LOG=trace "$ROCKET_MEM_BIN" --config /tmp/rm-qa-obs9.toml \
-  --aof-path /tmp/rm-qa-obs10.aof --snapshot-path /tmp/rm-qa-obs10.snap > /tmp/rm-qa-obs10.log 2>&1 &
-PID=$!
-sleep 0.5
-printf 'auth tester secretpw123\nset longkey abcdefghijklmnopqrstuvwxyz0123456789\n' | redis-cli -h numericlabs.lxd -p 6379
-kill $PID
-```
+`ROCKET_MEM_LOG_VALUE_MAX_BYTES` and `RUST_LOG=trace`.
 
 **Steps:**
 ```bash
+cd /tmp/rm-qa-work
+rm -f /tmp/rm-qa-obs10.aof /tmp/rm-qa-obs10.snap /tmp/rm-qa-obs10.log
+ROCKET_MEM_LOG_VALUE_MAX_BYTES=8 RUST_LOG=trace "$ROCKET_MEM_BIN" --config /tmp/rm-qa-obs9.toml \
+  --aof-path /tmp/rm-qa-obs10.aof --snapshot-path /tmp/rm-qa-obs10.snap > /tmp/rm-qa-obs10.log 2>&1 &
+disown
+PID=$!
+sleep 0.5
+printf 'auth tester secretpw123\nset longkey abcdefghijklmnopqrstuvwxyz0123456789\n' | redis-cli -h numericlabs.lxd -p 6379 > /dev/null
+
 grep "command arguments" /tmp/rm-qa-obs10.log | grep SET
+kill $PID
 ```
 
 **Expected:**
 ```
-...cmd{cmd=SET key=longkey argc=2}: rocket_mem::dispatcher: command arguments args=longkey abcdefgh…(28 more)
+<date> TRACE <conn>:cmd{cmd=SET key=longkey argc=2}: rocket_mem::dispatcher: command arguments args=longkey abcdefgh…(28 more)
 ```
 
 **Notes:** The cap applies **per argument independently**, in bytes of the stored value: `longkey`
 is 7 bytes, under the 8-byte cap, so it renders whole; the 36-byte value truncates to its first 8
 bytes plus a `…(28 more)` marker. `log_value_max_bytes` defaults to 128 and is only consulted at
-`trace` — raising or lowering it has no effect at `debug` or above.
+`trace` — raising or lowering it has no effect at `debug` or above. Same restructuring as OBS-09:
+the Precondition's server-start bash is now this case's own Steps (with a `rm -f` of its own stale
+log file — without it, a leftover `/tmp/rm-qa-obs10.log` from any earlier run would let `grep`
+return old content even if this run's own server never started). `<conn>` replaces the original
+`...` ellipsis, which was never a real wildcard token — same fix as OBS-08.
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -6039,25 +6172,39 @@ bytes plus a `…(28 more)` marker. `log_value_max_bytes` defaults to 128 and is
 
 ### OBS-11 — Auth success/failure logged by username; NOPERM denials logged by username — never the password
 
-**Precondition:** Same ACL server as OBS-09, any log level `info` or above (these events are
+**Precondition:** Same ACL config as OBS-09, any log level `info` or above (these events are
 `info`/`warn`, so they're visible at the production default — unlike OBS-08's per-command line).
 
 **Steps:**
 ```bash
-redis-cli -h numericlabs.lxd -p 6379 auth tester wrongpassword123     # bad password
-redis-cli -h numericlabs.lxd -p 6379 auth tester secretpw123          # good password
-grep -E "auth (success|failure)" /tmp/rm-qa-obs9.log
+cd /tmp/rm-qa-work
+rm -f /tmp/rm-qa-obs11.aof /tmp/rm-qa-obs11.snap /tmp/rm-qa-obs11.log
+"$ROCKET_MEM_BIN" --config /tmp/rm-qa-obs9.toml \
+  --aof-path /tmp/rm-qa-obs11.aof --snapshot-path /tmp/rm-qa-obs11.snap > /tmp/rm-qa-obs11.log 2>&1 &
+disown
+PID=$!
+sleep 0.5
+
+redis-cli -h numericlabs.lxd -p 6379 auth tester wrongpassword123 > /dev/null    # bad password
+redis-cli -h numericlabs.lxd -p 6379 auth tester secretpw123 > /dev/null         # good password
+grep -E "auth (success|failure)" /tmp/rm-qa-obs11.log
+kill $PID
 ```
 
 **Expected:**
 ```
-WARN ...: rocket_mem::dispatcher: auth failure user=tester
-INFO ...: rocket_mem::dispatcher: auth success user=tester
+<date>  WARN <conn>: rocket_mem::dispatcher: auth failure user=tester
+<date>  INFO <conn>: rocket_mem::dispatcher: auth success user=tester
 ```
 
 **Notes:** Both events carry `user`, never the password, at any level. A `NOPERM` denial (a
 permitted user running a command or touching a key their rules don't grant) logs the same way —
-`user`/`cmd`/`key`, never a secret.
+`user`/`cmd`/`key`, never a secret. This case now starts its own fresh server (reusing OBS-09's
+`/tmp/rm-qa-obs9.toml` config, its own aof/snapshot/log paths) instead of assuming "the same ACL
+server as OBS-09" is still alive — OBS-09's own Steps kill their server at the end (required so
+OBS-10 can bind the same port), so by the time OBS-11 runs there is nothing left to reuse. Same
+`<conn>`/`<date>` wildcarding as OBS-08's fix, and the original `...` ellipsis wasn't a real
+wildcard token either.
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -6079,13 +6226,16 @@ permitted user running a command or touching a key their rules don't grant) logs
 relevant field by name:
 ```
 <date>  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=numericlabs.lxd:6379
-<date>  INFO rocket_mem: resolved config summary node_id=numericlabs.lxd:6379 addr=numericlabs.lxd:6379 rmp_addr=numericlabs.lxd:7379 metrics_addr=numericlabs.lxd:9121 aof_path=... snapshot_path=... log_filter=info log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=true acl_user_count=1 tls_enabled=false tls_replication_enabled=false
+<date>  INFO rocket_mem: resolved config summary node_id=numericlabs.lxd:6379 addr=numericlabs.lxd:6379 rmp_addr=numericlabs.lxd:7379 metrics_addr=numericlabs.lxd:9121 aof_path=<path> snapshot_path=<path> log_filter=info log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=true acl_user_count=1 tls_enabled=false tls_replication_enabled=false
 ```
 
 **Notes:** No ACL username, password, or TLS key material appears — only `acl_enabled` (bool) and
 `acl_user_count` (a count). `log_filter` reports the *resolved* filter directive (`RUST_LOG` if
 set, else the configured `log_level`) — the log line's field is named `log_filter` even though
-the config key is `log_level`.
+the config key is `log_level`. `<path>` replaces the original `...` ellipsis, which wasn't a real
+wildcard token — same fix as OBS-08/OBS-10. The server piped into `head -2` exits on its own once
+`head` closes the pipe (confirmed: no leftover process on 6379/7379/9121 afterward) — no `&`/`kill`
+needed for this case.
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -6097,11 +6247,14 @@ the config key is `log_level`.
 
 **Steps:**
 ```bash
+cd /tmp/rm-qa-work
+rm -f /tmp/rm-qa-obs13.aof /tmp/rm-qa-obs13.snap /tmp/rm-qa-obs13.log
 "$ROCKET_MEM_BIN" --addr numericlabs.lxd:6379 --rmp-addr numericlabs.lxd:7379 --metrics-addr numericlabs.lxd:9121 \
   --aof-path /tmp/rm-qa-obs13.aof --snapshot-path /tmp/rm-qa-obs13.snap > /tmp/rm-qa-obs13.log 2>&1 &
+disown
 PID=$!
 sleep 0.5
-printf 'ping\nset a 1\nset b 2\n' | redis-cli -h numericlabs.lxd -p 6379
+printf 'ping\nset a 1\nset b 2\n' | redis-cli -h numericlabs.lxd -p 6379 > /dev/null
 sleep 0.2
 grep -E "listener bound|connection accepted|connection closed" /tmp/rm-qa-obs13.log
 kill $PID
@@ -6112,15 +6265,18 @@ kill $PID
 <date>  INFO rocket_mem: listener bound protocol=metrics addr=http://192.168.1.12:9121/metrics
 <date>  INFO rocket_mem: listener bound protocol=RMP addr=192.168.1.12:7379
 <date>  INFO rocket_mem: listener bound protocol=RESP addr=192.168.1.12:6379
-<date>  INFO conn{conn_id=1 peer=192.168.1.12:NNNNN protocol=RESP tls=false node_id=numericlabs.lxd:6379}: rocket_mem::connection: connection accepted
-<date>  INFO conn{conn_id=1 peer=192.168.1.12:NNNNN protocol=RESP tls=false node_id=numericlabs.lxd:6379}: rocket_mem::connection: connection closed elapsed_us=NNN commands_served=3
+<date>  INFO conn{conn_id=1 peer=192.168.1.12:<n> protocol=RESP tls=false node_id=numericlabs.lxd:6379}: rocket_mem::connection: connection accepted
+<date>  INFO conn{conn_id=1 peer=192.168.1.12:<n> protocol=RESP tls=false node_id=numericlabs.lxd:6379}: rocket_mem::connection: connection closed elapsed_us=<n> commands_served=3
 ```
 
 **Notes:** `protocol` renders unquoted uppercase (`RESP`, `RMP`; `RESP+TLS`/`RMP+TLS` under TLS)
 except the metrics endpoint, which is lowercase `metrics`. `node_id` falls back to `config.addr`
 when the node has no `cluster_node_id`. Every `conn`-scoped line in a session carries the same
 `conn_id`, the correlation key across the connection's lifetime. `commands_served` counts every
-dispatched command, including ones that errored.
+dispatched command, including ones that errored. `<n>` replaces the original `NNNNN`/`NNN`
+placeholders, which were plain text, not real wildcard tokens (same class of fix as OBS-08/10/12's
+`...`). The `printf | redis-cli` pipe's own reply text (`PONG`/`OK`/`OK`) is now redirected to
+`/dev/null` — this case is only about the server's own log output, same reasoning as OBS-08.
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -6128,19 +6284,32 @@ dispatched command, including ones that errored.
 
 ### OBS-14 — Prometheus replica and cluster-peer gauges
 
-**Precondition:** Same server as OBS-04, its metrics endpoint reachable.
+**Precondition:** A standalone server, its metrics endpoint reachable.
 
 **Steps:**
 ```bash
+cd /tmp/rm-qa-work
+rm -f /tmp/rm-qa-obs14.aof /tmp/rm-qa-obs14.snap
+RUST_LOG="info,rocket_mem::connection=off" \
+ROCKET_MEM_ADDR=numericlabs.lxd:6379 ROCKET_MEM_RMP_ADDR=numericlabs.lxd:7379 \
+ROCKET_MEM_METRICS_ADDR=numericlabs.lxd:9121 \
+ROCKET_MEM_AOF_PATH=/tmp/rm-qa-obs14.aof ROCKET_MEM_SNAPSHOT_PATH=/tmp/rm-qa-obs14.snap \
+  "$ROCKET_MEM_BIN" > /dev/null 2>&1 &
+disown
+PID=$!
+sleep 0.5
+
 curl -s http://numericlabs.lxd:9121/metrics | grep -E \
-  "^rocket_mem_(good_replicas|replica_min_ack_offset|master_repl_offset|slave_repl_offset|cluster_peers_reachable|cluster_peers_unreachable) "
+  "^rocket_mem_(good_replicas|replica_min_ack_offset|master_repl_offset|slave_repl_offset|cluster_peers_reachable|cluster_peers_unreachable) " | sort
+kill $PID
 ```
 
-**Expected**, on a standalone node with no replicas connected:
+**Expected**, on a standalone node with no replicas connected (`sort`ed since these gauges'
+relative order in `/metrics` isn't stable run to run):
 ```
 rocket_mem_good_replicas 0
-rocket_mem_replica_min_ack_offset 0
 rocket_mem_master_repl_offset <n>
+rocket_mem_replica_min_ack_offset 0
 rocket_mem_slave_repl_offset 0
 ```
 
@@ -6150,7 +6319,11 @@ rocket_mem_slave_repl_offset 0
 write offset/`0` rather than being absent). `rocket_mem_cluster_peers_reachable`/
 `rocket_mem_cluster_peers_unreachable`, by contrast, are emitted **only in cluster mode with a
 peer prober running** — confirmed absent from this standalone instance's `/metrics` output by
-design, not a bug. See CLUSTER-07 for these two gauges' cluster-mode behavior.
+design, not a bug. See CLUSTER-07 for these two gauges' cluster-mode behavior. This case now
+starts (and kills) its own fresh server rather than assuming "the same server as OBS-04" is still
+up — OBS-06 already killed the OBS-01..05 server to make room for its own, so nothing survives
+that far into the suite. Also this suite's own last case, so it tears its server down completely
+(same as RMP-05/SMOKE-12), leaving 6379/7379/9121 free for whatever runs next.
 
 **Result:** ☐ Pass ☐ Fail
 
