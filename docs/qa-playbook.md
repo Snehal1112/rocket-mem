@@ -6664,13 +6664,13 @@ cat /tmp/acltls-qa/acl-server.log
 
 **Expected:**
 ```
-PID=2373827
-2026-09-12T05:36:10.429907Z  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=127.0.0.1:6510
-2026-09-12T05:36:10.429946Z  INFO rocket_mem: resolved config summary node_id=127.0.0.1:6510 addr=127.0.0.1:6510 rmp_addr=127.0.0.1:6511 metrics_addr=127.0.0.1:9310 aof_path=/tmp/acltls-qa/acl.aof snapshot_path=/tmp/acltls-qa/acl.snap log_filter=info log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=true acl_user_count=4 tls_enabled=false tls_replication_enabled=false
-2026-09-12T05:36:10.554031Z  INFO rocket_mem::aof: aof recovery replay complete commands=0 bytes=0 elapsed_us=6
-2026-09-12T05:36:10.554361Z  INFO rocket_mem: listener bound protocol=metrics addr=http://127.0.0.1:9310/metrics
-2026-09-12T05:36:10.554413Z  INFO rocket_mem: listener bound protocol=RMP addr=127.0.0.1:6511
-2026-09-12T05:36:10.554437Z  INFO rocket_mem: listener bound protocol=RESP addr=127.0.0.1:6510
+PID=<pid>
+<date>  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=127.0.0.1:6510
+<date>  INFO rocket_mem: resolved config summary node_id=127.0.0.1:6510 addr=127.0.0.1:6510 rmp_addr=127.0.0.1:6511 metrics_addr=127.0.0.1:9310 aof_path=/tmp/acltls-qa/acl.aof snapshot_path=/tmp/acltls-qa/acl.snap log_filter=info log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=true acl_user_count=4 tls_enabled=false tls_replication_enabled=false
+<date>  INFO rocket_mem::aof: aof recovery replay complete commands=0 bytes=0 elapsed_us=<n>
+<date>  INFO rocket_mem: listener bound protocol=metrics addr=http://127.0.0.1:9310/metrics
+<date>  INFO rocket_mem: listener bound protocol=RMP addr=127.0.0.1:6511
+<date>  INFO rocket_mem: listener bound protocol=RESP addr=127.0.0.1:6510
 
 ┌─────────────────────────────────────────────────┐
 │ rocket-mem v0.1.4                                │
@@ -6823,7 +6823,7 @@ NOAUTH Authentication required.
 server redis
 version rocket-mem-0.1.0
 proto 3
-id 9
+id <n>
 mode standalone
 role master
 modules
@@ -7043,14 +7043,14 @@ redis-cli -p 6510 --user admin --pass adminpw --no-auth-warning acl getuser nobo
 **Expected:**
 ```
 admin
-user admin on #$argon2id$v=19$m=19456,t=2,p=1$OPHgcsV/dVHnIOriFp6Ltw$eVHSkyW7ilQCuktH/RBgP8omeUclaeBiihrzy8xDrCQ +@all ~*
-user scoped on #$argon2id$v=19$m=19456,t=2,p=1$1aifAU8Dw97eOU/Oi51BNA$X+iQwwBMM6ZmMpcpw9Y0vxTyyRjIYy3CrdtYLXiJET0 +@all ~app:*
-user app on #$argon2id$v=19$m=19456,t=2,p=1$oqQQ5b+DIk31Bp7EmobzCQ$UMySJ81JsIguaRCKRVfJW/ro8EqYK84V5+i8JRr2uWo ~app:* +get
-user retired off #$argon2id$v=19$m=19456,t=2,p=1$xe5KLzYiYbHkAhCt4VjCmg$x2X2RMn9a5y88B3Z78nA9n0GZuZpwOJQEj5YyffSwh4 +@all ~*
+user admin on #<hash> +@all ~*
+user scoped on #<hash> +@all ~app:*
+user app on #<hash> ~app:* +get
+user retired off #<hash> +@all ~*
 flags
 on
 passwords
-$argon2id$v=19$m=19456,t=2,p=1$oqQQ5b+DIk31Bp7EmobzCQ$UMySJ81JsIguaRCKRVfJW/ro8EqYK84V5+i8JRr2uWo
+<hash>
 commands
 +get
 keys
@@ -7098,7 +7098,7 @@ OK
 flags
 on
 passwords
-$argon2id$v=19$m=19456,t=2,p=1$5O40PQ4fgO7jI9PitlMaQg$J/KdBLPqwPGK7rDGvIDmtcRYM0FnlUQx5fsHEunyPcw
+<hash>
 commands
 +get +set -set
 keys
@@ -7240,68 +7240,6 @@ rather than creating a half-configured user. Line 2 in particular would otherwis
 
 ---
 
-### ACL-16 — Verify a `>password` or `on`/`off` token inside TOML `rules` fails startup, with the password redacted
-
-**Precondition:** The server from ACL-01 is **stopped** (see the teardown block below), and ports
-6510, 6511 and 9310 are free. These runs fail before binding anything, but starting from a clean
-slate keeps the output unambiguous.
-
-**Steps:**
-```bash
-cat > /tmp/acltls-qa/acl-bad.toml <<'EOF'
-addr = "127.0.0.1:6510"
-rmp_addr = "127.0.0.1:6511"
-metrics_addr = "127.0.0.1:9310"
-
-[[acl.users]]
-username = "admin"
-enabled = true
-rules = ["on", ">secret123", "allcommands", "allkeys"]
-EOF
-
-"$ROCKET_MEM_BIN" --config /tmp/acltls-qa/acl-bad.toml
-echo "exit=$?"
-
-# Same file with the `on` token removed, so the password token is the first failure.
-sed 's/"on", //' /tmp/acltls-qa/acl-bad.toml > /tmp/acltls-qa/acl-bad2.toml
-"$ROCKET_MEM_BIN" --config /tmp/acltls-qa/acl-bad2.toml
-echo "exit=$?"
-
-ss -lnt | grep -E ':(6510|6511|9310)\b' || echo "ports free"
-```
-
-**Expected:**
-```
-2026-09-12T05:38:30.468491Z  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=127.0.0.1:6510
-2026-09-12T05:38:30.468538Z  INFO rocket_mem: resolved config summary node_id=127.0.0.1:6510 addr=127.0.0.1:6510 rmp_addr=127.0.0.1:6511 metrics_addr=127.0.0.1:9310 aof_path=./appendonly.aof snapshot_path=./dump.snapshot log_filter=info log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=true acl_user_count=1 tls_enabled=false tls_replication_enabled=false
-Error: Custom { kind: InvalidInput, error: "acl bootstrap: ERR syntax error at 'on'" }
-exit=1
-2026-09-12T05:38:30.479274Z  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=127.0.0.1:6510
-2026-09-12T05:38:30.479288Z  INFO rocket_mem: resolved config summary node_id=127.0.0.1:6510 addr=127.0.0.1:6510 rmp_addr=127.0.0.1:6511 metrics_addr=127.0.0.1:9310 aof_path=./appendonly.aof snapshot_path=./dump.snapshot log_filter=info log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=true acl_user_count=1 tls_enabled=false tls_replication_enabled=false
-Error: Custom { kind: InvalidInput, error: "acl bootstrap: ERR syntax error at '<password token>'" }
-exit=1
-ports free
-```
-
-**Notes:** Two things to check beyond the exit code.
-
-First, the second error says `'<password token>'` — the literal string `secret123` is **not**
-echoed. A misconfigured password must not leak into stderr, journald, container logs or CI output.
-If you ever see the actual password there, that is a security defect worth filing.
-
-Second, no `listener bound` event is printed at all — the two lines that do appear (`rocket-mem
-starting`, `resolved config summary`) are pure logging with no side effect; the ACL bootstrap
-check still runs before anything is bound, so the process leaves no half-started state. (This
-differs from the TLS failures in TLS-08, which abort after the metrics and RMP listeners are
-already up.)
-
-The `Error: Custom { ... }` wrapper is `std::io::Error`'s `Debug` output rather than a hand-written
-message. Noisy, but the useful part is inside it.
-
-**Result:** ☐ Pass ☐ Fail
-
----
-
 ### ACL-17 — Verify no credential reaches the slow log or the AOF
 
 **Precondition:** ACL-01 through ACL-14 have been run against a live server on port 6510, so the
@@ -7315,19 +7253,19 @@ grep -aic -E 'AUTH|ACL|adminpw|apppw' /tmp/acltls-qa/acl.aof
 
 **Expected:**
 ```
-61
-1788234467
-25797
+<n>
+<n>
+<n>
 AUTH
 ... (2 more arguments)
-60
-1788234454
-28587
+<n>
+<n>
+<n>
 AUTH
 ... (2 more arguments)
-59
-1788234453
-23238
+<n>
+<n>
+<n>
 ```
 
 and the `grep -c` prints:
@@ -7367,14 +7305,17 @@ curl -s http://127.0.0.1:9310/metrics | grep -E 'rocket_mem_command_errors_total
 **Expected:**
 ```
 # TYPE rocket_mem_command_errors_total counter
-rocket_mem_command_errors_total{cmd="acl"} 6
-rocket_mem_command_errors_total{cmd="auth"} 3
-rocket_mem_command_errors_total{cmd="get"} 3
-rocket_mem_command_errors_total{cmd="mget"} 2
-rocket_mem_command_errors_total{cmd="hello"} 1
-rocket_mem_command_errors_total{cmd="set"} 2
-rocket_mem_command_errors_total{cmd="ping"} 4
+rocket_mem_command_errors_total{cmd="acl"} <n>
+rocket_mem_command_errors_total{cmd="auth"} <n>
+rocket_mem_command_errors_total{cmd="get"} <n>
+rocket_mem_command_errors_total{cmd="mget"} <n>
+rocket_mem_command_errors_total{cmd="hello"} <n>
+rocket_mem_command_errors_total{cmd="set"} <n>
+rocket_mem_command_errors_total{cmd="ping"} <n>
 ```
+
+**Automation note:** the label set above must be reconfirmed against a real run before this case
+is registered — see the ACL suite automation live-verification plan.
 
 **Notes:** The counter values depend on exactly which of the earlier cases you ran and how many
 times; only the label shape is fixed. The two findings here are:
@@ -7405,10 +7346,14 @@ grep -E 'auth success|auth failure|permission denied' /tmp/acltls-qa/acl-server.
 
 **Expected:** three log lines of this shape (timestamps/`conn_id`/`peer` vary):
 ```
-...  INFO conn{conn_id=N peer=127.0.0.1:PORT protocol=RESP tls=false node_id=...}: rocket_mem::dispatcher: auth success user=admin
-...  WARN conn{conn_id=N peer=127.0.0.1:PORT protocol=RESP tls=false node_id=...}: rocket_mem::dispatcher: auth failure user=admin
-...  WARN conn{conn_id=N peer=127.0.0.1:PORT protocol=RESP tls=false node_id=...}: rocket_mem::dispatcher: permission denied user=app
+<date>  INFO conn{conn_id=<n> peer=127.0.0.1:<port> protocol=RESP tls=false node_id=127.0.0.1:6510}: rocket_mem::dispatcher: auth success user=admin
+<date>  WARN conn{conn_id=<n> peer=127.0.0.1:<port> protocol=RESP tls=false node_id=127.0.0.1:6510}: rocket_mem::dispatcher: auth failure user=admin
+<date>  WARN conn{conn_id=<n> peer=127.0.0.1:<port> protocol=RESP tls=false node_id=127.0.0.1:6510}: rocket_mem::dispatcher: permission denied user=app
 ```
+
+**Automation note:** `node_id` above is filled in literally (`127.0.0.1:6510`, matching this
+suite's fixed config, confirmed deterministic in ACL-01's own capture) rather than wildcarded —
+reconfirm against a real run before this case is registered, same as ACL-18's label set.
 
 **Notes:** `auth success`/`auth failure` log at `INFO`/`WARN` with a `user=` field and never the
 password; `permission denied` logs the same way on every `NOPERM`. Both are at or above the
@@ -7423,17 +7368,77 @@ redaction specifically, not this stderr-log-by-username behavior.
 
 ---
 
-### ACL teardown
+### ACL-16 — Verify a `>password` or `on`/`off` token inside TOML `rules` fails startup, with the password redacted
 
+**Precondition:** ACL-01 through ACL-19 completed; the server from ACL-01 is still running on port
+6510.
+
+**Steps:**
 ```bash
 PID=$(cut -d= -f2 /tmp/acltls-qa/acl.pid)
 kill $PID
 sleep 1
 ss -lnt | grep -E ':(6510|6511|9310)\b' || echo "ports free"
+
+cat > /tmp/acltls-qa/acl-bad.toml <<'EOF'
+addr = "127.0.0.1:6510"
+rmp_addr = "127.0.0.1:6511"
+metrics_addr = "127.0.0.1:9310"
+
+[[acl.users]]
+username = "admin"
+enabled = true
+rules = ["on", ">secret123", "allcommands", "allkeys"]
+EOF
+
+"$ROCKET_MEM_BIN" --config /tmp/acltls-qa/acl-bad.toml
+echo "exit=$?"
+
+# Same file with the `on` token removed, so the password token is the first failure.
+sed 's/"on", //' /tmp/acltls-qa/acl-bad.toml > /tmp/acltls-qa/acl-bad2.toml
+"$ROCKET_MEM_BIN" --config /tmp/acltls-qa/acl-bad2.toml
+echo "exit=$?"
+
+ss -lnt | grep -E ':(6510|6511|9310)\b' || echo "ports free"
 ```
 
-Kill by that PID only. Never `pkill -f rocket-mem` — a broad pattern kill also takes out any other
-`rocket-mem` a colleague or a parallel test run has going.
+**Expected:**
+```
+ports free
+<date>  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=127.0.0.1:6510
+<date>  INFO rocket_mem: resolved config summary node_id=127.0.0.1:6510 addr=127.0.0.1:6510 rmp_addr=127.0.0.1:6511 metrics_addr=127.0.0.1:9310 aof_path=./appendonly.aof snapshot_path=./dump.snapshot log_filter=info log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=true acl_user_count=1 tls_enabled=false tls_replication_enabled=false
+Error: Custom { kind: InvalidInput, error: "acl bootstrap: ERR syntax error at 'on'" }
+exit=1
+<date>  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=127.0.0.1:6510
+<date>  INFO rocket_mem: resolved config summary node_id=127.0.0.1:6510 addr=127.0.0.1:6510 rmp_addr=127.0.0.1:6511 metrics_addr=127.0.0.1:9310 aof_path=./appendonly.aof snapshot_path=./dump.snapshot log_filter=info log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=true acl_user_count=1 tls_enabled=false tls_replication_enabled=false
+Error: Custom { kind: InvalidInput, error: "acl bootstrap: ERR syntax error at '<password token>'" }
+exit=1
+ports free
+```
+
+**Notes:** ACL-16 now also stops the ACL-01 server as its own first step (folded in from the old
+standalone "ACL teardown" section) — it's the natural last case since, unlike ACL-17/18/19, it has
+no dependency on the server's accumulated history, only on its ports being free once it's done.
+Same pattern RMP-05/SMOKE-12/PUBSUB-12 use to end their own suites. Kill by that PID only — never
+`pkill -f rocket-mem`, a broad pattern kill also takes out any other `rocket-mem` a colleague or a
+parallel test run has going.
+
+Two more things to check beyond the exit code.
+
+First, the second error says `'<password token>'` — the literal string `secret123` is **not**
+echoed. A misconfigured password must not leak into stderr, journald, container logs or CI output.
+If you ever see the actual password there, that is a security defect worth filing.
+
+Second, no `listener bound` event is printed at all — the two lines that do appear (`rocket-mem
+starting`, `resolved config summary`) are pure logging with no side effect; the ACL bootstrap
+check still runs before anything is bound, so the process leaves no half-started state. (This
+differs from the TLS failures in TLS-08, which abort after the metrics and RMP listeners are
+already up.)
+
+The `Error: Custom { ... }` wrapper is `std::io::Error`'s `Debug` output rather than a hand-written
+message. Noisy, but the useful part is inside it.
+
+**Result:** ☐ Pass ☐ Fail
 
 ---
 
