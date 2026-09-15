@@ -109,6 +109,10 @@ cd tools/qa-agent && yarn test src/suites.test.ts
 
 Expected: PASS.
 
+- [ ] **Step 5: Fix two stale comments Plan 2's final review flagged, while this file is open**
+
+`SUITE_EXTRA_OWN_SERVER_PORTS` now has three entries (`Cluster`, `Pub/sub`, and — once this task's own edit lands — nothing changes here, this is about the comment predating TLS's own Plan 2 registration) — but the comment above it, plus matching comments in `server.ts` and `index.ts`, still say "only Cluster today." Update all three to reflect that `Cluster`, `Pub/sub`, and `TLS` all have entries. Also add one sentence to the new `SUITE_SCRATCH_PATHS` comment (Step 3 above) or to `SUITE_SERVER_PORT["TLS"]`'s existing comment noting that `suitePorts("TLS")` deliberately omits `7379`/`9121` (TLS's own RMP/metrics ports) — consistent with every other suite on the shared `6379` bank, and harmless for `killScratchProcess` (one process, any of its five bound ports resolves the same pid), but worth spelling out as deliberate rather than an oversight.
+
 ---
 
 ### Task 2: Wire `SUITE_SCRATCH_PATHS` into `/api/clear-env`
