@@ -31,6 +31,15 @@ const VALUE_PROPS = [
 export function Why() {
   return (
     <section id="why" className="mx-auto max-w-6xl px-4 py-20 sm:px-6">
+      <div className="mb-10 flex flex-col gap-2 text-center">
+        <h2 className="font-heading text-3xl font-semibold">
+          Why rocket-mem
+        </h2>
+        <p className="text-muted-foreground">
+          Compatibility first, with the durability and concurrency Redis
+          leaves on the table.
+        </p>
+      </div>
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
         <Card className="sm:col-span-3">
           <CardHeader>

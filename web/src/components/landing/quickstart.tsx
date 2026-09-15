@@ -26,10 +26,10 @@ export function Quickstart() {
         </p>
       </div>
       <Tabs defaultValue="docker">
-        <TabsList className="mx-auto">
+        <TabsList className="mx-auto max-w-full">
           <TabsTrigger value="docker">Docker</TabsTrigger>
-          <TabsTrigger value="binary">Binary download</TabsTrigger>
-          <TabsTrigger value="source">Build from source</TabsTrigger>
+          <TabsTrigger value="binary">Binary</TabsTrigger>
+          <TabsTrigger value="source">Source</TabsTrigger>
         </TabsList>
         <TabsContent value="docker">
           <CopyCodeBlock code={DOCKER_COMMAND} />

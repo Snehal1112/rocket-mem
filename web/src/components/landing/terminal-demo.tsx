@@ -23,7 +23,7 @@ export function TerminalDemo() {
     >
       {/* A nested dark scope, so the card resolves the project's own dark
           tokens in either page theme and always reads as a terminal. */}
-      <div className="dark max-w-2xl">
+      <div className="dark max-w-2xl" style={{ colorScheme: "dark" }}>
         <Card className="p-0 font-heading text-xs leading-relaxed sm:text-sm">
           <div className="overflow-x-auto">
             <div className="min-w-max space-y-4 px-5 py-5 sm:px-6">

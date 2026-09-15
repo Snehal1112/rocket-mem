@@ -2,6 +2,26 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <script>
+      // Stamp the resolved theme class on <html> before first paint, so a
+      // returning dark-mode visitor doesn't see a white flash while React
+      // mounts. Mirrors theme-provider.tsx's own storage key and system
+      // resolution logic — keep the two in sync if either changes.
+      ;(function () {
+        try {
+          var stored = localStorage.getItem("theme")
+          var isDark =
+            stored === "dark" ||
+            (stored !== "light" &&
+              window.matchMedia("(prefers-color-scheme: dark)").matches)
+          document.documentElement.classList.toggle("dark", isDark)
+        } catch (e) {
+          // localStorage may be unavailable (e.g. blocked storage); fall
+          // through with no class, matching the light default.
+        }
+      })()
+    </script>
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>rocket-mem — a Redis-compatible store, from scratch in Rust</title>
     <meta
