@@ -7809,6 +7809,7 @@ hand.
 **Steps:**
 ```bash
 [ -f /tmp/acltls-qa/tls.pid ] && kill "$(cut -d= -f2 /tmp/acltls-qa/tls.pid)" 2>/dev/null
+rm -f /tmp/acltls-qa/tls.pid
 sleep 1
 cd /tmp/acltls-qa
 
@@ -8052,6 +8053,7 @@ anywhere in this build.
 ```bash
 for f in /tmp/acltls-qa/tls.pid /tmp/acltls-qa/acltls.pid; do
   [ -f "$f" ] && kill "$(cut -d= -f2 "$f")" 2>/dev/null
+  rm -f "$f"
 done
 sleep 1
 ss -lnt | grep -E ':(6379|7379|16379|17379|9121)\b' || echo "ports free"
@@ -8092,9 +8094,6 @@ rm -rf /tmp/acltls-qa
 ```
 
 **Result:** ☐ Pass ☐ Fail
-
----
-
 
 ---
 
