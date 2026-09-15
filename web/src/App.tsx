@@ -6,6 +6,7 @@ import { Why } from "@/components/landing/why"
 import { Features } from "@/components/landing/features"
 import { Architecture } from "@/components/landing/architecture"
 import { Performance } from "@/components/landing/performance"
+import { SecurityObservability } from "@/components/landing/security-observability"
 
 function App() {
   return (
@@ -18,6 +19,7 @@ function App() {
         <Features />
         <Architecture />
         <Performance />
+        <SecurityObservability />
       </main>
       <SiteFooter />
     </>
