@@ -7,6 +7,7 @@ import { Features } from "@/components/landing/features"
 import { Architecture } from "@/components/landing/architecture"
 import { Performance } from "@/components/landing/performance"
 import { SecurityObservability } from "@/components/landing/security-observability"
+import { CommandCoverage } from "@/components/landing/command-coverage"
 
 function App() {
   return (
@@ -20,6 +21,7 @@ function App() {
         <Architecture />
         <Performance />
         <SecurityObservability />
+        <CommandCoverage />
       </main>
       <SiteFooter />
     </>
