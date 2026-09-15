@@ -17,6 +17,7 @@
 - Any fix discovered here to a value that's **wrong, not just variable** (a stale literal) is a real doc-accuracy bug — fix it to the real captured value, don't wildcard it away.
 - `tools/qa-agent` is gitignored — no commits for anything under `tools/qa-agent` itself, only for `docs/qa-playbook.md`/`docs/qa-playbook.html`.
 - Smallstep's `step` CLI is required for `TLS-01`. If it isn't installed, install it first (see `TLS-01`'s own Precondition for install options) rather than skip the case.
+- **Known gap, found by Plan 2's final review, that this plan must close:** no TLS case's `Steps` ever kills the server `TLS-02`/`TLS-10` start — the doc's own "TLS teardown" section is prose outside any case, so `qa-agent` never runs it. Worse, `TLS-10`'s server requires auth (its config sets an `admin` ACL user), so `tools/qa-agent/src/index.ts`'s end-of-run `killIfRocketMem` safety net is *correctly refused* (`processTracker.ts`'s `probeIsRealClusterNode` fails closed on `NOAUTH`). Left unaddressed, a full `yarn cli --suite "TLS"` run ends with an unreapable server still bound to `6379/7379/9121/16379/17379` — the live cluster's own address bank. Task 2 Step 1 below folds in the fix: add a teardown to `TLS-11`'s `Steps`, mirroring `ACL-16`'s own fold-in (kill by PID from `/tmp/acltls-qa/tls.pid` and `acltls.pid`, then confirm `ss` shows the ports free) — same pattern already used elsewhere in this doc.
 
 ---
 
@@ -70,9 +71,21 @@ Write the findings as a short list (case id → fix needed) rather than fixing i
 
 **Interfaces:** none beyond what Plans 1/2/3 already established (including `SUITE_SCRATCH_PATHS["TLS"]` from Plan 3).
 
-- [ ] **Step 1: Apply every fix from Task 1's findings list**
+- [ ] **Step 1: Apply every fix from Task 1's findings list, plus the teardown fix from Global Constraints**
 
 For each finding, edit both `docs/qa-playbook.md` (by hand) and `docs/qa-playbook.html`'s embedded JSON (via a short Node script, same style as the earlier wiring plan's sync script). Re-verify sync the same way Plan 2 Task 1 Step 2 did.
+
+Additionally — this is required regardless of what Task 1's live run found, per the Global Constraints note above — add a teardown to `TLS-11`'s `Steps` (it's the last case in execution order, same reasoning `ACL-16` used to become ACL's own final-case teardown): after `TLS-11`'s existing `timeout 2` command, append:
+
+```bash
+for f in /tmp/acltls-qa/tls.pid /tmp/acltls-qa/acltls.pid; do
+  [ -f "$f" ] && kill "$(cut -d= -f2 "$f")" 2>/dev/null
+done
+sleep 1
+ss -lnt | grep -E ':(6379|7379|16379|17379|9121)\b' || echo "ports free"
+```
+
+Prepend the matching `ports free` line to `TLS-11`'s `Expected` block (same shape as `ACL-16`'s own folded-in teardown output). Delete the now-redundant standalone "TLS teardown" section once this lands (its content now lives inside `TLS-11`'s own Steps). Sync this into `docs/qa-playbook.html`'s JSON the same way as every other fix in this step.
 
 - [ ] **Step 2: Re-run the suite**
 
