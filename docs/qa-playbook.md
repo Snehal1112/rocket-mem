@@ -4042,10 +4042,18 @@ mode is followed by one blank line, including the restricted-mode error below.
 
 ### PUBSUB-01 — Basic SUBSCRIBE + PUBLISH delivery
 
-**Precondition:** Server running per the startup block above. No existing subscribers on `news`.
+**Precondition:** No servers on 6600-6601/9600. No existing subscribers on `news`.
 
 **Steps:**
 ```bash
+ROCKET_MEM_ADDR=127.0.0.1:6600 ROCKET_MEM_RMP_ADDR=127.0.0.1:6601 \
+ROCKET_MEM_METRICS_ADDR=127.0.0.1:9600 \
+ROCKET_MEM_AOF_PATH=$DATA/pubsub-leader.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/pubsub-leader.snap \
+  $BIN > /dev/null 2>&1 &
+disown
+echo $! > /tmp/pubsub-leader.pid
+sleep 0.5
+
 redis-cli -p 6600 subscribe news > /tmp/pubsub01.out 2>&1 &
 SUBPID=$!
 sleep 0.4
@@ -4347,6 +4355,7 @@ ERR SUBSCRIBE is not allowed in transactions
 
 QUEUED
 EXECABORT Transaction discarded because of previous errors
+
 ```
 
 **Expected (PUBLISH inside MULTI):**
@@ -4373,21 +4382,20 @@ normally and only actually publishes — and delivers to the live subscriber —
 
 ### PUBSUB-09 — Cross-node delivery: a leader's PUBLISH reaches a follower's local subscriber
 
-**Precondition:** The leader from the section intro is running. Start a follower and attach it:
+**Precondition:** The leader from PUBSUB-01 is running. No servers on 6610-6611/9610.
+
+**Steps:**
 ```bash
 ROCKET_MEM_ADDR=127.0.0.1:6610 ROCKET_MEM_RMP_ADDR=127.0.0.1:6611 \
 ROCKET_MEM_METRICS_ADDR=127.0.0.1:9610 \
 ROCKET_MEM_AOF_PATH=$DATA/pubsub-follower.aof ROCKET_MEM_SNAPSHOT_PATH=$DATA/pubsub-follower.snap \
-  $BIN &
+  $BIN > /dev/null 2>&1 &
+disown
 echo $! > /tmp/pubsub-follower.pid
 sleep 0.5
 redis-cli -p 6610 replicaof 127.0.0.1 6600
 sleep 0.5
-redis-cli -p 6610 info replication | head -5   # master_link_status:up
-```
 
-**Steps:**
-```bash
 redis-cli -p 6610 subscribe crossnode > /tmp/pubsub09.out 2>&1 &
 FSUB=$!
 sleep 0.4
@@ -4399,6 +4407,7 @@ cat /tmp/pubsub09.out
 
 **Expected:**
 ```
+OK
 0
 subscribe
 crossnode
@@ -4408,7 +4417,9 @@ crossnode
 from-leader
 ```
 
-**Notes:** `PUBLISH` on the leader replies `0` — its *own* local subscriber count, genuinely zero
+**Notes:** `OK` is `REPLICAOF`'s own reply, folded into this case's Steps (along with starting
+the follower itself) so the runner can execute it — see the section intro for the prose version
+of the same setup. `PUBLISH` on the leader replies `0` — its *own* local subscriber count, genuinely zero
 here — yet the follower's subscriber still receives the message a moment later. A publishing
 node only ever reports its own local delivery count: the leader forwards the raw `PUBLISH` to the
 follower over the existing replication stream, and the follower's own registry delivers it to its
@@ -4479,14 +4490,16 @@ redis-cli -p 6600 pubsub numsub cleantest
 cleantest
 cleantest
 1
+
 cleantest
 0
 ```
 
 **Notes:** Reading top to bottom: `PUBSUB CHANNELS` lists `cleantest` while the subscriber is
-connected. After it disconnects, `PUBSUB CHANNELS` prints nothing at all (an empty array renders
-as zero lines in `redis-cli`'s raw mode) and `PUBSUB NUMSUB cleantest` reports `0` — cleanup on
-disconnect is prompt, even though there's no explicit unsubscribe in this scenario at all, only
+connected. After it disconnects, `PUBSUB CHANNELS` returns a genuinely empty array — which
+`redis-cli`'s raw mode renders as one blank line, not zero lines (confirmed via `redis-cli -p
+6600 pubsub channels | xxd`: exactly one byte, `0a`) — and `PUBSUB NUMSUB cleantest` reports `0`
+— cleanup on disconnect is prompt, even though there's no explicit unsubscribe in this scenario at all, only
 the connection closing.
 
 **Result:** ☐ Pass ☐ Fail
@@ -4502,6 +4515,10 @@ the connection closing.
 redis-cli -p 6600 subscribe
 redis-cli -p 6600 publish onlyone
 redis-cli -p 6600 psubscribe
+
+kill $(cat /tmp/pubsub-leader.pid) $(cat /tmp/pubsub-follower.pid) 2>/dev/null
+rm -f /tmp/pubsub-leader.pid /tmp/pubsub-follower.pid
+rm -f /tmp/pubsub0*.out /tmp/pubsub1*.out
 ```
 
 **Expected:**
@@ -4511,6 +4528,7 @@ ERR wrong number of arguments for 'subscribe' command
 ERR wrong number of arguments for 'publish' command
 
 ERR wrong number of arguments for 'psubscribe' command
+
 
 ```
 
@@ -5509,7 +5527,7 @@ kill $PID
 ```bash
 cd /tmp/rm-qa-work
 rm -f /tmp/rm-qa-cfg1.aof /tmp/rm-qa-cfg1.snap
-ROCKET_MEM_ADDR=numericlabs.lxd:6479 \
+ROCKET_MEM_ADDR=numericlabs.lxd:6395 \
 RUST_LOG="info,rocket_mem::connection=off" \
   "$ROCKET_MEM_BIN" \
   --config /tmp/rm-qa-cfg/my-config.toml &
@@ -5521,12 +5539,12 @@ kill $PID
 
 **Expected:**
 ```
-<date>  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=numericlabs.lxd:6479
-<date>  INFO rocket_mem: resolved config summary node_id=numericlabs.lxd:6479 addr=numericlabs.lxd:6479 rmp_addr=numericlabs.lxd:7379 metrics_addr=numericlabs.lxd:9121 aof_path=/tmp/rm-qa-cfg1.aof snapshot_path=/tmp/rm-qa-cfg1.snap log_filter=info,rocket_mem::connection=off log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=false acl_user_count=0 tls_enabled=false tls_replication_enabled=false
+<date>  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=numericlabs.lxd:6395
+<date>  INFO rocket_mem: resolved config summary node_id=numericlabs.lxd:6395 addr=numericlabs.lxd:6395 rmp_addr=numericlabs.lxd:7379 metrics_addr=numericlabs.lxd:9121 aof_path=/tmp/rm-qa-cfg1.aof snapshot_path=/tmp/rm-qa-cfg1.snap log_filter=info,rocket_mem::connection=off log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=false acl_user_count=0 tls_enabled=false tls_replication_enabled=false
 <date>  INFO rocket_mem::aof: aof recovery replay complete commands=0 bytes=0 elapsed_us=<n>
 <date>  INFO rocket_mem: listener bound protocol=metrics addr=http://192.168.1.12:9121/metrics
 <date>  INFO rocket_mem: listener bound protocol=RMP addr=192.168.1.12:7379
-<date>  INFO rocket_mem: listener bound protocol=RESP addr=192.168.1.12:6479
+<date>  INFO rocket_mem: listener bound protocol=RESP addr=192.168.1.12:6395
 
 ┌───────────────────────────────────────────────────────────────────────────────────────────────────┐
 │ rocket-mem v0.1.4                                                                                 │
@@ -5538,15 +5556,16 @@ kill $PID
 │ listeners                                                                                         │
 │           metrics  http://192.168.1.12:9121/metrics                                               │
 │           RMP      192.168.1.12:7379                                                              │
-│           RESP     192.168.1.12:6479                                                              │
+│           RESP     192.168.1.12:6395                                                              │
 └───────────────────────────────────────────────────────────────────────────────────────────────────┘
+
 
 ```
 
-**Notes:** `addr` bound on **`numericlabs.lxd:6479`** (the env value — shard-a's real replica
-address, used here purely as a distinct override value), not `numericlabs.lxd:6379` (the TOML
-value) — env beats file. `rmp_addr`/`metrics_addr` are untouched, still from the TOML, since no
-env var set them.
+**Notes:** `addr` bound on **`numericlabs.lxd:6395`** (the env value — a scratch port distinct
+from both the TOML's and any real cluster node's address, so this case can't collide with the
+live production cluster), not `numericlabs.lxd:6379` (the TOML value) — env beats file.
+`rmp_addr`/`metrics_addr` are untouched, still from the TOML, since no env var set them.
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -5560,25 +5579,25 @@ env var set them.
 ```bash
 cd /tmp/rm-qa-work
 rm -f /tmp/rm-qa-cfg1.aof /tmp/rm-qa-cfg1.snap
-ROCKET_MEM_ADDR=numericlabs.lxd:6479 \
+ROCKET_MEM_ADDR=numericlabs.lxd:6395 \
 RUST_LOG="info,rocket_mem::connection=off" \
   "$ROCKET_MEM_BIN" \
-  --config /tmp/rm-qa-cfg/my-config.toml --addr numericlabs.lxd:6380 &
+  --config /tmp/rm-qa-cfg/my-config.toml --addr numericlabs.lxd:6396 &
 disown
 PID=$!
 sleep 0.5
-redis-cli -h numericlabs.lxd -p 6380 ping
+redis-cli -h numericlabs.lxd -p 6396 ping
 kill $PID
 ```
 
 **Expected:**
 ```
-<date>  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=numericlabs.lxd:6380
-<date>  INFO rocket_mem: resolved config summary node_id=numericlabs.lxd:6380 addr=numericlabs.lxd:6380 rmp_addr=numericlabs.lxd:7379 metrics_addr=numericlabs.lxd:9121 aof_path=/tmp/rm-qa-cfg1.aof snapshot_path=/tmp/rm-qa-cfg1.snap log_filter=info,rocket_mem::connection=off log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=false acl_user_count=0 tls_enabled=false tls_replication_enabled=false
+<date>  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=numericlabs.lxd:6396
+<date>  INFO rocket_mem: resolved config summary node_id=numericlabs.lxd:6396 addr=numericlabs.lxd:6396 rmp_addr=numericlabs.lxd:7379 metrics_addr=numericlabs.lxd:9121 aof_path=/tmp/rm-qa-cfg1.aof snapshot_path=/tmp/rm-qa-cfg1.snap log_filter=info,rocket_mem::connection=off log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=false acl_user_count=0 tls_enabled=false tls_replication_enabled=false
 <date>  INFO rocket_mem::aof: aof recovery replay complete commands=0 bytes=0 elapsed_us=<n>
 <date>  INFO rocket_mem: listener bound protocol=metrics addr=http://192.168.1.12:9121/metrics
 <date>  INFO rocket_mem: listener bound protocol=RMP addr=192.168.1.12:7379
-<date>  INFO rocket_mem: listener bound protocol=RESP addr=192.168.1.12:6380
+<date>  INFO rocket_mem: listener bound protocol=RESP addr=192.168.1.12:6396
 
 ┌───────────────────────────────────────────────────────────────────────────────────────────────────┐
 │ rocket-mem v0.1.4                                                                                 │
@@ -5590,18 +5609,17 @@ kill $PID
 │ listeners                                                                                         │
 │           metrics  http://192.168.1.12:9121/metrics                                               │
 │           RMP      192.168.1.12:7379                                                              │
-│           RESP     192.168.1.12:6380                                                              │
+│           RESP     192.168.1.12:6396                                                              │
 └───────────────────────────────────────────────────────────────────────────────────────────────────┘
 
 PONG
 ```
 
-**Notes:** Only `--addr` was passed on the command line. `addr` bound on `numericlabs.lxd:6380`
-(shard-b leader's real address, used here purely as a distinct override value — CLI beats env
-beats file). `rmp_addr` (`numericlabs.lxd:7379`) and `metrics_addr` (`numericlabs.lxd:9121`) are
-still the TOML's values, not the built-in defaults (`127.0.0.1:6380`/`127.0.0.1:9121`) and not
-reset by the unpassed flags — an unset CLI flag is genuinely absent from the merge, not serialized
-as null.
+**Notes:** Only `--addr` was passed on the command line. `addr` bound on `numericlabs.lxd:6396`
+(a scratch port, distinct from both the env var's and the TOML's — CLI beats env beats file).
+`rmp_addr` (`numericlabs.lxd:7379`) and `metrics_addr` (`numericlabs.lxd:9121`) are still the
+TOML's values, not the built-in defaults (`127.0.0.1:6396`/`127.0.0.1:9121`) and not reset by the
+unpassed flags — an unset CLI flag is genuinely absent from the merge, not serialized as null.
 
 **Result:** ☐ Pass ☐ Fail
 
@@ -6621,6 +6639,7 @@ records its PID in a file for exactly that reason.
 **Steps:**
 ```bash
 mkdir -p /tmp/acltls-qa
+rm -f /tmp/acltls-qa/acl.aof /tmp/acltls-qa/acl.snap
 
 cat > /tmp/acltls-qa/acl.toml <<'EOF'
 addr = "127.0.0.1:6510"
@@ -6654,7 +6673,6 @@ enabled = true
 rules = ["allcommands", "~app:*"]
 EOF
 
-cd /tmp/acltls-qa
 nohup "$ROCKET_MEM_BIN" \
   --config /tmp/acltls-qa/acl.toml > /tmp/acltls-qa/acl-server.log 2>&1 &
 echo "PID=$!" > /tmp/acltls-qa/acl.pid
@@ -7553,7 +7571,6 @@ the live cluster first if it's running (see the port note at the top of this doc
 
 **Steps:**
 ```bash
-cd /tmp/acltls-qa
 ROCKET_MEM_ADDR=numericlabs.lxd:6379 ROCKET_MEM_RMP_ADDR=numericlabs.lxd:7379 \
 ROCKET_MEM_METRICS_ADDR=numericlabs.lxd:9121 \
 ROCKET_MEM_AOF_PATH=/tmp/acltls-qa/tls.aof ROCKET_MEM_SNAPSHOT_PATH=/tmp/acltls-qa/tls.snap \
@@ -7932,7 +7949,6 @@ enabled = true
 rules = ["allcommands", "allkeys"]
 EOF
 
-cd /tmp/acltls-qa
 nohup "$ROCKET_MEM_BIN" \
   --config /tmp/acltls-qa/acl-tls.toml > /tmp/acltls-qa/acltls-server.log 2>&1 &
 echo "PID=$!" > /tmp/acltls-qa/acltls.pid
