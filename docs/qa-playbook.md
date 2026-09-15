@@ -7540,9 +7540,9 @@ ls -l /tmp/acltls-qa/tls
 Your certificate has been saved in cert.pem.
 Your private key has been saved in key.pem.
 exit=0
-total 8
--rw------- 1 numericlabs numericlabs 599 Sep 13 08:36 cert.pem
--rw------- 1 numericlabs numericlabs 227 Sep 13 08:36 key.pem
+total <n>
+-rw------- 1 <user> <group> <n> <date> cert.pem
+-rw------- 1 <user> <group> <n> <date> key.pem
 ```
 
 **Notes:** `--profile self-signed` needs `--subtle` — Smallstep's own guard against generating a
