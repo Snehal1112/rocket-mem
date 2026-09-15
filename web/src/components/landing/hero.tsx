@@ -33,15 +33,15 @@ function DockerCommand() {
   // The box sizes to the command itself once the row has room for it, so
   // the command only scrolls horizontally on narrow screens.
   return (
-    <div className="flex w-full min-w-0 items-center gap-2 rounded-xl border border-border bg-muted/40 py-2 pl-3 pr-2 lg:w-auto">
+    <div className="flex w-full min-w-0 items-center gap-2 rounded-xl border border-border bg-muted/40 py-2 pr-2 pl-3 lg:w-auto">
       {/* The prompt is decoration, so keep it out of a drag-selected copy. */}
       <span
         aria-hidden="true"
-        className="select-none font-heading text-sm text-muted-foreground"
+        className="font-heading text-sm text-muted-foreground select-none"
       >
         $
       </span>
-      <code className="min-w-0 flex-1 overflow-x-auto whitespace-pre font-heading text-xs text-foreground sm:text-sm">
+      <code className="min-w-0 flex-1 overflow-x-auto font-heading text-xs whitespace-pre text-foreground sm:text-sm">
         {DOCKER_COMMAND}
       </code>
       <Button
@@ -61,12 +61,12 @@ function DockerCommand() {
 
 export function Hero() {
   return (
-    <section className="mx-auto max-w-6xl px-4 pb-16 pt-20 sm:px-6 sm:pb-24 sm:pt-28">
-      <h1 className="max-w-[20ch] text-balance font-heading text-3xl font-semibold leading-[1.1] tracking-tight sm:text-5xl lg:text-6xl">
+    <section className="mx-auto max-w-6xl px-4 pt-20 pb-16 sm:px-6 sm:pt-28 sm:pb-24">
+      <h1 className="max-w-[20ch] font-heading text-3xl leading-[1.1] font-semibold tracking-tight text-balance sm:text-5xl lg:text-6xl">
         A Redis-compatible store, built from scratch in Rust
       </h1>
 
-      <p className="mt-6 max-w-[60ch] text-pretty text-base leading-relaxed text-muted-foreground sm:text-lg">
+      <p className="mt-6 max-w-[60ch] text-base leading-relaxed text-pretty text-muted-foreground sm:text-lg">
         rocket-mem speaks RESP2 and RESP3. Point{" "}
         <code className="font-heading text-[0.9em] text-foreground">
           redis-cli

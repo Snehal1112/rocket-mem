@@ -30,8 +30,7 @@ function ThemeToggle() {
 
   const cycleTheme = () => {
     const currentIndex = THEME_SEQUENCE.indexOf(theme)
-    const nextTheme =
-      THEME_SEQUENCE[(currentIndex + 1) % THEME_SEQUENCE.length]
+    const nextTheme = THEME_SEQUENCE[(currentIndex + 1) % THEME_SEQUENCE.length]
     setTheme(nextTheme)
   }
 

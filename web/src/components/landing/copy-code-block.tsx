@@ -14,7 +14,7 @@ export function CopyCodeBlock({ code }: { code: string }) {
 
   return (
     <div className="flex items-start gap-2 rounded-2xl border border-border bg-muted/50 px-4 py-3">
-      <pre className="flex-1 overflow-x-auto whitespace-pre-wrap font-heading text-xs text-foreground sm:text-sm">
+      <pre className="flex-1 overflow-x-auto font-heading text-xs whitespace-pre-wrap text-foreground sm:text-sm">
         {code}
       </pre>
       <Button

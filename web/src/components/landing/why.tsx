@@ -42,8 +42,8 @@ export function Why() {
               rocket-mem speaks RESP2 and RESP3, with full <code>HELLO</code>{" "}
               version negotiation. Point your existing Redis client —{" "}
               <code>redis-cli</code>, <code>redis-py</code>,{" "}
-              <code>ioredis</code>, <code>go-redis</code>, or any other — at
-              it and it just works. No code changes.
+              <code>ioredis</code>, <code>go-redis</code>, or any other — at it
+              and it just works. No code changes.
             </CardDescription>
           </CardHeader>
         </Card>

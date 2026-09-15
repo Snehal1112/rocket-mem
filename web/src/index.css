@@ -214,28 +214,6 @@
   --radius-4xl: calc(var(--radius) * 2.6);
 }
 
-@layer components {
-  /* The hero transcript plays once on load; each line is delayed inline. */
-  .terminal-line {
-    animation: terminal-line-in 220ms ease-out both;
-  }
-}
-
-@keyframes terminal-line-in {
-  from {
-    opacity: 0;
-  }
-  to {
-    opacity: 1;
-  }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .terminal-line {
-    animation: none;
-  }
-}
-
 @layer base {
   * {
     @apply border-border outline-ring/50;

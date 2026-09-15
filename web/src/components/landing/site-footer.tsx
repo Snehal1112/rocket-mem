@@ -13,9 +13,7 @@ export function SiteFooter() {
     <footer className="border-t border-border">
       <div className="mx-auto flex max-w-6xl flex-col gap-4 px-4 py-10 sm:px-6">
         <div className="flex flex-wrap items-center justify-between gap-4">
-          <span className="font-heading text-sm font-medium">
-            rocket-mem
-          </span>
+          <span className="font-heading text-sm font-medium">rocket-mem</span>
           <nav className="flex flex-wrap gap-6">
             {FOOTER_LINKS.map((link) => (
               <a
