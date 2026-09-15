@@ -748,7 +748,7 @@ export ROCKET_MEM_BIN="$ROCKET_MEM_REPO/target/release/rocket-mem"</pre>
 
   function triggerClearEnv(btn){
     var section = btn.getAttribute('data-section');
-    confirmDialog('Stop "' + section + '"\'s server, free its ports, and clear its recorded results?').then(function(ok){
+    confirmDialog('Stop "' + section + '"\'s server, free its ports, delete its scratch files on disk, and clear its recorded results?').then(function(ok){
       if (!ok) return;
       // Raw section, not attr(section) — the selector must match the DOM attribute's actual
       // (already-decoded) value, same as triggerRun's own '[data-run="'+id+'"]' pattern above.
@@ -773,6 +773,14 @@ export ROCKET_MEM_BIN="$ROCKET_MEM_REPO/target/release/rocket-mem"</pre>
               ? (killed ? 'Cleaned ' + killed + ', left ' + notOurs + ' alone' : 'Left ' + notOurs + ' alone')
               : killed ? (free ? 'Cleaned ' + killed + ', ' + free + ' already free' : 'Cleaned')
               : 'Already clean';
+            // removedPaths reflects file cleanup, which happens independently of each port's own
+            // kill/already-free/not-ours outcome above (server.ts's removal loop is intentionally
+            // unconditional) — fold it in as its own clause so a run that only freed ports still
+            // reads correctly (no "removed 0 files" noise) and one that both freed ports AND
+            // removed files reports both facts, instead of the port-only message silently going
+            // stale the moment removedPaths has anything to say.
+            var removedCount = (body.removedPaths || []).length;
+            if (removedCount) msg += ', removed ' + removedCount + ' file' + (removedCount === 1 ? '' : 's');
             // Reset every case in this suite back to untested too — same convention setVerdict
             // uses (delete the key; a literal 'todo' string is never stored). render() rebuilds
             // the whole list, which is exactly why `el` is looked up via find() AFTER this, not
