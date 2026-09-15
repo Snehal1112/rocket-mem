@@ -1,0 +1,11 @@
+# Vendored shadcn/ui components. Kept byte-identical to the registry so that
+# `shadcn add --overwrite` upgrades apply cleanly; `format` would rewrite them.
+src/components/ui/
+
+node_modules/
+coverage/
+.pnpm-store/
+pnpm-lock.yaml
+package-lock.json
+pnpm-lock.yaml
+yarn.lock
