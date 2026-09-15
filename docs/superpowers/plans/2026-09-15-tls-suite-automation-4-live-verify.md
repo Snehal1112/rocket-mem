@@ -153,7 +153,16 @@ process.stdin.on("end", () => console.log(JSON.parse(data).ran.map(r => [r.id, r
 
 Expected: a genuine `pass` for `TLS-01` — this is the exact request the browser's "Run" button sends (`docs/qa-playbook.html`'s `triggerRun`), so a real pass here proves the button's full click-to-execution path works, not just its visibility condition.
 
-- [ ] **Step 4: Confirm the Clean environment button's own request path removes TLS's scratch files**
+- [ ] **Step 4: Wire the Clean environment button's UI to reflect `removedPaths` (required — found by Plan 3's final review, not optional polish)**
+
+Plan 3's `/api/clear-env` response gained a `removedPaths` field, but `docs/qa-playbook.html`'s client JS was never updated to use it — verified live during Plan 3: when TLS's ports are held by a process `killScratchProcess` correctly refuses to touch (e.g. the real live cluster), the button's result message says "Left 3 alone," which is actively misleading when 11 scratch files were in fact just deleted. Fix both of the following in `docs/qa-playbook.html`:
+
+1. **Confirm dialog wording** (search for the `triggerClearEnv`/confirm-dialog message text, e.g. `Stop "` + section + `"'s server, free its ports, and clear its recorded results?`): update it to also mention that the suite's own scratch files on disk will be deleted, not just that ports will be freed.
+2. **Result message**: the current logic builds its message purely from `body.ports` (killed/already-free/left-alone counts). Fold `body.removedPaths.length` in too — e.g. append `, removed N file(s)` (or equivalent phrasing consistent with the rest of the message) whenever `removedPaths.length > 0`, so a run that only frees ports still reads correctly (no "removed 0 files" noise) and a run that both frees ports and removes files reports both facts.
+
+Also add, in `tools/qa-agent/src/server.ts`, one sentence to the comment directly above the removal loop (`server.ts:397-399` as of Plan 3) documenting that removal is **intentionally unconditional** — it runs regardless of each port's kill outcome (`killed`/`already-free`/`not-ours`), because the scratch files are disposable QA fixtures (regenerable by re-running `TLS-01`) and a `not-ours` port outcome (the file owner is a process this suite doesn't control) shouldn't block cleaning up TLS's own leftover config/certs. This is a one-line documentation addition, not a behavior change — Plan 3's own live verification already exercised this exact path and it's the desired behavior.
+
+- [ ] **Step 5: Confirm the Clean environment button's own request path removes TLS's scratch files**
 
 ```bash
 ls /tmp/acltls-qa
@@ -164,9 +173,9 @@ process.stdin.on("end", () => console.log(JSON.parse(data)));
 ls /tmp/acltls-qa
 ```
 
-Expected: the second `ls` shows TLS's files gone (matching Plan 3's `SUITE_SCRATCH_PATHS["TLS"]` list) — this closes the second half of the original ask ("remove/clean the entire test env along with ports and configuration files").
+Expected: the second `ls` shows TLS's files gone (matching Plan 3's `SUITE_SCRATCH_PATHS["TLS"]` list) — this closes the second half of the original ask ("remove/clean the entire test env along with ports and configuration files"). Also open the page in a browser (or re-read the updated `triggerClearEnv` source) and confirm Step 4's message-construction fix actually reads `removedPaths` from this real response.
 
-- [ ] **Step 5: Full regression**
+- [ ] **Step 6: Full regression**
 
 ```bash
 cd /home/numericlabs/data/rocket/rocket-mem/tools/qa-agent
@@ -175,11 +184,11 @@ yarn test && yarn typecheck
 
 Expected: all green.
 
-- [ ] **Step 6: Restart the live cluster, if this plan's Task 1 Step 1 stopped it**
+- [ ] **Step 7: Restart the live cluster, if this plan's Task 1 Step 1 stopped it**
 
 Bring it back up via its own documented procedure — same one used to stop it. Confirm with the same `ss`/`pgrep` check from Task 1 Step 1 that it's back.
 
-- [ ] **Step 7: Report back to the user**
+- [ ] **Step 8: Report back to the user**
 
 Summarize: how many live-run mismatches were found and fixed (Task 1/2, including the `TLS-09`/`TLS-10` fill-in), confirmation both the Run and Clean environment buttons work end to end for TLS, whether the live cluster was stopped/restarted during this plan, and the final commit list (`git log --oneline -8`).
 
