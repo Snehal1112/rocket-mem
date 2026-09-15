@@ -8,6 +8,7 @@ import { Architecture } from "@/components/landing/architecture"
 import { Performance } from "@/components/landing/performance"
 import { SecurityObservability } from "@/components/landing/security-observability"
 import { CommandCoverage } from "@/components/landing/command-coverage"
+import { Quickstart } from "@/components/landing/quickstart"
 
 function App() {
   return (
@@ -22,6 +23,7 @@ function App() {
         <Performance />
         <SecurityObservability />
         <CommandCoverage />
+        <Quickstart />
       </main>
       <SiteFooter />
     </>
