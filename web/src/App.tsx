@@ -4,6 +4,7 @@ import { Hero } from "@/components/landing/hero"
 import { TerminalDemo } from "@/components/landing/terminal-demo"
 import { Why } from "@/components/landing/why"
 import { Features } from "@/components/landing/features"
+import { Architecture } from "@/components/landing/architecture"
 
 function App() {
   return (
@@ -14,6 +15,7 @@ function App() {
         <TerminalDemo />
         <Why />
         <Features />
+        <Architecture />
       </main>
       <SiteFooter />
     </>
