@@ -7801,12 +7801,15 @@ instead of this error, that is a genuine regression.
 
 ### TLS-08 — Verify a TLS address without a cert/key is a startup error, not an unbound listener
 
-**Precondition:** The server from TLS-02 is **stopped** and ports 6379, 7379, 16379 and 9121 are
-free. These runs bind the metrics and RMP listeners before aborting, so a running server would
-mask the real error with `AddrInUse`.
+**Precondition:** TLS-02 through TLS-07 completed. These runs bind the metrics and RMP listeners
+before aborting, so a running server would mask the real error with `AddrInUse` — this case's own
+Steps stop TLS-02's server as their first action, rather than assuming it was already stopped by
+hand.
 
 **Steps:**
 ```bash
+[ -f /tmp/acltls-qa/tls.pid ] && kill "$(cut -d= -f2 /tmp/acltls-qa/tls.pid)" 2>/dev/null
+sleep 1
 cd /tmp/acltls-qa
 
 # A: TLS address set, no cert or key at all.
@@ -7829,18 +7832,30 @@ ROCKET_MEM_TLS_KEY_PATH=/tmp/acltls-qa/tls/cert.pem \
 "$ROCKET_MEM_BIN"; echo "exit=$?"
 ```
 
-**Expected:** (scenario A shown in full; B and C are the same shape with two more `listener bound`
-lines — `metrics` and `RMP` — appearing before their own error)
+**Expected:** all three scenarios back to back, in order (A, then B, then C) — B and C are the
+same shape as A with two more `listener bound` lines (`metrics` and `RMP`) appearing before their
+own error, confirmed live 2026-09-15:
 ```
 <date>  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=numericlabs.lxd:6379
 <date>  INFO rocket_mem: resolved config summary node_id=numericlabs.lxd:6379 addr=numericlabs.lxd:6379 rmp_addr=numericlabs.lxd:7379 metrics_addr=numericlabs.lxd:9121 aof_path=./appendonly.aof snapshot_path=./dump.snapshot log_filter=info log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=false acl_user_count=0 tls_enabled=true tls_replication_enabled=false
 <date>  INFO rocket_mem::aof: aof recovery replay complete commands=0 bytes=0 elapsed_us=<n>
 Error: Custom { kind: InvalidInput, error: "tls_resp_addr is set but tls_cert_path/tls_key_path is not -- TLS requires both" }
 exit=1
+<date>  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=numericlabs.lxd:6379
+<date>  INFO rocket_mem: resolved config summary node_id=numericlabs.lxd:6379 addr=numericlabs.lxd:6379 rmp_addr=numericlabs.lxd:7379 metrics_addr=numericlabs.lxd:9121 aof_path=./appendonly.aof snapshot_path=./dump.snapshot log_filter=info log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=false acl_user_count=0 tls_enabled=true tls_replication_enabled=false
+<date>  INFO rocket_mem::aof: aof recovery replay complete commands=0 bytes=0 elapsed_us=<n>
+<date>  INFO rocket_mem: listener bound protocol=metrics addr=http://192.168.1.12:9121/metrics
+<date>  INFO rocket_mem: listener bound protocol=RMP addr=192.168.1.12:7379
+Error: Os { code: 2, kind: NotFound, message: "No such file or directory" }
+exit=1
+<date>  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=numericlabs.lxd:6379
+<date>  INFO rocket_mem: resolved config summary node_id=numericlabs.lxd:6379 addr=numericlabs.lxd:6379 rmp_addr=numericlabs.lxd:7379 metrics_addr=numericlabs.lxd:9121 aof_path=./appendonly.aof snapshot_path=./dump.snapshot log_filter=info log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=false acl_user_count=0 tls_enabled=true tls_replication_enabled=false
+<date>  INFO rocket_mem::aof: aof recovery replay complete commands=0 bytes=0 elapsed_us=<n>
+<date>  INFO rocket_mem: listener bound protocol=metrics addr=http://192.168.1.12:9121/metrics
+<date>  INFO rocket_mem: listener bound protocol=RMP addr=192.168.1.12:7379
+Error: Custom { kind: InvalidData, error: "no certificate found in cert file" }
+exit=1
 ```
-Scenario B ends with `Error: Os { code: 2, kind: NotFound, message: "No such file or directory" }` /
-`exit=1`; scenario C ends with `Error: Custom { kind: InvalidData, error: "no certificate found in
-cert file" }` / `exit=1` — both unchanged, reconfirmed live.
 
 **Notes:** The behavior under test is that all three exit 1. A TLS misconfiguration must never
 result in a server that comes up happily with its TLS listener silently missing — that would look
@@ -7896,16 +7911,44 @@ timeout 2 "$ROCKET_MEM_BIN" \
   --config /tmp/acltls-qa/cfgdir/tls-relative.toml; echo "exit=$?"
 ```
 
-**Expected:** (structured logging replaces the old plain lines — see TLS-02; substance below is
-unchanged and reconfirmed live)
+**Expected:** confirmed live 2026-09-15 — both runs in full:
 ```
-... startup/config-summary logging, then:
+<date>  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=numericlabs.lxd:6379
+<date>  INFO rocket_mem: resolved config summary node_id=numericlabs.lxd:6379 addr=numericlabs.lxd:6379 rmp_addr=numericlabs.lxd:7379 metrics_addr=numericlabs.lxd:9121 aof_path=/tmp/acltls-qa/tls.aof snapshot_path=/tmp/acltls-qa/tls.snap log_filter=info log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=false acl_user_count=0 tls_enabled=true tls_replication_enabled=false
+<date>  INFO rocket_mem::aof: aof recovery replay complete commands=<n> bytes=<n> elapsed_us=<n>
+<date>  INFO rocket_mem: listener bound protocol=metrics addr=http://192.168.1.12:9121/metrics
+<date>  INFO rocket_mem: listener bound protocol=RMP addr=192.168.1.12:7379
 Error: Os { code: 2, kind: NotFound, message: "No such file or directory" }
 exit=1
-... startup/config-summary logging, then four `listener bound` events (metrics/RMP/RESP+TLS/RESP —
-this config only sets tls_resp_addr, not tls_rmp_addr, so there is no RMP+TLS listener here):
+<date>  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=numericlabs.lxd:6379
+<date>  INFO rocket_mem: resolved config summary node_id=numericlabs.lxd:6379 addr=numericlabs.lxd:6379 rmp_addr=numericlabs.lxd:7379 metrics_addr=numericlabs.lxd:9121 aof_path=/tmp/acltls-qa/tls.aof snapshot_path=/tmp/acltls-qa/tls.snap log_filter=info log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=false acl_user_count=0 tls_enabled=true tls_replication_enabled=false
+<date>  INFO rocket_mem::aof: aof recovery replay complete commands=<n> bytes=<n> elapsed_us=<n>
+<date>  INFO rocket_mem: listener bound protocol=metrics addr=http://192.168.1.12:9121/metrics
+<date>  INFO rocket_mem: listener bound protocol=RMP addr=192.168.1.12:7379
+<date>  INFO rocket_mem: listener bound protocol=RESP+TLS addr=192.168.1.12:16379
+<date>  INFO rocket_mem: listener bound protocol=RESP addr=192.168.1.12:6379
+
+┌───────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ rocket-mem v0.1.4                                                                                 │
+├───────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ storage   recovered /tmp/acltls-qa/tls.snap + /tmp/acltls-qa/tls.aof (generation 0)               │
+│ acl       no users configured -- auth disabled, every client is trusted                           │
+│ cluster   standalone (no cluster_config set)                                                      │
+│ replicas  none connected yet -- REPLICAOF is a live command; INFO REPLICATION shows current state │
+│ listeners                                                                                         │
+│           metrics   http://192.168.1.12:9121/metrics                                              │
+│           RMP       192.168.1.12:7379                                                             │
+│           RESP+TLS  192.168.1.12:16379                                                            │
+│           RESP      192.168.1.12:6379                                                             │
+└───────────────────────────────────────────────────────────────────────────────────────────────────┘
+
 exit=124
 ```
+(this config only sets `tls_resp_addr`, not `tls_rmp_addr`, so there is no `RMP+TLS` listener
+here — four `listener bound` events, not five. A stray peer intermittently attempts (and fails) a
+TLS handshake against whatever's listening on 16379/17379 on this host — expected environmental
+noise, unrelated to this case's own Steps; the qa-agent runner strips lines matching that exact
+pattern before comparing, regardless of which case is running.)
 
 **Notes:** This is a real trap. The **same config file** fails from one directory and starts
 cleanly from another, with no diagnostic naming the path it actually tried. `tls_cert_path` and
@@ -7960,11 +8003,33 @@ redis-cli --tls --cacert /tmp/acltls-qa/tls/cert.pem -h numericlabs.lxd -p 16379
   --user admin --pass adminpw --no-auth-warning ping
 ```
 
-**Expected:** (structured logging replaces the old plain lines — see TLS-02 for the full shape;
-substance below is unchanged and reconfirmed live — note the boxed table's `acl` row now reads
-`1 user configured, auth required` instead of TLS-02's `no users configured`)
+**Expected:** confirmed live 2026-09-15 — note the boxed table's `acl` row reads `1 user
+configured, auth required` instead of TLS-02's `no users configured`:
 ```
-... startup/config-summary logging, then five `listener bound` events (metrics/RMP/RESP+TLS/RMP+TLS/RESP)
+<date>  INFO rocket_mem: rocket-mem starting version="0.1.4" node_id=numericlabs.lxd:6379
+<date>  INFO rocket_mem: resolved config summary node_id=numericlabs.lxd:6379 addr=numericlabs.lxd:6379 rmp_addr=numericlabs.lxd:7379 metrics_addr=numericlabs.lxd:9121 aof_path=/tmp/acltls-qa/acltls.aof snapshot_path=/tmp/acltls-qa/acltls.snap log_filter=info log_value_max_bytes=128 slowlog_threshold_micros=10000 cluster_mode=false acl_enabled=true acl_user_count=1 tls_enabled=true tls_replication_enabled=false
+<date>  INFO rocket_mem::aof: aof recovery replay complete commands=<n> bytes=<n> elapsed_us=<n>
+<date>  INFO rocket_mem: listener bound protocol=metrics addr=http://192.168.1.12:9121/metrics
+<date>  INFO rocket_mem: listener bound protocol=RMP addr=192.168.1.12:7379
+<date>  INFO rocket_mem: listener bound protocol=RESP+TLS addr=192.168.1.12:16379
+<date>  INFO rocket_mem: listener bound protocol=RMP+TLS addr=192.168.1.12:17379
+<date>  INFO rocket_mem: listener bound protocol=RESP addr=192.168.1.12:6379
+
+┌───────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ rocket-mem v0.1.4                                                                                 │
+├───────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ storage   recovered /tmp/acltls-qa/acltls.snap + /tmp/acltls-qa/acltls.aof (generation 0)         │
+│ acl       1 user configured, auth required                                                        │
+│ cluster   standalone (no cluster_config set)                                                      │
+│ replicas  none connected yet -- REPLICAOF is a live command; INFO REPLICATION shows current state │
+│ listeners                                                                                         │
+│           metrics   http://192.168.1.12:9121/metrics                                              │
+│           RMP       192.168.1.12:7379                                                             │
+│           RESP+TLS  192.168.1.12:16379                                                            │
+│           RMP+TLS   192.168.1.12:17379                                                            │
+│           RESP      192.168.1.12:6379                                                             │
+└───────────────────────────────────────────────────────────────────────────────────────────────────┘
+
 NOAUTH Authentication required.
 
 PONG
@@ -7981,10 +8046,16 @@ anywhere in this build.
 
 ### TLS-11 — Verify the plaintext-announce-address warning when a TLS-serving follower has no `replica_announce_addr`
 
-**Precondition:** TLS-01 completed. Ports free.
+**Precondition:** TLS-10 completed; the server from TLS-10 is still running on port 6379.
 
 **Steps:**
 ```bash
+for f in /tmp/acltls-qa/tls.pid /tmp/acltls-qa/acltls.pid; do
+  [ -f "$f" ] && kill "$(cut -d= -f2 "$f")" 2>/dev/null
+done
+sleep 1
+ss -lnt | grep -E ':(6379|7379|16379|17379|9121)\b' || echo "ports free"
+
 cd /tmp/acltls-qa
 ROCKET_MEM_ADDR=numericlabs.lxd:6379 ROCKET_MEM_RMP_ADDR=numericlabs.lxd:7379 \
 ROCKET_MEM_METRICS_ADDR=numericlabs.lxd:9121 \
@@ -7995,41 +8066,32 @@ ROCKET_MEM_REPLICAOF=numericlabs.lxd:1 \
 timeout 2 "$ROCKET_MEM_BIN" 2>&1 | grep -i "plaintext"
 ```
 
-**Expected:** one `WARN` line naming the plaintext address:
+**Expected:** the teardown's own `ports free` line, then one `WARN` line naming the plaintext
+address:
 ```
+ports free
 <date>  WARN rocket_mem: replica_announce_addr is unset while a TLS listener is configured -- this node advertises its plaintext address to its leader announced=numericlabs.lxd:6379
 ```
 
-**Notes:** This fires once, at startup, purely from config shape — it does not need a reachable
+**Notes:** This case now also stops the TLS-10 server as its own first step (folded in from the
+old standalone "TLS teardown" section) — it's the natural last case since, unlike TLS-08/09/10, it
+has no dependency on the server's accumulated history, only on its ports being free once it's
+done. Same pattern RMP-05/SMOKE-12/PUBSUB-12/ACL-16 use to end their own suites.
+
+The warning itself fires once, at startup, purely from config shape — it does not need a reachable
 leader (`should_warn_plaintext_announce` in `config.rs` is checked before the replication client
 starts, so it logs even though `numericlabs.lxd:1` refuses the connection). It requires all three of:
 `replicaof` set, at least one of `tls_resp_addr`/`tls_rmp_addr` set, and `replica_announce_addr`
 unset. See REPL-10 for `replica_announce_addr` itself changing what a leader reports about a
 follower.
 
-**Result:** ☐ Pass ☐ Fail
-
----
-
-### TLS teardown
-
-```bash
-for f in /tmp/acltls-qa/tls.pid /tmp/acltls-qa/acltls.pid; do
-  [ -f "$f" ] && kill "$(cut -d= -f2 "$f")" 2>/dev/null
-done
-sleep 1
-ss -lnt | grep -E ':(6379|7379|16379|17379|9121)\b' || echo "ports free"
-```
-
-Expected final line: `ports free`.
-
-Again: kill by PID only. Do not use `pkill -f rocket-mem`.
-
-To discard everything this playbook created:
+To discard everything this playbook created, once this case's own teardown has run:
 
 ```bash
 rm -rf /tmp/acltls-qa
 ```
+
+**Result:** ☐ Pass ☐ Fail
 
 ---
 
