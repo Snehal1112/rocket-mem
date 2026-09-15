@@ -186,20 +186,34 @@ mode, dark mode, system mode, and mobile width (~400px, nav collapses to the
 
 ## Implementation planning guidance
 
-Per this project's standing plan convention, implementation proceeds as
-chained plans of at most 3 tasks each (`docs/superpowers/plans/2026-09-15-landing-page-plans/`),
-each referencing this spec via a relative `../../specs/...` path. Suggested
-split, roughly in complexity order:
+Per this project's standing plan convention (matching the recent
+`rocket-mem-mcp-N-*`, `qa-agent-N-*`, `tls-suite-automation-N-*` series),
+implementation proceeds as chained flat-file plans of at most 3 tasks each,
+named `docs/superpowers/plans/2026-09-15-landing-page-N-<slug>.md`, each
+referencing this spec via a relative `../specs/...` path and pointing to its
+successor via a `## Next plan` section. Suggested split, in page-build
+order:
 
-1. **Scaffold** — config files, tooling, dependencies, vendored `ui/`
-   components + `lib/utils.ts` + `hooks/use-mobile.ts` +
-   `theme-provider.tsx`, base `index.css` tokens/fonts, `main.tsx` provider
-   wiring. Mechanical — low design judgment.
-2. **Structural sections** — `site-nav`, `site-footer`, `quickstart`,
-   `command-coverage`, `features`, `security-observability`, `why`. Mostly
-   composition of already-vendored primitives.
-3. **High-design-judgment sections** — `hero`, `architecture` diagram,
-   `performance` chart, `terminal-demo`. Invoke the `frontend-design` skill
-   for these; they carry the most visual/taste weight on the page.
-4. **Integration** — assemble `App.tsx`, verify typecheck/lint/build,
-   manual browser QA (themes + mobile width).
+1. **`-1-scaffold-config`** — package.json/tsconfig/vite/biome/prettier
+   config, `bun install`, base `index.css` tokens/fonts, `lib/utils.ts`,
+   minimal `App.tsx`/`main.tsx`. Mechanical — low design judgment.
+2. **`-2-vendor-ui-theming`** — vendor the `ui/` component subset, `sheet`,
+   `hooks/use-mobile.ts`, `theme-provider.tsx`; wire light/dark/system
+   theming into `main.tsx`. Mechanical, one moderate task (theme UX).
+3. **`-3-chart-nav-footer`** — `chart.tsx` + recharts dependency,
+   `site-nav`, `site-footer`; establishes the page shell every later plan
+   inserts sections into.
+4. **`-4-hero-terminal`** — `hero`, `terminal-demo`. High design judgment —
+   invoke the `frontend-design` skill.
+5. **`-5-why-features`** — `why` (compatibility-led value props),
+   `features`. Structural composition.
+6. **`-6-architecture-performance`** — `architecture` diagram,
+   `performance` chart. High design judgment — invoke `frontend-design`.
+7. **`-7-security-commands-quickstart`** — `security-observability`,
+   `command-coverage`, `quickstart`. Structural composition.
+8. **`-8-integration-verification`** — final typecheck/lint/build pass,
+   `web/README.md`, manual browser QA (themes + mobile width).
+
+Each plan after the first appends its section(s) into `App.tsx` at the
+correct fixed position in this page order, so `App.tsx` grows section by
+section rather than being assembled all at once at the end.
