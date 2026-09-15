@@ -7997,7 +7997,7 @@ timeout 2 "$ROCKET_MEM_BIN" 2>&1 | grep -i "plaintext"
 
 **Expected:** one `WARN` line naming the plaintext address:
 ```
-...  WARN rocket_mem: replica_announce_addr is unset while a TLS listener is configured -- this node advertises its plaintext address to its leader announced=numericlabs.lxd:6379
+<date>  WARN rocket_mem: replica_announce_addr is unset while a TLS listener is configured -- this node advertises its plaintext address to its leader announced=numericlabs.lxd:6379
 ```
 
 **Notes:** This fires once, at startup, purely from config shape — it does not need a reachable
