@@ -248,6 +248,84 @@ fn parse_score(raw: &[u8]) -> Result<f64, Frame> {
     Ok(score)
 }
 
+/// Parses the trailing timeout argument shared by `BLPOP`/`BRPOP`/`BLMOVE`/`BRPOPLPUSH`: a
+/// non-negative float, `0` meaning "block forever" (matching real Redis). Both the single-attempt
+/// dispatch arms below and `connection.rs`'s poll-loop deadline (via `blocking_timeout`) call
+/// this, so a malformed timeout produces the identical error message everywhere it's checked --
+/// including on `aof::replay` and the follower apply loop, which call `dispatch` directly with no
+/// poll loop in the picture at all.
+fn parse_timeout_secs(raw: &[u8]) -> Result<f64, Frame> {
+    let secs: f64 = std::str::from_utf8(raw)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| Frame::Error("ERR timeout is not a float or out of range".into()))?;
+    if !secs.is_finite() || secs < 0.0 {
+        return Err(Frame::Error("ERR timeout is negative".into()));
+    }
+    Ok(secs)
+}
+
+/// `LEFT`/`RIGHT`, case-insensitively -- `LMOVE`/`BLMOVE`'s direction arguments.
+fn parse_list_end(raw: &[u8]) -> Option<engine::commands::list::ListEnd> {
+    if raw.eq_ignore_ascii_case(b"LEFT") {
+        Some(engine::commands::list::ListEnd::Left)
+    } else if raw.eq_ignore_ascii_case(b"RIGHT") {
+        Some(engine::commands::list::ListEnd::Right)
+    } else {
+        None
+    }
+}
+
+/// `BLPOP`/`BRPOP`'s scan: pops from `end` of the first `keys` entry, in argument order, that
+/// actually has something to pop. A key present as `Value::List` always has at least one element
+/// (an emptied list is deleted, never stored empty -- see `commands::list::lmove`'s doc comment),
+/// so any `Some` return here is final; a WRONGTYPE on an earlier key stops the scan immediately
+/// via `?`, matching real Redis rather than skipping past it to a later, valid key.
+fn first_available_pop(
+    engine: &Engine,
+    keys: &[Bytes],
+    end: engine::commands::list::ListEnd,
+) -> Result<Option<(Bytes, Bytes)>, common::EngineError> {
+    for key in keys {
+        let popped = match end {
+            engine::commands::list::ListEnd::Left => commands::list::lpop(engine, key)?,
+            engine::commands::list::ListEnd::Right => commands::list::rpop(engine, key)?,
+        };
+        if let Some(val) = popped {
+            return Ok(Some((key.clone(), val)));
+        }
+    }
+    Ok(None)
+}
+
+/// If `frame` is a `BLPOP`/`BRPOP`/`BLMOVE`/`BRPOPLPUSH` command, its parsed timeout in seconds
+/// (`Ok`) or the error frame its malformed/negative timeout argument produces (`Err`). `None` for
+/// every other command, including one of these four with too few arguments to have a timeout at
+/// all -- that case reaches `dispatch`'s own `require_args!` error unchanged.
+///
+/// The timeout is always the last argument for all four commands, so no per-command arity table
+/// is needed here. `connection.rs`'s poll loop calls this once, before it starts polling, purely
+/// to learn the deadline to give up at -- it is not what validates the timeout for a client
+/// request; `dispatch`'s own arms do that independently (see `parse_timeout_secs`'s doc comment).
+pub(crate) fn blocking_timeout(frame: &Frame) -> Option<Result<f64, Frame>> {
+    let Frame::Array(items) = frame else {
+        return None;
+    };
+    let Some(Frame::Bulk(name)) = items.first() else {
+        return None;
+    };
+    let is_blocking = ["BLPOP", "BRPOP", "BLMOVE", "BRPOPLPUSH"]
+        .iter()
+        .any(|c| name.eq_ignore_ascii_case(c.as_bytes()));
+    if !is_blocking || items.len() < 2 {
+        return None;
+    }
+    let Frame::Bulk(raw) = &items[items.len() - 1] else {
+        return None;
+    };
+    Some(parse_timeout_secs(raw))
+}
+
 macro_rules! require_args {
     ($rest:expr, $n:expr, $name:expr) => {
         if $rest.len() < $n {
@@ -624,6 +702,99 @@ pub fn dispatch(engine: &Engine, frame: Frame, _protocol: &mut Protocol, _client
             require_args!(rest, 1, "lpop");
             match commands::list::lpop(engine, &rest[0]) {
                 Ok(Some(b)) => Frame::Bulk(b),
+                Ok(None) => Frame::Null,
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
+        "LMOVE" => {
+            require_args!(rest, 4, "lmove");
+            let (from, to) = match (parse_list_end(&rest[2]), parse_list_end(&rest[3])) {
+                (Some(f), Some(t)) => (f, t),
+                _ => return Frame::Error("ERR syntax error".into()),
+            };
+            match commands::list::lmove(engine, &rest[0], rest[1].clone(), from, to) {
+                Ok(Some(b)) => Frame::Bulk(b),
+                Ok(None) => Frame::Null,
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
+        "RPOPLPUSH" => {
+            require_args!(rest, 2, "rpoplpush");
+            match commands::list::lmove(
+                engine,
+                &rest[0],
+                rest[1].clone(),
+                engine::commands::list::ListEnd::Right,
+                engine::commands::list::ListEnd::Left,
+            ) {
+                Ok(Some(b)) => Frame::Bulk(b),
+                Ok(None) => Frame::Null,
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
+        // BLMOVE/BRPOPLPUSH/BLPOP/BRPOP: single non-blocking attempt only -- see
+        // `blocking_timeout`'s doc comment and CLAUDE.md's dispatch-invariant note. The actual
+        // waiting (retrying this same arm at an interval until it stops returning `Frame::Null`,
+        // the timeout elapses, or the client disconnects) happens entirely in
+        // `connection.rs`'s poll loop, outside of and never holding any shard lock.
+        "BLMOVE" => {
+            require_args!(rest, 5, "blmove");
+            if let Err(e) = parse_timeout_secs(&rest[4]) {
+                return e;
+            }
+            let (from, to) = match (parse_list_end(&rest[2]), parse_list_end(&rest[3])) {
+                (Some(f), Some(t)) => (f, t),
+                _ => return Frame::Error("ERR syntax error".into()),
+            };
+            match commands::list::lmove(engine, &rest[0], rest[1].clone(), from, to) {
+                Ok(Some(b)) => Frame::Bulk(b),
+                Ok(None) => Frame::Null,
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
+        "BRPOPLPUSH" => {
+            require_args!(rest, 3, "brpoplpush");
+            if let Err(e) = parse_timeout_secs(&rest[2]) {
+                return e;
+            }
+            match commands::list::lmove(
+                engine,
+                &rest[0],
+                rest[1].clone(),
+                engine::commands::list::ListEnd::Right,
+                engine::commands::list::ListEnd::Left,
+            ) {
+                Ok(Some(b)) => Frame::Bulk(b),
+                Ok(None) => Frame::Null,
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
+        "BLPOP" => {
+            require_args!(rest, 2, "blpop");
+            if let Err(e) = parse_timeout_secs(&rest[rest.len() - 1]) {
+                return e;
+            }
+            match first_available_pop(
+                engine,
+                &rest[..rest.len() - 1],
+                engine::commands::list::ListEnd::Left,
+            ) {
+                Ok(Some((key, val))) => Frame::Array(vec![Frame::Bulk(key), Frame::Bulk(val)]),
+                Ok(None) => Frame::Null,
+                Err(e) => engine_error_to_frame(e),
+            }
+        }
+        "BRPOP" => {
+            require_args!(rest, 2, "brpop");
+            if let Err(e) = parse_timeout_secs(&rest[rest.len() - 1]) {
+                return e;
+            }
+            match first_available_pop(
+                engine,
+                &rest[..rest.len() - 1],
+                engine::commands::list::ListEnd::Right,
+            ) {
+                Ok(Some((key, val))) => Frame::Array(vec![Frame::Bulk(key), Frame::Bulk(val)]),
                 Ok(None) => Frame::Null,
                 Err(e) => engine_error_to_frame(e),
             }
@@ -1410,6 +1581,10 @@ pub(crate) const KNOWN_COMMANDS: &[&str] = &[
     "APPEND",
     "AUTH",
     "BGREWRITEAOF",
+    "BLMOVE",
+    "BLPOP",
+    "BRPOP",
+    "BRPOPLPUSH",
     "CLIENT",
     "CLUSTER",
     "COMMAND",
@@ -1445,6 +1620,7 @@ pub(crate) const KNOWN_COMMANDS: &[&str] = &[
     "LINDEX",
     "LINSERT",
     "LLEN",
+    "LMOVE",
     "LPOP",
     "LPUSH",
     "LRANGE",
@@ -1471,6 +1647,7 @@ pub(crate) const KNOWN_COMMANDS: &[&str] = &[
     "RENAMENX",
     "REPLICAOF",
     "RPOP",
+    "RPOPLPUSH",
     "RPUSH",
     "SADD",
     "SAVE",
@@ -1518,6 +1695,8 @@ fn command_info_entry(name_upper: &str) -> Frame {
         KeySpec::Second => (2, 2, 1, 2),
         KeySpec::All => (1, -1, 1, 1),
         KeySpec::EveryOther => (1, -1, 2, 2),
+        KeySpec::FirstTwo => (1, 2, 1, 2),
+        KeySpec::AllButLast => (1, -2, 1, 2),
     };
     let arity = -(key_count + 1);
     let flag = if crate::aof::WRITE_COMMANDS.contains(&name_upper) {
@@ -1550,6 +1729,13 @@ enum KeySpec {
     All,
     /// Arguments 0, 2, 4, ... (`MSET k1 v1 k2 v2`).
     EveryOther,
+    /// The first two arguments only, ignoring any trailing non-key arguments (`LMOVE`/`BLMOVE`'s
+    /// `LEFT`/`RIGHT` direction tokens, `BRPOPLPUSH`'s timeout) -- both are keys this node would
+    /// write, same rationale as `All`'s destination case.
+    FirstTwo,
+    /// Every argument except the last (`BLPOP`/`BRPOP key1 key2 ... timeout` -- the trailing
+    /// timeout is never a key).
+    AllButLast,
 }
 
 fn key_spec(name: &str) -> KeySpec {
@@ -1569,6 +1755,8 @@ fn key_spec(name: &str) -> KeySpec {
         "DEL" | "EXISTS" | "MGET" | "RENAME" | "RENAMENX" | "SINTER" | "SUNION" | "SDIFF"
         | "SINTERSTORE" | "SUNIONSTORE" | "SDIFFSTORE" => KeySpec::All,
         "MSET" | "MSETNX" => KeySpec::EveryOther,
+        "LMOVE" | "BLMOVE" | "RPOPLPUSH" | "BRPOPLPUSH" => KeySpec::FirstTwo,
+        "BLPOP" | "BRPOP" => KeySpec::AllButLast,
         _ if KNOWN_COMMANDS.binary_search(&name).is_ok() => KeySpec::First,
         _ => KeySpec::None, // unknown command: no keys, so dispatch's own error reaches the client
     }
@@ -1600,6 +1788,11 @@ fn command_keys(frame: &Frame) -> Vec<&Bytes> {
         KeySpec::Second => args.into_iter().skip(1).take(1).collect(),
         KeySpec::All => args,
         KeySpec::EveryOther => args.into_iter().step_by(2).collect(),
+        KeySpec::FirstTwo => args.into_iter().take(2).collect(),
+        KeySpec::AllButLast => {
+            let n = args.len().saturating_sub(1);
+            args.into_iter().take(n).collect()
+        }
     }
 }
 
@@ -3821,8 +4014,13 @@ fn logged_key(frame: &Frame, name: &str) -> Option<Bytes> {
     let index = match key_spec(name) {
         KeySpec::None => return None,
         KeySpec::Second => 2,
-        // `First`, `All` and `EveryOther` all name argument 1 as their first key.
-        KeySpec::First | KeySpec::All | KeySpec::EveryOther => 1,
+        // `First`, `All`, `EveryOther`, `FirstTwo` and `AllButLast` all name argument 1 as their
+        // first key.
+        KeySpec::First
+        | KeySpec::All
+        | KeySpec::EveryOther
+        | KeySpec::FirstTwo
+        | KeySpec::AllButLast => 1,
     };
     let Frame::Array(items) = frame else {
         return None;
@@ -3895,6 +4093,10 @@ pub(crate) const KNOWN_COMMANDS_LOWER: &[&str] = &[
     "append",
     "auth",
     "bgrewriteaof",
+    "blmove",
+    "blpop",
+    "brpop",
+    "brpoplpush",
     "client",
     "cluster",
     "command",
@@ -3930,6 +4132,7 @@ pub(crate) const KNOWN_COMMANDS_LOWER: &[&str] = &[
     "lindex",
     "linsert",
     "llen",
+    "lmove",
     "lpop",
     "lpush",
     "lrange",
@@ -3956,6 +4159,7 @@ pub(crate) const KNOWN_COMMANDS_LOWER: &[&str] = &[
     "renamenx",
     "replicaof",
     "rpop",
+    "rpoplpush",
     "rpush",
     "sadd",
     "save",
@@ -4323,6 +4527,15 @@ fn dispatch_and_log_gated(
             Frame::Simple(_) => {
                 rewrite_set_ttl_to_pexpireat(items).unwrap_or_else(|| vec![original_frame.clone()])
             }
+            _ => vec![original_frame.clone()],
+        },
+        // `connection.rs`'s poll loop calls `dispatch_and_log_gated` with this same original
+        // frame on every retry until it stops returning `Frame::Null` -- logging/replicating
+        // every failed tick of a long (or `0` = forever) block would flood the AOF and the
+        // replica stream. `LMOVE`/`RPOPLPUSH` are single-shot (never polled) and deterministic,
+        // so they need no such arm and fall through to the default below, same as `LPOP`/`RPOP`.
+        "BLMOVE" | "BRPOPLPUSH" | "BLPOP" | "BRPOP" => match &reply {
+            Frame::Null => Vec::new(),
             _ => vec![original_frame.clone()],
         },
         _ => vec![original_frame.clone()],
@@ -8291,6 +8504,238 @@ mod tests {
     }
 
     #[test]
+    fn lmove_moves_between_two_lists() {
+        let engine = Engine::new();
+        dispatch(
+            &engine,
+            cmd(&[b"RPUSH", b"src", b"a", b"b"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"LMOVE", b"src", b"dst", b"LEFT", b"RIGHT"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Bulk(Bytes::from_static(b"a"))
+        );
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"LRANGE", b"dst", b"0", b"-1"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Array(vec![Frame::Bulk(Bytes::from_static(b"a"))])
+        );
+    }
+
+    #[test]
+    fn lmove_on_a_missing_source_returns_null() {
+        let engine = Engine::new();
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"LMOVE", b"missing", b"dst", b"LEFT", b"RIGHT"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Null
+        );
+    }
+
+    #[test]
+    fn lmove_with_an_invalid_direction_is_a_syntax_error() {
+        let engine = Engine::new();
+        let reply = dispatch(
+            &engine,
+            cmd(&[b"LMOVE", b"src", b"dst", b"SIDEWAYS", b"RIGHT"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert!(matches!(reply, Frame::Error(_)));
+    }
+
+    #[test]
+    fn rpoplpush_is_lmove_right_to_left() {
+        let engine = Engine::new();
+        dispatch(
+            &engine,
+            cmd(&[b"RPUSH", b"src", b"a", b"b"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"RPOPLPUSH", b"src", b"dst"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Bulk(Bytes::from_static(b"b"))
+        );
+    }
+
+    #[test]
+    fn blmove_makes_one_non_blocking_attempt_and_returns_null_immediately_when_empty() {
+        let engine = Engine::new();
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"BLMOVE", b"missing", b"dst", b"LEFT", b"RIGHT", b"0"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Null
+        );
+        assert!(!engine.exists(b"dst"));
+    }
+
+    #[test]
+    fn blmove_succeeds_immediately_when_source_already_has_data() {
+        let engine = Engine::new();
+        dispatch(
+            &engine,
+            cmd(&[b"RPUSH", b"src", b"a"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"BLMOVE", b"src", b"dst", b"LEFT", b"RIGHT", b"0"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Bulk(Bytes::from_static(b"a"))
+        );
+    }
+
+    #[test]
+    fn blmove_rejects_a_negative_timeout() {
+        let engine = Engine::new();
+        let reply = dispatch(
+            &engine,
+            cmd(&[b"BLMOVE", b"src", b"dst", b"LEFT", b"RIGHT", b"-1"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert!(matches!(reply, Frame::Error(_)));
+    }
+
+    #[test]
+    fn blmove_rejects_a_non_numeric_timeout() {
+        let engine = Engine::new();
+        let reply = dispatch(
+            &engine,
+            cmd(&[b"BLMOVE", b"src", b"dst", b"LEFT", b"RIGHT", b"soon"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert!(matches!(reply, Frame::Error(_)));
+    }
+
+    #[test]
+    fn brpoplpush_makes_one_non_blocking_attempt() {
+        let engine = Engine::new();
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"BRPOPLPUSH", b"missing", b"dst", b"0"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Null
+        );
+    }
+
+    #[test]
+    fn blpop_scans_keys_in_order_and_returns_key_and_value() {
+        let engine = Engine::new();
+        dispatch(
+            &engine,
+            cmd(&[b"RPUSH", b"k2", b"only"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"BLPOP", b"k1", b"k2", b"0"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"k2")),
+                Frame::Bulk(Bytes::from_static(b"only")),
+            ])
+        );
+    }
+
+    #[test]
+    fn blpop_on_all_empty_keys_makes_one_non_blocking_attempt_and_returns_null() {
+        let engine = Engine::new();
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"BLPOP", b"k1", b"k2", b"0"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Null
+        );
+    }
+
+    #[test]
+    fn brpop_pops_from_the_right() {
+        let engine = Engine::new();
+        dispatch(
+            &engine,
+            cmd(&[b"RPUSH", b"l", b"a", b"b"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert_eq!(
+            dispatch(
+                &engine,
+                cmd(&[b"BRPOP", b"l", b"0"]),
+                &mut Protocol::default(),
+                1
+            ),
+            Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"l")),
+                Frame::Bulk(Bytes::from_static(b"b")),
+            ])
+        );
+    }
+
+    #[test]
+    fn blpop_stops_at_a_wrongtype_key_instead_of_skipping_to_a_later_valid_one() {
+        let engine = Engine::new();
+        dispatch(
+            &engine,
+            cmd(&[b"SET", b"k1", b"v"]),
+            &mut Protocol::default(),
+            1,
+        );
+        dispatch(
+            &engine,
+            cmd(&[b"RPUSH", b"k2", b"a"]),
+            &mut Protocol::default(),
+            1,
+        );
+        let reply = dispatch(
+            &engine,
+            cmd(&[b"BLPOP", b"k1", b"k2", b"0"]),
+            &mut Protocol::default(),
+            1,
+        );
+        assert!(matches!(reply, Frame::Error(_)));
+    }
+
+    #[test]
     fn set_type_commands_round_trip() {
         let engine = Engine::new();
         dispatch(
@@ -10948,6 +11393,80 @@ mod tests {
         assert_eq!(read_aof(&dir), ""); // Frame::Null reply — nothing was popped, nothing to log
     }
 
+    #[test]
+    fn dispatch_and_log_does_not_log_a_blpop_tick_that_found_nothing() {
+        // The shape a poll-loop tick actually produces: BLPOP against a still-empty key, over
+        // and over, must never reach the AOF -- see `dispatch_and_log_gated`'s `to_log`
+        // suppression arm for `BLMOVE`/`BRPOPLPUSH`/`BLPOP`/`BRPOP`. Without it, an
+        // indefinitely-blocked client (timeout `0`) would flood the AOF and every replica at the
+        // poll interval for as long as it stays blocked.
+        let engine = Engine::new();
+        let (dir, aof) = test_aof();
+        let reply = dispatch_and_log(
+            &engine,
+            &aof,
+            &ReplicationHandle::default(),
+            cmd(&[b"BLPOP", b"missing", b"0"]),
+            &Session::new(),
+            1,
+        );
+        assert_eq!(reply, Frame::Null);
+        aof.fsync().unwrap();
+        assert_eq!(read_aof(&dir), "");
+    }
+
+    #[test]
+    fn dispatch_and_log_logs_a_successful_blpop_verbatim() {
+        // Deterministic (unlike SPOP), so replay just needs the original frame, not a rewrite --
+        // it will pop the same first-available key deterministically because AOF is sequential
+        // single-writer.
+        let engine = Engine::new();
+        let (dir, aof) = test_aof();
+        dispatch_and_log(
+            &engine,
+            &aof,
+            &ReplicationHandle::default(),
+            cmd(&[b"RPUSH", b"l", b"a"]),
+            &Session::new(),
+            1,
+        );
+        let reply = dispatch_and_log(
+            &engine,
+            &aof,
+            &ReplicationHandle::default(),
+            cmd(&[b"BLPOP", b"l", b"0"]),
+            &Session::new(),
+            1,
+        );
+        assert_eq!(
+            reply,
+            Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"l")),
+                Frame::Bulk(Bytes::from_static(b"a")),
+            ])
+        );
+        aof.fsync().unwrap();
+        let logged = read_aof(&dir);
+        assert!(logged.ends_with("*3\r\n$5\r\nBLPOP\r\n$1\r\nl\r\n$1\r\n0\r\n"));
+    }
+
+    #[test]
+    fn dispatch_and_log_does_not_log_a_blmove_tick_that_found_nothing() {
+        let engine = Engine::new();
+        let (dir, aof) = test_aof();
+        let reply = dispatch_and_log(
+            &engine,
+            &aof,
+            &ReplicationHandle::default(),
+            cmd(&[b"BLMOVE", b"missing", b"dst", b"LEFT", b"RIGHT", b"0"]),
+            &Session::new(),
+            1,
+        );
+        assert_eq!(reply, Frame::Null);
+        aof.fsync().unwrap();
+        assert_eq!(read_aof(&dir), "");
+    }
+
     // `/dev/full` accepts an open and then fails every actual write with ENOSPC -- the same
     // deterministic stand-in for a full disk used in aof.rs's own propagation tests. Linux-only.
     #[cfg(target_os = "linux")]
@@ -11223,10 +11742,9 @@ mod tests {
                                     let tolerance = 5_000i64;
                                     assert!(
                                         (delta - expected_delta).abs() < tolerance,
-                                        "PEXPIREAT delta {} not close to EX=100s ({} ms); \
-                                         indicates buggy PX precedence (would be ~5000 ms)",
-                                        delta,
-                                        expected_delta
+                                        "PEXPIREAT delta {delta} not close to EX=100s \
+                                         ({expected_delta} ms); indicates buggy PX precedence \
+                                         (would be ~5000 ms)"
                                     );
                                     return; // Test passed
                                 }
@@ -12586,6 +13104,34 @@ mod tests {
         assert_eq!(
             command_keys(&cmd(&[b"MSETNX", b"a", b"1", b"b", b"2"])),
             vec![&Bytes::from_static(b"a"), &Bytes::from_static(b"b")]
+        );
+    }
+
+    #[test]
+    fn command_keys_takes_only_the_first_two_arguments_for_lmove_ignoring_the_direction_tokens() {
+        assert_eq!(
+            command_keys(&cmd(&[b"LMOVE", b"src", b"dst", b"LEFT", b"RIGHT"])),
+            vec![&Bytes::from_static(b"src"), &Bytes::from_static(b"dst")]
+        );
+        assert_eq!(
+            command_keys(&cmd(&[b"BLMOVE", b"src", b"dst", b"LEFT", b"RIGHT", b"0"])),
+            vec![&Bytes::from_static(b"src"), &Bytes::from_static(b"dst")]
+        );
+        assert_eq!(
+            command_keys(&cmd(&[b"BRPOPLPUSH", b"src", b"dst", b"0"])),
+            vec![&Bytes::from_static(b"src"), &Bytes::from_static(b"dst")]
+        );
+    }
+
+    #[test]
+    fn command_keys_takes_every_argument_but_the_trailing_timeout_for_blpop_and_brpop() {
+        assert_eq!(
+            command_keys(&cmd(&[b"BLPOP", b"k1", b"k2", b"0"])),
+            vec![&Bytes::from_static(b"k1"), &Bytes::from_static(b"k2")]
+        );
+        assert_eq!(
+            command_keys(&cmd(&[b"BRPOP", b"k1", b"0"])),
+            vec![&Bytes::from_static(b"k1")]
         );
     }
 

@@ -317,6 +317,97 @@ pub fn lrem(
     })
 }
 
+/// Which end of a list an `LMOVE`/`RPOPLPUSH`/`BLMOVE`/`BRPOPLPUSH`/`BLPOP`/`BRPOP` operates on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListEnd {
+    Left,
+    Right,
+}
+
+/// Pops one element from `from` of `source` and pushes it onto `to` of `destination` --
+/// `LMOVE`'s primitive, also `RPOPLPUSH`'s (`source`, `destination`, `Right`, `Left`). `source ==
+/// destination` is a valid "rotate" call: the two `with_mut_delta` calls below run sequentially
+/// against the same shard, never simultaneously, so this cannot deadlock.
+///
+/// `Ok(None)` for a missing or WRONGTYPE-free-but-empty `source` -- impossible to distinguish
+/// from "empty" here since an empty list is never stored (`Shard::with_mut_delta` deletes a list
+/// the moment it empties, see `ltrim`) -- and, per the missing-key-mutation convention every
+/// other command here follows, this must not create anything on `destination`.
+///
+/// Not atomic across the two keys when they land on different shards -- matches the codebase's
+/// existing convention for cross-key mutation (see `commands::keys::rename`,
+/// `commands::set::store_or_delete`): never hold two shard locks at once, accepting the same
+/// small non-atomic window those commands already accept. `destination`'s type is checked
+/// *before* `source` is touched, specifically so a WRONGTYPE destination can never cost the
+/// source list an element in the first place; the doc comment on `push_one`'s caller below
+/// covers the one remaining race this leaves (destination changing type in between).
+pub fn lmove(
+    engine: &Engine,
+    source: &[u8],
+    destination: Bytes,
+    from: ListEnd,
+    to: ListEnd,
+) -> Result<Option<Bytes>, common::EngineError> {
+    let dest_ok = engine.with_ref(&destination, |v| matches!(v, None | Some(Value::List(_))));
+    if !dest_ok {
+        return Err(common::EngineError::WrongType);
+    }
+
+    let popped = engine.with_mut_delta(source, |existing| match existing {
+        None => (Ok(None), 0),
+        Some(Value::List(list)) => {
+            let popped = match from {
+                ListEnd::Left => list.pop_front(),
+                ListEnd::Right => list.pop_back(),
+            };
+            let delta = popped_delta(&popped);
+            (Ok(popped), delta)
+        }
+        Some(_) => (Err(common::EngineError::WrongType), 0),
+    })?;
+    let Some(val) = popped else {
+        return Ok(None);
+    };
+
+    if let Err(e) = push_one(engine, destination, to, val.clone()) {
+        // destination raced from list to some other type between the check above and this push
+        // -- undo the pop (push back onto the same end it came from) rather than lose the
+        // element, since it has already been removed from `source` by this point.
+        let _ = push_one(engine, Bytes::copy_from_slice(source), from, val);
+        return Err(e);
+    }
+    Ok(Some(val))
+}
+
+/// Pushes `val` onto `end` of `key`, creating the list if `key` is missing. The `Err` case is
+/// only reachable via the race `lmove` documents above: normal callers already confirmed `key`
+/// is `None`-or-`List` immediately beforehand.
+fn push_one(
+    engine: &Engine,
+    key: Bytes,
+    end: ListEnd,
+    val: Bytes,
+) -> Result<(), common::EngineError> {
+    let existed = engine.with_mut_delta(&key, |existing| match existing {
+        None => (Ok(false), 0),
+        Some(Value::List(list)) => {
+            let delta = val.len() as isize + 8; // matches Value::approx_size's per-element cost
+            match end {
+                ListEnd::Left => list.push_front(val.clone()),
+                ListEnd::Right => list.push_back(val.clone()),
+            }
+            (Ok(true), delta)
+        }
+        Some(_) => (Err(common::EngineError::WrongType), 0),
+    })?;
+    if !existed {
+        let mut list = VecDeque::new();
+        list.push_back(val);
+        engine.set(key, Value::List(list));
+    }
+    Ok(())
+}
+
 pub fn linsert(
     engine: &Engine,
     key: Bytes,
@@ -888,6 +979,166 @@ mod tests {
         let value = engine.get(key).expect("key must exist");
         let expected = key.len() + value.approx_size();
         assert_eq!(engine.memory_used(), expected);
+    }
+
+    #[test]
+    fn lmove_moves_one_element_from_left_of_source_to_right_of_destination() {
+        let engine = Engine::new();
+        rpush(
+            &engine,
+            Bytes::from_static(b"src"),
+            vec![Bytes::from_static(b"a"), Bytes::from_static(b"b")],
+        )
+        .unwrap();
+        let moved = lmove(
+            &engine,
+            b"src",
+            Bytes::from_static(b"dst"),
+            ListEnd::Left,
+            ListEnd::Right,
+        )
+        .unwrap();
+        assert_eq!(moved, Some(Bytes::from_static(b"a")));
+        assert_eq!(
+            lrange(&engine, b"src", 0, -1).unwrap(),
+            vec![Bytes::from_static(b"b")]
+        );
+        assert_eq!(
+            lrange(&engine, b"dst", 0, -1).unwrap(),
+            vec![Bytes::from_static(b"a")]
+        );
+    }
+
+    #[test]
+    fn lmove_on_a_missing_source_returns_none_and_creates_nothing() {
+        let engine = Engine::new();
+        let moved = lmove(
+            &engine,
+            b"missing",
+            Bytes::from_static(b"dst"),
+            ListEnd::Left,
+            ListEnd::Right,
+        )
+        .unwrap();
+        assert_eq!(moved, None);
+        assert!(!engine.exists(b"dst"));
+    }
+
+    #[test]
+    fn lmove_on_a_wrongtype_source_returns_wrongtype_and_leaves_destination_untouched() {
+        let engine = Engine::new();
+        engine.set(
+            Bytes::from_static(b"src"),
+            Value::String(Bytes::from_static(b"v")),
+        );
+        rpush(
+            &engine,
+            Bytes::from_static(b"dst"),
+            vec![Bytes::from_static(b"x")],
+        )
+        .unwrap();
+        assert_eq!(
+            lmove(
+                &engine,
+                b"src",
+                Bytes::from_static(b"dst"),
+                ListEnd::Left,
+                ListEnd::Right
+            )
+            .unwrap_err(),
+            common::EngineError::WrongType
+        );
+        assert_eq!(
+            lrange(&engine, b"dst", 0, -1).unwrap(),
+            vec![Bytes::from_static(b"x")]
+        );
+    }
+
+    #[test]
+    fn lmove_on_a_wrongtype_destination_returns_wrongtype_without_popping_source() {
+        let engine = Engine::new();
+        rpush(
+            &engine,
+            Bytes::from_static(b"src"),
+            vec![Bytes::from_static(b"a")],
+        )
+        .unwrap();
+        engine.set(
+            Bytes::from_static(b"dst"),
+            Value::String(Bytes::from_static(b"v")),
+        );
+        assert_eq!(
+            lmove(
+                &engine,
+                b"src",
+                Bytes::from_static(b"dst"),
+                ListEnd::Left,
+                ListEnd::Right
+            )
+            .unwrap_err(),
+            common::EngineError::WrongType
+        );
+        // source must be untouched -- the destination check runs before source is popped
+        assert_eq!(
+            lrange(&engine, b"src", 0, -1).unwrap(),
+            vec![Bytes::from_static(b"a")]
+        );
+    }
+
+    #[test]
+    fn lmove_on_the_same_key_rotates_the_list() {
+        let engine = Engine::new();
+        rpush(
+            &engine,
+            Bytes::from_static(b"l"),
+            vec![
+                Bytes::from_static(b"a"),
+                Bytes::from_static(b"b"),
+                Bytes::from_static(b"c"),
+            ],
+        )
+        .unwrap();
+        let moved = lmove(
+            &engine,
+            b"l",
+            Bytes::from_static(b"l"),
+            ListEnd::Left,
+            ListEnd::Right,
+        )
+        .unwrap();
+        assert_eq!(moved, Some(Bytes::from_static(b"a")));
+        assert_eq!(
+            lrange(&engine, b"l", 0, -1).unwrap(),
+            vec![
+                Bytes::from_static(b"b"),
+                Bytes::from_static(b"c"),
+                Bytes::from_static(b"a"),
+            ]
+        );
+    }
+
+    #[test]
+    fn lmove_onto_a_missing_destination_creates_it() {
+        let engine = Engine::new();
+        rpush(
+            &engine,
+            Bytes::from_static(b"src"),
+            vec![Bytes::from_static(b"a")],
+        )
+        .unwrap();
+        lmove(
+            &engine,
+            b"src",
+            Bytes::from_static(b"dst"),
+            ListEnd::Right,
+            ListEnd::Left,
+        )
+        .unwrap();
+        assert!(!engine.exists(b"src")); // emptied source is deleted, not left as an empty list
+        assert_eq!(
+            lrange(&engine, b"dst", 0, -1).unwrap(),
+            vec![Bytes::from_static(b"a")]
+        );
     }
 
     #[test]

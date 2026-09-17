@@ -420,8 +420,35 @@ async fn handle_connection<S>(
             serve_replica(framed, &aof, &replication, advertised_addr).await;
             return; // serve_replica never returns until the replica connection dies
         }
-        let response =
-            dispatcher::dispatch_and_log(&engine, &aof, &replication, frame, &session, client_id);
+        let response = match dispatcher::blocking_timeout(&frame) {
+            Some(Ok(timeout_secs)) => {
+                match run_blocking_command(
+                    &engine,
+                    &aof,
+                    &replication,
+                    frame,
+                    &session,
+                    client_id,
+                    timeout_secs,
+                    &mut framed,
+                    &mut pending,
+                )
+                .await
+                {
+                    Some(reply) => reply,
+                    None => return, // client disconnected while blocked
+                }
+            }
+            Some(Err(err_frame)) => err_frame,
+            None => dispatcher::dispatch_and_log(
+                &engine,
+                &aof,
+                &replication,
+                frame,
+                &session,
+                client_id,
+            ),
+        };
         conn_stats.record_command();
         framed.codec_mut().protocol = session.protocol(); // sync BEFORE sending this reply
                                                           // Buffer without flushing -- a flush is a write syscall, and flushing after
@@ -441,6 +468,83 @@ async fn handle_connection<S>(
                     return;
                 }
             }
+        }
+    }
+}
+
+/// How often a blocking command's poll loop (below) retries the non-blocking attempt
+/// `dispatch`'s own arm for it makes. Short enough that a client blocked on `BLPOP`/`BRPOP`/
+/// `BLMOVE`/`BRPOPLPUSH` sees new data within one interval of it arriving; long enough that an
+/// indefinitely-blocked command (timeout `0`, e.g. e4a-service's `BLMove(ctx, ..., 0)` reliable-
+/// queue pattern) doesn't spin.
+const BLOCKING_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(30);
+
+/// Drives a `BLPOP`/`BRPOP`/`BLMOVE`/`BRPOPLPUSH` command to completion.
+///
+/// `dispatch`'s own arm for each of these four only ever makes one non-blocking attempt and
+/// returns `Frame::Null` when there's nothing yet -- see `dispatcher::blocking_timeout`'s doc
+/// comment and CLAUDE.md's dispatch-invariant note ("no `.await` while a shard lock is held").
+/// The actual waiting happens entirely here, outside of and never holding any shard lock: retry
+/// `dispatch_and_log` (a full attempt, with its own AOF/metrics/logging -- see
+/// `dispatch_and_log_gated`'s `to_log` suppression arm for why a failed tick never reaches the
+/// AOF or a replica) at `BLOCKING_POLL_INTERVAL` until it stops returning `Frame::Null`,
+/// `timeout_secs` elapses (`0` means forever, matching real Redis), or the client disconnects.
+///
+/// Returns `None` when the client's connection closed while waiting -- there is nothing left to
+/// reply to, and the caller must return from `handle_connection` exactly as it already does for
+/// every other read-side EOF/decode-error. A frame arriving from the client while still blocked
+/// (a real blocking client shouldn't pipeline behind one of these, but a decode succeeding is not
+/// itself a disconnect) is stashed into `pending` for the outer loop to pick up once this command
+/// finally resolves, rather than being dropped.
+#[allow(clippy::too_many_arguments)]
+async fn run_blocking_command<S>(
+    engine: &Arc<Engine>,
+    aof: &Arc<AofWriter>,
+    replication: &Arc<ReplicationHandle>,
+    frame: protocol::Frame,
+    session: &dispatcher::Session,
+    client_id: u64,
+    timeout_secs: f64,
+    framed: &mut Framed<S, RespCodec>,
+    pending: &mut Option<Option<std::io::Result<protocol::Frame>>>,
+) -> Option<protocol::Frame>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let deadline = (timeout_secs > 0.0)
+        .then(|| tokio::time::Instant::now() + std::time::Duration::from_secs_f64(timeout_secs));
+    loop {
+        let reply = dispatcher::dispatch_and_log(
+            engine,
+            aof,
+            replication,
+            frame.clone(),
+            session,
+            client_id,
+        );
+        if !matches!(reply, protocol::Frame::Null) {
+            return Some(reply);
+        }
+        if let Some(deadline) = deadline {
+            if tokio::time::Instant::now() >= deadline {
+                return Some(protocol::Frame::Null);
+            }
+        }
+        if pending.is_some() {
+            // Already holding one frame stashed from an earlier tick -- there is nowhere safe to
+            // put a second one, so stop racing `framed.next()` for the rest of this wait (which
+            // also means a disconnect from here on is only noticed once this command finally
+            // resolves, not immediately; an acceptable trade-off for what is already an unusual
+            // case, a client pipelining behind a blocking command).
+            tokio::time::sleep(BLOCKING_POLL_INTERVAL).await;
+            continue;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(BLOCKING_POLL_INTERVAL) => {}
+            next = framed.next() => match next {
+                Some(Ok(f)) => *pending = Some(Some(Ok(f))),
+                _ => return None, // EOF or decode error while blocked -- connection is going away
+            },
         }
     }
 }
@@ -2188,5 +2292,154 @@ mod tests {
                 Frame::Integer(2),
             ])
         );
+    }
+
+    /// The actual bug this covers: e4a-service's domain-validation-sync server calls
+    /// `go-redis`'s `BLMove(ctx, src, dst, "LEFT", "RIGHT", 0)` (timeout `0` = block forever) to
+    /// pump a reliable queue, and got `ERR unknown command 'BLMOVE'` because the command didn't
+    /// exist at all. This proves the whole path end to end over a real socket: one connection
+    /// genuinely blocks on an empty source list, a second connection pushes an element onto it,
+    /// and the first receives the moved element -- not just that a single non-blocking `dispatch`
+    /// attempt returns the right `Frame` (that's `dispatcher.rs`'s own unit tests), but that the
+    /// `connection.rs` poll loop actually waits and actually wakes up.
+    #[tokio::test]
+    async fn blmove_with_a_zero_timeout_blocks_until_another_connection_pushes_the_source() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let engine = Arc::new(Engine::new());
+        let (_dir, aof) = test_aof();
+        tokio::spawn(serve(
+            listener,
+            engine,
+            aof,
+            Arc::new(crate::replication::ReplicationHandle::default()),
+            Arc::from("test-node"),
+        ));
+
+        let mut blocker = Framed::new(
+            TcpStream::connect(addr).await.unwrap(),
+            RespCodec::default(),
+        );
+        blocker
+            .send(Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"BLMOVE")),
+                Frame::Bulk(Bytes::from_static(b"src")),
+                Frame::Bulk(Bytes::from_static(b"dst")),
+                Frame::Bulk(Bytes::from_static(b"LEFT")),
+                Frame::Bulk(Bytes::from_static(b"RIGHT")),
+                Frame::Bulk(Bytes::from_static(b"0")),
+            ]))
+            .await
+            .unwrap();
+
+        // Give the BLMOVE a moment to actually start blocking (several poll ticks) before
+        // pushing -- proving it waits, not that it happened to win a race against an
+        // instantaneous push.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        let mut pusher = Framed::new(
+            TcpStream::connect(addr).await.unwrap(),
+            RespCodec::default(),
+        );
+        pusher
+            .send(Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"RPUSH")),
+                Frame::Bulk(Bytes::from_static(b"src")),
+                Frame::Bulk(Bytes::from_static(b"payload")),
+            ]))
+            .await
+            .unwrap();
+        assert_eq!(pusher.next().await.unwrap().unwrap(), Frame::Integer(1));
+
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(2), blocker.next())
+            .await
+            .expect("BLMOVE must unblock once the source is pushed to, not hang forever")
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply, Frame::Bulk(Bytes::from_static(b"payload")));
+    }
+
+    /// `BLPOP`'s equivalent of the test above, and it additionally proves the poll loop gives up
+    /// at the client's own timeout rather than only ever returning on success: nothing ever
+    /// pushes to the key, so this must come back `nil` once its (short, test-sized) timeout
+    /// elapses, not hang.
+    #[tokio::test]
+    async fn blpop_returns_nil_once_its_timeout_elapses_with_nothing_pushed() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let engine = Arc::new(Engine::new());
+        let (_dir, aof) = test_aof();
+        tokio::spawn(serve(
+            listener,
+            engine,
+            aof,
+            Arc::new(crate::replication::ReplicationHandle::default()),
+            Arc::from("test-node"),
+        ));
+
+        let mut client = Framed::new(
+            TcpStream::connect(addr).await.unwrap(),
+            RespCodec::default(),
+        );
+        client
+            .send(Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"BLPOP")),
+                Frame::Bulk(Bytes::from_static(b"never-pushed")),
+                Frame::Bulk(Bytes::from_static(b"0.2")),
+            ]))
+            .await
+            .unwrap();
+
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(2), client.next())
+            .await
+            .expect("BLPOP must give up at its own timeout, not hang forever")
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply, Frame::Null);
+    }
+
+    /// A connection blocked on `BLPOP` must not wedge the whole server -- a second, unrelated
+    /// connection has to keep being served normally while the first is still waiting.
+    #[tokio::test]
+    async fn a_connection_blocked_on_blpop_does_not_block_other_connections() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let engine = Arc::new(Engine::new());
+        let (_dir, aof) = test_aof();
+        tokio::spawn(serve(
+            listener,
+            engine,
+            aof,
+            Arc::new(crate::replication::ReplicationHandle::default()),
+            Arc::from("test-node"),
+        ));
+
+        let mut blocker = Framed::new(
+            TcpStream::connect(addr).await.unwrap(),
+            RespCodec::default(),
+        );
+        blocker
+            .send(Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"BLPOP")),
+                Frame::Bulk(Bytes::from_static(b"never-pushed")),
+                Frame::Bulk(Bytes::from_static(b"0")),
+            ]))
+            .await
+            .unwrap();
+
+        let mut other = Framed::new(
+            TcpStream::connect(addr).await.unwrap(),
+            RespCodec::default(),
+        );
+        other
+            .send(Frame::Array(vec![Frame::Bulk(Bytes::from_static(b"PING"))]))
+            .await
+            .unwrap();
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(2), other.next())
+            .await
+            .expect("an unrelated connection must not be blocked by another's BLPOP")
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply, Frame::Simple("PONG".into()));
     }
 }

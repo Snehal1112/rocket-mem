@@ -17,7 +17,7 @@ environment variables and config-file options, see
 |---|---|
 | String/Key | `GET`, `SET` (`NX`/`XX`/`EX`/`PX`), `GETSET`, `GETRANGE`, `SETRANGE`, `APPEND`, `STRLEN`, `INCR`/`DECR`/`INCRBY`, `MSET`, `MGET`, `MSETNX`, `RENAME`, `RENAMENX`, `TYPE`, `RANDOMKEY`, `KEYS` (glob: `*`, `?`, `[abc]` only), `SCAN`, `DEL`/`EXISTS` (variadic), `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`, `TTL`, `PTTL`, `PERSIST`, `MEMORY USAGE`, `OBJECT ENCODING` |
 | Hash | `HSET`, `HGET`, `HDEL`, `HEXISTS`, `HGETALL`, `HLEN`, `HINCRBY`, `HKEYS`, `HVALS`, `HMGET`, `HSETNX`, `HSCAN` |
-| List | `LPUSH`, `RPUSH` (both variadic), `LPOP`, `RPOP`, `LRANGE`, `LLEN`, `LINDEX`, `LSET`, `LTRIM`, `LREM`, `LINSERT` |
+| List | `LPUSH`, `RPUSH` (both variadic), `LPOP`, `RPOP`, `LRANGE`, `LLEN`, `LINDEX`, `LSET`, `LTRIM`, `LREM`, `LINSERT`, `LMOVE`, `RPOPLPUSH`, `BLMOVE`[^blocking-poll], `BRPOPLPUSH`[^blocking-poll], `BLPOP`[^blocking-poll], `BRPOP`[^blocking-poll] |
 | Set | `SADD`, `SREM`, `SMEMBERS`, `SISMEMBER`, `SCARD`, `SINTER`, `SUNION`, `SDIFF`, `SINTERSTORE`, `SUNIONSTORE`, `SDIFFSTORE`, `SPOP`, `SRANDMEMBER` |
 | Sorted Set | `ZADD`, `ZSCORE`, `ZREM`, `ZCARD`, `ZINCRBY`, `ZRANGE`, `ZRANK` |
 | Server/Cluster | `PING`, `ECHO`, `DEBUG SLEEP`[^debug-sleep-cap], `SELECT`, `COMMAND`, `HELLO`, `INFO [section]`, `SAVE`, `BGREWRITEAOF`, `REPLICAOF`, `PSYNC`, `CLUSTER KEYSLOT`/`SHARDS`/`NODES`/`INFO`/`MYID`, `SLOWLOG GET`/`LEN`/`RESET` |
@@ -26,6 +26,8 @@ environment variables and config-file options, see
 | Pub/Sub | `SUBSCRIBE`, `UNSUBSCRIBE`, `PSUBSCRIBE`, `PUNSUBSCRIBE`, `PUBLISH`, `PUBSUB CHANNELS`/`NUMSUB`/`NUMPAT` |
 
 [^debug-sleep-cap]: `DEBUG SLEEP` is capped at a 10-second maximum duration; a longer request is rejected with an error rather than accepted and blocking a server thread indefinitely.
+
+[^blocking-poll]: Blocked via a connection-layer poll loop (retrying the non-blocking primitive every ~30ms) rather than a wake-up notification, and only over RESP — see "Known divergences" below for both limitations.
 
 `KEYS`'s glob support is intentionally partial: no character ranges (`[a-z]`), negation
 (`[^abc]`), or escaping. Active expiry sweeps one whole shard per 100ms tick rather than
@@ -113,6 +115,17 @@ implement.
   implement. See [the pub/sub spec](superpowers/specs/2026-09-11-pubsub-spec.md)'s "Cluster
   scope" section.
 - **No sharded pub/sub (`SPUBLISH`/`SSUBSCRIBE`).** Not applicable without cluster-wide fanout.
+- **`BLPOP`/`BRPOP`/`BLMOVE`/`BRPOPLPUSH` block via polling, not a wake-up notification.**
+  `dispatch()` itself only ever makes one non-blocking attempt (matching the project's own rule
+  that the dispatch path never holds a shard lock across an `.await`); the actual waiting is a
+  `crates/server/src/connection.rs` loop that retries that attempt roughly every 30ms until it
+  succeeds, the client's timeout elapses, or the client disconnects. This means a client
+  unblocks up to ~30ms after the data it's waiting for actually arrives, rather than
+  immediately — usually immaterial, but worth knowing if sub-millisecond wakeup latency matters
+  to a workload. **This only applies to RESP connections.** An RMP client calling one of these
+  four commands gets `dispatch()`'s single non-blocking attempt with no poll loop around it at
+  all: an immediate reply either way, timeout argument accepted but otherwise ignored. True
+  blocking over RMP is not implemented.
 
 ## Commands not implemented
 
@@ -123,7 +136,8 @@ in [`docs/rocket-mem-sprint-plan.md`](rocket-mem-sprint-plan.md) (its retro entr
 follow-on backlog covering exactly these four areas, plus live cluster resharding).
 
 - **List/sorted-set extras:** `LPOS`, `LMPOP`, `ZMPOP`, and their blocking (`B*`) counterparts
-  (`BLPOP`, `BRPOP`, `BLMPOP`, `BZMPOP`, `BZPOPMIN`/`BZPOPMAX`, etc.).
+  (`BLMPOP`, `BZMPOP`, `BZPOPMIN`/`BZPOPMAX`, etc.). `BLPOP`/`BRPOP`/`BLMOVE`/`BRPOPLPUSH` *are*
+  implemented — see the Command coverage table and "Known divergences" below.
 - **Key/object extras:** `COPY`, `OBJECT FREQ`, `OBJECT IDLETIME`, `WAIT`, `LOLWUT`.
 - **Lua scripting:** `EVAL`, `EVALSHA`, `SCRIPT LOAD`/`EXISTS`/`FLUSH`.
 - **Sharded pub/sub:** `SPUBLISH`, `SSUBSCRIBE`, `SUNSUBSCRIBE` (Redis 7's cluster-aware pub/sub
