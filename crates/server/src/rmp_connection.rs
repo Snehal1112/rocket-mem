@@ -211,10 +211,15 @@ async fn handle_connection<S>(
         let request = match next {
             Ok(msg) if msg.msg_type == MsgType::Request => msg,
             Ok(_) => break, // a stray Response from a misbehaving client
-            Err(e) => {
+            // `RmpCodec::decode` only ever produces `ErrorKind::InvalidData` -- see
+            // `connection.rs`'s matching comment for why every other kind reaching here is a
+            // transport-level abrupt disconnect (e.g. a TLS client that drops its socket
+            // without sending `close_notify`), not a malformed message.
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
                 tracing::warn!(%peer, error = %e, "rmp decode error");
                 break;
             }
+            Err(_) => break, // abrupt transport-level disconnect — not a protocol error
         };
         conn_stats.record_command();
         // Blocks once MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION tasks are already mid-dispatch --
@@ -494,6 +499,90 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert_eq!(replication.connected_clients(), 0);
         assert_eq!(replication.total_connections(), 1); // the lifetime total never drops
+    }
+
+    fn fixture(name: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(name)
+    }
+
+    /// Mirrors `connection::tests::a_tls_client_that_disconnects_without_a_close_notify_is_not_logged_as_a_decode_error`
+    /// for the RMP path: `RmpCodec::decode` only ever produces `ErrorKind::InvalidData`, so a
+    /// TLS client that drops its stream without `shutdown()` (never sending `close_notify`)
+    /// must not be logged as an "rmp decode error".
+    ///
+    /// Retries with a fresh connection (and a fresh capture buffer) up to 3 times, each against a
+    /// bounded 2s poll -- see `connection.rs`'s
+    /// `a_connection_that_sends_nothing_before_disconnecting_still_logs_both_events_at_info` for
+    /// the identical rationale: under heavy parallel test load a single attempt's 2s budget can
+    /// elapse before this thread gets scheduled at all, which a retry against a fresh, independent
+    /// connection absorbs without weakening what any single attempt proves.
+    #[tokio::test]
+    async fn a_tls_client_that_disconnects_without_a_close_notify_is_not_logged_as_a_decode_error()
+    {
+        let engine = Arc::new(Engine::new());
+        let (_dir, aof) = test_aof();
+        let replication = Arc::new(ReplicationHandle::default());
+        let client_config = crate::tls::load_client_config(&fixture("test-cert.pem")).unwrap();
+        let tls_config =
+            crate::tls::load_server_config(&fixture("test-cert.pem"), &fixture("test-key.pem"))
+                .unwrap();
+
+        const ATTEMPTS: u32 = 3;
+        let mut last_log = String::new();
+        for _attempt in 1..=ATTEMPTS {
+            let writer = crate::logging::test_support::CapturedLogs::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(writer.clone())
+                .with_max_level(tracing::Level::INFO)
+                .with_ansi(false)
+                .finish();
+            let _guard = tracing::subscriber::set_default(subscriber);
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(serve_tls(
+                listener,
+                Arc::clone(&tls_config),
+                Arc::clone(&engine),
+                Arc::clone(&aof),
+                Arc::clone(&replication),
+                Arc::from("test-node"),
+            ));
+
+            let connector = tokio_rustls::TlsConnector::from(Arc::clone(&client_config));
+            let tcp = TcpStream::connect(addr).await.unwrap();
+            let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+            let tls_stream = connector.connect(server_name, tcp).await.unwrap();
+            drop(tls_stream); // no shutdown() -- no close_notify is sent
+
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+            let succeeded = loop {
+                let log = writer.text();
+                if log.contains("connection closed") {
+                    break true;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    last_log = log;
+                    break false;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            };
+            if succeeded {
+                assert!(
+                    !writer.text().contains("decode error"),
+                    "an abrupt TLS disconnect without close_notify must not be logged as an rmp \
+                     decode error, got: {}",
+                    writer.text()
+                );
+                return;
+            }
+        }
+        panic!(
+            "expected a \"connection closed\" log line, even after {ATTEMPTS} fresh attempts -- \
+             last attempt got: {last_log}"
+        );
     }
 
     #[tokio::test]

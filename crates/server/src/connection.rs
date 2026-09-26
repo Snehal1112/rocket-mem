@@ -379,11 +379,18 @@ async fn handle_connection<S>(
         };
         let frame = match next {
             Some(Ok(frame)) => frame,
-            Some(Err(e)) => {
+            // `RespCodec::decode` (see `protocol::codec::parse_frame`) only ever produces
+            // `ErrorKind::InvalidData` -- every other kind reaching here comes from the
+            // transport, not the parser, e.g. a client that drops its TLS socket without
+            // sending `close_notify` (`UnexpectedEof`) or an abrupt RST (`ConnectionReset`).
+            // Neither is a malformed frame, so only `InvalidData` is worth a warning; anything
+            // else is a routine abrupt disconnect, same as a clean EOF below.
+            Some(Err(e)) if e.kind() == std::io::ErrorKind::InvalidData => {
                 tracing::warn!(%peer, error = %e, "connection closed: decode error");
                 return;
             }
-            None => return, // client disconnected cleanly — not worth logging
+            Some(Err(_)) => return, // abrupt transport-level disconnect — not a protocol error
+            None => return,         // client disconnected cleanly — not worth logging
         };
         if is_psync_command(&frame) {
             // PSYNC never reaches `dispatch_and_log` (it's intercepted here, before the frame
@@ -1098,6 +1105,78 @@ mod tests {
             "a connection that never sent a valid frame must still log both events at info, \
              even after {ATTEMPTS} fresh attempts -- last attempt got: {last_log}"
         );
+    }
+
+    fn fixture(name: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(name)
+    }
+
+    /// A TLS client that drops its stream without calling `shutdown()` never sends a
+    /// `close_notify` alert (the same behavior `cluster_health`'s `probe_ping` doc comment
+    /// already documents on the outbound side), which rustls/the OS surfaces as some
+    /// non-`InvalidData` `io::Error` -- `ConnectionReset` on this loopback path, `UnexpectedEof`
+    /// on others, depending on OS/timing. `RespCodec::decode` itself only ever produces
+    /// `ErrorKind::InvalidData` (see its `parse_frame` error sites), so whichever kind actually
+    /// shows up here, it is never a malformed frame -- it's a routine abrupt disconnect, and
+    /// must not be logged as a "decode error".
+    #[tokio::test]
+    async fn a_tls_client_that_disconnects_without_a_close_notify_is_not_logged_as_a_decode_error()
+    {
+        let engine = Arc::new(Engine::new());
+        let (_dir, aof) = test_aof();
+        let replication = Arc::new(crate::replication::ReplicationHandle::new(
+            Arc::clone(&engine),
+            std::env::temp_dir().join("tls-close-notify-log-level-test-unused.snapshot"),
+        ));
+
+        let writer = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(writer.clone())
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let tls_config =
+            crate::tls::load_server_config(&fixture("test-cert.pem"), &fixture("test-key.pem"))
+                .unwrap();
+        tokio::spawn(serve_tls(
+            listener,
+            tls_config,
+            engine,
+            aof,
+            replication,
+            Arc::from("test-node"),
+        ));
+
+        let client_config = crate::tls::load_client_config(&fixture("test-cert.pem")).unwrap();
+        let connector = tokio_rustls::TlsConnector::from(client_config);
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let tls_stream = connector.connect(server_name, tcp).await.unwrap();
+        drop(tls_stream); // no shutdown() -- no close_notify is sent
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let log = writer.text();
+            if log.contains("connection closed") {
+                assert!(
+                    !log.contains("decode error"),
+                    "an abrupt TLS disconnect without close_notify must not be logged as a \
+                     decode error, got: {log}"
+                );
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "expected a \"connection closed\" log line, got: {log}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 
     /// Covers the helper all four accept loops call (plaintext and TLS, for both RESP and RMP).
